@@ -8,7 +8,7 @@
   "type": "module",
   "main": "dist/main/index.js",
   "scripts": {
-    "build": "tsc -b --pretty false && node ../../packages/ui/scripts/copy-assets.mjs && node scripts/prepare-legal.mjs && vite build",
+    "build": "node scripts/ensure-electron.mjs && tsc -b --pretty false && node ../../packages/ui/scripts/copy-assets.mjs && node scripts/prepare-legal.mjs && vite build",
     "dist": "npm run build && node scripts/clean-package-output.mjs && node scripts/package-macos.mjs && npm run verify:dist",
     "start": "npm run build && electron .",
     "test": "tsc -b --pretty false && node --test dist/main/*.test.js",

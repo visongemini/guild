@@ -19,9 +19,31 @@ Guild 已开放源码，当前仓库包含可构建的桌面客户端源码：
 源码公开不等于 macOS 安装包已通过 Apple 公证。面向普通用户分发的安装包仍需
 Developer ID 签名与公证；开发者可按下方步骤在本机自行构建。
 
+## 下载与安装
+
+普通用户可以从 GitHub Releases 下载 `Guild-2.1.6-arm64.dmg`，打开 DMG 后将 Guild
+拖入“应用程序”。当前安装包尚未经过 Apple 公证；macOS 首次启动若提示开发者无法
+验证，请在 Finder 中右键 Guild，选择“打开”，并再次确认。不要从第三方网站下载或
+执行来历不明的解除隔离命令。
+
+从源码构建需要 Apple Silicon Mac、Node.js 24/npm，以及已经由用户自行安装并登录的
+官方 `grok` CLI：
+
+```sh
+git clone https://github.com/visongemini/guild.git
+cd guild
+npm ci
+npm test
+npm run package:desktop
+open apps/desktop/dist/Guild-2.1.6-arm64.dmg
+```
+
+`npm ci` 会在首次安装时下载并校验与锁文件一致的 Electron 二进制；桌面构建也会再次
+检查它，不再依赖手工执行 Electron。若下载因网络中断失败，恢复网络后运行
+`npm run prepare:electron`，再重新打包。
+
 ## 开发与验证
 
-需要 macOS、Node.js/npm，以及已经由用户自行安装并登录的官方 `grok` CLI。
 Guild 不读取 `~/.grok/auth.json`，也不会代替 Grok 直接请求上游。
 
 ```sh
@@ -73,6 +95,22 @@ The current branch contains the complete daily-use core: native workspace select
 workspace-owned tasks, multi-turn conversations, cancellation, durable follow-up queues,
 ACP permission choices, official usage display, inline image/audio rendering, local SQLite
 persistence, restart and sleep/wake recovery, bilingual UI, and a verified arm64 DMG build.
+
+Apple Silicon users can download `Guild-2.1.6-arm64.dmg` from GitHub Releases. The current
+build is not Apple-notarized; on first launch, use Finder's **Open** context-menu action and
+confirm macOS's warning. To build from source with Node.js 24 and npm 11:
+
+```sh
+git clone https://github.com/visongemini/guild.git
+cd guild
+npm ci
+npm test
+npm run package:desktop
+open apps/desktop/dist/Guild-2.1.6-arm64.dmg
+```
+
+The install and desktop-build paths both prepare and verify the lockfile-pinned Electron binary.
+If the first download is interrupted, restore network access and run `npm run prepare:electron`.
 
 Public source availability does not imply an Apple-notarized binary release. Guild never reads
 `~/.grok/auth.json`; all model requests originate from the official user-installed Grok process.

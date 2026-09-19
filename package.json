@@ -5,6 +5,11 @@
   "private": true,
   "license": "MIT",
   "type": "module",
+  "engines": {
+    "node": ">=24.0.0",
+    "npm": ">=11.0.0"
+  },
+  "packageManager": "npm@11.11.0",
   "workspaces": [
     "apps/desktop",
     "packages/contracts",
@@ -14,6 +19,8 @@
     "packages/ui"
   ],
   "scripts": {
+    "postinstall": "npm run prepare:electron",
+    "prepare:electron": "node apps/desktop/scripts/ensure-electron.mjs",
     "check": "tsc -b --pretty false",
     "build": "tsc -b --pretty false && node packages/ui/scripts/copy-assets.mjs",
     "clean": "node scripts/clean.mjs",
