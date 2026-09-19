@@ -1,0 +1,21 @@
+{
+  "name": "@guild/contracts",
+  "version": "2.0.0",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./desktop-ipc": {
+      "types": "./dist/desktop-ipc.d.ts",
+      "import": "./dist/desktop-ipc.js"
+    },
+    "./continuous-footer": {
+      "types": "./dist/continuous-footer.d.ts",
+      "import": "./dist/continuous-footer.js"
+    }
+  }
+}

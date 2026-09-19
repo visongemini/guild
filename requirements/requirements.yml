@@ -1,0 +1,865 @@
+schema_version: 1
+document_id: GUILD2-REQUIREMENTS
+product_version: 2.0.27
+baseline_ui: Guild 1.1.13
+status: implementation
+
+id_policy:
+  immutable: true
+  format: "^PC-[A-Z][A-Z0-9]*-[0-9]{3}$"
+  rule: >-
+    Published requirement IDs are never renamed or reused. Superseded requirements remain
+    present with a disposition and replacement ID.
+
+traceability_policy:
+  pre_implementation: implementation_commits may be empty only while no production code implements the requirement.
+  production_change: Every production commit must cite at least one active requirement ID and be appended to its implementation_commits.
+  public_snapshot: Historic implementation_commits are provenance identifiers and need not be embedded in a history-free public source snapshot.
+  test_results: Planned test IDs are stable definitions; immutable result artifacts record pass/fail, tested commit and package hash.
+  release: Every P0 requirement must resolve to passing evidence for the exact release commit and packaged application where applicable.
+
+allowed_values:
+  severity:
+    P0: Required for a safe and truthful 2.0 release; a failed packaged acceptance blocks release.
+    P1: Required for the owning phase exit; an unresolved failure blocks that phase.
+    P2: Required before final release unless explicitly deferred by a recorded product decision.
+  phase:
+    0: Provenance and feasibility
+    1: Vertical runtime slice
+    2: Durable conversation experience
+    3: Complete desktop workflow
+    4: Migration and polish
+    5: Release evidence
+
+acceptance_stories:
+  AS-001:
+    source: docs/01-PRODUCT-CONTRACT.md#acceptance-stories
+    summary: >-
+      Select a workspace, complete a task with thinking, tools and media, run a queued follow-up,
+      quit, reopen and continue with either a proven restored session or a truthful broken binding.
+  AS-002:
+    source: docs/01-PRODUCT-CONTRACT.md#acceptance-stories
+    summary: >-
+      Close the lid during a long tool run, resume to the exact truthful state, and send again
+      without restarting Guild.
+  AS-003:
+    source: docs/01-PRODUCT-CONTRACT.md#acceptance-stories
+    summary: >-
+      Run two tasks in different workspaces concurrently without cross-task late events,
+      permissions or session identities.
+  AS-004:
+    source: docs/01-PRODUCT-CONTRACT.md#acceptance-stories
+    summary: >-
+      Resize narrow to wide with popovers, menus and media open while preserving visibility and
+      the accepted Guild 1.1.13 layout.
+  AS-005:
+    source: docs/01-PRODUCT-CONTRACT.md#acceptance-stories
+    summary: >-
+      Disable optional browser synchronization, relaunch, and observe no browser or Keychain access.
+  AS-006:
+    source: docs/01-PRODUCT-CONTRACT.md#acceptance-stories
+    summary: >-
+      Inject runtime, transport, storage and network failures and receive truthful bounded recovery
+      rather than a permanent running indicator.
+  AS-007:
+    source: docs/01-PRODUCT-CONTRACT.md#account-and-runtime
+    summary: >-
+      Edit the local nickname and avatar, persist them across restart, open the independent
+      settings dialog, change language, restore-last-task and workspace behavior, send official
+      Grok model and reasoning effort to the official process, keep browser sync off, and keep
+      long conversations scrollable, persist background-task notifications, and never activate
+      Guild merely because a background task changed state.
+  AS-008:
+    source: docs/01-PRODUCT-CONTRACT.md#projects-workspaces-and-tasks
+    summary: >-
+      Run, queue, pause for permission, fail and interrupt different tasks, then identify each state
+      from one aligned sidebar icon slot without opening the conversation.
+  AS-009:
+    source: docs/01-PRODUCT-CONTRACT.md#account-and-runtime
+    summary: >-
+      Open one bilingual feature center, directly run representative official Grok session and
+      administrative functions, and prove raw argv or unconfirmed destructive actions cannot execute.
+  AS-010:
+    source: docs/01-PRODUCT-CONTRACT.md#desktop-interaction
+    summary: >-
+      Package consecutive local Guild releases under one certificate-backed designated requirement
+      so macOS recognizes updates without reverting to a per-build ad-hoc identity.
+
+acceptance_tests:
+  CT-TRACE-001:
+    layer: contract
+    phase: 0
+    status: planned
+    proves: Requirement schema, unique IDs, allowed severities/phases and closed references validate.
+  CT-RUN-001:
+    layer: contract
+    phase: 0
+    status: planned
+    proves: Every allowed Run transition vector succeeds and every unlisted transition is rejected.
+  CT-RUN-002:
+    layer: property
+    phase: 0
+    status: planned
+    proves: Completed, failed, cancelled and interrupted Run states are absorbing.
+  CT-RUN-003:
+    layer: contract
+    phase: 0
+    status: planned
+    proves: Cancellation intent is durable before notification and cannot become cancelled on send alone.
+  CT-SESS-001:
+    layer: contract
+    phase: 0
+    status: planned
+    proves: Session binding transitions never silently replace a session or revive an interrupted Run.
+  CT-EVENT-001:
+    layer: contract
+    phase: 0
+    status: planned
+    proves: Wrong task, Run, session, adapter epoch or ingest mode events are rejected.
+  CT-REPLAY-001:
+    layer: contract
+    phase: 0
+    status: planned
+    proves: Load replay is staged behind a completion barrier and reconciles without duplicate history.
+  CT-PERM-001:
+    layer: contract
+    phase: 0
+    status: planned
+    proves: Permission identity is exact and resolution is exactly once, with expiry and orphan paths.
+  CT-PROC-001:
+    layer: contract
+    phase: 0
+    status: planned
+    proves: Adapter epochs are monotonic and events from exited or superseded epochs cannot mutate state.
+  EV-CLEAN-001:
+    layer: evidence
+    phase: 0
+    status: planned
+    proves: Content-addressed clean input manifest and negative access tests deny every prohibited path.
+  EV-ACP-001:
+    layer: live-spike
+    phase: 0
+    status: planned
+    proves: Official process initialize, advertised authentication and session creation succeed without credential reads.
+  EV-ACP-002:
+    layer: live-spike
+    phase: 0
+    status: planned
+    proves: Resume and load/replay capabilities, ordering and identifier stability are measured, not assumed.
+  EV-ACP-003:
+    layer: live-spike
+    phase: 0
+    status: planned
+    proves: Process topology, permission, cancellation, concurrency and client capability claims are falsified or accepted.
+  EV-ASSET-001:
+    layer: evidence
+    phase: 0
+    status: planned
+    proves: Every transferred visual, font and sound asset has provenance, rights, hash and approval.
+  EV-CUSTODY-001:
+    layer: evidence
+    phase: 0
+    status: planned
+    proves: Protected raw protocol evidence and sanitized clean-side derivatives are hash-linked by a redaction manifest.
+  EV-SCAN-001:
+    layer: evidence
+    phase: 0
+    status: planned
+    proves: Dependency, license, secret and Electron-security scans run from the first dependency commit onward.
+  IT-PERSIST-001:
+    layer: integration
+    phase: 1
+    status: planned
+    proves: Send, Run creation, messages and terminal outcome are atomic, durable and idempotent across crash injection.
+  IT-RUNTIME-001:
+    layer: integration
+    phase: 1
+    status: planned
+    proves: Two consecutive prompts use the intended task and session through the official process.
+  IT-RUNTIME-002:
+    layer: integration
+    phase: 1
+    status: planned
+    proves: EOF, malformed frames, silent transport, process exit and bounded timeout reach truthful outcomes.
+  IT-SEC-001:
+    layer: packaged-integration
+    phase: 1
+    status: planned
+    proves: Renderer isolation, IPC sender checks, navigation denial, scoped protocols and no startup credential access hold.
+  AT-RECOVERY-001:
+    layer: packaged-acceptance
+    phase: 1
+    status: planned
+    proves: Quit/reopen and renderer reload preserve local history without duplicate process or send.
+  AT-POWER-001:
+    layer: packaged-acceptance
+    phase: 1
+    status: planned
+    proves: Real lid-close preserves readable state and a fresh send works after wake without app restart.
+  AT-CONCURRENCY-001:
+    layer: packaged-acceptance
+    phase: 2
+    status: planned
+    proves: Concurrent tasks and delayed events remain isolated by workspace, task, Run, session and epoch.
+  AT-CONVERSATION-001:
+    layer: packaged-acceptance
+    phase: 2
+    status: planned
+    proves: Thought, tools, permissions, media, diffs, queue and long history render durably and chronologically.
+  AT-UI-001:
+    layer: packaged-visual
+    phase: 1
+    status: planned
+    proves: The Phase 1 conversation/composer surface matches approved Guild 1.1.13 captures with no redesign.
+  AT-UI-002:
+    layer: packaged-visual
+    phase: 3
+    status: planned
+    proves: Full narrow, default and wide bilingual state matrix has no unexplained visual or interaction diff.
+  AT-I18N-001:
+    layer: packaged-acceptance
+    phase: 1
+    status: planned
+    proves: Chinese and English switch persistently and all user-facing strings come from locale catalogs.
+  AT-A11Y-001:
+    layer: packaged-acceptance
+    phase: 1
+    status: planned
+    proves: First-use UI primitives expose keyboard, focus, accessibility and reduced-motion semantics.
+  AT-ACCOUNT-001:
+    layer: packaged-acceptance
+    phase: 3
+    status: planned
+    proves: Account values come only from official surfaces and unavailable values are labeled without estimates.
+  AT-ATTENTION-001:
+    layer: packaged-acceptance
+    phase: 3
+    status: planned
+    proves: >-
+      Background task state transitions notify at most once while Guild is unfocused, never activate
+      the window by delivery alone, and open the exact task only after an explicit notification click.
+  AT-PROF-001:
+    layer: packaged-acceptance
+    phase: 3
+    status: planned
+    proves: Local nickname and validated avatar persist across restart through the media grant protocol.
+  AT-SET-001:
+    layer: packaged-acceptance
+    phase: 3
+    status: planned
+    proves: Independent settings persist language, restore-last-task, workspace mode, and official Grok model or reasoning without enabling browser sync.
+  AT-SCROLL-001:
+    layer: packaged-acceptance
+    phase: 2
+    status: planned
+    proves: A conversation taller than the main pane scrolls inside the conversation region rather than growing the shell.
+  AT-LAYOUT-001:
+    layer: packaged-acceptance
+    phase: 3
+    status: planned
+    proves: Sidebar profile/settings, truthful pre-activity conversation status, and composer remain inside the window box and shared content axis at narrow, default, and short sizes.
+  AT-LAYOUT-002:
+    layer: packaged-acceptance
+    phase: 3
+    status: planned
+    proves: An open task or workspace menu stays inside the window after resize from wide to narrow.
+  AT-WORKSPACE-001:
+    layer: packaged-acceptance
+    phase: 3
+    status: planned
+    proves: Sending on a task whose workspace folder is gone names the missing folder and does not start the official Grok process.
+  AT-COMPOSER-001:
+    layer: packaged-acceptance
+    phase: 3
+    status: planned
+    proves: Composer text above the IPC length bound is named and is not persisted or sent.
+  AT-GROK-001:
+    layer: packaged-acceptance
+    phase: 3
+    status: planned
+    proves: >-
+      Every allowlisted official Grok management action has one bilingual GUI entry, representative
+      read-only actions execute through the official process, extra parameters are rejected, sensitive
+      output is redacted, destructive actions require a second confirmation, management cannot overlap
+      ACP or queued work, and application close aborts and joins the owned command process group.
+  AT-SIGN-001:
+    layer: packaged-acceptance
+    phase: 5
+    status: planned
+    proves: >-
+      Packaged app and helpers share the persistent Guild signing authority; the outer designated
+      requirement contains the fixed bundle identifier and certificate root but no per-build cdhash.
+  AT-MIGRATION-001:
+    layer: packaged-acceptance
+    phase: 4
+    status: planned
+    proves: Neutral import dry-run, atomic commit, idempotent re-import, conflict handling and snapshot restore pass.
+  EV-RELEASE-001:
+    layer: release-evidence
+    phase: 5
+    status: planned
+    proves: Requirement, test result, implementation commit, package hash and release ledger agree.
+
+requirements:
+  - id: PC-TRACE-001
+    title: Stable requirement traceability
+    statement: >-
+      Every product requirement has an immutable ID, severity, owning phase, acceptance-story
+      references, acceptance-test references and implementation commit references.
+    severity: P0
+    phase: 0
+    acceptance_stories: [AS-001, AS-002, AS-003, AS-004, AS-005, AS-006]
+    acceptance_tests: [CT-TRACE-001, EV-RELEASE-001]
+    implementation_commits: [5e21163738ab53f753c33f7f55b0045ce4c2d8f7]
+    sources: [AGENTS.md, docs/00-PROVENANCE-CHARTER.md, reviews/SOL-PRO-REVIEW.md]
+
+  - id: PC-PROV-001
+    title: Independent source boundary
+    statement: >-
+      Production implementation uses only a content-addressed allow-listed clean snapshot and
+      cannot access prohibited source, installed application data, dirty-side transcripts or credentials.
+    severity: P0
+    phase: 0
+    acceptance_stories: []
+    acceptance_tests: [EV-CLEAN-001, EV-RELEASE-001]
+    implementation_commits: []
+    sources: [AGENTS.md, docs/00-PROVENANCE-CHARTER.md]
+
+  - id: PC-PROV-002
+    title: Asset provenance
+    statement: >-
+      No icon, character, font, sound or media asset transfers without recorded source, rights,
+      canonical hash and reviewer approval.
+    severity: P0
+    phase: 0
+    acceptance_stories: [AS-004]
+    acceptance_tests: [EV-ASSET-001, EV-RELEASE-001]
+    implementation_commits: []
+    sources: [docs/00-PROVENANCE-CHARTER.md, docs/01-PRODUCT-CONTRACT.md]
+
+  - id: PC-EVID-001
+    title: Two-tier runtime evidence custody
+    statement: >-
+      Raw runtime frames remain protected outside clean implementation inputs; only a sanitized
+      derivative, redaction manifest and hashes linking both tiers cross the filtration boundary.
+    severity: P2
+    phase: 0
+    acceptance_stories: []
+    acceptance_tests: [EV-CUSTODY-001, EV-RELEASE-001]
+    implementation_commits: []
+    sources: [reviews/SOL-PRO-REVIEW.md, docs/00-PROVENANCE-CHARTER.md]
+
+  - id: PC-SCAN-001
+    title: Continuous safety and license scans
+    statement: >-
+      Dependency, license, secret and Electron-security scans begin with the first dependency commit
+      and continue through release rather than appearing only at the final gate.
+    severity: P2
+    phase: 0
+    acceptance_stories: []
+    acceptance_tests: [EV-SCAN-001, EV-RELEASE-001]
+    implementation_commits: [3c2c0e2ca6154fdca04a6892b2ea2e43a18e5b81]
+    sources: [AGENTS.md, reviews/SOL-PRO-REVIEW.md]
+
+  - id: PC-SEC-001
+    title: Official process is the only upstream caller
+    statement: >-
+      All Grok upstream requests originate from the official Grok process; Guild never parses
+      credential files to issue requests and exposes no shared or externally reachable gateway.
+      A Finder launch may hand the child only validated macOS proxy environment values; Guild still
+      never sends the upstream request itself. The local owner may choose only the official
+      process's default or bypassPermissions mode; the latter does not expose Guild to another
+      client, user, or network caller.
+    severity: P0
+    phase: 0
+    acceptance_stories: [AS-005, AS-006]
+    acceptance_tests: [EV-ACP-001, IT-SEC-001, EV-RELEASE-001]
+    implementation_commits: [effe75f69f28b8ca025027ee9ceb9d85f8c695b2, c67b33be224c9372bbb93848e8d1fec340b79a2d, ec1f1e59b58d91cca2650d4a83f7f2b14294c721]
+    sources: [AGENTS.md, docs/01-PRODUCT-CONTRACT.md, docs/02-ARCHITECTURE.md]
+
+  - id: PC-SEC-002
+    title: No unsolicited startup access
+    statement: >-
+      Application launch does not spawn authentication solely for UI population and does not request
+      browser, Keychain or Grok login access until the user initiates the corresponding feature.
+    severity: P0
+    phase: 1
+    acceptance_stories: [AS-005]
+    acceptance_tests: [EV-ACP-001, IT-SEC-001]
+    implementation_commits: [3c2c0e2ca6154fdca04a6892b2ea2e43a18e5b81]
+    sources: [docs/01-PRODUCT-CONTRACT.md, reviews/SOL-PRO-REVIEW.md]
+
+  - id: PC-SEC-003
+    title: Hardened Electron boundary
+    statement: >-
+      The packaged shell enforces renderer sandboxing, context isolation, nodeIntegration false,
+      CSP, webSecurity, sender-frame and window validation, denied navigation/window creation,
+      restricted external links, scoped custom protocols and hardened fuses.
+    severity: P1
+    phase: 1
+    acceptance_stories: [AS-004, AS-005]
+    acceptance_tests: [IT-SEC-001]
+    implementation_commits: [3c2c0e2ca6154fdca04a6892b2ea2e43a18e5b81, ec1f1e59b58d91cca2650d4a83f7f2b14294c721]
+    sources: [AGENTS.md, docs/02-ARCHITECTURE.md, reviews/SOL-PRO-REVIEW.md]
+
+  - id: PC-TASK-001
+    title: Durable task and workspace identity
+    statement: >-
+      A task belongs to one canonical workspace and cannot send without it; task, workspace,
+      session and Run identities never silently rebind.
+    severity: P0
+    phase: 1
+    acceptance_stories: [AS-001, AS-003, AS-008]
+    acceptance_tests: [CT-SESS-001, IT-RUNTIME-001, AT-CONCURRENCY-001, AT-WORKSPACE-001, AT-COMPOSER-001]
+    implementation_commits: [3c2c0e2ca6154fdca04a6892b2ea2e43a18e5b81, 1ea41c787cf577db621033278d55091ae0a7e670]
+    sources: [docs/01-PRODUCT-CONTRACT.md]
+
+  - id: PC-RUN-001
+    title: Authoritative Run state machine
+    statement: >-
+      Each invocation uses the legal Run transitions in docs/08-STATE-MACHINES.md, including
+      cancel_requested, with every transition durably recorded and reasoned.
+    severity: P0
+    phase: 0
+    acceptance_stories: [AS-001, AS-002, AS-003, AS-006]
+    acceptance_tests: [CT-RUN-001, CT-RUN-002, IT-PERSIST-001]
+    implementation_commits: [5e21163738ab53f753c33f7f55b0045ce4c2d8f7, effe75f69f28b8ca025027ee9ceb9d85f8c695b2, 55c521a13220b860450d49c65285432632bb3ed1]
+    sources: [docs/01-PRODUCT-CONTRACT.md, docs/02-ARCHITECTURE.md, reviews/SOL-PRO-REVIEW.md]
+
+  - id: PC-RUN-002
+    title: Truthful cancellation
+    statement: >-
+      Cancellation intent is persisted before the runtime notification. cancelled is reached only
+      after a cancellation terminal response, confirmed owned-process exit, forced-kill completion,
+      or an authoritative queued-run transaction that records local not-dispatched proof. That
+      queued transaction is valid cancellation proof and is distinct from merely writing a cancel
+      notification.
+    severity: P0
+    phase: 1
+    acceptance_stories: [AS-006]
+    acceptance_tests: [CT-RUN-003, EV-ACP-003, IT-RUNTIME-002]
+    implementation_commits: [5e21163738ab53f753c33f7f55b0045ce4c2d8f7, effe75f69f28b8ca025027ee9ceb9d85f8c695b2, 1ea41c787cf577db621033278d55091ae0a7e670, ec1f1e59b58d91cca2650d4a83f7f2b14294c721, 5711a51ef82ae71494816e7fb25c914586fef308]
+    sources: [reviews/SOL-PRO-REVIEW.md, docs/08-STATE-MACHINES.md]
+
+  - id: PC-RUN-003
+    title: Absorbing terminal outcomes
+    statement: >-
+      Completed, failed, cancelled and interrupted are absorbing; no recovery, replay or late event
+      may move that Run back to a non-terminal state.
+    severity: P0
+    phase: 0
+    acceptance_stories: [AS-002, AS-006]
+    acceptance_tests: [CT-RUN-002, CT-EVENT-001, IT-RUNTIME-002]
+    implementation_commits: [5e21163738ab53f753c33f7f55b0045ce4c2d8f7, effe75f69f28b8ca025027ee9ceb9d85f8c695b2, c67b33be224c9372bbb93848e8d1fec340b79a2d]
+    sources: [reviews/SOL-PRO-REVIEW.md, docs/08-STATE-MACHINES.md]
+
+  - id: PC-RUN-004
+    title: Interrupted work is never silently resumed
+    statement: >-
+      Process death, terminal transport loss, application quit during an active turn or bounded
+      liveness failure terminalizes that Run as interrupted. Session recovery never revives that
+      Run or automatically resends its instruction; an explicit later send creates a new Run. The
+      GUI separately presents the terminal Run and restored session, calls missing change evidence
+      unconfirmed rather than unchanged, and exposes explicit retry and local diagnostics actions.
+    severity: P0
+    phase: 1
+    acceptance_stories: [AS-002, AS-006]
+    acceptance_tests: [CT-RUN-001, IT-RUNTIME-002, AT-POWER-001]
+    implementation_commits: [effe75f69f28b8ca025027ee9ceb9d85f8c695b2, 3c2c0e2ca6154fdca04a6892b2ea2e43a18e5b81, 88b40e8f01fd41509ac751b5d35bcc778ab07cf8]
+    sources: [docs/01-PRODUCT-CONTRACT.md, reviews/SOL-PRO-REVIEW.md]
+
+  - id: PC-RUN-005
+    title: Durable queued follow-up and explicit preemption
+    statement: >-
+      A queued follow-up remains bound to its intended task and session and creates a later Run only
+      after the active Run terminates; queueing is Guild behavior, not an ACP capability claim. FIFO
+      is the default. Explicit preemption persists the selected queue priority and cancellation
+      intent for the exact active Run, requests official cancellation, and dispatches the selected
+      turn only after the old Run is terminal; root prompts never overlap.
+    severity: P1
+    phase: 2
+    acceptance_stories: [AS-001, AS-003]
+    acceptance_tests: [IT-PERSIST-001, AT-CONVERSATION-001, AT-CONCURRENCY-001]
+    implementation_commits: [3c2c0e2ca6154fdca04a6892b2ea2e43a18e5b81, c67b33be224c9372bbb93848e8d1fec340b79a2d, 1f3d344e352fddbb8d8f42dd1319908abdab0e5f, ec1f1e59b58d91cca2650d4a83f7f2b14294c721, 5711a51ef82ae71494816e7fb25c914586fef308]
+    sources: [docs/01-PRODUCT-CONTRACT.md, docs/02-ARCHITECTURE.md]
+
+  - id: PC-SESS-001
+    title: Orthogonal session binding
+    statement: >-
+      SessionBinding is independent of Run state; restoring or replacing a session never changes an
+      interrupted Run and never silently attaches a task to a different runtime session. A
+      user-authorized replacement durably records its semantic-recovery requirement before official
+      session creation, then receives one bounded task-local recovery capsule before its first
+      context-dependent prompt; missing task context blocks ambiguous continuation before Run creation.
+    severity: P0
+    phase: 0
+    acceptance_stories: [AS-001, AS-002, AS-003]
+    acceptance_tests: [CT-SESS-001, AT-RECOVERY-001]
+    implementation_commits: [5e21163738ab53f753c33f7f55b0045ce4c2d8f7, effe75f69f28b8ca025027ee9ceb9d85f8c695b2, c67b33be224c9372bbb93848e8d1fec340b79a2d, 1f3d344e352fddbb8d8f42dd1319908abdab0e5f, ec1f1e59b58d91cca2650d4a83f7f2b14294c721, 90057359c0c81f7bf25bbefe46190c2ff61f67b0]
+    sources: [docs/01-PRODUCT-CONTRACT.md, reviews/SOL-PRO-REVIEW.md, docs/08-STATE-MACHINES.md, docs/04-DECISION-LOG.md]
+
+  - id: PC-SESS-002
+    title: Resume before load
+    statement: >-
+      After restart Guild probes and prefers advertised session resume; it uses load only when proven,
+      and marks the binding broken if neither operation succeeds.
+    severity: P0
+    phase: 1
+    acceptance_stories: [AS-001, AS-002]
+    acceptance_tests: [EV-ACP-002, CT-SESS-001, AT-RECOVERY-001]
+    implementation_commits: [effe75f69f28b8ca025027ee9ceb9d85f8c695b2, c67b33be224c9372bbb93848e8d1fec340b79a2d, 1f3d344e352fddbb8d8f42dd1319908abdab0e5f, ec1f1e59b58d91cca2650d4a83f7f2b14294c721]
+    sources: [reviews/SOL-PRO-REVIEW.md]
+
+  - id: PC-SESS-003
+    title: Replay reconciliation barrier
+    statement: >-
+      Load-time updates are labeled replay, staged, reconciled against durable local history and
+      committed only after a load-completion barrier; they never blindly append or trigger side effects.
+    severity: P0
+    phase: 1
+    acceptance_stories: [AS-001, AS-006]
+    acceptance_tests: [CT-REPLAY-001, EV-ACP-002, AT-RECOVERY-001]
+    implementation_commits: [5e21163738ab53f753c33f7f55b0045ce4c2d8f7, effe75f69f28b8ca025027ee9ceb9d85f8c695b2]
+    sources: [reviews/SOL-PRO-REVIEW.md, docs/08-STATE-MACHINES.md]
+
+  - id: PC-TRN-001
+    title: Advertised ACP authentication
+    statement: >-
+      The agent subprocess requests automatic-update suppression when the installed binary supports
+      it, pins and verifies the binary for each epoch, initializes, selects only an advertised
+      authentication method, authenticates, then creates a session without Guild reading credentials.
+    severity: P0
+    phase: 0
+    acceptance_stories: [AS-001, AS-006]
+    acceptance_tests: [EV-ACP-001]
+    implementation_commits: [effe75f69f28b8ca025027ee9ceb9d85f8c695b2, c67b33be224c9372bbb93848e8d1fec340b79a2d]
+    sources: [reviews/SOL-PRO-REVIEW.md]
+
+  - id: PC-TRN-002
+    title: Process and transport epoch isolation
+    statement: >-
+      Every spawned adapter process receives a monotonic non-reused epoch and all normalized events
+      carry it; exited or superseded epochs cannot mutate current state.
+    severity: P0
+    phase: 0
+    acceptance_stories: [AS-002, AS-003, AS-006]
+    acceptance_tests: [CT-PROC-001, CT-EVENT-001, AT-CONCURRENCY-001]
+    implementation_commits: [5e21163738ab53f753c33f7f55b0045ce4c2d8f7, effe75f69f28b8ca025027ee9ceb9d85f8c695b2, 88b40e8f01fd41509ac751b5d35bcc778ab07cf8, 1f3d344e352fddbb8d8f42dd1319908abdab0e5f, ec1f1e59b58d91cca2650d4a83f7f2b14294c721, 5711a51ef82ae71494816e7fb25c914586fef308]
+    sources: [reviews/SOL-PRO-REVIEW.md, docs/08-STATE-MACHINES.md]
+
+  - id: PC-TRN-003
+    title: Bounded transport liveness
+    statement: >-
+      Process state, transport activity, power state and bounded silence jointly determine health;
+      an alive process with unusable stdio cannot leave a Run permanently active. Interruptions retain
+      bounded redacted local exit evidence and publish a truthful session-recovery outcome.
+    severity: P0
+    phase: 1
+    acceptance_stories: [AS-002, AS-006]
+    acceptance_tests: [EV-ACP-003, IT-RUNTIME-002, AT-POWER-001]
+    implementation_commits: [effe75f69f28b8ca025027ee9ceb9d85f8c695b2, c67b33be224c9372bbb93848e8d1fec340b79a2d, 1f3d344e352fddbb8d8f42dd1319908abdab0e5f, ec1f1e59b58d91cca2650d4a83f7f2b14294c721]
+    sources: [docs/01-PRODUCT-CONTRACT.md, docs/02-ARCHITECTURE.md]
+
+  - id: PC-EVENT-001
+    title: Exact live-event admission
+    statement: >-
+      A live event is admitted only when task, Run, session, adapter epoch and event kind match current
+      authoritative state; tool and permission events additionally require the exact tool-call identity.
+    severity: P0
+    phase: 0
+    acceptance_stories: [AS-003, AS-006]
+    acceptance_tests: [CT-EVENT-001, AT-CONCURRENCY-001]
+    implementation_commits: [5e21163738ab53f753c33f7f55b0045ce4c2d8f7, effe75f69f28b8ca025027ee9ceb9d85f8c695b2, 88b40e8f01fd41509ac751b5d35bcc778ab07cf8]
+    sources: [docs/02-ARCHITECTURE.md, reviews/SOL-PRO-REVIEW.md, docs/08-STATE-MACHINES.md]
+
+  - id: PC-PERM-001
+    title: Exact permission identity
+    statement: >-
+      Permission identity is the tuple task, Run, session, toolCall, adapterEpoch and window; no
+      wildcard or partial match can display or resolve a request.
+    severity: P0
+    phase: 0
+    acceptance_stories: [AS-003, AS-006]
+    acceptance_tests: [CT-PERM-001, EV-ACP-003, AT-CONCURRENCY-001]
+    implementation_commits: [5e21163738ab53f753c33f7f55b0045ce4c2d8f7, effe75f69f28b8ca025027ee9ceb9d85f8c695b2, 55c521a13220b860450d49c65285432632bb3ed1]
+    sources: [docs/01-PRODUCT-CONTRACT.md, reviews/SOL-PRO-REVIEW.md, docs/08-STATE-MACHINES.md]
+
+  - id: PC-PERM-002
+    title: Exactly-once permission resolution
+    statement: >-
+      A permission request has one durable resolution; wrong-window responses are rejected and pending
+      requests expire or become orphaned when their window, Run, transport or process identity disappears.
+    severity: P0
+    phase: 1
+    acceptance_stories: [AS-002, AS-003, AS-006]
+    acceptance_tests: [CT-PERM-001, IT-RUNTIME-002]
+    implementation_commits: [5e21163738ab53f753c33f7f55b0045ce4c2d8f7, effe75f69f28b8ca025027ee9ceb9d85f8c695b2]
+    sources: [reviews/SOL-PRO-REVIEW.md, docs/08-STATE-MACHINES.md]
+
+  - id: PC-PWR-001
+    title: Orthogonal power and recovery state
+    statement: >-
+      Suspend, sleep, resume and recovery are tracked independently from Run and SessionBinding;
+      sleep while awaiting permission does not rewrite the prior Run state.
+    severity: P0
+    phase: 1
+    acceptance_stories: [AS-002]
+    acceptance_tests: [CT-RUN-001, AT-POWER-001]
+    implementation_commits: [3c2c0e2ca6154fdca04a6892b2ea2e43a18e5b81]
+    sources: [docs/01-PRODUCT-CONTRACT.md, reviews/SOL-PRO-REVIEW.md, docs/08-STATE-MACHINES.md]
+
+  - id: PC-PWR-002
+    title: Wake usability
+    statement: >-
+      After real lid close and wake, existing local history remains readable, state is truthful and a
+      fresh message can be sent without restarting the application. Resume never reveals, restores,
+      or focuses Guild unless the user explicitly activates the application.
+    severity: P0
+    phase: 1
+    acceptance_stories: [AS-002]
+    acceptance_tests: [AT-POWER-001]
+    implementation_commits: [3c2c0e2ca6154fdca04a6892b2ea2e43a18e5b81]
+    sources: [docs/01-PRODUCT-CONTRACT.md, docs/03-ROADMAP-AND-GATES.md]
+
+  - id: PC-ATTN-001
+    title: Truthful background attention without focus theft
+    statement: >-
+      Sidebar icons distinguish authoritative running, queued, permission, failed, interrupted,
+      cancelled and idle states in one aligned slot. When enabled, a newly observed permission,
+      completion, failure or interruption may notify while Guild is unfocused, but delivery never
+      activates the window; only an explicit notification click opens and focuses the exact task.
+      Background progress, renderer recovery, system resume, and duplicate executable launches also
+      never raise or focus Guild without distinct user activation. Renderer recovery reloads the
+      existing native window and preserves its visibility, bounds, z-order, and focus state.
+    severity: P1
+    phase: 3
+    acceptance_stories: [AS-007, AS-008]
+    acceptance_tests: [AT-ATTENTION-001, AT-UI-002]
+    implementation_commits: []
+    sources: [docs/01-PRODUCT-CONTRACT.md, docs/04-DECISION-LOG.md]
+
+  - id: PC-DATA-001
+    title: Authoritative durable state
+    statement: >-
+      One main-process store atomically persists tasks, drafts, queued turns, messages, permissions,
+      Run transitions and recovery checkpoints with idempotent send and ingestion keys.
+    severity: P0
+    phase: 1
+    acceptance_stories: [AS-001, AS-002, AS-003, AS-006]
+    acceptance_tests: [IT-PERSIST-001, AT-RECOVERY-001, AT-CONCURRENCY-001]
+    implementation_commits: [55c521a13220b860450d49c65285432632bb3ed1, 3c2c0e2ca6154fdca04a6892b2ea2e43a18e5b81]
+    sources: [docs/01-PRODUCT-CONTRACT.md, docs/02-ARCHITECTURE.md, reviews/SOL-PRO-REVIEW.md]
+
+  - id: PC-CONV-001
+    title: Truthful conversation timeline
+    statement: >-
+      User and assistant authorship is unambiguous; official ACP thought periods coalesce with
+      compact tool-kind icons, tool calls remain chronological, the slash menu opens from a
+      versioned core snapshot and silently refreshes from official ACP, slash commands expose a
+      truthful Run-derived lifecycle even without authored output, and unsupported tool, diff or
+      terminal surfaces are labeled rather than simulated. Live planning, editing, reading,
+      searching, executing and response labels derive only from official event kinds and states.
+      Multiplexed official child sessions expose only ordered phase, count and tool-kind activity;
+      child-authored text is never persisted as the root assistant response.
+    severity: P1
+    phase: 2
+    acceptance_stories: [AS-001, AS-003]
+    acceptance_tests: [AT-CONVERSATION-001]
+    implementation_commits: [3c2c0e2ca6154fdca04a6892b2ea2e43a18e5b81, 1ea41c787cf577db621033278d55091ae0a7e670, 88b40e8f01fd41509ac751b5d35bcc778ab07cf8, c67b33be224c9372bbb93848e8d1fec340b79a2d, 1f3d344e352fddbb8d8f42dd1319908abdab0e5f, ec1f1e59b58d91cca2650d4a83f7f2b14294c721]
+    sources: [docs/01-PRODUCT-CONTRACT.md]
+
+  - id: PC-CONV-002
+    title: Supported media and bounded rendering
+    statement: >-
+      Supported text, code, images, audio, video and documents render through scoped file access while
+      long conversations remain responsive and durable; inactive in-memory task windows use a
+      bounded least-recently-used cache without truncating the active conversation.
+    severity: P1
+    phase: 2
+    acceptance_stories: [AS-001, AS-004]
+    acceptance_tests: [AT-CONVERSATION-001, AT-UI-002, AT-SCROLL-001]
+    implementation_commits: [3c2c0e2ca6154fdca04a6892b2ea2e43a18e5b81, c67b33be224c9372bbb93848e8d1fec340b79a2d, 1f3d344e352fddbb8d8f42dd1319908abdab0e5f, ec1f1e59b58d91cca2650d4a83f7f2b14294c721, 5711a51ef82ae71494816e7fb25c914586fef308]
+    sources: [docs/01-PRODUCT-CONTRACT.md, docs/02-ARCHITECTURE.md]
+
+  - id: PC-UI-001
+    title: Guild 1.1.13 UI is locked
+    statement: >-
+      Guild 2 reproduces the accepted Guild 1.1.13 visible layout, hierarchy, typography, colors,
+      spacing, icons, shadows, motion, menus and interaction outcomes from approved black-box evidence;
+      the internal rebuild does not authorize a redesign.
+    severity: P0
+    phase: 1
+    acceptance_stories: [AS-001, AS-004]
+    acceptance_tests: [AT-UI-001, AT-UI-002, EV-ASSET-001]
+    implementation_commits: [3c2c0e2ca6154fdca04a6892b2ea2e43a18e5b81]
+    sources: [docs/01-PRODUCT-CONTRACT.md, docs/04-DECISION-LOG.md, reviews/ADJUDICATION.md]
+
+  - id: PC-UI-002
+    title: Measured visual parity
+    statement: >-
+      Narrow, default and wide Chinese/English reference states have exact deterministic geometry,
+      at most one-pixel baseline or optical-icon variance, and no unexplained perceptual diff.
+    severity: P0
+    phase: 3
+    acceptance_stories: [AS-004]
+    acceptance_tests: [AT-UI-001, AT-UI-002]
+    implementation_commits: []
+    sources: [docs/01-PRODUCT-CONTRACT.md, docs/03-ROADMAP-AND-GATES.md]
+
+  - id: PC-UI-003
+    title: Platform interaction and accessibility
+    statement: >-
+      Window zoom, responsive popovers, external-display recovery and keyboard/pointer menus work
+      without changing the accepted visual direction. Sidebar titles reserve width only for actual
+      trailing metadata, the composer shares the conversation alignment axis, and Banny supports one
+      persisted, reachable home, task, or bounded free-window placement with center-drop home snapping.
+      After a turn is accepted and before official runtime activity arrives, a truthful elapsed status
+      remains in normal conversation flow on that same axis and never invents completion progress.
+      Opening task files or review creates a non-overlay third column beside the project and conversation
+      columns, with independent scrolling, keyboard/pointer resizing and a locally remembered width.
+      User-message hover actions remain reachable without reserving an empty row inside each bubble.
+      Concurrent task rows reorder only for explicit user turn submission, queueing or pinning; runtime
+      output, tools, progress, token updates, drafts and terminal transitions never move a task row.
+    severity: P1
+    phase: 3
+    acceptance_stories: [AS-004]
+    acceptance_tests: [AT-UI-002, AT-LAYOUT-001, AT-LAYOUT-002]
+    implementation_commits: [3c2c0e2ca6154fdca04a6892b2ea2e43a18e5b81, 1ea41c787cf577db621033278d55091ae0a7e670, 88b40e8f01fd41509ac751b5d35bcc778ab07cf8, 1f3d344e352fddbb8d8f42dd1319908abdab0e5f, ec1f1e59b58d91cca2650d4a83f7f2b14294c721]
+    sources: [docs/01-PRODUCT-CONTRACT.md, reviews/SOL-PRO-REVIEW.md]
+
+  - id: PC-A11Y-001
+    title: Accessibility from the first UI primitive
+    statement: >-
+      Keyboard semantics, visible focus, accessibility roles/names and reduced-motion behavior are
+      implemented with the first UI primitives; Phase 4 performs a final audit rather than adding them.
+    severity: P2
+    phase: 1
+    acceptance_stories: [AS-004]
+    acceptance_tests: [AT-A11Y-001, AT-UI-002]
+    implementation_commits: [3c2c0e2ca6154fdca04a6892b2ea2e43a18e5b81, 1ea41c787cf577db621033278d55091ae0a7e670, 88b40e8f01fd41509ac751b5d35bcc778ab07cf8, 1f3d344e352fddbb8d8f42dd1319908abdab0e5f, ec1f1e59b58d91cca2650d4a83f7f2b14294c721]
+    sources: [docs/01-PRODUCT-CONTRACT.md, reviews/SOL-PRO-REVIEW.md]
+
+  - id: PC-I18N-001
+    title: Persistent bilingual interface
+    statement: >-
+      All user-facing strings are maintained in Simplified Chinese and English locale catalogs and
+      the first launch selects the supported system language, then the user's language choice
+      persists without an application restart or later system-locale override.
+    severity: P0
+    phase: 1
+    acceptance_stories: [AS-001, AS-004]
+    acceptance_tests: [AT-I18N-001, AT-UI-002]
+    implementation_commits: [3c2c0e2ca6154fdca04a6892b2ea2e43a18e5b81, 1ea41c787cf577db621033278d55091ae0a7e670, 88b40e8f01fd41509ac751b5d35bcc778ab07cf8, 1f3d344e352fddbb8d8f42dd1319908abdab0e5f, ec1f1e59b58d91cca2650d4a83f7f2b14294c721]
+    sources: [AGENTS.md, docs/01-PRODUCT-CONTRACT.md]
+
+  - id: PC-PROF-001
+    title: Local Guild profile is not a Grok account
+    statement: >-
+      Nickname and optional avatar are Guild-local, persist in the private data directory, enter
+      only through a main-process file dialog with magic-byte validation, and are served only
+      through guild-media grants. They are never a Grok account and never read ~/.grok/auth.json.
+    severity: P1
+    phase: 3
+    acceptance_stories: [AS-007]
+    acceptance_tests: [AT-PROF-001]
+    implementation_commits: []
+    sources: [docs/01-PRODUCT-CONTRACT.md, docs/04-DECISION-LOG.md]
+
+  - id: PC-SET-001
+    title: Independent settings dialog
+    statement: >-
+      Settings open as an independent dialog with General, Grok, Privacy and About. Language,
+      restore-last-task, new-task workspace mode, and background-task notification policy persist.
+      Official Grok model and reasoning effort are sent to the official process. Browser login sync
+      stays off and unavailable.
+    severity: P1
+    phase: 3
+    acceptance_stories: [AS-007, AS-005]
+    acceptance_tests: [AT-SET-001, AT-I18N-001, AT-ATTENTION-001]
+    implementation_commits: []
+    sources: [docs/01-PRODUCT-CONTRACT.md, docs/04-DECISION-LOG.md]
+
+  - id: PC-ACC-001
+    title: Official account and runtime facts only
+    statement: >-
+      Account usage, context-window use, limits, reset time, models, reasoning controls, login,
+      logout and update use only capabilities reported by official Grok surfaces; unavailable
+      values are labeled and never estimated. No third-party model adapter, provider route or
+      selector containing external models exists; only verified official Grok models and real
+      reasoning efforts may be selected. The account and official-usage summary opens as a
+      non-modal popover anchored above the lower-left avatar and remains inside the resized sidebar.
+    severity: P1
+    phase: 3
+    acceptance_stories: [AS-004, AS-006]
+    acceptance_tests: [EV-ACP-003, AT-ACCOUNT-001]
+    implementation_commits: [3c2c0e2ca6154fdca04a6892b2ea2e43a18e5b81, 1ea41c787cf577db621033278d55091ae0a7e670, c67b33be224c9372bbb93848e8d1fec340b79a2d, ec1f1e59b58d91cca2650d4a83f7f2b14294c721, 5711a51ef82ae71494816e7fb25c914586fef308]
+    sources: [docs/01-PRODUCT-CONTRACT.md, docs/02-ARCHITECTURE.md]
+
+  - id: PC-GROK-001
+    title: Complete typed official Grok feature center
+    statement: >-
+      Every verified user-operable capability of the installed official Grok runtime is available
+      through a bilingual Guild control or official session command without requiring slash typing.
+      Administrative actions use exact typed parameter allowlists and literal argv templates; raw
+      commands, shells, server or relay controls, private credential reads, and external models remain
+      impossible. Sensitive output is redacted and destructive actions require explicit confirmation.
+      Management runs only while ACP work and queues are idle, admits one owned process group, and is
+      aborted and joined before application shutdown. Sanitized incremental output is visible while
+      long-running commands such as device authorization are still active, with bounded throttling
+      and incomplete structured output withheld until it can be safely redacted.
+    severity: P1
+    phase: 3
+    acceptance_stories: [AS-009]
+    acceptance_tests: [AT-GROK-001, AT-I18N-001, IT-SEC-001]
+    implementation_commits: []
+    sources: [docs/01-PRODUCT-CONTRACT.md, docs/02-ARCHITECTURE.md, docs/17-GROK-BUILD-1.0.13-GUI-SURFACE.md]
+
+  - id: PC-SIGN-001
+    title: Stable local macOS update identity
+    statement: >-
+      Consecutive local release packages reuse one certificate-backed signing identity for the Guild
+      app and helpers. Package verification rejects ad-hoc signatures and a designated requirement
+      pinned to one cdhash. Public Developer ID signing and notarization remain a separate release gate.
+    severity: P1
+    phase: 5
+    acceptance_stories: [AS-010]
+    acceptance_tests: [AT-SIGN-001, EV-RELEASE-001]
+    implementation_commits: []
+    sources: [docs/01-PRODUCT-CONTRACT.md, docs/02-ARCHITECTURE.md, docs/04-DECISION-LOG.md]
+
+  - id: PC-FALLBACK-001
+    title: Truthful reduced fallback
+    statement: >-
+      Any official-CLI fallback names its missing capabilities in Chinese and English and never shows
+      interactive permission UI when permission round trips are unavailable.
+    severity: P0
+    phase: 1
+    acceptance_stories: [AS-001, AS-006]
+    acceptance_tests: [EV-ACP-003, IT-RUNTIME-001, AT-I18N-001]
+    implementation_commits: []
+    sources: [docs/01-PRODUCT-CONTRACT.md, docs/02-ARCHITECTURE.md]
+
+  - id: PC-MIG-001
+    title: Neutral migration boundary
+    statement: >-
+      Migration uses a versioned neutral manifest with hashes, origin IDs, attachment policy, staged
+      validation, dry run, atomic import, idempotent re-import, conflict handling and snapshot restore;
+      imported runtime session IDs remain broken until an official restore is proven.
+    severity: P1
+    phase: 4
+    acceptance_stories: [AS-001, AS-006]
+    acceptance_tests: [AT-MIGRATION-001]
+    implementation_commits: []
+    sources: [docs/00-PROVENANCE-CHARTER.md, docs/02-ARCHITECTURE.md, reviews/SOL-PRO-REVIEW.md]
+
+  - id: PC-REL-001
+    title: Evidence-gated release
+    statement: >-
+      Release is blocked until every P0 requirement has a passing packaged acceptance or named Phase 0
+      evidence result and the source tag, package, installed application and ledger identify one commit.
+    severity: P0
+    phase: 5
+    acceptance_stories: [AS-001, AS-002, AS-003, AS-004, AS-005, AS-006]
+    acceptance_tests: [EV-RELEASE-001]
+    implementation_commits: []
+    sources: [docs/00-PROVENANCE-CHARTER.md, docs/03-ROADMAP-AND-GATES.md]

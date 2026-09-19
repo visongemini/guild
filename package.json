@@ -1,0 +1,31 @@
+{
+  "name": "guild",
+  "version": "2.1.6",
+  "author": "BDV",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "workspaces": [
+    "apps/desktop",
+    "packages/contracts",
+    "packages/domain",
+    "packages/persistence",
+    "packages/runtime-grok",
+    "packages/ui"
+  ],
+  "scripts": {
+    "check": "tsc -b --pretty false",
+    "build": "tsc -b --pretty false && node packages/ui/scripts/copy-assets.mjs",
+    "clean": "node scripts/clean.mjs",
+    "test": "node scripts/clean.mjs && tsc -b --pretty false && node packages/ui/scripts/copy-assets.mjs && node scripts/run-tests.mjs",
+    "build:desktop": "npm run build -w @guild/desktop",
+    "package:desktop": "npm run dist -w @guild/desktop",
+    "verify:desktop-package": "npm run verify:dist -w @guild/desktop",
+    "start:desktop": "npm run start -w @guild/desktop",
+    "audit": "npm audit"
+  },
+  "devDependencies": {
+    "@types/node": "24.13.3",
+    "typescript": "7.0.2"
+  }
+}

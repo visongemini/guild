@@ -1,0 +1,96 @@
+import { closeSync } from "node:fs";
+import { spawn } from "node:child_process";
+
+if (process.argv[2] !== "stdio") {
+  process.exit(91);
+}
+
+const mode = process.argv[3];
+const node = process.execPath;
+
+function linger(ignoreTerm = false) {
+  if (ignoreTerm) {
+    process.on("SIGTERM", () => undefined);
+  } else {
+    process.on("SIGTERM", () => process.exit(0));
+  }
+  process.stdout.write("READY\n");
+  setInterval(() => undefined, 1_000);
+}
+
+function writeThenExit(text, code = 0) {
+  process.stdout.write(text, () => process.exit(code));
+}
+
+function leaderWithDescendant(closeStdio) {
+  const source = [
+    "process.on('SIGTERM', () => undefined)",
+    "process.send?.('READY')",
+    "setInterval(() => undefined, 1000)",
+  ].join(";");
+  const descendant = spawn(node, ["-e", source], {
+    stdio: closeStdio ? ["ignore", "ignore", "ignore", "ipc"] : ["inherit", "inherit", "inherit", "ipc"],
+  });
+  if (descendant.pid === undefined) {
+    process.exit(93);
+  }
+  descendant.once("message", () => {
+    process.kill(descendant.pid, 0);
+    descendant.disconnect();
+    process.stdout.write(`DESCENDANT:${descendant.pid}\n`, () => process.exit(0));
+  });
+}
+
+switch (mode) {
+  case "argv":
+    writeThenExit(`agent|stdio|${mode}|${process.argv[4]}\n`);
+    break;
+  case "environment":
+    writeThenExit(`${JSON.stringify({
+      cwd: process.cwd(),
+      home: process.env.HOME,
+      path: process.env.PATH,
+      lang: process.env.LANG,
+      keep: "KEEP" in process.env,
+      dyld: "DYLD_X" in process.env,
+      ld: "LD_X" in process.env,
+      nodeOptions: "NODE_OPTIONS" in process.env,
+      lowerProxy: process.env.https_proxy,
+      environment: process.env,
+    })}\n`);
+    break;
+  case "stderr":
+    process.stderr.write("Authorization: Bearer top-", () => {
+      process.stderr.write("secret-token\npassword=hun", () => {
+        process.stderr.write("ter2\nliteral=literal-", () => {
+          process.stderr.write(`secret-value\n${"x".repeat(160)}\n`, () => process.exit(0));
+        });
+      });
+    });
+    break;
+  case "immediate-exit":
+    process.exit(23);
+    break;
+  case "stdout-eof":
+    process.stdout.end();
+    setTimeout(() => process.exit(7), 50);
+    break;
+  case "close-stdin":
+    closeSync(0);
+    linger();
+    break;
+  case "linger":
+    linger();
+    break;
+  case "ignore-term":
+    linger(true);
+    break;
+  case "descendant-hold-stdio":
+    leaderWithDescendant(false);
+    break;
+  case "descendant-close-stdio":
+    leaderWithDescendant(true);
+    break;
+  default:
+    process.exit(92);
+}

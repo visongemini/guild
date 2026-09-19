@@ -1,0 +1,44 @@
+project: Guild
+target_version: 2.1.6
+owner: BDV
+implementation_origin: blank_repository
+created: 2026-08-26
+
+allowed_inputs:
+  - content_addressed_filtered_specification_snapshot
+  - user_requirements
+  - black_box_observation_of_released_app_behavior
+  - public_official_documentation
+  - independently_written_acceptance_tests
+  - black_box_visual_measurements_of_installed_guild_1_1_13
+  - reviewed_BDV_owned_assets_with_manifest_and_checksum
+
+forbidden_inputs:
+  - any_legacy_reference_repository_source_tree
+  - source_archives_or_package_extractions_derived_from_a_legacy_reference_repository
+  - installed_guild_1_1_bundle_or_private_application_support_data
+  - devtools_remote_debugging_DOM_CSSOM_or_generated_source_maps
+  - old_repository_diffs_architecture_dumps_or_review_transcripts
+  - copied_code_comments_identifiers_or_distinctive_nonfunctional_organization
+
+external_runtime:
+  name: official_grok_process
+  transport_target: ACP_over_stdio
+  credentials_policy: never_extract_for_direct_upstream_requests
+  network_policy: no_shared_gateway
+
+evidence_required:
+  - independently_initialized_clean_repository_without_governance_git_objects
+  - clean_session_filesystem_denial_policy
+  - clean_session_input_manifest_and_transcript
+  - specification_filtration_log
+  - requirement_to_commit_mapping
+  - dependency_lockfile
+  - SPDX_dependency_inventory
+  - SBOM
+  - source_similarity_scan
+  - secret_and_brand_asset_scan
+  - packaged_app_acceptance_report
+  - visual_baseline_manifest_and_per_state_diffs
+  - owned_asset_provenance_manifest
+  - human_countersigned_release_ledger

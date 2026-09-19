@@ -1,0 +1,16 @@
+{
+  "name": "@guild/domain",
+  "version": "2.0.0",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "dependencies": {
+    "@guild/contracts": "2.0.0"
+  }
+}

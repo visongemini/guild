@@ -1,0 +1,90 @@
+{
+  "name": "@guild/desktop",
+  "version": "2.1.6",
+  "author": "BDV",
+  "description": "An independent desktop client for the official Grok agent process.",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "main": "dist/main/index.js",
+  "scripts": {
+    "build": "tsc -b --pretty false && node ../../packages/ui/scripts/copy-assets.mjs && node scripts/prepare-legal.mjs && vite build",
+    "dist": "npm run build && node scripts/clean-package-output.mjs && node scripts/package-macos.mjs && npm run verify:dist",
+    "start": "npm run build && electron .",
+    "test": "tsc -b --pretty false && node --test dist/main/*.test.js",
+    "verify:dist": "node scripts/verify-package.mjs"
+  },
+  "dependencies": {
+    "@guild/contracts": "2.0.0",
+    "@guild/domain": "2.0.0",
+    "@guild/persistence": "2.0.0",
+    "@guild/runtime-grok": "2.0.0"
+  },
+  "devDependencies": {
+    "@electron/fuses": "2.1.3",
+    "@guild/ui": "2.0.0",
+    "@types/react": "19.2.18",
+    "@types/react-dom": "19.2.5",
+    "@vitejs/plugin-react": "5.2.0",
+    "electron": "43.4.1",
+    "electron-builder": "26.15.3",
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
+    "vite": "7.3.6"
+  },
+  "build": {
+    "appId": "app.guild.desktop.v2",
+    "productName": "Guild",
+    "artifactName": "Guild-${version}-${arch}.${ext}",
+    "copyright": "Copyright \u00a9 2026 BDV",
+    "asar": true,
+    "afterPack": "scripts/after-pack.cjs",
+    "extraResources": [
+      {
+        "from": "dist/legal",
+        "to": "legal",
+        "filter": [
+          "**/*"
+        ]
+      }
+    ],
+    "electronFuses": {
+      "runAsNode": false,
+      "enableCookieEncryption": true,
+      "enableNodeOptionsEnvironmentVariable": false,
+      "enableNodeCliInspectArguments": false,
+      "enableEmbeddedAsarIntegrityValidation": true,
+      "onlyLoadAppFromAsar": true,
+      "grantFileProtocolExtraPrivileges": false,
+      "resetAdHocDarwinSignature": true
+    },
+    "files": [
+      "dist/main/**/*.js",
+      "!dist/main/**/*.test.js",
+      "!dist/main/fixture-service.js",
+      "dist/preload/index.cjs",
+      "dist/renderer/**/*",
+      "!**/*.map",
+      "!node_modules/@guild/*/src{,/**/*}",
+      "!node_modules/@guild/*/dist/**/*.test.js",
+      "!node_modules/@guild/*/dist/**/*-testing.js",
+      "!node_modules/@guild/*/dist/**/*.d.ts",
+      "!node_modules/@guild/*/tsconfig*.json",
+      "!node_modules/@guild/*/*.tsbuildinfo",
+      "package.json"
+    ],
+    "mac": {
+      "category": "public.app-category.developer-tools",
+      "icon": "build/icon.icns",
+      "identity": "-",
+      "entitlements": "build/entitlements.mac.plist",
+      "entitlementsInherit": "build/entitlements.mac.inherit.plist",
+      "target": [
+        "dmg"
+      ],
+      "timestamp": "none",
+      "hardenedRuntime": true,
+      "gatekeeperAssess": false
+    }
+  }
+}

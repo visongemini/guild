@@ -1,0 +1,22 @@
+Guild 2 third-party notices
+
+Guild 2 includes or is built with open-source software. Principal shipped components include:
+
+- Electron 43.4.1 — MIT License. The packaged application also carries Electron's
+  `LICENSE.electron.txt` and Chromium's `LICENSES.chromium.html` notices.
+- React and React DOM 19.2.8 — MIT License, Meta Platforms, Inc. and affiliates.
+- Phosphor Icons for React 2.1.10 — MIT License, Phosphor Icons.
+- react-markdown 10.1.0 and remark-gfm 4.0.1, including their unified/remark ecosystem
+  dependencies — MIT License.
+
+Build, packaging, and test tooling includes TypeScript, Vite, Electron Builder, Electron Fuses,
+Node.js type definitions, and their transitive dependencies under their respective licenses.
+
+`package-lock.json` is authoritative for the exact resolved npm package set.
+`evidence/sbom.cdx.json` records the dependency set in CycloneDX form. License files distributed
+inside each npm package and the packaged Electron notices remain authoritative; this summary does
+not replace their terms.
+
+The official Grok executable is an external user-installed runtime, is not
+vendored in this repository, and retains xAI's separate terms and trademarks.
+Guild 2 is not affiliated with, endorsed by, or sponsored by xAI.
