@@ -87,6 +87,24 @@ let processListExecutable = "/bin/ps";
 
 before(async () => {
   if (process.platform !== "darwin") return;
+  try {
+    const output = await new Promise<string>((resolve, reject) => {
+      execFile(
+        "/bin/ps",
+        ["-p", String(process.pid), "-o", "pid="],
+        { encoding: "utf8" },
+        (error, stdout) => {
+          if (error !== null) reject(error);
+          else resolve(stdout);
+        },
+      );
+    });
+    assert.equal(Number(output.trim()), process.pid);
+    return;
+  } catch {
+    // Some local sandbox-exec profiles reject Apple's protected system ps.
+    // Fall through to a private non-privileged copy only in that environment.
+  }
   // macOS rejects setuid executables inside sandbox-exec. The teardown only
   // needs this user's processes, so run a non-privileged copy of system ps.
   processListToolDirectory = await mkdtemp(join(packageRoot, ".runtime-grok-tools-"));
