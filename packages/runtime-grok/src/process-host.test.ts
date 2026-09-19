@@ -1568,8 +1568,18 @@ describe("GrokProcessHost execution policy and lifecycle (PC-TRN-001/002/003)", 
           realCleanup = () => pinned.cleanup();
           return new Promise<PinnedExecutableCleanup>(() => undefined);
         },
-        signalGroup: (_processGroupId, signal) => {
+        signalGroup: (processGroupId, signal) => {
           signalRequests.push(signal);
+          if (signal === "SIGKILL") {
+            // The lifecycle seam still reports the synthetic failure needed by
+            // this test. Kill only the registered fixture group underneath it
+            // so a failed assertion cannot strand a real child on a CI host.
+            try {
+              process.kill(-processGroupId, "SIGKILL");
+            } catch (cause: unknown) {
+              if ((cause as { readonly code?: string }).code !== "ESRCH") throw cause;
+            }
+          }
           return { signal, outcome: "failed", errorCode: "EPERM" };
         },
         probeGroup: () => "present",
