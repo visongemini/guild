@@ -442,6 +442,43 @@ describe("ACP v1 adapter initialization and durable session establishment", () =
     await adapter.close();
   });
 
+  it("probes liveness with a local round trip that counts any JSON-RPC answer as alive", async () => {
+    const process = new FakeProcess();
+    const sink = new RecordingSink();
+    const adapter = await startAdapter(process, sink);
+
+    const probing = adapter.probeLiveness(500);
+    const request = await waitForOutbound(process, "_guild/ping");
+    assert.deepEqual(request.params, {});
+    process.emitMessages({
+      jsonrpc: "2.0",
+      id: request.id,
+      error: { code: -32601, message: "Method not found" },
+    });
+    assert.equal(await probing, true);
+    assert.equal(adapter.state, "ready");
+
+    const second = adapter.probeLiveness(500);
+    const next = await waitForOutbound(process, "_guild/ping", 1);
+    process.emitMessages({ jsonrpc: "2.0", id: next.id, result: {} });
+    assert.equal(await second, true);
+    await adapter.close();
+  });
+
+  it("reports an unresponsive process without faulting or closing the adapter", async () => {
+    const process = new FakeProcess();
+    const sink = new RecordingSink();
+    const adapter = await startAdapter(process, sink);
+
+    assert.equal(await adapter.probeLiveness(20), false);
+    assert.equal(adapter.state, "ready", "a missed probe is evidence for the caller, not a fault");
+    assert.equal(process.stopCalls, 0);
+    process.rejectNextWrite = true;
+    assert.equal(await adapter.probeLiveness(500), false);
+    await adapter.close();
+    assert.equal(await adapter.probeLiveness(500), false);
+  });
+
   it("applies only supported official Grok model and reasoning selectors", async () => {
     const process = new FakeProcess();
     const sink = new RecordingSink();

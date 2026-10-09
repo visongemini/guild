@@ -46,6 +46,7 @@ import {
 import { ACP_V1_METHODS } from "./acp-v1-methods.js";
 import {
   JsonRpcPeer,
+  JsonRpcRemoteError,
   type JsonRpcDiagnostic,
   type JsonRpcHandlerReply,
   type JsonRpcInboundNotification,
@@ -297,6 +298,9 @@ export type AcpV1AdapterOptions = {
 };
 
 type AdapterState = "created" | "starting" | "ready" | "faulted" | "closed";
+
+/** Not an ACP method: Grok rejects it with "method not found", which is all a liveness probe needs. */
+const LIVENESS_PROBE_METHOD = "_guild/ping";
 type SessionPhase = "committing" | "ready" | "replaying" | "barrier_committing";
 
 type Deferred<T> = {
@@ -489,6 +493,27 @@ export class AcpV1Adapter {
       );
     } catch (cause: unknown) {
       throw this.normalizeOperationFailure(cause);
+    }
+  }
+
+  /**
+   * Local liveness probe: one JSON-RPC round trip that touches no session and no upstream
+   * service. The official runtime answers an unknown extension method with an error response,
+   * which proves it is still reading and writing stdio. A timeout or dead transport yields
+   * `false`; the probe never faults or closes the adapter itself.
+   */
+  async probeLiveness(timeoutMs: number): Promise<boolean> {
+    if (this.currentState !== "ready") return false;
+    try {
+      const handle = this.peer.sendRequest(LIVENESS_PROBE_METHOD, {}, {
+        responseTimeoutMs: timeoutMs,
+        writeTimeoutMs: timeoutMs,
+      });
+      await handle.write;
+      await handle.response;
+      return true;
+    } catch (cause: unknown) {
+      return cause instanceof JsonRpcRemoteError;
     }
   }
 

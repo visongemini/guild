@@ -537,3 +537,43 @@ close-button behavior. Tool audio, embedded resources, and resource links remain
 
 Reason: users need to see the same visual evidence the agent actually inspected without widening
 the renderer filesystem capability or treating raw tool input/output as trusted presentation data.
+
+## D-052 — Cold-start work is paid once: cached binary identity, one shared pinned copy, kept idle processes, prewarm
+
+Reason: diagnostics from 107 real starts showed a median 5.3 s from "start" to a usable session, while
+the raw official binary reaches `session/new` in about 0.25 s. Every spawn located the binary with
+`which`, hashed all 168 MB, ran `grok --version`, copied the binary into a new private directory,
+fsynced it and hashed it again; macOS additionally inspects a never-executed file on its first
+launch (about 2 s for this binary). The pinning intent (the executed bytes equal the pinned SHA-256,
+independent of the source pathname) is unchanged; the work is now done once per binary instead of
+once per process:
+
+- The located binary (path, SHA-256, version) is cached for the life of the app and trusted only
+  while the PATH hit still resolves to the same file and its device, inode, size, mtime and ctime are
+  unchanged. A repointed symlink, an in-place update, a failed preflight or a failed spawn re-locates.
+- The staged copy is shared, content-addressed (`.grok-pin-<sha256>`), and published by an atomic
+  rename after the existing first-stage checks (regular file, Mach-O, independent inode, read-only,
+  hash equals the pin). It is reused only while its identity (device, inode, size, mtime, ctime, mode
+  0500, owner, link count) and its private directory are unchanged; a missing or altered copy is
+  replaced. A copy left by an earlier process is adopted only after it hashes to the pin. A process
+  never deletes the shared copy; leftovers of other SHA-256 values and orphaned private stages older
+  than an hour are removed at app start. `pinExecutable` keeps its private per-process semantics for
+  the deterministic teardown tests.
+- System resume no longer closes every runtime. A process that served a Run, or was still starting,
+  is closed exactly as before (its Run is terminalized and a prompt that may still be in flight in it
+  must not overlap the next one; prompts are never replayed). An idle healthy process only has to answer
+  one local stdio round trip (an unknown extension method, which the official runtime rejects with
+  "method not found" in under a millisecond; no session and no upstream traffic). Architecture states
+  that an alive process with dead stdio is not healthy, so a process that does not answer within 2 s is
+  closed and restarts lazily from the durable binding. Probing cannot prove upstream connections are
+  still usable; a hung prompt after wake is still handled by cancel escalation.
+- The active task's process is prewarmed (spawn, initialize, authenticate, `session/resume`) when the
+  task is restored, selected, typed into, or after resume, without ever sending a prompt. A prewarm
+  and a send share the same in-flight start. Only tasks whose binding awaits restore are prewarmed:
+  creating a session for a task the user may discard would leave an empty official session behind.
+  A prewarmed process that was never used is released when another task becomes active, a failed
+  prewarm is not retried for 15 s, and it is not shown as task activity.
+- Official usage borrows an already authenticated live process instead of starting an extra one, and
+  falls back to a dedicated process only if the borrowed call fails.
+- The child environment carries the fixed Guild-owned value `OPENVIKING_RECALL_COMPRESS=off` (see
+  `docs/18-SPEED-PLAN-2.2.md`).

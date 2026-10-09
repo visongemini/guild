@@ -46,8 +46,51 @@ Baseline: 2.1.6 (`b010cd2` + test commits), branch `guild-2.2-speed`.
    prompt. Respect the existing idle teardown.
 5. Usage popover: reuse a live adapter when one exists instead of spawning a new process.
 
+6. Child environment: Guild always sets `OPENVIKING_RECALL_COMPRESS=off` for the `grok` process
+   (a fixed Guild-owned value in `buildChildEnvironment`, never inherited from the parent; the rest of
+   the allowlist is unchanged). Measured 2026-10-09: every prompt first runs the user's OpenViking
+   memory plugin hook `plugin/openviking-memory/hooks:user_prompt_submit`, which by default spawns a
+   `claude -p` digest compressor and takes 12-16 s per prompt. With compression off the same hook takes
+   0.3-0.5 s and still injects the recalled context (only not rewritten). The plugin itself is untouched.
+
 Acceptance: measured spawn-to-ready under 1 s on a warm machine (was 5.3 s median);
 time from Send to `session/prompt` on the wire under 100 ms when prewarmed.
+
+#### WP1 results (`scripts/bench/runtime-cold-start.mjs`, real `grok` 1.0.50, no prompt sent)
+
+Median ms of 5 runs through locate, pin and spawn, `initialize`, `authenticate` and `session/new`,
+with the real `GrokProcessHost` and runtime locator. "cold" is a fresh process with an empty staging
+root, "restart" a fresh process with the staged copy already on disk, "warm" the same process again.
+The first block was measured on an idle machine, the second pair back to back while the machine was
+loaded by parallel work (load average about 5), so absolute values drift by up to 30 % but the
+before/after ratio holds.
+
+| scenario | before | after |
+|---|---|---|
+| cold, idle | 1730 | 1715 (unchanged; see below) |
+| restart, idle | 1706 | 403 |
+| warm, idle | 1705 | 253 (locate 0, pin 3, initialize 116, session/new 133) |
+| cold / restart / warm, loaded | 1815 / 1721 / 1776 | 2381 / 648 / 374 |
+| cold / restart / warm, loaded, rerun | 3440 / 2938 / 1723 | 2360 / 800 / 557 |
+
+Where the 1.7 s went: `initialize` alone was 1.27 s, against 0.11 s when the raw official binary is
+spawned directly. The cause is macOS inspecting a never-executed file: a freshly copied 168 MB
+copy takes 1.97 s on its first `exec` and 12 ms on the second. A new private copy per spawn paid that
+every time; the shared copy pays it once per install (or reboot). The app-start warm-up
+(`runtime-warmup.ts`) moves that one-time cost into the background: after it the first exec of the
+staged copy took 12 ms. A cold start is therefore not faster in the benchmark, which does not include
+the warm-up, but is off the critical path in the app. The field median of 5.3 s also contains cold
+disk caches and wake-from-sleep effects that this idle-machine benchmark cannot reproduce.
+
+Not measured: Send to `session/prompt` on the wire. Sending a prompt costs the user's quota, so
+the prewarmed path was verified with the fake runtime (one start shared by prewarm and send, no
+prompt before the send) rather than against the official process.
+
+Finding outside WP1: on this machine the official `grok` advertises 133 slash commands, above the
+128-entry `maxContentItems` limit of the ACP codec, and driving `AcpV1Adapter` standalone from a
+scratch directory faults with `collection_limit_exceeded` right after `session/new`. Not reproduced
+inside the app, but it would stop every start if it applies there. The benchmark therefore reads ACP
+responses with a minimal loop instead of `AcpV1Adapter`.
 
 ### WP2 streaming write path (store.ts write side, live-service stream handlers)
 

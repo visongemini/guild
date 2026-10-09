@@ -13,6 +13,7 @@ import type {
 import {
   ExecutablePinError,
   pinExecutable,
+  pinExecutableShared,
   type ExecutablePinFailureCode,
   type PinnedExecutable,
   type PinnedExecutableCleanup,
@@ -153,6 +154,8 @@ export type GrokProcessHostOptions = {
 /** @internal Only the non-root package testing entry may construct this seam. */
 export type InternalProcessHostTestConfiguration = {
   readonly fixtureArgs?: readonly string[];
+  /** Defaults to the private per-process pin so teardown tests observe a deterministic stage. */
+  readonly pin?: typeof pinExecutable;
   readonly afterPin?: (pinned: PinnedExecutable) => void | Promise<void>;
   readonly cleanupPinned?: (pinned: PinnedExecutable) => Promise<PinnedExecutableCleanup>;
   readonly signalGroup?: (processGroupId: number, signal: "SIGTERM" | "SIGKILL") => ProcessGroupSignalEvidence;
@@ -162,9 +165,7 @@ export type InternalProcessHostTestConfiguration = {
   readonly cleanupDeadlineMs?: number;
 };
 
-type ProcessHostLifecycle = Required<Omit<InternalProcessHostTestConfiguration, "fixtureArgs">> & {
-  readonly pin: typeof pinExecutable;
-};
+type ProcessHostLifecycle = Required<Omit<InternalProcessHostTestConfiguration, "fixtureArgs">>;
 
 type HostState = "closed" | "created" | "failed" | "running" | "starting" | "stopping";
 type Deferred<T> = { readonly promise: Promise<T>; readonly reject: (reason: unknown) => void; readonly resolve: (value: T) => void };
@@ -187,6 +188,15 @@ const ALLOWED_ENVIRONMENT_KEYS = new Set([
 const ENVIRONMENT_DENYLIST = new Set([
   "NODE_OPTIONS", "NODE_PATH", "ELECTRON_RUN_AS_NODE", "BASH_ENV", "ENV", "ZDOTDIR",
 ]);
+/**
+ * Fixed Guild-owned values, never inherited from the parent. The user's OpenViking memory
+ * plugin otherwise runs a `claude -p` digest compressor inside every prompt hook (measured
+ * 12-16 s per prompt); with compression off the hook takes under 0.5 s and still injects the
+ * recalled context.
+ */
+const GUILD_OWNED_CHILD_ENVIRONMENT = Object.freeze({
+  OPENVIKING_RECALL_COMPRESS: "off",
+} as const);
 const DISABLED_EXTERNAL_INSTRUCTION_IMPORTS = Object.freeze([
   "GROK_CLAUDE_AGENTS_ENABLED",
   "GROK_CLAUDE_RULES_ENABLED",
@@ -734,7 +744,8 @@ class ProcessHostCore {
 }
 
 const PRODUCTION_LIFECYCLE = Object.freeze<ProcessHostLifecycle>({
-  pin: pinExecutable,
+  // One verified staged copy per SHA-256 is reused by every spawn (see executable-pin.ts).
+  pin: pinExecutableShared,
   afterPin: () => undefined,
   cleanupPinned: (pinned) => pinned.cleanup(),
   signalGroup,
@@ -755,6 +766,7 @@ export function createInternalProcessHostForTesting(
   );
   return new ProcessHostCore(options, Object.freeze({
     ...PRODUCTION_LIFECYCLE,
+    pin: configuration.pin ?? pinExecutable,
     afterPin: configuration.afterPin ?? PRODUCTION_LIFECYCLE.afterPin,
     cleanupPinned: configuration.cleanupPinned ?? PRODUCTION_LIFECYCLE.cleanupPinned,
     signalGroup: configuration.signalGroup ?? PRODUCTION_LIFECYCLE.signalGroup,
@@ -831,6 +843,7 @@ export function buildChildEnvironment(
   for (const key of DISABLED_EXTERNAL_INSTRUCTION_IMPORTS) {
     result[key] = "false";
   }
+  Object.assign(result, GUILD_OWNED_CHILD_ENVIRONMENT);
   return Object.freeze(result);
 }
 
