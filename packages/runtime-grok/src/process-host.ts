@@ -188,6 +188,15 @@ const ALLOWED_ENVIRONMENT_KEYS = new Set([
 const ENVIRONMENT_DENYLIST = new Set([
   "NODE_OPTIONS", "NODE_PATH", "ELECTRON_RUN_AS_NODE", "BASH_ENV", "ENV", "ZDOTDIR",
 ]);
+/**
+ * Fixed Guild-owned values, never inherited from the parent. The user's OpenViking memory
+ * plugin otherwise runs a `claude -p` digest compressor inside every prompt hook (measured
+ * 12-16 s per prompt); with compression off the hook takes under 0.5 s and still injects the
+ * recalled context.
+ */
+const GUILD_OWNED_CHILD_ENVIRONMENT = Object.freeze({
+  OPENVIKING_RECALL_COMPRESS: "off",
+} as const);
 const DISABLED_EXTERNAL_INSTRUCTION_IMPORTS = Object.freeze([
   "GROK_CLAUDE_AGENTS_ENABLED",
   "GROK_CLAUDE_RULES_ENABLED",
@@ -834,6 +843,7 @@ export function buildChildEnvironment(
   for (const key of DISABLED_EXTERNAL_INSTRUCTION_IMPORTS) {
     result[key] = "false";
   }
+  Object.assign(result, GUILD_OWNED_CHILD_ENVIRONMENT);
   return Object.freeze(result);
 }
 

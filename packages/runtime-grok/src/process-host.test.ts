@@ -943,6 +943,7 @@ describe("GrokProcessHost execution policy and lifecycle (PC-TRN-001/002/003)", 
       assert.equal(childEnvironment.GROK_CLAUDE_RULES_ENABLED, "false");
       assert.equal(childEnvironment.GROK_CURSOR_AGENTS_ENABLED, "false");
       assert.equal(childEnvironment.GROK_CURSOR_RULES_ENABLED, "false");
+      assert.equal(childEnvironment.OPENVIKING_RECALL_COMPRESS, "off");
       await bounded(host.waitForTermination());
     } finally {
       await cleanup(host, group);
@@ -972,6 +973,21 @@ describe("GrokProcessHost execution policy and lifecycle (PC-TRN-001/002/003)", 
     assert.equal(environment.GROK_CURSOR_RULES_ENABLED, "false");
     assert.equal(environment.GROK_CLAUDE_SKILLS_ENABLED, undefined);
     assert.equal(environment.GROK_CLAUDE_MCPS_ENABLED, undefined);
+  });
+
+  it("always turns off OpenViking recall compression and ignores any parent value", () => {
+    assert.equal(buildChildEnvironment().OPENVIKING_RECALL_COMPRESS, "off");
+    assert.equal(buildChildEnvironment({ OPENVIKING_RECALL_COMPRESS: "on" }).OPENVIKING_RECALL_COMPRESS, "off");
+    assert.equal(buildChildEnvironment({ OPENVIKING_RECALL_COMPRESS: undefined }).OPENVIKING_RECALL_COMPRESS, "off");
+    // Only the one Guild-owned value is injected; other plugin variables stay outside the allowlist.
+    const environment = buildChildEnvironment({
+      OPENVIKING_RECALL_COMPRESS: "auto",
+      OPENVIKING_URL: "http://127.0.0.1:1933",
+      PATH: "/usr/bin",
+    });
+    assert.equal(environment.OPENVIKING_URL, undefined);
+    assert.equal(environment.OPENVIKING_RECALL_COMPRESS, "off");
+    assert.equal(Object.isFrozen(environment), true);
   });
 
   it("rejects invalid environment input before spawning without leaking values", async () => {
