@@ -49,6 +49,8 @@ export {
   type TaskAuthority,
   type TaskMetadataRecord,
   type TaskRuntimeSettingsRecord,
+  type TaskWorktreeRecord,
+  type TaskWorktreeStatus,
   type WorkspaceListItem,
   type WorkspaceRecord,
 } from "./store.js";

@@ -23,6 +23,19 @@ import {
 } from "./grok-models.js";
 import type { RunPhaseProjection } from "./run-phase.js";
 import {
+  GUILD_TASK_ISOLATIONS,
+  type ApplyWorktreeRequest,
+  type ApplyWorktreeResponse,
+  type DiscardWorktreeRequest,
+  type DiscardWorktreeResponse,
+  type GuildTaskIsolation,
+  type GuildWorktreeStatus,
+  type OpenWorktreeResourceRequest,
+  type PreviewWorktreeApplyRequest,
+  type PreviewWorktreeApplyResponse,
+  type TaskWorktreeProjection,
+} from "./worktrees.js";
+import {
   GUILD_REWIND_SCOPES,
   GUILD_STEER_MAX_LENGTH,
   type ConvertQueuedTurnToSteerRequest,
@@ -116,6 +129,10 @@ export const DESKTOP_IPC_CHANNELS = Object.freeze({
   previewRewind: "guild:v1:run:rewind:preview",
   executeRewind: "guild:v1:run:rewind:execute",
   loadRunFileDiff: "guild:v1:run:file-diff:load",
+  previewWorktreeApply: "guild:v1:worktree:preview-apply",
+  applyWorktree: "guild:v1:worktree:apply",
+  discardWorktree: "guild:v1:worktree:discard",
+  openWorktreeResource: "guild:v1:worktree:resource:open",
   decidePermission: "guild:v1:permission:decide",
   setDraft: "guild:v1:draft:set",
   authorizeSessionReplacement: "guild:v1:session:authorize-replacement",
@@ -187,6 +204,8 @@ export type WorkspaceProjection = {
   readonly workspaceId: WorkspaceId;
   readonly name: string;
   readonly archived: boolean;
+  /** True when the folder is inside a git work tree, so a task may ask for an isolated worktree (F3). */
+  readonly worktreeAvailable?: true;
   readonly tasks: readonly TaskSummaryProjection[];
 };
 
@@ -200,6 +219,8 @@ export type TaskSummaryProjection = {
   readonly queuedTurnCount?: number;
   readonly activeRunState?: RunState;
   readonly activeActivity?: GuildTaskActivity;
+  /** Present when the task works in its own git worktree (F3); the sidebar shows a branch glyph. */
+  readonly worktreeStatus?: GuildWorktreeStatus;
 };
 
 export type TimelineItemStatus =
@@ -303,6 +324,8 @@ export type TaskViewProjection = {
   readonly runCheckpoints?: readonly RunCheckpointProjection[];
   /** Whether a rewind could be offered right now (F2). */
   readonly rewind?: RewindAvailabilityProjection;
+  /** Branch, ahead / behind and uncommitted count of the task's isolated worktree (F3). */
+  readonly worktree?: TaskWorktreeProjection;
   readonly auxiliaryActivity?: Readonly<{
     activity: GuildTaskActivity;
     startedAtMs: number;
@@ -499,7 +522,11 @@ export type ChoosePromptFilesRequest = { readonly taskId: TaskId };
 export type ChoosePromptFilesResponse =
   | { readonly status: "cancelled" }
   | { readonly status: "selected"; readonly attachments: readonly PromptAttachment[] };
-export type CreateTaskRequest = { readonly workspaceId: WorkspaceId };
+export type CreateTaskRequest = {
+  readonly workspaceId: WorkspaceId;
+  /** `"worktree"` makes the task work in its own git worktree on its own branch (F3). */
+  readonly isolation?: GuildTaskIsolation;
+};
 export type OpenTaskRequest = { readonly taskId: TaskId; readonly sequence?: number };
 export type UpdateWorkspaceRequest = {
   readonly workspaceId: WorkspaceId;
@@ -522,6 +549,12 @@ export type CancelQueuedTurnRequest = { readonly taskId: TaskId; readonly queueI
 export type PrioritizeQueuedTurnRequest = CancelQueuedTurnRequest;
 export type PreemptQueuedTurnRequest = CancelQueuedTurnRequest;
 export type CancelRunRequest = { readonly taskId: TaskId; readonly runId: RunId };
+export type {
+  ApplyWorktreeRequest,
+  DiscardWorktreeRequest,
+  OpenWorktreeResourceRequest,
+  PreviewWorktreeApplyRequest,
+};
 export type {
   ConvertQueuedTurnToSteerRequest,
   ExecuteRewindRequest,
@@ -714,6 +747,10 @@ export type DesktopRequestByChannel = {
   readonly [DESKTOP_IPC_CHANNELS.previewRewind]: PreviewRewindRequest;
   readonly [DESKTOP_IPC_CHANNELS.executeRewind]: ExecuteRewindRequest;
   readonly [DESKTOP_IPC_CHANNELS.loadRunFileDiff]: LoadRunFileDiffRequest;
+  readonly [DESKTOP_IPC_CHANNELS.previewWorktreeApply]: PreviewWorktreeApplyRequest;
+  readonly [DESKTOP_IPC_CHANNELS.applyWorktree]: ApplyWorktreeRequest;
+  readonly [DESKTOP_IPC_CHANNELS.discardWorktree]: DiscardWorktreeRequest;
+  readonly [DESKTOP_IPC_CHANNELS.openWorktreeResource]: OpenWorktreeResourceRequest;
   readonly [DESKTOP_IPC_CHANNELS.decidePermission]: DecidePermissionRequest;
   readonly [DESKTOP_IPC_CHANNELS.setDraft]: SetDraftRequest;
   readonly [DESKTOP_IPC_CHANNELS.authorizeSessionReplacement]: AuthorizeSessionReplacementRequest;
@@ -759,6 +796,10 @@ export type DesktopResponseByChannel = {
   readonly [DESKTOP_IPC_CHANNELS.previewRewind]: PreviewRewindResponse;
   readonly [DESKTOP_IPC_CHANNELS.executeRewind]: ExecuteRewindResponse;
   readonly [DESKTOP_IPC_CHANNELS.loadRunFileDiff]: LoadRunFileDiffResponse;
+  readonly [DESKTOP_IPC_CHANNELS.previewWorktreeApply]: PreviewWorktreeApplyResponse;
+  readonly [DESKTOP_IPC_CHANNELS.applyWorktree]: ApplyWorktreeResponse;
+  readonly [DESKTOP_IPC_CHANNELS.discardWorktree]: DiscardWorktreeResponse;
+  readonly [DESKTOP_IPC_CHANNELS.openWorktreeResource]: EmptyDesktopResponse;
   readonly [DESKTOP_IPC_CHANNELS.decidePermission]: EmptyDesktopResponse;
   readonly [DESKTOP_IPC_CHANNELS.setDraft]: EmptyDesktopResponse;
   readonly [DESKTOP_IPC_CHANNELS.authorizeSessionReplacement]: TaskViewProjection;
@@ -835,6 +876,14 @@ export type GuildRendererApi = Readonly<{
   readonly loadRunFileDiff: (
     request: LoadRunFileDiffRequest,
   ) => Promise<LoadRunFileDiffResponse>;
+  readonly previewWorktreeApply: (
+    request: PreviewWorktreeApplyRequest,
+  ) => Promise<PreviewWorktreeApplyResponse>;
+  readonly applyWorktree: (request: ApplyWorktreeRequest) => Promise<ApplyWorktreeResponse>;
+  readonly discardWorktree: (request: DiscardWorktreeRequest) => Promise<DiscardWorktreeResponse>;
+  readonly openWorktreeResource: (
+    request: OpenWorktreeResourceRequest,
+  ) => Promise<EmptyDesktopResponse>;
   readonly decidePermission: (
     request: DecidePermissionRequest,
   ) => Promise<EmptyDesktopResponse>;
@@ -1051,10 +1100,17 @@ export function parseDesktopRequest<Channel extends DesktopInvokeChannel>(
     case DESKTOP_IPC_CHANNELS.openRuntimeDiagnostics:
       return exactRecord(input, []) as DesktopRequestByChannel[Channel];
     case DESKTOP_IPC_CHANNELS.createTask: {
-      const record = exactRecord(input, ["workspaceId"]);
+      const record = exactRecord(input, ["workspaceId"], ["isolation"]);
       const parsed = parseWorkspaceId(record["workspaceId"]);
+      const isolation = record["isolation"];
       if (!parsed.ok) throw new TypeError("invalid_workspace_id");
-      return Object.freeze({ workspaceId: boundedId(parsed.value) }) as DesktopRequestByChannel[Channel];
+      if (isolation !== undefined && !(GUILD_TASK_ISOLATIONS as readonly unknown[]).includes(isolation)) {
+        throw new TypeError("invalid_task_isolation");
+      }
+      return Object.freeze({
+        workspaceId: boundedId(parsed.value),
+        ...(isolation === undefined ? {} : { isolation: isolation as GuildTaskIsolation }),
+      }) as DesktopRequestByChannel[Channel];
     }
     case DESKTOP_IPC_CHANNELS.choosePromptFiles: {
       const record = exactRecord(input, ["taskId"]);
@@ -1300,6 +1356,23 @@ export function parseDesktopRequest<Channel extends DesktopInvokeChannel>(
         throw new TypeError("invalid_run_file_diff");
       }
       return Object.freeze({ taskId: boundedId(taskId.value), runId: boundedId(runId.value), path }) as DesktopRequestByChannel[Channel];
+    }
+    case DESKTOP_IPC_CHANNELS.previewWorktreeApply:
+    case DESKTOP_IPC_CHANNELS.applyWorktree:
+    case DESKTOP_IPC_CHANNELS.discardWorktree: {
+      const record = exactRecord(input, ["taskId"]);
+      const taskId = parseTaskId(record["taskId"]);
+      if (!taskId.ok) throw new TypeError("invalid_worktree_request");
+      return Object.freeze({ taskId: boundedId(taskId.value) }) as DesktopRequestByChannel[Channel];
+    }
+    case DESKTOP_IPC_CHANNELS.openWorktreeResource: {
+      const record = exactRecord(input, ["taskId", "action"]);
+      const taskId = parseTaskId(record["taskId"]);
+      const action = record["action"];
+      if (!taskId.ok || (action !== "folder" && action !== "terminal")) {
+        throw new TypeError("invalid_worktree_request");
+      }
+      return Object.freeze({ taskId: boundedId(taskId.value), action }) as DesktopRequestByChannel[Channel];
     }
     case DESKTOP_IPC_CHANNELS.decidePermission: {
       const record = exactRecord(input, ["taskId", "runId", "permissionId", "decision"]);

@@ -198,6 +198,19 @@ vectors and checkpoint refs it created itself (`refs/guild/checkpoints/<task>/<n
 fsmonitor and credential prompts disabled and a deadline on every process; it deletes only files that a
 Run's checkpoints say a Run added, after checking they resolve inside the task folder.
 
+### Worktree operations (Guild 2.2)
+
+`guild:v1:worktree:preview-apply`, `guild:v1:worktree:apply`, `guild:v1:worktree:discard` and
+`guild:v1:worktree:resource:open` take a task id (and `folder` or `terminal` for the last one) and nothing
+else: no path, branch, ref or revision is ever named by the renderer, and `createTask` accepts only the
+literal `isolation: "worktree"`. Main reads the worktree path, branch and base from its own
+`task_worktrees` row, requires the path to be a directory directly under `<data>/worktrees` (real path,
+symlink-safe) before it deletes or opens anything, and deletes only a branch shaped `guild/...` that it
+created. Git runs with fixed argument vectors, hooks, fsmonitor, signing and prompts off, a deadline on
+every process, and never pushes or fetches. Errors cross the boundary as fixed codes only
+(`worktree_<reason>` from a refused creation); paths and git's stderr never do. The projection carries the
+branch name and counts, not the worktree path.
+
 ## Minimal preload surface
 
 Preload exposes one frozen, versioned `window.guild` object through `contextBridge`. Each

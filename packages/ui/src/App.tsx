@@ -21,6 +21,7 @@ import { FileTextIcon as FileText } from "@phosphor-icons/react/FileText";
 import { FilesIcon as Files } from "@phosphor-icons/react/Files";
 import { GitDiffIcon as GitDiff } from "@phosphor-icons/react/GitDiff";
 import { GitForkIcon as GitFork } from "@phosphor-icons/react/GitFork";
+import { GitMergeIcon as GitMerge } from "@phosphor-icons/react/GitMerge";
 import { DownloadSimpleIcon as DownloadSimple } from "@phosphor-icons/react/DownloadSimple";
 import { GearSixIcon as GearSix } from "@phosphor-icons/react/GearSix";
 import { GlobeIcon as Globe } from "@phosphor-icons/react/Globe";
@@ -102,6 +103,8 @@ import {
   type BannyPlacement,
 } from "./banny-seat.js";
 import { resolveContextMenuSeed, type ContextMenuSeed } from "./context-menu.js";
+import { WorktreeGlyph, useWorktreeUi } from "./Worktree.js";
+import { worktreeMessagesFor } from "./worktree-messages.js";
 import { slashCommandStatus, type SlashCommandStatus } from "./command-status.js";
 import { observeExternalComposerInput } from "./composer-external-input.js";
 import { contextWindowView } from "./context-window.js";
@@ -383,6 +386,18 @@ export function GuildApp({ api }: GuildAppProps) {
       return derived;
     }), [projection?.workspaces]);
   const pendingTaskIds = useMemo(() => new Set(pendingSends.keys()), [pendingSends]);
+  // F3: the per-task git worktree (new-task option, topbar chip and menu, dialogs).
+  const worktreeLocale = projection?.locale ?? "en-US";
+  const worktreeUi = useWorktreeUi({
+    api,
+    locale: worktreeLocale,
+    workspaces: activeWorkspaces,
+    setProjection,
+    storage: typeof window === "undefined" ? undefined : window.localStorage,
+    viewport,
+    cancelLabel: messagesFor(worktreeLocale).cancel,
+    closeLabel: messagesFor(worktreeLocale).closeDialog,
+  });
   const bannySeatTaskId = useMemo(
     () => resolveBannySeatTaskId(projection?.workspaces ?? [], bannyPlacement),
     [projection?.workspaces, bannyPlacement],
@@ -779,6 +794,7 @@ export function GuildApp({ api }: GuildAppProps) {
         viewport.width,
         viewport.height,
         confirmDelete || renamingTask,
+        resolvedContextMenu.type === "task" && resolvedContextMenu.task.worktreeStatus !== undefined ? 64 : 0,
       );
   const contextManagementBlocked = resolvedContextMenu !== undefined && (
     resolvedContextMenu.type === "task"
@@ -952,7 +968,8 @@ export function GuildApp({ api }: GuildAppProps) {
     return selected;
   }
 
-  async function createTask(workspaceId?: string) {
+  /** `isolated` is the user's choice on the new-task option; without it the remembered choice applies. */
+  async function createTask(workspaceId?: string, isolated?: boolean) {
     let target = workspaceId;
     if (target === undefined) {
       const lastWorkspaceId = projection?.generalSettings.lastWorkspaceId;
@@ -978,7 +995,7 @@ export function GuildApp({ api }: GuildAppProps) {
       await persistCurrentDraft();
       setWorkspacePickerOpen(false);
       setExpandedWorkspaces((current) => new Set([...current, target!]));
-      const task = await api.createTask({ workspaceId: target as WorkspaceProjection["workspaceId"] });
+      const task = await worktreeUi.createTask(target, isolated);
       activeTaskIdRef.current = task.task.taskId;
       setProjection((current) => current === undefined ? current : { ...current, activeTask: task });
       setDraft("");
@@ -1953,6 +1970,7 @@ export function GuildApp({ api }: GuildAppProps) {
                 <span>{workspaceName(projection.workspaces, activeTask.task.workspaceId, messages.workspaceFallback)}</span>
               </span>
             )}
+            {worktreeUi.renderChip(activeTask)}
           </div>
           <div className="guild-top-actions">
             <button
@@ -2068,6 +2086,7 @@ export function GuildApp({ api }: GuildAppProps) {
                 [messages.starterExplain, messages.starterExplainDraft, <ChatCircleDots size={19} />],
               ] as const).map(([label, text, icon]) => <button type="button" key={label} disabled={draft.trim().length > 0}
                 onClick={() => { setDraft(text); composerInput.current?.focus(); }}>{icon}<span>{label}</span><ArrowUpRight size={15} /></button>)}</div>
+              {worktreeUi.renderStartOption(activeTask, true, busy, (checked) => void createTask(activeTask.task.workspaceId, checked))}
             </div>
           ) : (
             <Timeline
@@ -2144,6 +2163,7 @@ export function GuildApp({ api }: GuildAppProps) {
         </section>
 
         <form className="guild-composer-wrap" onSubmit={(event) => void submit(event)}>
+          {worktreeUi.renderBanner(activeTask)}
           {activeTask?.sessionRecovery === "replacement_required" && (
             <div className="guild-session-recovery" role="alert">
               <div>
@@ -2536,6 +2556,20 @@ export function GuildApp({ api }: GuildAppProps) {
                   <button type="button" onClick={() => void forkTaskContext()}><GitFork size={16} />{messages.forkFromHere}</button>
                   <button type="button" onClick={() => void exportTaskContext("markdown")}><DownloadSimple size={16} />{messages.exportMarkdown}</button>
                   <button type="button" onClick={() => void exportTaskContext("json")}><DownloadSimple size={16} />{messages.exportJson}</button>
+                  {(resolvedContextMenu.task.worktreeStatus === "active" || resolvedContextMenu.task.worktreeStatus === "applied") && (
+                    <button type="button" disabled={contextManagementBlocked} onClick={() => {
+                      const target = resolvedContextMenu.task;
+                      setContextMenu(undefined);
+                      worktreeUi.openApply(target.taskId, target.taskId === activeTask?.task.taskId ? activeTask?.worktree : undefined);
+                    }}><GitMerge size={16} />{worktreeUi.messages.taskMenuMerge}</button>
+                  )}
+                  {resolvedContextMenu.task.worktreeStatus !== undefined && resolvedContextMenu.task.worktreeStatus !== "discarded" && (
+                    <button type="button" className="danger" disabled={contextManagementBlocked} onClick={() => {
+                      const target = resolvedContextMenu.task;
+                      setContextMenu(undefined);
+                      worktreeUi.openDiscard(target.taskId, target.taskId === activeTask?.task.taskId ? activeTask?.worktree : undefined);
+                    }}><Trash size={16} />{worktreeUi.messages.taskMenuDiscard}</button>
+                  )}
                   <div className="guild-context-divider" />
                 </>
               )}
@@ -2551,6 +2585,8 @@ export function GuildApp({ api }: GuildAppProps) {
           )}
         </div>
       )}
+
+      {worktreeUi.renderOverlays(activeTask, running)}
 
       {commandPaletteOpen && (
         <div className="guild-command-backdrop" role="presentation" onPointerDown={closeCommandPalette}>
@@ -3137,7 +3173,7 @@ function isTaskManagementBlocked(task: TaskSummaryProjection): boolean {
   return isLiveRunState(task.activeRunState) || (task.queuedTurnCount ?? 0) > 0;
 }
 
-const WorkspaceTree = memo(function WorkspaceTree({ workspace, expanded, activeTaskId, bannySeatTaskId, bannyDragging, bannyDropTargetId, pendingTaskIds, unreadTaskIds, locale, onToggle, onOpenTask, onNewTask, onBannyDragStart, onBannyDragEnd, onBannyDropTarget, onBannyDrop, onPinTask, onArchiveTask, onContextMenu }: {
+export const WorkspaceTree = memo(function WorkspaceTree({ workspace, expanded, activeTaskId, bannySeatTaskId, bannyDragging, bannyDropTargetId, pendingTaskIds, unreadTaskIds, locale, onToggle, onOpenTask, onNewTask, onBannyDragStart, onBannyDragEnd, onBannyDropTarget, onBannyDrop, onPinTask, onArchiveTask, onContextMenu }: {
   readonly workspace: WorkspaceProjection;
   readonly expanded: boolean;
   readonly activeTaskId?: string;
@@ -3219,8 +3255,10 @@ const WorkspaceTree = memo(function WorkspaceTree({ workspace, expanded, activeT
                 type="button"
                 onClick={() => onOpenTask(task.taskId)}
               >
-                <span className={`guild-task-state ${status}`} title={taskStatusTitle(status, task, messages)}>
-                  <TaskStatusGlyph status={status} />
+                <span className={`guild-task-state ${status}`} title={status === "idle" && task.worktreeStatus !== undefined ? worktreeMessagesFor(locale).sidebarTitle(task.worktreeStatus) : taskStatusTitle(status, task, messages)}>
+                  {status === "idle" && task.worktreeStatus !== undefined
+                    ? <WorktreeGlyph status={task.worktreeStatus} messages={worktreeMessagesFor(locale)} />
+                    : <TaskStatusGlyph status={status} />}
                   {status !== "idle" && <span className="guild-sr-only">{taskStatusTitle(status, task, messages)}</span>}
                 </span>
                 <span className="guild-task-title">{task.title}</span>

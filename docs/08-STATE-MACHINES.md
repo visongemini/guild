@@ -369,6 +369,23 @@ Run checkpoint (`run_checkpoints`, one row per Run from schema v17 on):
 
 A rewind is only started and executed while no Run is non-terminal and no turn is queued.
 
+## 7b. Task worktree (Guild 2.2, schema v18)
+
+One row per task created with `isolation: "worktree"` (`task_worktrees`); it never changes the Run's state.
+
+| From | Event | To |
+|---|---|---|
+| (none) | `createTask` with isolation, worktree and branch created | `active` |
+| `active` | merge back succeeded (`git merge --no-ff`) | `applied` |
+| `applied` | a refresh finds commits ahead or uncommitted files | `active` |
+| `active` / `applied` | a refresh or an operation finds the directory, the branch or the worktree gone | `missing` |
+| `missing` | a refresh finds the worktree again | `active` |
+| `active` / `applied` / `missing` | discard confirmed, worktree removed and branch deleted | `discarded` (terminal) |
+
+Apply and discard run only while no Run is non-terminal, no turn is queued and no send is in flight, and
+they hold the service's command queue so a Run cannot start meanwhile. `discarded` blocks sending
+(`canSend` false); `missing` disables the composer until the folder returns or the worktree is discarded.
+
 ## 8. Required transition tests
 
 Before the first production implementation commit, contract fixtures must cover every legal row and

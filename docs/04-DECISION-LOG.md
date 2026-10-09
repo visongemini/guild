@@ -713,3 +713,72 @@ Rewind (`previewRewind`, `executeRewind`)
 Residual risks: `git push --mirror` would publish `refs/guild/*`; checkpoint refs are not pruned; a Steer
 that races a queued turn's dispatch can reach the runtime twice; a Guild send racing a runtime-started
 turn fails the new Run with the usual "send again" notice.
+
+## D-056 — A task can work in its own git worktree; Guild runs the git, and merges only through a read-only check and `git merge --no-ff`
+
+Date: 2026-10-10. Implements F3 of `docs/19-BORROWED-FEATURES-FEASIBILITY.md` (backend, IPC, UI; schema v18).
+The official `_x.ai/git/worktree/apply` failed both live tests and there is no merge command, so Guild
+uses its own local git, with the bounded hook-free runner of D-055 (`git-checkpoints.ts` `runGit`).
+
+Creation (`createTask({ workspaceId, isolation: "worktree" })`)
+- The workspace folder must be inside a git work tree (`rev-parse --show-toplevel`) with at least one
+  commit. Otherwise the call throws `worktree_<reason>` (`not_a_git_repo`, `no_commits`,
+  `workspace_not_in_commit`, `git_unavailable`, `timeout`, `git_failed`); that fixed code is the only
+  message `toDesktopIpcFailure` lets through besides the three older ones, and no task row is left behind.
+- `git worktree add -b guild/<slug>-<hash8> <data>/worktrees/<taskId> <HEAD commit>`. The slug is the
+  ASCII title (placeholder titles give `task`), the hash comes from the task id. `base_commit` and
+  `base_branch` (absent on a detached HEAD) are recorded. A workspace that is a sub-folder of the
+  repository maps to the same sub-folder of the worktree (`source_repo_path` is the top level).
+- The new worktree has committed files only: no ignored files (node_modules) and none of the owner's
+  uncommitted changes. The UI says so in the chip menu.
+
+Where the task works
+- `taskRootPath` (live service) replaces the workspace folder everywhere a task is scoped: the process
+  working directory and `session/new|resume|load` cwd, prompt attachments, tool-media, files the
+  workbench opens, recovery capsules, and the F2 checkpoints and rewind. `assertUsable` refuses a
+  discarded worktree and one whose real path is not under `<data>/worktrees`, whatever the stored row says.
+- Verified live with grok 1.0.50: one tiny turn in a worktree task inside a scratch repository answered
+  with the worktree path as its working directory; the scratch repository stayed clean.
+
+Status (`task_worktrees`): dirty files, commits ahead and behind come from one bounded `git status` and
+`git rev-list --left-right --count` (5 s), refreshed when a task is opened (at most once a second), after
+every Run and after Apply, never per chunk. `unavailable` keeps the last numbers.
+
+Apply (`previewWorktreeApply`, `applyWorktree`)
+- Refused while a Run, a queued turn or a send is in flight. Apply holds the command queue for its whole
+  duration, so no Run can start in between; the preview does not.
+- Preview is read-only: uncommitted files become a snapshot commit object built in a private index
+  (never a commit on the branch), then `git merge-tree --write-tree` against the base branch tip names
+  conflicting files (git 2.38+, else `git_too_old`). It is refused when the checkout is not on the base
+  branch (the branch it is on is named), a merge, rebase, cherry-pick, revert or bisect is in progress,
+  the checkout has staged changes (git refuses any non-fast-forward merge with them), or has
+  uncommitted changes in a file the merge changes.
+- Apply re-runs the same evaluation, then commits uncommitted files in the worktree as `Guild
+  <guild@localhost>` ("Guild task changes: <title>"), then `git merge --no-ff --no-edit --no-verify
+  --no-gpg-sign`, with the owner's own identity when git has one. A merge that conflicts anyway (the
+  checkout changed after the check) is aborted with `git merge --abort` and HEAD is verified to be where
+  it was; the repository is never left mid-merge. The result is verified to be a two-parent commit on the
+  old tip. After a merge the status is `applied`; the worktree and branch stay, and new work makes the
+  status `active` again.
+- Never pushes, fetches, rebases, resets, stashes or checks out in the owner's checkout.
+
+Discard: confirmation in the UI (it lists the uncommitted files and unmerged commits that go). Then
+`git worktree remove --force <path>` (only a directory directly under `<data>/worktrees`, real path
+checked) and `git branch -D <recorded guild/ branch>` (only that name shape); a worktree directory the
+owner deleted by hand is cleaned with the same command and no `worktree prune`, so the owner's other
+worktrees are never touched. The row becomes `discarded`; the task stays readable and cannot send.
+A missing folder is status `missing` (send disabled with a banner; only discard is offered). Starting
+another task while the open one is untouched removes its fresh worktree; one that holds work is kept
+and titled with its branch so it shows in the sidebar.
+
+Interface: the new-task option (checkbox on a task with no message, only for git workspaces, remembered
+per workspace in local storage), topbar chip with branch, "领先 n" and "有 m 处未提交", chip menu (merge,
+discard, Finder, Terminal, note on ignored files), sidebar branch glyph for an idle worktree task,
+task-menu entries, merge and discard dialogs, composer banner. All strings are in `worktree-messages.ts`.
+
+Residual risks: deleting a task does not remove its worktree (its branch and files stay for the owner to
+find with `git branch`); `refs/guild/checkpoints/<task>/*` of a discarded task stay; a worktree path
+longer than the OS limit fails creation (reported as `git_failed`); git hooks of the owner's repository
+are deliberately not run, so a repository that depends on a post-checkout hook (for example to install
+dependencies) gets none; large repositories make creation take seconds (60 s budget).
+

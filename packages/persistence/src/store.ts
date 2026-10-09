@@ -340,6 +340,26 @@ export type RunCheckpointRecord = Readonly<{
   updatedAtMs: number;
 }>;
 
+export type TaskWorktreeStatus = "active" | "applied" | "discarded" | "missing";
+
+/** Where a task's isolated git worktree lives and what it was cut from (F3). */
+export type TaskWorktreeRecord = Readonly<{
+  taskId: TaskId;
+  sourceWorkspaceId: string;
+  /** Top level of the source repository (a realpath). */
+  sourceRepoPath: string;
+  /** Root of the linked worktree, under Guild's own data directory. */
+  worktreePath: string;
+  /** Always `guild/...`: the only kind of branch Guild creates and deletes. */
+  branch: string;
+  baseCommit: string;
+  /** Absent when the source checkout was on a detached HEAD. */
+  baseBranch?: string;
+  status: TaskWorktreeStatus;
+  createdAtMs: number;
+  updatedAtMs: number;
+}>;
+
 export type ContinuousTaskStatus =
   | "active"
   | "paused"
@@ -936,6 +956,25 @@ export interface GuildPersistence {
   /** Cheap: the next checkpoint ordinal and the number of rows, without decoding any file summary. */
   nextRunCheckpointOrdinal(taskId: TaskId): number;
   countRunCheckpoints(taskId: TaskId): number;
+  // F3 task worktrees.
+  /** Records the worktree of a task. A task has at most one; a second call is rejected. */
+  createTaskWorktree(input: {
+    readonly taskId: TaskId;
+    readonly sourceWorkspaceId: string;
+    readonly sourceRepoPath: string;
+    readonly worktreePath: string;
+    readonly branch: string;
+    readonly baseCommit: string;
+    readonly baseBranch?: string;
+  }): TaskWorktreeRecord;
+  loadTaskWorktree(taskId: TaskId): TaskWorktreeRecord | undefined;
+  /** Every row; there is at most one per task, so the list stays short. */
+  listTaskWorktrees(): readonly TaskWorktreeRecord[];
+  /** Moves the row to `status`; returns it unchanged when it already has that status. */
+  setTaskWorktreeStatus(input: {
+    readonly taskId: TaskId;
+    readonly status: TaskWorktreeStatus;
+  }): TaskWorktreeRecord;
   createRun(input: { readonly taskId: TaskId; readonly runId: RunId }): RunRecord;
   applyRun(input: {
     readonly taskId: TaskId;
@@ -4530,6 +4569,86 @@ class SqliteGuildPersistence implements GuildPersistence {
     return exactInteger(row, "count");
   }
 
+  createTaskWorktree(input: {
+    readonly taskId: TaskId;
+    readonly sourceWorkspaceId: string;
+    readonly sourceRepoPath: string;
+    readonly worktreePath: string;
+    readonly branch: string;
+    readonly baseCommit: string;
+    readonly baseBranch?: string;
+  }): TaskWorktreeRecord {
+    const taskId = parsedTaskId(input.taskId);
+    const workspaceId = parsedWorkspaceId(input.sourceWorkspaceId);
+    const sourceRepoPath = parsedCanonicalPath(input.sourceRepoPath);
+    const worktreePath = parsedCanonicalPath(input.worktreePath);
+    const branch = boundedString(input.branch, 200);
+    const baseCommit = boundedString(input.baseCommit, 64);
+    const baseBranch = input.baseBranch === undefined ? null : boundedString(input.baseBranch, 255);
+    if (!branch.startsWith("guild/") || branch.length < 7 || !/^[0-9a-f]{40}([0-9a-f]{24})?$/u.test(baseCommit)) {
+      throw persistenceError("domain_operation_rejected");
+    }
+    return this.#immediate(() => {
+      this.#requiredTaskMetadataForWorktree(taskId);
+      if (this.#selectTaskWorktree(taskId) !== undefined) {
+        throw persistenceError("aggregate_already_exists");
+      }
+      const at = exactNow();
+      this.#database
+        .prepare(`
+          INSERT INTO task_worktrees(
+            task_id, source_workspace_id, source_repo_path, worktree_path, branch, base_commit,
+            base_branch, status, created_at_ms, updated_at_ms
+          ) VALUES(?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)
+        `)
+        .run(taskId, workspaceId, sourceRepoPath, worktreePath, branch, baseCommit, baseBranch, at, at);
+      const created = this.#selectTaskWorktree(taskId);
+      if (created === undefined) throw persistenceError("aggregate_integrity_failed");
+      return created;
+    });
+  }
+
+  loadTaskWorktree(taskIdInput: TaskId): TaskWorktreeRecord | undefined {
+    this.#assertOpen();
+    return this.#selectTaskWorktree(parsedTaskId(taskIdInput));
+  }
+
+  listTaskWorktrees(): readonly TaskWorktreeRecord[] {
+    this.#assertOpen();
+    return Object.freeze(
+      this.#database
+        .prepare("SELECT * FROM task_worktrees ORDER BY created_at_ms, task_id")
+        .all()
+        .map((row) => this.#decodeTaskWorktreeRow(row)),
+    );
+  }
+
+  setTaskWorktreeStatus(input: {
+    readonly taskId: TaskId;
+    readonly status: TaskWorktreeStatus;
+  }): TaskWorktreeRecord {
+    const taskId = parsedTaskId(input.taskId);
+    if (
+      input.status !== "active" && input.status !== "applied" &&
+      input.status !== "discarded" && input.status !== "missing"
+    ) {
+      throw persistenceError("domain_operation_rejected");
+    }
+    return this.#immediate(() => {
+      const existing = this.#selectTaskWorktree(taskId);
+      if (existing === undefined) throw persistenceError("aggregate_not_found");
+      if (existing.status === input.status) return existing;
+      // A discarded worktree is gone for good; nothing brings it back.
+      if (existing.status === "discarded") throw persistenceError("domain_operation_rejected");
+      this.#database
+        .prepare("UPDATE task_worktrees SET status = ?, updated_at_ms = MAX(updated_at_ms, ?) WHERE task_id = ?")
+        .run(input.status, exactNow(), taskId);
+      const updated = this.#selectTaskWorktree(taskId);
+      if (updated === undefined) throw persistenceError("aggregate_integrity_failed");
+      return updated;
+    });
+  }
+
   listTaskRuns(taskIdInput: TaskId): readonly RunRecord[] {
     this.#assertOpen();
     const taskId = parsedTaskId(taskIdInput);
@@ -6703,6 +6822,40 @@ class SqliteGuildPersistence implements GuildPersistence {
       ...(entryId === undefined ? {} : { entryId }),
       ...(queueId === undefined ? {} : { queueId }),
       ...(started === undefined || !started.ok ? {} : { startedRunId: started.value }),
+      createdAtMs: exactInteger(row, "created_at_ms"),
+      updatedAtMs: exactInteger(row, "updated_at_ms"),
+    });
+  }
+
+  #requiredTaskMetadataForWorktree(taskId: TaskId): void {
+    const row = this.#database.prepare("SELECT task_id FROM task_metadata WHERE task_id = ?").get(taskId);
+    if (row === undefined) throw persistenceError("aggregate_not_found");
+  }
+
+  #selectTaskWorktree(taskId: TaskId): TaskWorktreeRecord | undefined {
+    const row = this.#database.prepare("SELECT * FROM task_worktrees WHERE task_id = ?").get(taskId);
+    return row === undefined ? undefined : this.#decodeTaskWorktreeRow(row);
+  }
+
+  #decodeTaskWorktreeRow(row: SqlRow): TaskWorktreeRecord {
+    const task = parseTaskId(exactText(row, "task_id"));
+    const status = exactText(row, "status");
+    if (
+      !task.ok ||
+      (status !== "active" && status !== "applied" && status !== "discarded" && status !== "missing")
+    ) {
+      throw persistenceError("aggregate_integrity_failed");
+    }
+    const baseBranch = optionalText(row, "base_branch");
+    return freeze({
+      taskId: task.value,
+      sourceWorkspaceId: exactText(row, "source_workspace_id"),
+      sourceRepoPath: exactText(row, "source_repo_path"),
+      worktreePath: exactText(row, "worktree_path"),
+      branch: exactText(row, "branch"),
+      baseCommit: exactText(row, "base_commit"),
+      ...(baseBranch === undefined ? {} : { baseBranch }),
+      status,
       createdAtMs: exactInteger(row, "created_at_ms"),
       updatedAtMs: exactInteger(row, "updated_at_ms"),
     });

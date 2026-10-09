@@ -679,3 +679,83 @@ test("the new request channels are registered invoke channels and unknown names 
   );
   assert.equal(new Set(Object.values(DESKTOP_IPC_CHANNELS)).size, Object.values(DESKTOP_IPC_CHANNELS).length, "no channel name is reused");
 });
+
+test("createTask accepts an optional worktree isolation and nothing else [F3]", () => {
+  const workspaceId = "workspace-1";
+  assert.deepEqual(
+    parseDesktopRequest(DESKTOP_IPC_CHANNELS.createTask, { workspaceId }),
+    { workspaceId },
+  );
+  assert.deepEqual(
+    parseDesktopRequest(DESKTOP_IPC_CHANNELS.createTask, { workspaceId, isolation: "worktree" }),
+    { workspaceId, isolation: "worktree" },
+  );
+  for (const rejected of [
+    { workspaceId, isolation: "container" },
+    { workspaceId, isolation: "" },
+    { workspaceId, isolation: true },
+    { workspaceId, isolation: null },
+    { workspaceId, isolation: "worktree", branch: "guild/x" },
+    { workspaceId, path: "/tmp/x" },
+    { isolation: "worktree" },
+  ]) {
+    assert.throws(() => parseDesktopRequest(DESKTOP_IPC_CHANNELS.createTask, rejected), TypeError, JSON.stringify(rejected));
+  }
+});
+
+test("worktree requests take a task id and nothing a renderer could aim at a path, branch or revision [F3]", () => {
+  const taskId = "task-1";
+  for (const channel of [
+    DESKTOP_IPC_CHANNELS.previewWorktreeApply,
+    DESKTOP_IPC_CHANNELS.applyWorktree,
+    DESKTOP_IPC_CHANNELS.discardWorktree,
+  ]) {
+    assert.deepEqual(parseDesktopRequest(channel, { taskId }), { taskId });
+    for (const rejected of [
+      {},
+      { taskId: "" },
+      { taskId, branch: "guild/other" },
+      { taskId, path: "/tmp" },
+      { taskId, base: "main" },
+      { taskId, force: true },
+      { taskId: 1 },
+    ]) {
+      assert.throws(() => parseDesktopRequest(channel, rejected), TypeError, `${channel} ${JSON.stringify(rejected)}`);
+    }
+  }
+  for (const action of ["folder", "terminal"] as const) {
+    assert.deepEqual(
+      parseDesktopRequest(DESKTOP_IPC_CHANNELS.openWorktreeResource, { taskId, action }),
+      { taskId, action },
+    );
+  }
+  for (const rejected of [
+    { taskId },
+    { taskId, action: "file" },
+    { taskId, action: "folder", path: "/etc" },
+    { taskId, action: "Folder" },
+    { taskId, action: "../.." },
+  ]) {
+    assert.throws(
+      () => parseDesktopRequest(DESKTOP_IPC_CHANNELS.openWorktreeResource, rejected),
+      TypeError,
+      JSON.stringify(rejected),
+    );
+  }
+});
+
+test("the worktree channels are registered invoke channels, not events [F3]", () => {
+  for (const channel of [
+    DESKTOP_IPC_CHANNELS.previewWorktreeApply,
+    DESKTOP_IPC_CHANNELS.applyWorktree,
+    DESKTOP_IPC_CHANNELS.discardWorktree,
+    DESKTOP_IPC_CHANNELS.openWorktreeResource,
+  ]) {
+    assert.match(channel, /^guild:v1:worktree:/u);
+    assert.equal((DESKTOP_EVENT_CHANNELS as readonly string[]).includes(channel), false);
+  }
+  assert.throws(
+    () => parseDesktopRequest("guild:v1:worktree:merge-anything" as never, { taskId: "task-1" }),
+    /unregistered_channel/u,
+  );
+});

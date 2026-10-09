@@ -1,8 +1,10 @@
 import type {
+  ApplyWorktreeResponse,
   ChooseAvatarResponse,
   ChoosePromptFilesResponse,
   ConvertQueuedTurnToSteerResponse,
   DesktopBootstrapProjection,
+  DiscardWorktreeResponse,
   ExecuteRewindRequest,
   ExecuteRewindResponse,
   ExportTaskResponse,
@@ -12,9 +14,11 @@ import type {
   GuildGrokStartupSettings,
   GuildLocale,
   GuildNewTaskWorkspaceMode,
+  GuildTaskIsolation,
   LoadRunFileDiffRequest,
   LoadRunFileDiffResponse,
   PreviewRewindResponse,
+  PreviewWorktreeApplyResponse,
   RunId,
   RunGrokManagementRequest,
   RunGrokManagementResponse,
@@ -36,7 +40,8 @@ export interface DesktopApplicationService {
   bootstrap(): Promise<DesktopBootstrapProjection>;
   chooseWorkspace(): Promise<DesktopBootstrapProjection>;
   choosePromptFiles(taskId: TaskId): Promise<ChoosePromptFilesResponse>;
-  createTask(workspaceId: WorkspaceId): Promise<TaskViewProjection>;
+  /** `isolation: "worktree"` (F3) gives the task its own git worktree; refusals throw `worktree_<reason>`. */
+  createTask(workspaceId: WorkspaceId, isolation?: GuildTaskIsolation): Promise<TaskViewProjection>;
   openTask(taskId: TaskId, sequence?: number): Promise<TaskViewProjection>;
   loadEarlierTimeline(taskId: TaskId): Promise<TaskViewProjection>;
   loadSlashCommands(taskId: TaskId): Promise<TaskViewProjection>;
@@ -86,6 +91,14 @@ export interface DesktopApplicationService {
   executeRewind(request: ExecuteRewindRequest): Promise<ExecuteRewindResponse>;
   /** F2: the bounded unified diff of one file the Run changed. */
   loadRunFileDiff(request: LoadRunFileDiffRequest): Promise<LoadRunFileDiffResponse>;
+  /** F3: what merging the task's worktree branch back would change, found without changing anything. */
+  previewWorktreeApply(taskId: TaskId): Promise<PreviewWorktreeApplyResponse>;
+  /** F3: commits uncommitted worktree files and merges the branch back with `git merge --no-ff`. */
+  applyWorktree(taskId: TaskId): Promise<ApplyWorktreeResponse>;
+  /** F3: removes the task's worktree and its Guild branch. The caller has confirmed. */
+  discardWorktree(taskId: TaskId): Promise<DiscardWorktreeResponse>;
+  /** F3: shows the task's worktree folder in Finder, or opens a terminal in it. */
+  openWorktreeResource(taskId: TaskId, action: "folder" | "terminal"): Promise<void>;
   decidePermission(input: {
     readonly taskId: TaskId;
     readonly runId: RunId;

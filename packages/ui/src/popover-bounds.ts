@@ -12,10 +12,12 @@ export function clampContextMenuPosition(
   viewportWidth: number,
   viewportHeight: number,
   confirming = false,
+  /** Extra menu height, for a task menu that carries more entries (worktree actions). */
+  extraHeight = 0,
 ): { readonly x: number; readonly y: number } {
   const width = confirming ? CONTEXT_MENU_CONFIRM_WIDTH : CONTEXT_MENU_WIDTH;
   return {
     x: Math.max(CONTEXT_MENU_MARGIN, Math.min(x, viewportWidth - width)),
-    y: Math.max(CONTEXT_MENU_MARGIN, Math.min(y, viewportHeight - CONTEXT_MENU_HEIGHT)),
+    y: Math.max(CONTEXT_MENU_MARGIN, Math.min(y, viewportHeight - CONTEXT_MENU_HEIGHT - extraHeight)),
   };
 }

@@ -71,9 +71,13 @@ import {
   type WindowId,
   type WorkspaceId,
   type XaiSignalEnvelope,
+  type ApplyWorktreeResponse,
   type ChooseAvatarResponse,
   type ChoosePromptFilesResponse,
+  type DiscardWorktreeResponse,
   type GuildNewTaskWorkspaceMode,
+  type GuildTaskIsolation,
+  type PreviewWorktreeApplyResponse,
   type SaveProfileAvatar,
   type RunGrokManagementRequest,
   type RunGrokManagementResponse,
@@ -178,6 +182,8 @@ import {
   type GitCheckpointPort,
   type RunRefs,
 } from "./git-checkpoints.js";
+import { gitWorktrees, type GitWorktreePort } from "./git-worktrees.js";
+import { createTaskWorktreeManager } from "./task-worktrees.js";
 
 const PRIMARY_WINDOW_ID = must(parseWindowId("guild-primary-window"));
 const TERMINAL_RUN_STATES = new Set(["completed", "failed", "cancelled", "interrupted"]);
@@ -319,6 +325,8 @@ export type LiveDesktopServiceOptions = {
   readonly checkpoints?: GitCheckpointPort;
   readonly checkpointStartBoundMs?: number;
   readonly checkpointEndTimeoutMs?: number;
+  /** Git operations behind per-task worktrees (F3); tests substitute a fake. */
+  readonly worktrees?: GitWorktreePort;
   readonly steerRequestTimeoutMs?: number;
   readonly promptSilenceMs?: number;
   readonly promptSettleMs?: number;
@@ -527,6 +535,14 @@ export function createLiveDesktopService(
     signal,
   }));
   const managementRunner = options.managementRunner ?? runOfficialGrokManagement;
+  // F3: tasks created with an isolated worktree run in `<data>/worktrees/<taskId>` instead of the workspace folder.
+  const worktreeManager = createTaskWorktreeManager({
+    store,
+    git: options.worktrees ?? gitWorktrees,
+    dataRoot: dirname(options.databasePath),
+    runBlock: (taskId) => worktreeRunBlock(taskId),
+    onChange: () => schedulePublish(),
+  });
   let activeTaskId: TaskId | undefined;
   let runtimeVersion: string | undefined;
   // Last model list the official runtime advertised. Seeded from the local cache so the picker has
@@ -899,8 +915,22 @@ export function createLiveDesktopService(
     return run;
   }
 
+  /**
+   * The folder everything about a task is scoped to: its session's working directory, attachment
+   * and tool-media boundaries, the files it may open, and the checkpoints. The workspace folder,
+   * or for a task with an isolated worktree (F3) that worktree.
+   */
+  function taskRootPath(taskId: TaskId, workspacePath: string): string {
+    return worktreeManager.rootPathOf(taskId, workspacePath);
+  }
+
   function workspacePathOf(taskId: TaskId): string {
-    return store.loadWorkspace(store.loadTaskMetadata(taskId).workspaceId).canonicalPath;
+    return taskRootPath(taskId, store.loadWorkspace(store.loadTaskMetadata(taskId).workspaceId).canonicalPath);
+  }
+
+  /** A Run, a queued turn or a send in flight keeps Apply and Discard from touching the worktree. */
+  function worktreeRunBlock(taskId: TaskId): "run_active" | undefined {
+    return rewindBlockedReason(taskId, controllers.get(taskId)) === undefined ? undefined : "run_active";
   }
 
   function completeCheckpointUnavailable(taskId: TaskId, runId: RunId, reason: string): void {
@@ -1035,6 +1065,8 @@ export function createLiveDesktopService(
       logRuntime({ category: "runtime", event: "interjection_settle_failed", taskId, runId });
     }
     void finishRunCheckpoint(taskId, controller, runId);
+    // F3: the chip's numbers move with the Run's edits.
+    void worktreeManager.refresh(taskId, { force: true }).catch(() => undefined);
     if (options.dispatchQueue) void scheduleQueuedDispatch(taskId);
   }
 
@@ -1138,6 +1170,48 @@ export function createLiveDesktopService(
       diff: result.diff,
       binary: result.binary,
       truncated: result.truncated,
+    });
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // F3 per-task worktrees: preview, apply, discard
+  // ---------------------------------------------------------------------------------------------
+
+  async function previewWorktreeApply(taskId: TaskId): Promise<PreviewWorktreeApplyResponse> {
+    assertOpen();
+    // Read-only, so it does not hold the command queue; it still refuses while a Run is active.
+    return worktreeManager.preview(taskId);
+  }
+
+  /** Commits and merges while holding the command queue, so no Run can start in the task meanwhile. */
+  async function applyWorktree(taskId: TaskId): Promise<ApplyWorktreeResponse> {
+    assertOpen();
+    return enqueueCommand(async () => {
+      assertOpen();
+      const title = store.loadTaskMetadata(taskId).title;
+      const outcome = await worktreeManager.apply(taskId, title);
+      if (outcome.status !== "applied") return outcome;
+      logRuntime({ category: "runtime", event: "worktree_applied", taskId });
+      await publish();
+      return Object.freeze({ ...outcome, task: taskView(taskId) });
+    });
+  }
+
+  async function discardWorktree(taskId: TaskId): Promise<DiscardWorktreeResponse> {
+    assertOpen();
+    return enqueueCommand(async () => {
+      assertOpen();
+      const outcome = await worktreeManager.discard(taskId);
+      if (outcome.status !== "discarded") return outcome;
+      // The folder the session ran in is gone: stop its process so nothing keeps it open.
+      const controller = controllers.get(taskId);
+      if (controller !== undefined) {
+        await closeController(taskId, controller);
+        controllers.delete(taskId);
+      }
+      logRuntime({ category: "runtime", event: "worktree_discarded", taskId });
+      await publish();
+      return Object.freeze({ status: "discarded" as const, task: taskView(taskId) });
     });
   }
 
@@ -1250,7 +1324,7 @@ export function createLiveDesktopService(
     const later = runs.slice(targetIndex + 1).filter((candidate) => !rolledBack.has(candidate.runId));
     const rolledBackRuns = Object.freeze([target.runId, ...later.map((candidate) => candidate.runId)]);
     const promptText = runPromptText(taskId, runId);
-    const cwd = workspace.canonicalPath;
+    const cwd = taskRootPath(taskId, workspace.canonicalPath);
 
     // Files first: they decide which official mode applies.
     const rows = new Map(store.listRunCheckpoints(taskId).map((row) => [row.runId, row]));
@@ -1995,14 +2069,46 @@ export function createLiveDesktopService(
     for (const workspace of store.listWorkspaces({ includeArchived: true })) {
       for (const task of store.listTasks({ workspaceId: workspace.workspaceId })) {
         if (!isPristineNewTask(task.taskId)) continue;
+        // A pristine task with a worktree is cleaned up by `sweepPristineWorktreeTasks` (async).
+        if (worktreeManager.rowOf(task.taskId) !== undefined) continue;
         store.deleteTask({ taskId: task.taskId, expectedRevision: task.revision });
         clearPersistedTaskSelection(task.taskId);
       }
     }
   }
 
+  /**
+   * Startup: an untouched task that still has a fresh worktree (the window was closed before the
+   * first message) is removed with it, except the one the window reopens on.
+   */
+  async function sweepPristineWorktreeTasks(): Promise<void> {
+    try {
+      hydrateActiveTask(store.loadAppSettings());
+      for (const taskId of worktreeManager.taskIds()) {
+        if (closed || closing || taskId === activeTaskId) continue;
+        const status = worktreeManager.statusOf(taskId);
+        if (status === undefined || status === "discarded") continue;
+        await enqueueCommand(async () => {
+          if (closed || closing || taskId === activeTaskId) return;
+          if (await discardPristineTask(taskId)) await publish();
+        });
+      }
+    } catch {
+      logRuntime({ category: "runtime", event: "worktree_sweep_failed" });
+    }
+  }
+
   async function discardPristineTask(taskId: TaskId): Promise<boolean> {
     if (!isPristineNewTask(taskId)) return false;
+    // F3: an untouched task takes its fresh worktree with it. One that holds anything (files the
+    // owner added by hand, a commit) is kept, and titled with its branch so it shows in the sidebar
+    // instead of staying a hidden provisional task.
+    const worktreeRow = worktreeManager.rowOf(taskId);
+    if (worktreeRow !== undefined && !(await worktreeManager.discardIfUntouched(taskId))) {
+      const metadata = store.loadTaskMetadata(taskId);
+      store.renameTask({ taskId, expectedRevision: metadata.revision, title: worktreeRow.branch });
+      return false;
+    }
     const controller = controllers.get(taskId);
     if (controller !== undefined) {
       await closeController(taskId, controller);
@@ -2226,7 +2332,7 @@ export function createLiveDesktopService(
   function buildBootstrapUnmemoized(restoreHistory: boolean, reuseSidebar: boolean): DesktopBootstrapProjection {
     const settings = store.loadAppSettings();
     hydrateActiveTask(settings);
-    const workspaces = reuseSidebar && sidebarCache !== undefined
+    const workspaces: readonly WorkspaceProjection[] = reuseSidebar && sidebarCache !== undefined
       ? refreshLiveSidebarTasks(sidebarCache)
       : store.listWorkspaces({ includeArchived: true }).map((workspace) => {
           const workspaceId = must(parseWorkspaceId(workspace.workspaceId));
@@ -2240,6 +2346,9 @@ export function createLiveDesktopService(
             workspaceId,
             name: workspace.displayName,
             archived: workspace.disposition === "archived",
+            ...(workspace.disposition === "active" && worktreeManager.isAvailableFor(workspace.canonicalPath)
+              ? { worktreeAvailable: true as const }
+              : {}),
             tasks: Object.freeze(tasks),
           });
         });
@@ -2446,6 +2555,7 @@ export function createLiveDesktopService(
       ? readOncePerBuild(`restore:${metadata.taskId}`, () => store.restoreTask(metadata.taskId))
       : undefined;
     const activity = currentTaskActivity(controllers.get(metadata.taskId));
+    const worktreeStatus = worktreeManager.statusOf(metadata.taskId);
     return Object.freeze({
       taskId: metadata.taskId,
       workspaceId: must(parseWorkspaceId(metadata.workspaceId)),
@@ -2458,6 +2568,7 @@ export function createLiveDesktopService(
         ? {}
         : { activeRunState: restored.currentRun.state }),
       ...(activity === undefined ? {} : { activeActivity: activity }),
+      ...(worktreeStatus === undefined ? {} : { worktreeStatus }),
     });
   }
 
@@ -2556,7 +2667,8 @@ export function createLiveDesktopService(
     // Post-replacement tool paths are model-authored and may already reflect the
     // cross-project guess this recovery guard is meant to stop. User-authored
     // corrections remain eligible above, but path evidence stays pre-replacement.
-    const observedPaths = recoveryToolPaths(beforeReplacement, workspace.canonicalPath);
+    const taskRoot = taskRootPath(taskId, workspace.canonicalPath);
+    const observedPaths = recoveryToolPaths(beforeReplacement, taskRoot);
     const capsuleBudget = Math.min(
       REPLACEMENT_RECOVERY_CAPSULE_MAX_LENGTH,
       ACP_V1_CODEC_LIMITS.maxStringLength - currentText.length - 256,
@@ -2567,7 +2679,7 @@ export function createLiveDesktopService(
     const capsule = replacementRecoveryCapsule({
       taskId,
       title: metadata.title,
-      workspacePath: workspace.canonicalPath,
+      workspacePath: taskRoot,
       userHistory,
       observedPaths,
       maxLength: capsuleBudget,
@@ -2654,6 +2766,10 @@ export function createLiveDesktopService(
     )];
     const runPhase = runPhaseProjection(controller, summary.activeRunState);
     const windowCheckpoints = runCheckpointProjections(taskId, entries);
+    const worktreeProjection = worktreeManager.projectionOf(taskId);
+    // Opening a task with a worktree refreshes its numbers in the background (bounded, at most
+    // once in a while); the projection that carries them follows.
+    if (worktreeProjection !== undefined) worktreeManager.noteViewed(taskId);
     const latestRunId = [...entries].reverse().find((entry) => entry.runId !== undefined)?.runId;
     const latestRun = latestRunId === undefined
       ? undefined
@@ -2664,7 +2780,7 @@ export function createLiveDesktopService(
           state: latestRun.state as "completed" | "failed" | "cancelled" | "interrupted",
           workbench: cachedWorkbench(
             `${taskId}\0run`,
-            workspace.canonicalPath,
+            taskRootPath(taskId, workspace.canonicalPath),
             entries.filter((entry) => entry.runId === latestRunId),
           ),
         })
@@ -2697,6 +2813,7 @@ export function createLiveDesktopService(
       steer: steerAvailability(taskId, controller),
       ...(windowCheckpoints.length === 0 ? {} : { runCheckpoints: windowCheckpoints }),
       rewind: rewindAvailability(taskId, controller),
+      ...(worktreeProjection === undefined ? {} : { worktree: worktreeProjection }),
       ...(latestAuxiliary === undefined
         ? {}
         : {
@@ -2707,7 +2824,7 @@ export function createLiveDesktopService(
               toolKinds: Object.freeze(auxiliaryToolKinds),
             }),
           }),
-      workbench: cachedWorkbench(`${taskId}\0all`, workspace.canonicalPath, entries),
+      workbench: cachedWorkbench(`${taskId}\0all`, taskRootPath(taskId, workspace.canonicalPath), entries),
       ...(recentResult === undefined ? {} : { recentResult }),
       ...(continuousTask === undefined
         ? {}
@@ -2726,6 +2843,8 @@ export function createLiveDesktopService(
       canSend:
         metadata.disposition === "active" &&
         workspace.disposition === "active" &&
+        worktreeProjection?.status !== "discarded" &&
+        worktreeProjection?.status !== "missing" &&
         !replacementRequired,
     });
   }
@@ -3531,7 +3650,10 @@ export function createLiveDesktopService(
     if (workspace.disposition !== "active" || metadata.disposition !== "active") {
       throw new Error("task_not_writable");
     }
-    await assertWorkspaceFolderExists(workspace.canonicalPath);
+    // F3: a task with an isolated worktree runs there; a discarded one cannot run at all.
+    await worktreeManager.assertUsable(taskId);
+    const taskRoot = taskRootPath(taskId, workspace.canonicalPath);
+    await assertWorkspaceFolderExists(taskRoot);
     const previousAdapter = controller.adapter;
     if (previousAdapter !== undefined) {
       if (previousAdapter.state !== "ready") {
@@ -3612,7 +3734,7 @@ export function createLiveDesktopService(
         adapterEpoch,
         sink: createSink(taskId, controller),
         stagingRoot: options.stagingRoot,
-        workingDirectory: workspace.canonicalPath,
+        workingDirectory: taskRoot,
         runtimeSettings: Object.freeze({
           permissionMode: selectedRuntimeSettings.permissionMode,
           startup: selectedRuntimeSettings.startup,
@@ -3680,7 +3802,7 @@ export function createLiveDesktopService(
       notePhase(controller, { type: "opening_session" });
       if (currentBinding.state === "creating") {
         startStage = "session_new";
-        session = await created.adapter.newSession(workspace.canonicalPath, sessionStartOptions);
+        session = await created.adapter.newSession(taskRoot, sessionStartOptions);
       } else if (
         currentBinding.state === "restore_pending" &&
         currentBinding.retainedSessionId !== undefined &&
@@ -3693,7 +3815,7 @@ export function createLiveDesktopService(
           try {
             session = await created.adapter.resumeSession(
               currentBinding.retainedSessionId,
-              workspace.canonicalPath,
+              taskRoot,
               sessionStartOptions,
             );
           } catch (cause: unknown) {
@@ -3706,7 +3828,7 @@ export function createLiveDesktopService(
           try {
             session = await created.adapter.loadSession(
               currentBinding.retainedSessionId,
-              workspace.canonicalPath,
+              taskRoot,
             );
           } catch (cause: unknown) {
             restoreCause = cause;
@@ -5797,7 +5919,7 @@ export function createLiveDesktopService(
   ): Promise<Readonly<{ readonly bytes: Buffer; readonly name: string }>> {
     const task = store.loadTaskMetadata(taskId);
     const workspace = store.loadWorkspace(task.workspaceId);
-    const workspacePath = await realpath(workspace.canonicalPath);
+    const workspacePath = await realpath(taskRootPath(taskId, workspace.canonicalPath));
     const canonical = await realpath(requestedPath);
     const within = relative(workspacePath, canonical);
     if (
@@ -6030,7 +6152,10 @@ export function createLiveDesktopService(
     for (const requested of attachments) {
       if (seen.has(requested.relativePath)) throw new Error("duplicate_prompt_attachment");
       seen.add(requested.relativePath);
-      const validated = await canonicalPromptAttachment(workspace.canonicalPath, requested.relativePath);
+      const validated = await canonicalPromptAttachment(
+        taskRootPath(taskId, workspace.canonicalPath),
+        requested.relativePath,
+      );
       resources.push(Object.freeze({
         name: validated.attachment.name,
         uri: validated.uri,
@@ -6087,6 +6212,7 @@ export function createLiveDesktopService(
     }
   }
   discardStoredPristineTasks();
+  void sweepPristineWorktreeTasks();
   const diagnosticsHydration = hydrateRuntimeIncidents().catch(() => undefined);
 
   const service: DesktopApplicationService = {
@@ -6149,8 +6275,9 @@ export function createLiveDesktopService(
       if (task.disposition !== "active" || workspace.disposition !== "active") {
         throw new Error("prompt_attachment_task_unavailable");
       }
+      const attachmentRoot = taskRootPath(taskId, workspace.canonicalPath);
       const selected = await options.choosePromptFiles?.({
-        workspacePath: workspace.canonicalPath,
+        workspacePath: attachmentRoot,
         locale: store.loadAppSettings().locale,
       });
       if (selected === undefined || selected.length === 0) {
@@ -6162,25 +6289,42 @@ export function createLiveDesktopService(
       const attachments = [];
       const seen = new Set<string>();
       for (const path of selected) {
-        const validated = await canonicalPromptAttachment(workspace.canonicalPath, path);
+        const validated = await canonicalPromptAttachment(attachmentRoot, path);
         if (seen.has(validated.attachment.relativePath)) continue;
         seen.add(validated.attachment.relativePath);
         attachments.push(validated.attachment);
       }
       return Object.freeze({ status: "selected", attachments: Object.freeze(attachments) });
     },
-    createTask: async (workspaceId) => enqueueCommand(async () => {
+    createTask: async (workspaceId, isolation?: GuildTaskIsolation) => enqueueCommand(async () => {
       assertOpen();
       const workspace = store.loadWorkspace(workspaceId);
       if (workspace.disposition !== "active") throw new Error("workspace_not_active");
       if (activeTaskId !== undefined) await discardPristineTask(activeTaskId);
       const taskId = id(parseTaskId, "task");
-      store.createConversationTask({
-        taskId,
-        workspaceId,
-        title: store.loadAppSettings().locale === "zh-CN" ? "新任务" : "New task",
-        owningWindowId: PRIMARY_WINDOW_ID,
-      });
+      const title = store.loadAppSettings().locale === "zh-CN" ? "新任务" : "New task";
+      const createTaskRow = (): void => {
+        store.createConversationTask({
+          taskId,
+          workspaceId,
+          title,
+          owningWindowId: PRIMARY_WINDOW_ID,
+        });
+      };
+      if (isolation === "worktree") {
+        // F3: the worktree is created first, so a refused one (not a git repository, no commits)
+        // leaves no task behind. It throws `worktree_<reason>`.
+        await worktreeManager.create({
+          taskId,
+          workspaceId,
+          workspacePath: workspace.canonicalPath,
+          title,
+          createTaskRow,
+        });
+        await worktreeManager.refresh(taskId, { force: true });
+      } else {
+        createTaskRow();
+      }
       activeTaskId = taskId;
       conversationPageDepths.set(taskId, 1);
       persistTaskSelection(taskId);
@@ -6209,6 +6353,8 @@ export function createLiveDesktopService(
       activeTaskId = taskId;
       if (!conversationPageDepths.has(taskId)) conversationPageDepths.set(taskId, 1);
       persistTaskSelection(taskId);
+      // F3: the user opened the task, so its worktree numbers are re-read if they are over a second old.
+      void worktreeManager.refresh(taskId, { minIntervalMs: 1_000 }).catch(() => undefined);
       await publish();
       scheduleQueuedDispatch(taskId);
       onActiveTaskChanged(taskId);
@@ -6326,6 +6472,25 @@ export function createLiveDesktopService(
       results.sort((a, b) => b.updatedAtMs - a.updatedAtMs);
       return Object.freeze({ results: Object.freeze(results) });
     }),
+    previewWorktreeApply: async (taskId) => previewWorktreeApply(taskId),
+    applyWorktree: async (taskId) => applyWorktree(taskId),
+    discardWorktree: async (taskId) => discardWorktree(taskId),
+    openWorktreeResource: async (taskId, action) => {
+      assertOpen();
+      const task = store.loadTaskMetadata(taskId);
+      const workspace = store.loadWorkspace(task.workspaceId);
+      if (task.disposition === "deleted" || workspace.disposition !== "active") {
+        throw new Error("worktree_unavailable");
+      }
+      const path = await worktreeManager.resourcePath(taskId, workspace.canonicalPath);
+      if (action === "folder") {
+        if (options.openWorkspaceFolder === undefined) throw new Error("workspace_folder_unavailable");
+        await options.openWorkspaceFolder(path);
+        return;
+      }
+      if (options.openWorkspaceTerminal === undefined) throw new Error("task_terminal_unavailable");
+      await options.openWorkspaceTerminal(path);
+    },
     openTaskResource: async (taskId, action, requestedPath) => {
       assertOpen();
       const task = store.loadTaskMetadata(taskId);
@@ -6333,7 +6498,7 @@ export function createLiveDesktopService(
       if (task.disposition === "deleted" || workspace.disposition !== "active") {
         throw new Error("task_resource_unavailable");
       }
-      const workspacePath = await realpath(workspace.canonicalPath);
+      const workspacePath = await realpath(taskRootPath(taskId, workspace.canonicalPath));
       if (action === "folder") {
         if (options.openWorkspaceFolder === undefined) throw new Error("workspace_folder_unavailable");
         await options.openWorkspaceFolder(workspacePath);
@@ -6471,6 +6636,12 @@ export function createLiveDesktopService(
     sendMessage: async (taskId, text, attachments = [], mode = "standard") => {
       assertOpen();
       if (managementOperationActive) throw new Error("grok_management_operation_active");
+      if (worktreeManager.rowOf(taskId) !== undefined) {
+        // F3: a discarded worktree cannot run, and a worktree folder deleted by hand is not a place to send into.
+        await worktreeManager.assertUsable(taskId);
+        const sendWorkspace = store.loadWorkspace(store.loadTaskMetadata(taskId).workspaceId);
+        await assertWorkspaceFolderExists(taskRootPath(taskId, sendWorkspace.canonicalPath));
+      }
       if (mode === "continuous" && attachments.length > 0) {
         throw new Error("continuous_task_attachments_not_supported");
       }

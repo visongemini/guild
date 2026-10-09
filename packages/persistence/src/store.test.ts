@@ -377,7 +377,7 @@ describe("main-only SQLite persistence", () => {
     store.close();
     const raw = new DatabaseSync(path);
     assert.equal(raw.prepare("PRAGMA journal_mode").get()?.["journal_mode"], "wal");
-    assert.equal(raw.prepare("PRAGMA user_version").get()?.["user_version"], 17);
+    assert.equal(raw.prepare("PRAGMA user_version").get()?.["user_version"], 18);
     const strictByTable = new Map(
       raw
         .prepare("PRAGMA table_list")
@@ -1091,7 +1091,7 @@ describe("main-only SQLite persistence", () => {
     const reopened = openGuildPersistence({ path });
     assert.equal(reopened.loadRun(taskId, runId).state, "completed");
     assert.equal(reopened.loadConversationEntry(taskId, "live-assistant-1").text, "Hello");
-    assert.equal(reopened.verifyIntegrity().schemaVersion, 17);
+    assert.equal(reopened.verifyIntegrity().schemaVersion, 18);
     reopened.close();
   });
 
@@ -1138,7 +1138,7 @@ describe("main-only SQLite persistence", () => {
     const next = store.commitLiveRuntimeEvent({ event: eventAt(257), mutation });
     assert.equal(next.ok, true);
     assert.equal(next.record?.text, "x".repeat(257));
-    assert.equal(store.verifyIntegrity().schemaVersion, 17);
+    assert.equal(store.verifyIntegrity().schemaVersion, 18);
     store.close();
   });
 
@@ -1150,6 +1150,7 @@ describe("main-only SQLite persistence", () => {
     const raw = new DatabaseSync(path);
     raw.exec(`
       PRAGMA foreign_keys = OFF;
+      DROP TABLE task_worktrees;
       DROP TABLE run_checkpoints;
       DROP TABLE task_interjections;
       DROP TABLE runtime_model_catalog;
@@ -1179,7 +1180,7 @@ describe("main-only SQLite persistence", () => {
         PRIMARY KEY(task_id, idempotency_key),
         UNIQUE(task_id, adapter_epoch, receive_sequence)
       ) STRICT;
-      DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17);
+      DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18);
       CREATE TABLE guild_meta_v1 (
         singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
         schema_version INTEGER NOT NULL CHECK(schema_version = 1),
@@ -1195,7 +1196,7 @@ describe("main-only SQLite persistence", () => {
     raw.close();
 
     const migrated = openGuildPersistence({ path });
-    assert.equal(migrated.verifyIntegrity().schemaVersion, 17);
+    assert.equal(migrated.verifyIntegrity().schemaVersion, 18);
     assert.equal(migrated.loadRun(taskId, runId).state, "queued");
     assert.throws(
       () => migrated.loadTaskMetadata(taskId),
@@ -1340,7 +1341,7 @@ describe("main-only SQLite persistence", () => {
     });
     assert.equal(secondDispatch.run.runId, secondQueuedRunId);
     assert.equal(store.listQueuedTurns(taskId).length, 0);
-    assert.equal(store.verifyIntegrity().schemaVersion, 17);
+    assert.equal(store.verifyIntegrity().schemaVersion, 18);
     store.close();
   });
 
@@ -2838,7 +2839,7 @@ describe("main-only SQLite persistence", () => {
       assert.equal(merged.payload.text, texts.slice(1).join(""));
 
       const reopened = openGuildPersistence({ path });
-      assert.equal(reopened.verifyIntegrity().schemaVersion, 17);
+      assert.equal(reopened.verifyIntegrity().schemaVersion, 18);
       // Admission continues from the last covered sequence, so the stream resumes gaplessly.
       const next = reopened.commitLiveRuntimeEvent({
         event: textChunk(lastSequence + 1, "!"),
@@ -3162,12 +3163,13 @@ describe("main-only SQLite persistence", () => {
         BEGIN
           SELECT RAISE(ABORT, 'conversation_entry_not_append_only');
         END;
+        DROP TABLE task_worktrees;
         DROP TABLE run_checkpoints;
         DROP TABLE task_interjections;
         DROP TABLE runtime_model_catalog;
         DROP TABLE task_runtime_settings;
         DROP TABLE task_context_usage;
-        DELETE FROM schema_migrations WHERE version IN (15, 16, 17);
+        DELETE FROM schema_migrations WHERE version IN (15, 16, 17, 18);
         CREATE TABLE guild_meta_v14 (
           singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
           schema_version INTEGER NOT NULL CHECK(schema_version = 14),
@@ -3190,12 +3192,12 @@ describe("main-only SQLite persistence", () => {
       downgrade.close();
 
       const migrated = openGuildPersistence({ path });
-      assert.equal(migrated.verifyIntegrity().schemaVersion, 17);
+      assert.equal(migrated.verifyIntegrity().schemaVersion, 18);
       migrated.close();
       assert.equal(snapshot(), before, "migration must not read-modify historical rows");
 
       const raw = new DatabaseSync(path);
-      assert.equal(raw.prepare("PRAGMA user_version").get()?.["user_version"], 17);
+      assert.equal(raw.prepare("PRAGMA user_version").get()?.["user_version"], 18);
       assert.match(
         String(raw.prepare("SELECT sql FROM sqlite_schema WHERE name = 'conversation_entry_is_append_only'").get()?.["sql"]),
         /octet_length/u,
@@ -3345,7 +3347,7 @@ describe("main-only SQLite persistence", () => {
 
       const reopened = openGuildPersistence({ path });
       assert.equal(reopened.loadLatestContextTokensUsed(taskId), 9_000);
-      assert.equal(reopened.verifyIntegrity().schemaVersion, 17);
+      assert.equal(reopened.verifyIntegrity().schemaVersion, 18);
       reopened.close();
     });
 
@@ -3404,11 +3406,12 @@ describe("main-only SQLite persistence", () => {
       withRaw(path, (raw) => {
         raw.exec(`
           PRAGMA foreign_keys = OFF;
+          DROP TABLE task_worktrees;
           DROP TABLE run_checkpoints;
           DROP TABLE task_interjections;
           DROP TABLE runtime_model_catalog;
           DROP TABLE task_runtime_settings;
-          DELETE FROM schema_migrations WHERE version IN (16, 17);
+          DELETE FROM schema_migrations WHERE version IN (16, 17, 18);
           CREATE TABLE app_settings_v15 (
             singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
             locale TEXT NOT NULL CHECK(locale IN ('zh-CN', 'en-US')),
@@ -3524,7 +3527,7 @@ describe("main-only SQLite persistence", () => {
       const older = seedV15(t, "grok-4.5", "medium");
 
       const migrated = openGuildPersistence({ path: owner });
-      assert.equal(migrated.verifyIntegrity().schemaVersion, 17);
+      assert.equal(migrated.verifyIntegrity().schemaVersion, 18);
       const settings = migrated.loadAppSettings();
       assert.equal(settings.grokModel, "grok-4.7");
       assert.equal(settings.reasoningEffort, "high");
@@ -3555,7 +3558,7 @@ describe("main-only SQLite persistence", () => {
       }
 
       withRaw(owner, (raw) => {
-        assert.equal(raw.prepare("PRAGMA user_version").get()?.["user_version"], 17);
+        assert.equal(raw.prepare("PRAGMA user_version").get()?.["user_version"], 18);
         assert.deepEqual(
           raw.prepare("SELECT version, name FROM schema_migrations WHERE version >= 15 ORDER BY version")
             .all().map((row) => ({ ...row })),
@@ -3563,6 +3566,7 @@ describe("main-only SQLite persistence", () => {
             { version: 15, name: "streaming_write_path_and_context_usage" },
             { version: 16, name: "runtime_model_catalog_and_task_settings" },
             { version: 17, name: "steer_interjections_and_run_checkpoints" },
+            { version: 18, name: "task_worktrees" },
           ],
         );
         assert.deepEqual(
@@ -3734,7 +3738,7 @@ describe("main-only SQLite persistence", () => {
       const reopened = openGuildPersistence({ path });
       assert.equal(reopened.loadAppSettings().grokModel, "grok-4.6");
       assert.equal(reopened.loadAppSettings().reasoningEffort, null);
-      assert.equal(reopened.verifyIntegrity().schemaVersion, 17);
+      assert.equal(reopened.verifyIntegrity().schemaVersion, 18);
       reopened.close();
     });
 
@@ -3836,7 +3840,7 @@ describe("main-only SQLite persistence", () => {
 
       store = openGuildPersistence({ path });
       assert.deepEqual(store.loadTaskRuntimeSettings(taskId), updated);
-      assert.equal(store.verifyIntegrity().schemaVersion, 17);
+      assert.equal(store.verifyIntegrity().schemaVersion, 18);
       assert.throws(
         () => store.clearTaskRuntimeSettings({ taskId, expectedRevision: 1 }),
         failure("persistence_cas_conflict"),
@@ -3896,7 +3900,7 @@ describe("main-only SQLite persistence", () => {
       });
       store = openGuildPersistence({ path });
       assert.deepEqual(store.loadModelCatalogCache()?.catalog, catalog);
-      assert.equal(store.verifyIntegrity().schemaVersion, 17);
+      assert.equal(store.verifyIntegrity().schemaVersion, 18);
 
       // An identical list (even built with another key order) is not rewritten; a changed list
       // or runtime version is.
@@ -3948,7 +3952,7 @@ describe("main-only SQLite persistence", () => {
         });
         const reopened = openGuildPersistence({ path });
         assert.equal(reopened.loadModelCatalogCache(), undefined, damaged);
-        assert.equal(reopened.verifyIntegrity().schemaVersion, 17);
+        assert.equal(reopened.verifyIntegrity().schemaVersion, 18);
         reopened.saveModelCatalogCache({ catalog });
         assert.deepEqual(reopened.loadModelCatalogCache()?.catalog, catalog);
         reopened.close();
@@ -4021,7 +4025,7 @@ describe("Steer interjections and run checkpoints (schema v17)", () => {
 
     const reopened = openGuildPersistence({ path });
     assert.equal(reopened.loadInterjection(taskId, "interject-1")?.state, "delivered");
-    assert.equal(reopened.verifyIntegrity().schemaVersion, 17);
+    assert.equal(reopened.verifyIntegrity().schemaVersion, 18);
     reopened.close();
   });
 
@@ -4241,9 +4245,10 @@ describe("Steer interjections and run checkpoints (schema v17)", () => {
     withRaw(path, (raw) => {
       raw.exec(`
         PRAGMA foreign_keys = OFF;
+        DROP TABLE task_worktrees;
         DROP TABLE run_checkpoints;
         DROP TABLE task_interjections;
-        DELETE FROM schema_migrations WHERE version = 17;
+        DELETE FROM schema_migrations WHERE version IN (17, 18);
         CREATE TABLE guild_meta_v16 (
           singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
           schema_version INTEGER NOT NULL CHECK(schema_version = 16),
@@ -4258,11 +4263,154 @@ describe("Steer interjections and run checkpoints (schema v17)", () => {
       `);
     });
     const migrated = openGuildPersistence({ path });
-    assert.equal(migrated.verifyIntegrity().schemaVersion, 17);
+    assert.equal(migrated.verifyIntegrity().schemaVersion, 18);
     assert.equal(migrated.loadConversationEntry(taskId, "history-1").text, "old");
     assert.deepEqual(migrated.listInterjections(taskId), []);
     assert.deepEqual(migrated.listRunCheckpoints(taskId), []);
     migrated.beginInterjection({ taskId, interjectionId: "interject-after", runId, text: "works after migration" });
+    migrated.close();
+  });
+});
+
+describe("Task worktrees (schema v18)", () => {
+  const baseCommit = "a".repeat(40);
+  const input = {
+    taskId,
+    sourceWorkspaceId: workspaceId,
+    sourceRepoPath: "/tmp/guild-source-repo",
+    worktreePath: "/tmp/guild-data/worktrees/task-1",
+    branch: "guild/task-1a2b3c4d",
+    baseCommit,
+    baseBranch: "main",
+  } as const;
+
+  function failure(code: string): (error: unknown) => boolean {
+    return (error: unknown) => error instanceof PersistenceError && error.code === code;
+  }
+
+  function withRaw<T>(path: string, operation: (raw: DatabaseSync) => T): T {
+    const raw = new DatabaseSync(path);
+    try {
+      return operation(raw);
+    } finally {
+      raw.close();
+    }
+  }
+
+  it("records one worktree per task, reloads it, and walks the status", (t) => {
+    const path = temporaryDatabase(t);
+    const store = conversationStore(path);
+    assert.equal(store.loadTaskWorktree(taskId), undefined);
+    assert.deepEqual(store.listTaskWorktrees(), []);
+    const created = store.createTaskWorktree(input);
+    assert.equal(created.status, "active");
+    assert.equal(created.branch, "guild/task-1a2b3c4d");
+    assert.equal(created.baseBranch, "main");
+    assert.equal(created.createdAtMs, created.updatedAtMs);
+    assert.throws(() => store.createTaskWorktree(input), failure("aggregate_already_exists"));
+
+    assert.equal(store.setTaskWorktreeStatus({ taskId, status: "applied" }).status, "applied");
+    assert.equal(store.setTaskWorktreeStatus({ taskId, status: "applied" }).status, "applied", "same status is a no-op");
+    assert.equal(store.setTaskWorktreeStatus({ taskId, status: "active" }).status, "active");
+    assert.equal(store.setTaskWorktreeStatus({ taskId, status: "missing" }).status, "missing");
+    assert.equal(store.setTaskWorktreeStatus({ taskId, status: "active" }).status, "active");
+    assert.equal(store.setTaskWorktreeStatus({ taskId, status: "discarded" }).status, "discarded");
+    assert.throws(
+      () => store.setTaskWorktreeStatus({ taskId, status: "active" }),
+      failure("domain_operation_rejected"),
+      "a discarded worktree cannot come back",
+    );
+    assert.throws(
+      () => store.setTaskWorktreeStatus({ taskId, status: "weird" as never }),
+      failure("domain_operation_rejected"),
+    );
+    store.close();
+
+    const reopened = openGuildPersistence({ path });
+    const loaded = reopened.loadTaskWorktree(taskId);
+    assert.equal(loaded?.status, "discarded");
+    assert.equal(loaded?.worktreePath, input.worktreePath);
+    assert.equal(loaded?.sourceRepoPath, input.sourceRepoPath);
+    assert.equal(loaded?.baseCommit, baseCommit);
+    assert.deepEqual(reopened.listTaskWorktrees().map((row) => row.taskId), [taskId]);
+    reopened.close();
+  });
+
+  it("keeps a detached base without a branch name and refuses anything that is not a Guild branch", (t) => {
+    const path = temporaryDatabase(t);
+    const store = conversationStore(path);
+    const { baseBranch: _omitted, ...detached } = input;
+    const created = store.createTaskWorktree(detached);
+    assert.equal(created.baseBranch, undefined);
+    store.close();
+
+    const second = conversationStore(temporaryDatabase(t));
+    for (const rejected of [
+      { ...input, branch: "main" },
+      { ...input, branch: "guild/" },
+      { ...input, branch: "feature/guild/x" },
+      { ...input, baseCommit: "not-a-sha" },
+      { ...input, baseCommit: "A".repeat(40) },
+      { ...input, worktreePath: "" },
+      { ...input, sourceRepoPath: "x".repeat(4_097) },
+    ]) {
+      assert.throws(() => second.createTaskWorktree(rejected), failure("domain_operation_rejected"), JSON.stringify(rejected));
+    }
+    assert.throws(
+      () => second.createTaskWorktree({ ...input, taskId: must(parseTaskId("task-unknown")) }),
+      failure("aggregate_not_found"),
+    );
+    second.close();
+  });
+
+  it("enforces the Guild branch and unique path rules in the table itself", (t) => {
+    const path = temporaryDatabase(t);
+    const store = conversationStore(path);
+    store.close();
+    withRaw(path, (raw) => {
+      const insert = (branch: string, taskIdValue: string, worktree: string) => raw.prepare(`
+        INSERT INTO task_worktrees(task_id, source_workspace_id, source_repo_path, worktree_path, branch,
+          base_commit, base_branch, status, created_at_ms, updated_at_ms)
+        VALUES(?, ?, '/r', ?, ?, ?, NULL, 'active', 1, 1)
+      `).run(taskIdValue, workspaceId, worktree, branch, baseCommit);
+      assert.throws(() => insert("main", taskId, "/w/a"), /CHECK constraint failed/u);
+      assert.throws(() => insert("guild/x", "task-missing", "/w/b"), /FOREIGN KEY constraint failed/u);
+      insert("guild/x", taskId, "/w/a");
+      const other = must(parseTaskId("task-2"));
+      raw.exec("PRAGMA foreign_keys = OFF");
+      assert.throws(() => insert("guild/y", other, "/w/a"), /UNIQUE constraint failed/u);
+      assert.throws(() => insert("guild/x", other, "/w/c"), /UNIQUE constraint failed/u);
+      assert.throws(() => raw.exec("UPDATE task_worktrees SET status = 'gone'"), /CHECK constraint failed/u);
+    });
+  });
+  it("migrates a v17 database forward without touching existing rows", (t) => {
+    const path = temporaryDatabase(t);
+    const legacy = liveReadyStore(path);
+    legacy.createConversationEntry({ taskId, entryId: "history-1", kind: "user", runId, text: "old", status: "complete" });
+    legacy.close();
+    withRaw(path, (raw) => {
+      raw.exec(`
+        PRAGMA foreign_keys = OFF;
+        DROP TABLE task_worktrees;
+        DELETE FROM schema_migrations WHERE version = 18;
+        CREATE TABLE guild_meta_v17 (
+          singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+          schema_version INTEGER NOT NULL CHECK(schema_version = 17),
+          clean_shutdown INTEGER NOT NULL CHECK(clean_shutdown IN (0, 1)),
+          last_integrity_at_ms INTEGER CHECK(last_integrity_at_ms IS NULL OR last_integrity_at_ms >= 0)
+        ) STRICT;
+        INSERT INTO guild_meta_v17(singleton, schema_version, clean_shutdown, last_integrity_at_ms)
+        SELECT singleton, 17, clean_shutdown, last_integrity_at_ms FROM guild_meta;
+        DROP TABLE guild_meta;
+        ALTER TABLE guild_meta_v17 RENAME TO guild_meta;
+        PRAGMA user_version = 17;
+      `);
+    });
+    const migrated = openGuildPersistence({ path });
+    assert.equal(migrated.verifyIntegrity().schemaVersion, 18);
+    assert.equal(migrated.loadConversationEntry(taskId, "history-1").text, "old");
+    assert.deepEqual(migrated.listTaskWorktrees(), []);
+    assert.equal(migrated.createTaskWorktree(input).status, "active");
     migrated.close();
   });
 });
