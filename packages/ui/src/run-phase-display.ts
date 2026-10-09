@@ -90,3 +90,61 @@ export function describeRunPhase(
     ),
   });
 }
+
+/** Phases that ended earlier in this turn, as the projection stream showed them. */
+export type RunPhaseTrailEntry = Readonly<{
+  projection: RunPhaseProjection;
+  /** The next phase's `phaseStartedAtMs` minus this phase's: exact, taken from the projection. */
+  durationMs: number;
+}>;
+
+export type RunPhaseHistory = Readonly<{
+  last: RunPhaseProjection;
+  trail: readonly RunPhaseTrailEntry[];
+}>;
+
+/** Only the most recent phases are worth a glance; older ones fall off the faint trail. */
+export const RUN_PHASE_TRAIL_LIMIT = 3;
+
+export function startRunPhaseHistory(projection: RunPhaseProjection): RunPhaseHistory {
+  return Object.freeze({ last: projection, trail: Object.freeze([]) });
+}
+
+/**
+ * Folds the next projection into the history. The trail is built only from transitions this
+ * view actually saw: a phase that ended before the line mounted is simply not on it, and a new
+ * turn starts a new trail. Nothing is inferred or reconstructed.
+ */
+export function advanceRunPhaseHistory(
+  history: RunPhaseHistory,
+  next: RunPhaseProjection,
+): RunPhaseHistory {
+  if (next === history.last) return history;
+  if (next.turnStartedAtMs !== history.last.turnStartedAtMs) return startRunPhaseHistory(next);
+  if (next.phaseStartedAtMs === history.last.phaseStartedAtMs) {
+    // The same phase with refreshed details (a tool name, a retry count): keep the trail.
+    return Object.freeze({ last: next, trail: history.trail });
+  }
+  const durationMs = next.phaseStartedAtMs - history.last.phaseStartedAtMs;
+  if (durationMs < 0) return startRunPhaseHistory(next);
+  const trail = [...history.trail, Object.freeze({ projection: history.last, durationMs })]
+    .slice(-RUN_PHASE_TRAIL_LIMIT);
+  return Object.freeze({ last: next, trail: Object.freeze(trail) });
+}
+
+export type RunPhaseTrailDisplay = Readonly<{ key: string; text: string }>;
+
+/** Trail items as text; phases shorter than one whole second add nothing and are left out. */
+export function describeRunPhaseTrail(
+  history: RunPhaseHistory,
+  messages: GuildMessages,
+): readonly RunPhaseTrailDisplay[] {
+  return Object.freeze(history.trail.flatMap((entry, index) => {
+    const seconds = Math.floor(entry.durationMs / 1_000);
+    if (seconds < 1) return [];
+    return [Object.freeze({
+      key: `${entry.projection.phaseStartedAtMs}-${index}`,
+      text: `${runPhaseLabel(entry.projection, false, messages)} ${messages.runDuration(seconds)}`,
+    })];
+  }));
+}

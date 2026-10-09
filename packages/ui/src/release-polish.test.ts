@@ -9,7 +9,7 @@ test("release chrome exposes truthful runtime state and no dead navigation contr
   assert.match(source, /messages\.toolKindLabel\(item\.toolKind\)/);
   assert.match(source, /className="guild-inline-error" role="alert"/);
   assert.doesNotMatch(source, /<SidebarNav[^>]+messages\.(?:extensions|automation|library)/);
-  const utilities = source.slice(source.indexOf('className="guild-sidebar-utilities"'), source.indexOf('className="guild-profile-bar"'));
+  const utilities = source.slice(source.indexOf('className="guild-sidebar-utilities"'), source.indexOf("</aside>"));
   assert.match(utilities, /onClick=\{openGrokControlCenter\}/);
   assert.match(utilities, /onClick=\{\(\) => openSettings\(\)\}/);
 });

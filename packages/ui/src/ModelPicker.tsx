@@ -1,4 +1,5 @@
 import type { GrokModelCatalog, SetTaskRuntimeSettingsResponse, TaskModelSelectionProjection } from "@guild/contracts";
+import { CaretDownIcon as CaretDown } from "@phosphor-icons/react/CaretDown";
 import { CheckIcon as Check } from "@phosphor-icons/react/Check";
 import { SpinnerGapIcon as SpinnerGap } from "@phosphor-icons/react/SpinnerGap";
 import {
@@ -142,7 +143,9 @@ export function ModelPicker({ messages, catalog, selection, onApply, initialOpen
       }}
     >
       <span>{view.triggerText}</span>
-      {pending && <SpinnerGap size={11} className="guild-spin" aria-hidden="true" />}
+      {pending
+        ? <SpinnerGap size={11} className="guild-spin" aria-hidden="true" />
+        : <CaretDown size={11} className="guild-model-picker-caret" aria-hidden="true" />}
     </button>
     {panelOpen && <div
       ref={popoverRef}
@@ -176,8 +179,13 @@ export function ModelPicker({ messages, catalog, selection, onApply, initialOpen
                 onClick={() => void apply(selectionAfterModelChange(catalog, row.id, view.selectedEffortId))}
               >
                 <span className="guild-model-row-name">
-                  <strong>{row.name}</strong>
-                  {row.selected && <Check size={13} weight="bold" aria-hidden="true" />}
+                  <span className="guild-model-row-title">
+                    <strong>{row.name}</strong>
+                    {row.priceMultiplier !== undefined && (
+                      <em className="guild-model-price-tag">{messages.modelPriceTag(row.priceMultiplier)}</em>
+                    )}
+                  </span>
+                  {row.selected && <Check size={14} weight="bold" aria-hidden="true" />}
                 </span>
                 {row.description !== undefined && <small className="guild-model-row-description">{row.description}</small>}
                 {row.contextLabel !== undefined && <small className="guild-model-row-meta">{row.contextLabel}</small>}
@@ -219,6 +227,7 @@ export function ModelPicker({ messages, catalog, selection, onApply, initialOpen
               ))}
             </div>
           )}
+          <p className="guild-model-footnote">{messages.modelPickerFootnote}</p>
         </>
       )}
       {notice !== undefined && (
