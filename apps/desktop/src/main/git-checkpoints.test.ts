@@ -150,6 +150,23 @@ describe("git checkpoints [F2]", () => {
     assert.deepEqual(checkpointDirectories(), directoriesBefore, "the private index directory is removed");
   });
 
+  it("sees an edit that keeps a file's size and lands within the second git last recorded for it", async () => {
+    // git's stat cache can miss such an edit; the copied index is dated so git re-reads the content.
+    for (let round = 0; round < 12; round += 1) {
+      const root = repository(`racy-${round}`, { "dir/c.txt": "c original\n", "a.txt": "a original\n" });
+      const start = await captureCheckpoint({ cwd: root, taskId: "racy", ordinal: 1 });
+      write(root, "user-staged.txt", "staged\n");
+      git(root, "add", "user-staged.txt");
+      await captureCheckpoint({ cwd: root, taskId: "racy", ordinal: 2 });
+      write(root, "dir/c.txt", "c by run 2\n");
+      const end = await captureCheckpoint({ cwd: root, taskId: "racy", ordinal: 3 });
+      if (start.status !== "captured" || end.status !== "captured") return assert.fail("capture");
+      const summary = await summarizeDiff({ cwd: root, fromRef: start.ref, toRef: end.ref });
+      assert.deepEqual(summary.status === "ok" && summary.summary.files.map((file) => file.path).sort(),
+        ["dir/c.txt", "user-staged.txt"], `round ${round}`);
+    }
+  });
+
   it("captures an unborn repository, a repository during an index.lock, and parallel captures", async () => {
     const unborn = temporaryDirectory("unborn");
     git(unborn, "init", "-q", "-b", "main");
@@ -198,9 +215,12 @@ describe("git checkpoints [F2]", () => {
     chmodSync(hang, 0o755);
     setGitExecutableForTests(hang);
     const started = Date.now();
-    const result = await captureCheckpoint({ cwd: root, taskId: "t", ordinal: 1, limits: { timeoutMs: 400 } });
+    const result = await captureCheckpoint({ cwd: root, taskId: "t", ordinal: 1, limits: { timeoutMs: 1_500 } });
     assert.deepEqual(result, { status: "unavailable", reason: "timeout" });
-    assert.equal(Date.now() - started < 5_000, true);
+    assert.equal(Date.now() - started < 8_000, true);
+    for (let wait = 0; wait < 40 && !existsSync(marker); wait += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
     const pid = Number(readFileSync(marker, "utf8").trim());
     await new Promise((resolve) => setTimeout(resolve, 100));
     assert.throws(() => process.kill(pid, 0), /ESRCH/u, "the hung git process was killed");

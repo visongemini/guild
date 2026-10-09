@@ -5,10 +5,11 @@
  *
  * Safety contract, enforced by construction and covered by git-checkpoints.test.ts:
  *  - The user's index, HEAD, branches, tags, stash and reflogs are never written. Every capture
- *    runs against a private temporary `GIT_INDEX_FILE` (seeded from a copy of the real index so
- *    only changed files are re-hashed); `git add -A` respects .gitignore, so ignored files are
- *    not captured and untracked files are. The only repository writes are new objects plus the
- *    one ref being created.
+ *    runs against a private temporary `GIT_INDEX_FILE` seeded from a copy of the real index (dated
+ *    to the epoch so git re-reads every tracked file rather than trusting stat data that a
+ *    same-size edit within one second would fool; see `maxVerifiedIndexBytes`); `git add -A`
+ *    respects .gitignore, so ignored files are not captured and untracked files are. The only
+ *    repository writes are new objects plus the one ref being created.
  *  - Reads run with GIT_OPTIONAL_LOCKS=0 so git does not refresh the real index behind the user.
  *  - The restore step uses `git restore --source=<ref> --worktree`: the index is not a target, so
  *    a change the user staged stays staged. Files a Run added are deleted by this module (checked
@@ -23,7 +24,7 @@
 
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { copyFile, lstat, mkdtemp, readdir, realpath, rm, rmdir, stat } from "node:fs/promises";
+import { copyFile, lstat, mkdtemp, readdir, realpath, rm, rmdir, stat, utimes } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
@@ -47,6 +48,12 @@ export type GitCheckpointLimits = Readonly<{
   maxUntrackedBytes: number;
   /** Size of the largest one. */
   maxUntrackedFileBytes: number;
+  /**
+   * Index size up to which every tracked file is re-read on capture. Above it git's stat cache is
+   * trusted, which can miss an edit that keeps a file's size and lands in the same second as the
+   * stat git last recorded.
+   */
+  maxVerifiedIndexBytes: number;
 }>;
 
 export const DEFAULT_CHECKPOINT_LIMITS: GitCheckpointLimits = Object.freeze({
@@ -54,6 +61,7 @@ export const DEFAULT_CHECKPOINT_LIMITS: GitCheckpointLimits = Object.freeze({
   maxUntrackedFiles: 20_000,
   maxUntrackedBytes: 512 * 1024 * 1024,
   maxUntrackedFileBytes: 64 * 1024 * 1024,
+  maxVerifiedIndexBytes: 3 * 1024 * 1024,
 });
 
 export type GitChangeStatus = "A" | "M" | "D" | "R";
@@ -439,6 +447,13 @@ async function snapshotTree(
         // are re-read. The real index is only ever read.
         try {
           await copyFile(repository.indexPath, indexFile);
+          // Git trusts a stat entry unless the file is at least as new as the index file. An edit
+          // that keeps the size and lands in the same second as the recorded stat would then be
+          // missed, so the copy is dated to the epoch: every entry counts as possibly stale and
+          // git re-reads its content. The user's own index file is never touched.
+          if ((await stat(indexFile)).size <= limits.maxVerifiedIndexBytes) {
+            await utimes(indexFile, 1, 1);
+          }
         } catch {
           // No index yet (a fresh repository): git starts from an empty one.
         }

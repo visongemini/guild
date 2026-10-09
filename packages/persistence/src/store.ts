@@ -929,6 +929,11 @@ export interface GuildPersistence {
   }): readonly RunCheckpointRecord[];
   /** Every Run of the task in creation order. */
   listTaskRuns(taskId: TaskId): readonly RunRecord[];
+  /** Cheap: the Runs a rewind undid, without decoding any file summary. */
+  listRolledBackRunIds(taskId: TaskId): readonly RunId[];
+  /** Cheap: the next checkpoint ordinal and the number of rows, without decoding any file summary. */
+  nextRunCheckpointOrdinal(taskId: TaskId): number;
+  countRunCheckpoints(taskId: TaskId): number;
   createRun(input: { readonly taskId: TaskId; readonly runId: RunId }): RunRecord;
   applyRun(input: {
     readonly taskId: TaskId;
@@ -4420,12 +4425,25 @@ class SqliteGuildPersistence implements GuildPersistence {
   ): readonly RunCheckpointRecord[] {
     this.#assertOpen();
     const taskId = parsedTaskId(taskIdInput);
-    const wanted = runIds === undefined ? undefined : new Set(runIds.map(parsedRunId));
-    const rows = this.#database
-      .prepare("SELECT * FROM run_checkpoints WHERE task_id = ? ORDER BY ordinal")
-      .all(taskId)
-      .map((row) => this.#decodeRunCheckpointRow(row));
-    return Object.freeze(wanted === undefined ? rows : rows.filter((row) => wanted.has(row.runId)));
+    if (runIds === undefined) {
+      return Object.freeze(
+        this.#database
+          .prepare("SELECT * FROM run_checkpoints WHERE task_id = ? ORDER BY ordinal")
+          .all(taskId)
+          .map((row) => this.#decodeRunCheckpointRow(row)),
+      );
+    }
+    // Only the requested rows are decoded, in chunks the SQL parameter limit allows.
+    const wanted = [...new Set(runIds.map(parsedRunId))];
+    const rows: RunCheckpointRecord[] = [];
+    for (let offset = 0; offset < wanted.length; offset += 200) {
+      const chunk = wanted.slice(offset, offset + 200);
+      rows.push(...this.#database
+        .prepare(`SELECT * FROM run_checkpoints WHERE task_id = ? AND run_id IN (${chunk.map(() => "?").join(",")})`)
+        .all(taskId, ...chunk)
+        .map((row) => this.#decodeRunCheckpointRow(row)));
+    }
+    return Object.freeze(rows.sort((a, b) => a.ordinal - b.ordinal));
   }
 
   markRunsRolledBack(input: {
@@ -4465,6 +4483,35 @@ class SqliteGuildPersistence implements GuildPersistence {
       }
       return Object.freeze(marked);
     });
+  }
+
+  listRolledBackRunIds(taskIdInput: TaskId): readonly RunId[] {
+    this.#assertOpen();
+    const taskId = parsedTaskId(taskIdInput);
+    return Object.freeze(
+      this.#database
+        .prepare("SELECT run_id FROM run_checkpoints WHERE task_id = ? AND status = 'rolled_back' ORDER BY ordinal")
+        .all(taskId)
+        .map((row) => parsedRunId(exactText(row, "run_id") as RunId)),
+    );
+  }
+
+  nextRunCheckpointOrdinal(taskIdInput: TaskId): number {
+    this.#assertOpen();
+    const row = this.#database
+      .prepare("SELECT COALESCE(MAX(ordinal), 0) AS last_ordinal FROM run_checkpoints WHERE task_id = ?")
+      .get(parsedTaskId(taskIdInput));
+    if (row === undefined) throw persistenceError("aggregate_integrity_failed");
+    return exactInteger(row, "last_ordinal") + 1;
+  }
+
+  countRunCheckpoints(taskIdInput: TaskId): number {
+    this.#assertOpen();
+    const row = this.#database
+      .prepare("SELECT COUNT(*) AS count FROM run_checkpoints WHERE task_id = ?")
+      .get(parsedTaskId(taskIdInput));
+    if (row === undefined) throw persistenceError("aggregate_integrity_failed");
+    return exactInteger(row, "count");
   }
 
   listTaskRuns(taskIdInput: TaskId): readonly RunRecord[] {

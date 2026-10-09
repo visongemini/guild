@@ -212,6 +212,8 @@ export const GUILD_REWIND_REFUSAL_REASONS = Object.freeze([
   "session_replaced",
   /** The conversation cannot be rewound and there is no git checkpoint to offer files-only. */
   "nothing_to_rewind",
+  /** The installed runtime has no `_x.ai/rewind/*`; use `scope: "files_only"` where a checkpoint exists. */
+  "conversation_rewind_unsupported",
 ] as const);
 export type GuildRewindRefusalReason = (typeof GUILD_REWIND_REFUSAL_REASONS)[number];
 
@@ -247,6 +249,10 @@ export type RewindFilePlanProjection =
       /** No checkpoint: file changes made by shell commands cannot be reverted. */
       readonly kind: "none";
       readonly reason: GuildCheckpointUnavailableReason | "no_checkpoint_row";
+      /** Files the runtime's own edit-tool snapshots can restore (official mode `all`); shell edits are not among them. */
+      readonly runtimeRestore: readonly string[];
+      /** Of those, the files that changed since and would be overwritten. */
+      readonly runtimeConflicts: readonly string[];
     };
 
 export type RewindPlanProjection = {
@@ -262,7 +268,7 @@ export type RewindPlanProjection = {
         /** The prompt that goes back into the draft. */
         readonly promptText: string;
       }
-    | { readonly available: false; readonly reason: "unsupported" };
+    | { readonly available: false; readonly reason: "unsupported" | "runtime_unavailable" };
   /** This Run first, then every later Run (they are undone too). */
   readonly rolledBackRuns: readonly RunId[];
   readonly files: RewindFilePlanProjection;

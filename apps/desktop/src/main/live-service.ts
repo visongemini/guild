@@ -81,6 +81,27 @@ import {
   type PromptAttachment,
 } from "@guild/contracts";
 import {
+  GUILD_RUN_FILE_LIST_LIMIT,
+  GUILD_RUN_FILE_DIFF_MAX_BYTES,
+  type GuildCheckpointUnavailableReason,
+  type GuildRewindIrreversibleKind,
+  type GuildRewindRefusalReason,
+  type GuildRewindScope,
+  type RewindConflictProjection,
+  type ConvertQueuedTurnToSteerResponse,
+  type ExecuteRewindRequest,
+  type ExecuteRewindResponse,
+  type GuildSteerFallbackReason,
+  type LoadRunFileDiffRequest,
+  type LoadRunFileDiffResponse,
+  type PreviewRewindResponse,
+  type RewindAvailabilityProjection,
+  type RunCheckpointProjection,
+  type SteerAvailabilityProjection,
+  type SteerMessageResponse,
+  type TimelineInterjectionProjection,
+} from "@guild/contracts";
+import {
   CONFLICT_FREE_VERDICT,
   createRunPhaseTracker,
   type PermissionRecord,
@@ -94,6 +115,8 @@ import {
   type ConversationEntryRecord,
   type ContinuousTaskRecord,
   type GuildPersistence,
+  type InterjectionRecord,
+  type RunCheckpointRecord,
 } from "@guild/persistence";
 import {
   ACP_V1_CODEC_LIMITS,
@@ -111,6 +134,8 @@ import {
   type AcpV1SessionState,
   type JsonRpcInboundResponseWriteReceipt,
   type JsonRpcWriteReceipt,
+  type JsonValue,
+  type XaiExtensionOutcome,
 } from "@guild/runtime-grok";
 import type { DesktopApplicationService } from "./application-service.js";
 import {
@@ -147,6 +172,12 @@ import {
   RuntimeDiagnosticLog,
   type RuntimeDiagnosticRecord,
 } from "./runtime-diagnostics.js";
+import {
+  checkpointRef,
+  gitCheckpoints,
+  type GitCheckpointPort,
+  type RunRefs,
+} from "./git-checkpoints.js";
 
 const PRIMARY_WINDOW_ID = must(parseWindowId("guild-primary-window"));
 const TERMINAL_RUN_STATES = new Set(["completed", "failed", "cancelled", "interrupted"]);
@@ -172,6 +203,20 @@ const STREAM_LIVE_ENTRY_LIMIT = 32;
 /** More changed rows than this are cheaper to reload in one query than row by row. */
 const ENTRY_CACHE_BULK_RELOAD_ROWS = 48;
 const TERMINAL_RUN_CACHE_LIMIT = 512;
+/** `_x.ai/interject` is a local stdio round trip; it never waits on the model. */
+const DEFAULT_STEER_REQUEST_TIMEOUT_MS = 5_000;
+const ECHOED_INTERJECTION_LIMIT = 64;
+/**
+ * A Run's start checkpoint is taken before its prompt is sent. The send waits at most this long
+ * for it; past the bound the prompt goes out and the late capture is discarded, because by then
+ * the agent may already have changed files.
+ */
+const DEFAULT_CHECKPOINT_START_BOUND_MS = 3_000;
+const DEFAULT_CHECKPOINT_END_TIMEOUT_MS = 10_000;
+/** Stays well inside the 256 KiB the store allows for one Run's file summary. */
+const CHECKPOINT_FILES_JSON_BUDGET = 200_000;
+const REWIND_FILE_LIST_LIMIT = 500;
+const REWIND_REQUEST_TIMEOUT_MS = 10_000;
 
 export type WorkspaceChooser = () => Promise<string | undefined>;
 
@@ -209,6 +254,15 @@ export type RuntimeAdapterPort = {
     }[],
   ): Promise<RuntimeTurnPayload & { readonly type: "prompt_terminal" }>;
   cancel(session: AcpV1AdapterSession): Promise<JsonRpcWriteReceipt>;
+  /**
+   * One `_x.ai/*` extension request (Steer, rewind). Extensions are not advertised: `unsupported`
+   * means the installed runtime answered -32601. Any other failure rejects.
+   */
+  sendExtensionRequest(
+    method: string,
+    params: Readonly<Record<string, unknown>>,
+    options?: { readonly timeoutMs?: number },
+  ): Promise<XaiExtensionOutcome<JsonValue>>;
   /** Local stdio round trip; `false` means the process no longer answers. Never closes the adapter. */
   probeLiveness(timeoutMs: number): Promise<boolean>;
   close(): Promise<void>;
@@ -261,6 +315,11 @@ export type LiveDesktopServiceOptions = {
     readonly onOutput?: (output: string) => void;
   }) => Promise<RunGrokManagementResponse>;
   readonly cancelGraceMs?: number;
+  /** Git operations behind run checkpoints and rewind; tests substitute a fake. */
+  readonly checkpoints?: GitCheckpointPort;
+  readonly checkpointStartBoundMs?: number;
+  readonly checkpointEndTimeoutMs?: number;
+  readonly steerRequestTimeoutMs?: number;
   readonly promptSilenceMs?: number;
   readonly promptSettleMs?: number;
   /** Minimum delay before a failed background prewarm of the same task is retried. */
@@ -337,6 +396,18 @@ type RuntimeController = {
   sendsInFlight: number;
   /** True while the session runs a selection other than the stored one because the runtime refused it. */
   selectionRefused: boolean;
+  /** `_x.ai/interject` answered -32601 on this process: Steer is not offered again until it restarts. */
+  steerUnsupported: boolean;
+  /** `_x.ai/rewind/*` answered -32601 on this process. */
+  rewindUnsupported: boolean;
+  /** Steer ids the runtime already echoed, for an echo that beats the request's own response. */
+  readonly echoedInterjections: Set<string>;
+  /** Start checkpoints still being captured, by Run; the prompt waits for its own. */
+  readonly checkpointStarts: Map<RunId, Promise<void>>;
+  /** Runs whose prompt went out before their start checkpoint finished: that capture is discarded. */
+  readonly abandonedCheckpointStarts: Set<RunId>;
+  /** Captures of one task run strictly one after another, in the order the Runs happened. */
+  checkpointTail: Promise<void>;
 };
 
 type ReplayStaging = {
@@ -399,6 +470,8 @@ type PendingStreamDelta = {
   text: string;
   revision: number;
 };
+
+type GitChangedFileRecord = RunCheckpointRecord["files"][number];
 
 type ToolProjectionState = Readonly<{
   runtimeReplayKind: "tool" | "plan";
@@ -762,6 +835,7 @@ export function createLiveDesktopService(
   }
 
   function observeRuntimeSignal(
+    taskId: TaskId,
     controller: RuntimeController,
     envelope: XaiSignalEnvelope,
   ): void {
@@ -773,6 +847,10 @@ export function createLiveDesktopService(
     const session = controller.session;
     // Child (worker/reviewer) sessions are multiplexed on the same connection; their signals are not this turn's.
     if (envelope.sessionId !== null && session !== undefined && envelope.sessionId !== session.sessionId) return;
+    if (signal.kind === "session_interjection") {
+      noteInterjectionEcho(taskId, controller, signal.interjectionId);
+      return;
+    }
     if (signal.kind === "sessions_changed") {
       if (session === undefined) return;
       const own = signal.sessions.filter((entry) => entry.sessionId === session.sessionId);
@@ -781,6 +859,1006 @@ export function createLiveDesktopService(
       return;
     }
     notePhase(controller, { type: "signal", signal }, envelope.receivedMonotonicMs);
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // F2 run checkpoints, changed files, rewind
+  // ---------------------------------------------------------------------------------------------
+
+  const checkpoints = options.checkpoints ?? gitCheckpoints;
+  const checkpointStartBoundMs = options.checkpointStartBoundMs ?? DEFAULT_CHECKPOINT_START_BOUND_MS;
+  const checkpointEndTimeoutMs = options.checkpointEndTimeoutMs ?? DEFAULT_CHECKPOINT_END_TIMEOUT_MS;
+
+  /** A misbehaving port can never hold the task's captures: past the deadline the capture counts as timed out. */
+  async function captureWithin(
+    input: Parameters<GitCheckpointPort["capture"]>[0],
+    timeoutMs: number,
+  ): ReturnType<GitCheckpointPort["capture"]> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        checkpoints.capture({ ...input, limits: { ...input.limits, timeoutMs } }),
+        new Promise<Awaited<ReturnType<GitCheckpointPort["capture"]>>>((resolve) => {
+          timer = setTimeout(() => resolve({ status: "unavailable", reason: "timeout" }), timeoutMs + 1_000);
+          timer.unref?.();
+        }),
+      ]);
+    } catch {
+      return { status: "unavailable", reason: "git_failed" };
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  }
+
+  function enqueueCheckpointOperation(
+    controller: RuntimeController,
+    operation: () => Promise<void>,
+  ): Promise<void> {
+    const run = controller.checkpointTail.then(operation, operation);
+    controller.checkpointTail = run.catch(() => undefined);
+    return run;
+  }
+
+  function workspacePathOf(taskId: TaskId): string {
+    return store.loadWorkspace(store.loadTaskMetadata(taskId).workspaceId).canonicalPath;
+  }
+
+  function completeCheckpointUnavailable(taskId: TaskId, runId: RunId, reason: string): void {
+    try {
+      store.completeRunCheckpoint({
+        taskId, runId, status: "unavailable", detail: reason, files: [], filesTotal: 0, adds: 0, dels: 0,
+      });
+    } catch {
+      logRuntime({ category: "runtime", event: "checkpoint_record_failed", taskId, runId });
+    }
+    schedulePublish();
+  }
+
+  /**
+   * Captures the working tree for a Run that was just created, before its prompt is sent: the
+   * row is created synchronously (so the Run has its ordinal), the capture runs after earlier
+   * captures of the task, and `runPrompt` waits for it (bounded) before `session/prompt`.
+   * Never throws; a failed capture only marks the Run's checkpoint unavailable.
+   */
+  function beginRunCheckpoint(taskId: TaskId, controller: RuntimeController, runId: RunId): Promise<void> {
+    let ordinal: number;
+    let cwd: string;
+    try {
+      cwd = workspacePathOf(taskId);
+      const planned = checkpointRef(taskId, store.nextRunCheckpointOrdinal(taskId) * 2 - 1);
+      if (planned === undefined) throw new Error("checkpoint_ref_invalid");
+      ordinal = store.createRunCheckpoint({ taskId, runId, startRef: planned, status: "capturing" }).ordinal;
+    } catch {
+      logRuntime({ category: "runtime", event: "checkpoint_begin_failed", taskId, runId });
+      return Promise.resolve();
+    }
+    const operation = enqueueCheckpointOperation(controller, async () => {
+      if (controller.abandonedCheckpointStarts.delete(runId)) {
+        completeCheckpointUnavailable(taskId, runId, "timeout");
+        return;
+      }
+      const result = await captureWithin(
+        { cwd, taskId, ordinal: ordinal * 2 - 1 },
+        checkpointStartBoundMs,
+      );
+      if (controller.abandonedCheckpointStarts.delete(runId)) {
+        // The prompt already went out, so this tree may contain the agent's first edits.
+        completeCheckpointUnavailable(taskId, runId, "timeout");
+        return;
+      }
+      if (result.status !== "captured") completeCheckpointUnavailable(taskId, runId, result.reason);
+    });
+    controller.checkpointStarts.set(runId, operation);
+    return operation;
+  }
+
+  /** Waits for a Run's start checkpoint, but not longer than the bound; a late capture is discarded. */
+  async function awaitStartCheckpoint(controller: RuntimeController, runId: RunId): Promise<void> {
+    const start = controller.checkpointStarts.get(runId);
+    if (start === undefined) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const outcome = await Promise.race([
+      start.then(() => "ready" as const, () => "ready" as const),
+      new Promise<"late">((resolve) => {
+        timer = setTimeout(() => resolve("late"), checkpointStartBoundMs + 500);
+        timer.unref?.();
+      }),
+    ]);
+    if (timer !== undefined) clearTimeout(timer);
+    if (outcome === "late") controller.abandonedCheckpointStarts.add(runId);
+  }
+
+  /** After the Run is terminal: the end checkpoint and the stored changed-file summary. */
+  function finishRunCheckpoint(taskId: TaskId, controller: RuntimeController, runId: RunId): Promise<void> {
+    const operation = enqueueCheckpointOperation(controller, async () => {
+      try {
+        controller.checkpointStarts.delete(runId);
+        controller.abandonedCheckpointStarts.delete(runId);
+        const row = store.loadRunCheckpoint(taskId, runId);
+        if (row === undefined || row.status !== "capturing" || row.startRef === undefined) return;
+        const cwd = workspacePathOf(taskId);
+        const end = await captureWithin({ cwd, taskId, ordinal: row.ordinal * 2 }, checkpointEndTimeoutMs);
+        if (end.status !== "captured") {
+          completeCheckpointUnavailable(taskId, runId, end.reason);
+          return;
+        }
+        const summary = await checkpoints.summarize({
+          cwd,
+          fromRef: row.startRef,
+          toRef: end.ref,
+          maxFiles: GUILD_RUN_FILE_LIST_LIMIT,
+          timeoutMs: checkpointEndTimeoutMs,
+        });
+        if (summary.status !== "ok") {
+          completeCheckpointUnavailable(taskId, runId, summary.reason);
+          return;
+        }
+        const files: GitChangedFileRecord[] = [];
+        let budget = CHECKPOINT_FILES_JSON_BUDGET;
+        for (const file of summary.summary.files) {
+          const cost = file.path.length + (file.oldPath?.length ?? 0) + 80;
+          if (cost > budget) break;
+          budget -= cost;
+          files.push(file);
+        }
+        store.completeRunCheckpoint({
+          taskId,
+          runId,
+          endRef: end.ref,
+          status: "captured",
+          files,
+          filesTotal: summary.summary.filesTotal,
+          adds: summary.summary.adds,
+          dels: summary.summary.dels,
+        });
+        await publish();
+      } catch {
+        logRuntime({ category: "runtime", event: "checkpoint_finish_failed", taskId, runId });
+      }
+    });
+    return operation;
+  }
+
+  /**
+   * One place for everything that follows a Run reaching a terminal state: Steer rows nobody
+   * echoed, the end checkpoint and, for a turn the runtime started itself, the next queued turn.
+   */
+  function afterRunEnded(
+    taskId: TaskId,
+    controller: RuntimeController,
+    runId: RunId,
+    options: { readonly dispatchQueue: boolean } = { dispatchQueue: controller.promptRunId === undefined },
+  ): void {
+    try {
+      settleInterjectionsAfterRun(taskId, runId);
+    } catch {
+      logRuntime({ category: "runtime", event: "interjection_settle_failed", taskId, runId });
+    }
+    void finishRunCheckpoint(taskId, controller, runId);
+    if (options.dispatchQueue) void scheduleQueuedDispatch(taskId);
+  }
+
+  function runCheckpointProjections(
+    taskId: TaskId,
+    entries: readonly ConversationEntryRecord[],
+  ): readonly RunCheckpointProjection[] {
+    const runIds = [...new Set(entries.flatMap((entry) => entry.runId === undefined ? [] : [entry.runId]))];
+    if (runIds.length === 0) return Object.freeze([]);
+    return Object.freeze(store.listRunCheckpoints(taskId, runIds).map(projectRunCheckpoint));
+  }
+
+  function projectRunCheckpoint(row: RunCheckpointRecord): RunCheckpointProjection {
+    const files = row.files.slice(0, GUILD_RUN_FILE_LIST_LIMIT).map((file) => Object.freeze({
+      path: file.path,
+      ...(file.oldPath === undefined ? {} : { oldPath: file.oldPath }),
+      status: file.status,
+      adds: file.adds,
+      dels: file.dels,
+    }));
+    return Object.freeze({
+      runId: row.runId,
+      ordinal: row.ordinal,
+      status: row.status,
+      ...(row.detail === undefined ? {} : { detail: row.detail as GuildCheckpointUnavailableReason }),
+      rolledBack: row.status === "rolled_back",
+      filesChanged: row.filesTotal,
+      adds: row.adds,
+      dels: row.dels,
+      files: Object.freeze(files),
+      filesTruncated: row.filesTotal > files.length,
+    });
+  }
+
+  function rewindBlockedReason(
+    taskId: TaskId,
+    controller: RuntimeController | undefined,
+  ): "run_active" | "queue_not_empty" | undefined {
+    const run = readOncePerBuild(`restore:${taskId}`, () => store.restoreTask(taskId)).currentRun;
+    if (
+      (run !== undefined && !TERMINAL_RUN_STATES.has(run.state)) ||
+      (controller !== undefined &&
+        (controller.promptRunId !== undefined ||
+          controller.activeRunId !== undefined ||
+          controller.sendsInFlight > 0 ||
+          controller.pendingPermissions.size > 0 ||
+          (controller.startOperation !== undefined && !controller.startIsPrewarm)))
+    ) return "run_active";
+    if (readOncePerBuild(`queue:${taskId}`, () => store.listQueuedTurns(taskId)).length > 0) {
+      return "queue_not_empty";
+    }
+    return undefined;
+  }
+
+  function rewindAvailability(
+    taskId: TaskId,
+    controller: RuntimeController | undefined,
+  ): RewindAvailabilityProjection {
+    const blocked = rewindBlockedReason(taskId, controller);
+    if (blocked !== undefined) return Object.freeze({ available: false, reason: blocked });
+    if (store.countRunCheckpoints(taskId) === 0) {
+      return Object.freeze({ available: false, reason: "no_checkpoints" });
+    }
+    return Object.freeze({ available: true });
+  }
+
+  async function loadRunFileDiff(request: LoadRunFileDiffRequest): Promise<LoadRunFileDiffResponse> {
+    assertOpen();
+    const { taskId, runId } = request;
+    const row = store.loadRunCheckpoint(taskId, runId);
+    if (
+      row === undefined ||
+      row.startRef === undefined ||
+      row.endRef === undefined ||
+      (row.status !== "captured" && row.status !== "rolled_back")
+    ) {
+      return Object.freeze({ status: "unavailable" as const, reason: "no_checkpoint" as const });
+    }
+    const file = row.files.find((candidate) => candidate.path === request.path);
+    // The stored list is capped; a path past the cap is still a path the checkpoints can answer for.
+    if (file === undefined && row.filesTotal <= row.files.length) {
+      return Object.freeze({ status: "unavailable" as const, reason: "not_in_run" as const });
+    }
+    const result = await checkpoints.fileDiff({
+      cwd: workspacePathOf(taskId),
+      fromRef: row.startRef,
+      toRef: row.endRef,
+      path: request.path,
+      ...(file?.oldPath === undefined ? {} : { oldPath: file.oldPath }),
+      maxBytes: GUILD_RUN_FILE_DIFF_MAX_BYTES,
+    });
+    if (result.status !== "ok") {
+      return Object.freeze({
+        status: "unavailable" as const,
+        reason: result.reason === "invalid_path" ? "not_in_run" as const : "git_failed" as const,
+      });
+    }
+    return Object.freeze({
+      status: "ok" as const,
+      path: request.path,
+      diff: result.diff,
+      binary: result.binary,
+      truncated: result.truncated,
+    });
+  }
+
+  type RewindConversation =
+    | Readonly<{ available: true; mode: "conversation_only" | "all"; targetPromptIndex: number }>
+    | Readonly<{ available: false; reason: "unsupported" | "runtime_unavailable" }>;
+
+  type RewindFiles =
+    | Readonly<{
+        kind: "git";
+        startRef: string;
+        restore: readonly string[];
+        remove: readonly string[];
+        conflicts: readonly RewindConflictProjection[];
+      }>
+    | Readonly<{
+        kind: "none";
+        reason: GuildCheckpointUnavailableReason | "no_checkpoint_row";
+        runtimeRestore: readonly string[];
+        runtimeConflicts: readonly string[];
+      }>;
+
+  type RewindEvaluation =
+    | Readonly<{ ok: false; reason: GuildRewindRefusalReason }>
+    | Readonly<{
+        ok: true;
+        cwd: string;
+        sessionId: string | undefined;
+        adapter: RuntimeAdapterPort | undefined;
+        rolledBackRuns: readonly RunId[];
+        promptText: string;
+        conversation: RewindConversation;
+        files: RewindFiles;
+      }>;
+
+  function runPromptText(taskId: TaskId, runId: RunId): string {
+    const entry = allTaskConversationEntries(taskId).find((candidate) =>
+      candidate.runId === runId &&
+      candidate.kind === "user" &&
+      candidate.status === "complete" &&
+      candidate.metadata["interjection"] !== true &&
+      (candidate.metadata["hidden"] !== true || candidate.metadata["replayAnchor"] === true));
+    if (entry === undefined) return "";
+    if (entry.metadata["continuousInternal"] === true) {
+      return metadataString(entry, "continuousDisplayText") ?? "";
+    }
+    return entry.text;
+  }
+
+  function usedRecoveryCapsule(taskId: TaskId, runId: RunId): boolean {
+    return allTaskConversationEntries(taskId).some((entry) =>
+      entry.runId === runId &&
+      entry.kind === "notice" &&
+      entry.metadata["outboundPromptProof"] === true &&
+      entry.metadata["outboundPromptRecoveryCapsule"] === true);
+  }
+
+  /** What the runtime's own picker shows for a prompt: its first non-empty line, 57 characters at most. */
+  function previewMatches(preview: unknown, text: string): boolean {
+    if (typeof preview !== "string" || preview.length === 0) return true;
+    const line = text.split("\n").map((part) => part.trim()).find((part) => part.length > 0) ?? "";
+    return preview.endsWith("...") ? line.startsWith(preview.slice(0, -3)) : line === preview;
+  }
+
+  async function extensionRequest(
+    adapter: RuntimeAdapterPort,
+    controller: RuntimeController,
+    method: string,
+    params: Readonly<Record<string, unknown>>,
+  ): Promise<{ readonly status: "ok"; readonly result: Record<string, unknown> } | { readonly status: "unsupported" } | { readonly status: "failed" }> {
+    try {
+      const outcome = await adapter.sendExtensionRequest(method, params, { timeoutMs: REWIND_REQUEST_TIMEOUT_MS });
+      if (outcome.status === "unsupported") {
+        controller.rewindUnsupported = true;
+        return { status: "unsupported" };
+      }
+      const result = outcome.result;
+      return result !== null && typeof result === "object" && !Array.isArray(result)
+        ? { status: "ok", result: result as Record<string, unknown> }
+        : { status: "failed" };
+    } catch {
+      return { status: "failed" };
+    }
+  }
+
+  /**
+   * Everything a rewind to "before this Run" depends on, computed without changing anything:
+   * the Runs it undoes, the official prompt index and whether it lines up with Guild's own turn
+   * order, the official dry run, and the git file plan. Runs inside the command queue.
+   */
+  async function evaluateRewind(
+    taskId: TaskId,
+    runId: RunId,
+    live: Readonly<{ adapter: RuntimeAdapterPort; session: AcpV1AdapterSession }> | undefined,
+  ): Promise<RewindEvaluation> {
+    const metadata = store.loadTaskMetadata(taskId);
+    const workspace = store.loadWorkspace(metadata.workspaceId);
+    if (metadata.disposition !== "active" || workspace.disposition !== "active") {
+      return { ok: false, reason: "runtime_unavailable" };
+    }
+    const controller = controllers.get(taskId);
+    const blocked = rewindBlockedReason(taskId, controller);
+    if (blocked !== undefined) return { ok: false, reason: blocked };
+    const runs = store.listTaskRuns(taskId);
+    const targetIndex = runs.findIndex((candidate) => candidate.runId === runId);
+    if (targetIndex < 0) return { ok: false, reason: "run_not_found" };
+    const target = runs[targetIndex]!;
+    const rolledBack = new Set<string>(store.listRolledBackRunIds(taskId));
+    if (rolledBack.has(runId)) return { ok: false, reason: "already_rolled_back" };
+    const later = runs.slice(targetIndex + 1).filter((candidate) => !rolledBack.has(candidate.runId));
+    const rolledBackRuns = Object.freeze([target.runId, ...later.map((candidate) => candidate.runId)]);
+    const promptText = runPromptText(taskId, runId);
+    const cwd = workspace.canonicalPath;
+
+    // Files first: they decide which official mode applies.
+    const rows = new Map(store.listRunCheckpoints(taskId).map((row) => [row.runId, row]));
+    const targetRow = rows.get(runId);
+    const usable = (row: RunCheckpointRecord | undefined): row is RunCheckpointRecord & { startRef: string; endRef: string } =>
+      row !== undefined && row.status === "captured" && row.startRef !== undefined && row.endRef !== undefined;
+    let files: RewindFiles;
+    if (usable(targetRow)) {
+      const refs: RunRefs[] = [{ startRef: targetRow.startRef, endRef: targetRow.endRef }];
+      for (const laterRun of later) {
+        const row = rows.get(laterRun.runId);
+        if (usable(row)) refs.push({ startRef: row.startRef, endRef: row.endRef });
+      }
+      const planned = await checkpoints.planRewind({ cwd, runs: refs });
+      files = planned.status === "ok"
+        ? {
+            kind: "git",
+            startRef: targetRow.startRef,
+            restore: planned.plan.restore,
+            remove: planned.plan.remove,
+            conflicts: planned.plan.conflicts,
+          }
+        : { kind: "none", reason: planned.reason, runtimeRestore: [], runtimeConflicts: [] };
+    } else {
+      files = {
+        kind: "none",
+        reason: targetRow === undefined
+          ? "no_checkpoint_row"
+          : ((targetRow.detail as GuildCheckpointUnavailableReason | undefined) ?? "capture_skipped"),
+        runtimeRestore: [],
+        runtimeConflicts: [],
+      };
+    }
+
+    if (live === undefined) {
+      return {
+        ok: true, cwd, sessionId: undefined, adapter: undefined, rolledBackRuns, promptText, files,
+        conversation: { available: false, reason: "runtime_unavailable" },
+      };
+    }
+    const { adapter, session } = live;
+    if (target.sessionId !== session.sessionId) return { ok: false, reason: "session_replaced" };
+    const counted = runs.filter((candidate) =>
+      candidate.sessionId === session.sessionId && candidate.promptAccepted && !rolledBack.has(candidate.runId));
+    const targetPromptIndex = counted.findIndex((candidate) => candidate.runId === runId);
+    if (targetPromptIndex < 0) return { ok: false, reason: "prompt_index_mismatch" };
+    const runtimeController = controllerFor(taskId);
+    const points = await extensionRequest(adapter, runtimeController, "_x.ai/rewind/points", {
+      sessionId: session.sessionId,
+    });
+    if (points.status === "unsupported") {
+      return {
+        ok: true, cwd, sessionId: session.sessionId, adapter, rolledBackRuns, promptText, files,
+        conversation: { available: false, reason: "unsupported" },
+      };
+    }
+    if (points.status === "failed") {
+      return {
+        ok: true, cwd, sessionId: session.sessionId, adapter, rolledBackRuns, promptText, files,
+        conversation: { available: false, reason: "runtime_unavailable" },
+      };
+    }
+    const officialPoints = points.result["rewind_points"];
+    if (
+      !Array.isArray(officialPoints) ||
+      officialPoints.length !== counted.length ||
+      officialPoints.some((point, index) =>
+        point === null || typeof point !== "object" ||
+        (point as { prompt_index?: unknown }).prompt_index !== index)
+    ) {
+      return { ok: false, reason: "prompt_index_mismatch" };
+    }
+    const targetPoint = officialPoints[targetPromptIndex] as { prompt_preview?: unknown };
+    if (!usedRecoveryCapsule(taskId, runId) && !previewMatches(targetPoint.prompt_preview, promptText)) {
+      return { ok: false, reason: "prompt_index_mismatch" };
+    }
+    const mode: "conversation_only" | "all" = files.kind === "git" ? "conversation_only" : "all";
+    const dryRun = await extensionRequest(adapter, runtimeController, "_x.ai/rewind/execute", {
+      sessionId: session.sessionId,
+      targetPromptIndex,
+      mode,
+      force: false,
+    });
+    if (dryRun.status !== "ok") {
+      return dryRun.status === "unsupported"
+        ? {
+            ok: true, cwd, sessionId: session.sessionId, adapter, rolledBackRuns, promptText, files,
+            conversation: { available: false, reason: "unsupported" },
+          }
+        : { ok: false, reason: "runtime_refused" };
+    }
+    const dryError = dryRun.result["error"];
+    const dryConflicts = Array.isArray(dryRun.result["conflicts"]) ? dryRun.result["conflicts"] : [];
+    // A dry run reports external modifications as an `error`; they are only a warning for mode `all`.
+    if (
+      dryRun.result["target_prompt_index"] !== targetPromptIndex ||
+      (typeof dryError === "string" && dryError.length > 0 && dryConflicts.length === 0)
+    ) {
+      return { ok: false, reason: "runtime_refused" };
+    }
+    if (files.kind === "none") {
+      const strings = (value: unknown): readonly string[] =>
+        Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === "string").slice(0, REWIND_FILE_LIST_LIMIT) : [];
+      files = {
+        ...files,
+        runtimeRestore: strings(dryRun.result["clean_files"]),
+        runtimeConflicts: Object.freeze(dryConflicts.flatMap((entry) =>
+          entry !== null && typeof entry === "object" && typeof (entry as { path?: unknown }).path === "string"
+            ? [(entry as { path: string }).path]
+            : []).slice(0, REWIND_FILE_LIST_LIMIT)),
+      };
+    }
+    return {
+      ok: true, cwd, sessionId: session.sessionId, adapter, rolledBackRuns, promptText, files,
+      conversation: { available: true, mode, targetPromptIndex },
+    };
+  }
+
+  function irreversibleEffects(
+    locale: GuildLocale,
+    files: RewindFiles,
+  ): readonly Readonly<{ kind: GuildRewindIrreversibleKind; text: string }>[] {
+    const zh = locale === "zh-CN";
+    const items: { kind: GuildRewindIrreversibleKind; text: string }[] = [
+      {
+        kind: "network_and_mcp_effects",
+        text: zh
+          ? "已发出的网络请求、MCP 工具调用以及对其他服务造成的影响无法撤销。"
+          : "Network requests, MCP tool calls and anything already sent to other services cannot be undone.",
+      },
+      {
+        kind: "git_commits_and_pushes",
+        text: zh
+          ? "命令已经做出的 git 提交、推送、分支和 stash 变更不会被撤销。"
+          : "Git commits, pushes, branch changes and stashes made by commands are not undone.",
+      },
+      {
+        kind: "memory_writes",
+        text: zh
+          ? "Agent 写入记忆的内容不会被撤销。"
+          : "Notes the agent wrote to memory are not undone.",
+      },
+    ];
+    if (files.kind === "none") {
+      items.push({
+        kind: "shell_file_changes_without_git",
+        text: zh
+          ? "没有 git 检查点：命令行造成的文件改动无法还原，只有 Grok 编辑工具留下的快照可以还原。"
+          : "There is no git checkpoint, so file changes made by shell commands cannot be reverted; only the runtime's own edit-tool snapshots can be restored.",
+      });
+    }
+    return Object.freeze(items.map((item) => Object.freeze(item)));
+  }
+
+  function rewindPlanProjection(
+    runId: RunId,
+    evaluation: Extract<RewindEvaluation, { readonly ok: true }>,
+    locale: GuildLocale,
+  ): PreviewRewindResponse {
+    const files = evaluation.files.kind === "git"
+      ? Object.freeze({
+          kind: "git" as const,
+          restore: Object.freeze(evaluation.files.restore.slice(0, REWIND_FILE_LIST_LIMIT)),
+          remove: Object.freeze(evaluation.files.remove.slice(0, REWIND_FILE_LIST_LIMIT)),
+          conflicts: Object.freeze(evaluation.files.conflicts.slice(0, REWIND_FILE_LIST_LIMIT)),
+          truncated: evaluation.files.restore.length > REWIND_FILE_LIST_LIMIT ||
+            evaluation.files.remove.length > REWIND_FILE_LIST_LIMIT ||
+            evaluation.files.conflicts.length > REWIND_FILE_LIST_LIMIT,
+        })
+      : Object.freeze({
+          kind: "none" as const,
+          reason: evaluation.files.reason,
+          runtimeRestore: evaluation.files.runtimeRestore,
+          runtimeConflicts: evaluation.files.runtimeConflicts,
+        });
+    const scope: GuildRewindScope = evaluation.conversation.available ? "conversation_and_files" : "files_only";
+    return Object.freeze({
+      status: "ready" as const,
+      plan: Object.freeze({
+        runId,
+        scope,
+        conversation: evaluation.conversation.available
+          ? Object.freeze({
+              available: true as const,
+              mode: evaluation.conversation.mode,
+              targetPromptIndex: evaluation.conversation.targetPromptIndex,
+              promptText: evaluation.promptText,
+            })
+          : Object.freeze({ available: false as const, reason: evaluation.conversation.reason }),
+        rolledBackRuns: evaluation.rolledBackRuns,
+        files,
+        cannotUndo: irreversibleEffects(locale, evaluation.files),
+      }),
+    });
+  }
+
+  /** Brings the task's official session up so `_x.ai/rewind/*` has a resident session to talk to. */
+  async function liveForRewind(
+    taskId: TaskId,
+  ): Promise<Readonly<{ adapter: RuntimeAdapterPort; session: AcpV1AdapterSession }> | undefined> {
+    try {
+      const session = await ensureSession(taskId);
+      const adapter = controllerFor(taskId).adapter;
+      return adapter === undefined ? undefined : Object.freeze({ adapter, session });
+    } catch {
+      return undefined;
+    }
+  }
+
+  async function previewRewind(taskId: TaskId, runId: RunId): Promise<PreviewRewindResponse> {
+    assertOpen();
+    const live = await liveForRewind(taskId);
+    return enqueueCommand(async () => {
+      assertOpen();
+      const evaluation = await evaluateRewind(taskId, runId, live);
+      if (!evaluation.ok) return Object.freeze({ status: "refused" as const, reason: evaluation.reason });
+      return rewindPlanProjection(runId, evaluation, store.loadAppSettings().locale);
+    });
+  }
+
+  async function executeRewind(request: ExecuteRewindRequest): Promise<ExecuteRewindResponse> {
+    assertOpen();
+    const { taskId, runId } = request;
+    const scope: GuildRewindScope = request.scope ?? "conversation_and_files";
+    const live = scope === "conversation_and_files" ? await liveForRewind(taskId) : undefined;
+    return enqueueCommand(async () => {
+      assertOpen();
+      const refused = (reason: GuildRewindRefusalReason): ExecuteRewindResponse =>
+        Object.freeze({ status: "refused" as const, reason });
+      const evaluation = await evaluateRewind(taskId, runId, live);
+      if (!evaluation.ok) return refused(evaluation.reason);
+      if (scope === "conversation_and_files" && !evaluation.conversation.available) {
+        return refused(evaluation.conversation.reason === "unsupported"
+          ? "conversation_rewind_unsupported"
+          : "runtime_unavailable");
+      }
+      if (scope === "files_only" && evaluation.files.kind !== "git") return refused("nothing_to_rewind");
+      const gitFiles = evaluation.files.kind === "git" ? evaluation.files : undefined;
+      const conflicts = gitFiles?.conflicts ?? [];
+      if (
+        conflicts.some((conflict) => conflict.reason === "modified_after_run") &&
+        request.overwriteConflicts !== true
+      ) {
+        return Object.freeze({ status: "conflicts" as const, conflicts: Object.freeze([...conflicts]) });
+      }
+      const controller = controllerFor(taskId);
+      const reverted: string[] = [];
+      // 1. The conversation first: if the runtime refuses, no file has been touched.
+      if (scope === "conversation_and_files" && evaluation.conversation.available) {
+        const outcome = await extensionRequest(evaluation.adapter!, controller, "_x.ai/rewind/execute", {
+          sessionId: evaluation.sessionId,
+          targetPromptIndex: evaluation.conversation.targetPromptIndex,
+          mode: evaluation.conversation.mode,
+          force: true,
+        });
+        if (outcome.status !== "ok" || outcome.result["success"] !== true) {
+          return refused(outcome.status === "unsupported" ? "conversation_rewind_unsupported" : "runtime_refused");
+        }
+        if (Array.isArray(outcome.result["reverted_files"])) {
+          for (const entry of outcome.result["reverted_files"]) {
+            if (typeof entry === "string" && reverted.length < REWIND_FILE_LIST_LIMIT) reverted.push(entry);
+          }
+        }
+        controller.contextWindowUsage = undefined;
+        persistedContextTokens.delete(taskId);
+      }
+      // 2. The files, from Guild's start checkpoint of the first undone Run.
+      let restored: readonly string[] = reverted;
+      let removed: readonly string[] = [];
+      let failed: readonly Readonly<{ path: string; reason: string }>[] = [];
+      if (gitFiles !== undefined) {
+        const result = await checkpoints.restore({
+          cwd: evaluation.cwd,
+          sourceRef: gitFiles.startRef,
+          restore: gitFiles.restore,
+          remove: gitFiles.remove,
+        });
+        restored = result.restored;
+        removed = result.removed;
+        failed = result.failed;
+      }
+      // 3. Guild's own record: the Runs stay for audit and are marked, the prompt returns to the draft.
+      let draftRestored = false;
+      if (scope === "conversation_and_files") {
+        store.markRunsRolledBack({ taskId, runIds: evaluation.rolledBackRuns });
+        if (evaluation.promptText.trim().length > 0) {
+          const current = store.loadDraft(taskId);
+          if (current === undefined) {
+            store.saveDraft({ taskId, expectedRevision: 0, text: evaluation.promptText });
+            draftRestored = true;
+          } else if (!current.text.includes(evaluation.promptText)) {
+            store.saveDraft({
+              taskId,
+              expectedRevision: current.revision,
+              text: `${evaluation.promptText}\n\n${current.text}`,
+            });
+            draftRestored = true;
+          } else {
+            draftRestored = true;
+          }
+        }
+      }
+      const locale = store.loadAppSettings().locale;
+      store.createConversationEntry({
+        taskId,
+        entryId: unique("rewind"),
+        kind: "notice",
+        text: rewindNoticeText(locale, scope, evaluation.rolledBackRuns.length, restored.length, removed.length, failed.length),
+        metadata: { rewind: true, rewindScope: scope },
+        status: "complete",
+      });
+      await publish();
+      return Object.freeze({
+        status: "rolled_back" as const,
+        scope,
+        rolledBackRuns: scope === "conversation_and_files" ? evaluation.rolledBackRuns : Object.freeze([]),
+        restoredFiles: Object.freeze([...restored]),
+        removedFiles: Object.freeze([...removed]),
+        failedFiles: Object.freeze([...failed]),
+        draftRestored,
+      });
+    });
+  }
+
+  function rewindNoticeText(
+    locale: GuildLocale,
+    scope: GuildRewindScope,
+    runs: number,
+    restored: number,
+    removed: number,
+    failed: number,
+  ): string {
+    const failure = failed === 0 ? "" : locale === "zh-CN" ? `，${failed} 个文件未能还原` : `; ${failed} file${failed === 1 ? "" : "s"} could not be restored`;
+    if (locale === "zh-CN") {
+      return scope === "files_only"
+        ? `已把文件还原到该回合开始之前（还原 ${restored} 个，删除 ${removed} 个）；对话保持不变${failure}。`
+        : `已回退到该回合开始之前：${runs} 个回合被撤销（还原 ${restored} 个文件，删除 ${removed} 个）${failure}。被撤销的指令已放回输入框。`;
+    }
+    return scope === "files_only"
+      ? `Files were restored to before the Run started (${restored} restored, ${removed} removed); the conversation is unchanged${failure}.`
+      : `Rewound to before the Run started: ${runs} Run${runs === 1 ? "" : "s"} undone (${restored} file${restored === 1 ? "" : "s"} restored, ${removed} removed)${failure}. The reverted instruction is back in the draft.`;
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // F4 Steer
+  // ---------------------------------------------------------------------------------------------
+
+  function noteInterjectionEcho(
+    taskId: TaskId,
+    controller: RuntimeController,
+    interjectionId: string,
+  ): void {
+    controller.echoedInterjections.add(interjectionId);
+    while (controller.echoedInterjections.size > ECHOED_INTERJECTION_LIMIT) {
+      const oldest = controller.echoedInterjections.values().next().value;
+      if (oldest === undefined) break;
+      controller.echoedInterjections.delete(oldest);
+    }
+    void enqueueCommand(async () => {
+      if (closed || closing || maintenance) return;
+      if (store.loadInterjection(taskId, interjectionId)?.state !== "pending") return;
+      store.markInterjectionDelivered({ taskId, interjectionId });
+      await publish();
+    }).catch(() => {
+      logRuntime({ category: "runtime", event: "interjection_echo_failed", taskId });
+    });
+  }
+
+  /**
+   * Steer is offered while the runtime holds an accepted, running turn of this task and the
+   * installed process has not answered -32601 for `_x.ai/interject`.
+   */
+  function steerAvailability(
+    taskId: TaskId,
+    controller: RuntimeController | undefined,
+  ): SteerAvailabilityProjection {
+    const run = readOncePerBuild(`restore:${taskId}`, () => store.restoreTask(taskId)).currentRun;
+    if (run === undefined || TERMINAL_RUN_STATES.has(run.state)) {
+      return Object.freeze({ available: false, reason: "no_active_run" });
+    }
+    if (
+      (run.state !== "running" && run.state !== "awaiting_permission") ||
+      !run.promptAccepted
+    ) {
+      return Object.freeze({ available: false, reason: "turn_not_steerable" });
+    }
+    if (
+      controller === undefined ||
+      controller.adapter?.state !== "ready" ||
+      controller.session === undefined ||
+      controller.activeRunId !== run.runId
+    ) {
+      return Object.freeze({ available: false, reason: "runtime_unavailable" });
+    }
+    if (controller.steerUnsupported) return Object.freeze({ available: false, reason: "unsupported" });
+    return Object.freeze({ available: true });
+  }
+
+  function steerFallbackReason(
+    availability: Extract<SteerAvailabilityProjection, { readonly available: false }>,
+  ): GuildSteerFallbackReason {
+    switch (availability.reason) {
+      case "no_active_run": return "turn_not_running";
+      case "turn_not_steerable": return "turn_not_steerable";
+      case "unsupported": return "unsupported";
+      case "runtime_unavailable": return "runtime_error";
+    }
+  }
+
+  function steerFallbackNotice(reason: GuildSteerFallbackReason, locale: GuildLocale): string {
+    if (locale === "zh-CN") {
+      switch (reason) {
+        case "unsupported": return "当前 Grok 版本不支持向运行中的回合插话，这条消息已改为普通消息处理（排队或在回合结束后发送）。";
+        case "turn_not_running": return "回合已经结束，这条消息已改为普通消息发送。";
+        case "turn_not_steerable": return "当前回合暂时不能插话（尚未开始或正在取消），这条消息已改为普通消息处理。";
+        case "runtime_error": return "Grok 没有接受这次插话，这条消息已改为普通消息处理。";
+      }
+    }
+    switch (reason) {
+      case "unsupported": return "This Grok version cannot take a message into a running turn, so it was handled as an ordinary message (queued, or sent when the turn ends).";
+      case "turn_not_running": return "The turn had already ended, so the message was sent as an ordinary message.";
+      case "turn_not_steerable": return "The turn cannot take a message right now (it has not started, or it is being cancelled), so the message was handled as an ordinary message.";
+      case "runtime_error": return "Grok did not accept the interjection, so the message was handled as an ordinary message.";
+    }
+  }
+
+  type SteerSend =
+    | Readonly<{ kind: "unavailable"; reason: GuildSteerFallbackReason; hadRun: boolean }>
+    | Readonly<{
+        kind: "send";
+        interjectionId: string;
+        adapter: RuntimeAdapterPort;
+        controller: RuntimeController;
+        session: AcpV1AdapterSession;
+      }>;
+
+  /** Records the intent and returns what to send, or says why Steer is not possible. Runs in the command queue. */
+  function prepareSteer(taskId: TaskId, text: string): SteerSend {
+    assertOpen();
+    const metadata = store.loadTaskMetadata(taskId);
+    const workspace = store.loadWorkspace(metadata.workspaceId);
+    if (metadata.disposition !== "active" || workspace.disposition !== "active") {
+      throw new Error("task_not_writable");
+    }
+    const controller = controllers.get(taskId);
+    const availability = steerAvailability(taskId, controller);
+    const run = store.restoreTask(taskId).currentRun;
+    if (!availability.available) {
+      return Object.freeze({
+        kind: "unavailable" as const,
+        reason: steerFallbackReason(availability),
+        hadRun: run !== undefined && !TERMINAL_RUN_STATES.has(run.state),
+      });
+    }
+    const interjectionId = `interject-${randomUUID()}`;
+    store.beginInterjection({ taskId, interjectionId, runId: run!.runId, text });
+    return Object.freeze({
+      kind: "send" as const,
+      interjectionId,
+      adapter: controller!.adapter!,
+      controller: controller!,
+      session: controller!.session!,
+    });
+  }
+
+  type SteerRequestOutcome = "accepted" | "unsupported" | "failed";
+
+  async function sendInterjection(
+    send: Extract<SteerSend, { readonly kind: "send" }>,
+    text: string,
+  ): Promise<SteerRequestOutcome> {
+    try {
+      const outcome = await send.adapter.sendExtensionRequest(
+        "_x.ai/interject",
+        { sessionId: send.session.sessionId, text, interjectionId: send.interjectionId },
+        { timeoutMs: options.steerRequestTimeoutMs ?? DEFAULT_STEER_REQUEST_TIMEOUT_MS },
+      );
+      if (outcome.status === "unsupported") return "unsupported";
+      const status = (outcome.result as { readonly status?: unknown } | null)?.status;
+      return status === undefined || status === "queued" ? "accepted" : "failed";
+    } catch {
+      return "failed";
+    }
+  }
+
+  async function steerMessage(taskId: TaskId, rawText: string): Promise<SteerMessageResponse> {
+    assertOpen();
+    if (managementOperationActive) throw new Error("grok_management_operation_active");
+    // The runtime trims queued text; sending the trimmed text keeps a missed Steer's later turn matchable.
+    const text = rawText.trim();
+    if (text.length === 0) throw new Error("steer_message_empty");
+    const prepared = await enqueueCommand(async () => prepareSteer(taskId, text));
+    if (prepared.kind === "unavailable") {
+      // Only a turn that was running (or about to run) has anything to annotate.
+      if (prepared.hadRun) await recordSteerFallback(taskId, text, prepared.reason, undefined);
+      const sent = await service.sendMessage(taskId, text);
+      return sent.status === "queued"
+        ? Object.freeze({ status: "queued" as const, queueId: sent.queueId, reason: prepared.reason })
+        : Object.freeze({ status: "started" as const, runId: sent.runId, reason: prepared.reason });
+    }
+    const outcome = await sendInterjection(prepared, text);
+    if (outcome === "accepted") {
+      // The runtime holds the message now; a failure to record it must not send it a second time.
+      await enqueueCommand(async () => {
+        assertOpen();
+        store.commitInterjectionSent({
+          taskId,
+          interjectionId: prepared.interjectionId,
+          entryId: unique("user"),
+          delivered: prepared.controller.echoedInterjections.has(prepared.interjectionId),
+        });
+        await publish();
+      });
+      return Object.freeze({ status: "steered" as const, interjectionId: prepared.interjectionId });
+    }
+    const reason: GuildSteerFallbackReason = outcome === "unsupported" ? "unsupported" : "runtime_error";
+    if (outcome === "unsupported") prepared.controller.steerUnsupported = true;
+    await recordSteerFallback(taskId, text, reason, prepared.interjectionId);
+    const sent = await service.sendMessage(taskId, text);
+    return sent.status === "queued"
+      ? Object.freeze({ status: "queued" as const, queueId: sent.queueId, reason })
+      : Object.freeze({ status: "started" as const, runId: sent.runId, reason });
+  }
+
+  /** Records why a Steer became an ordinary message: the interjection row and an explanatory notice. */
+  async function recordSteerFallback(
+    taskId: TaskId,
+    text: string,
+    reason: GuildSteerFallbackReason,
+    interjectionId: string | undefined,
+  ): Promise<void> {
+    await enqueueCommand(async () => {
+      if (closed || closing) return;
+      let id = interjectionId;
+      if (id === undefined) {
+        // The request was never sent, so no row exists yet; the Run it targeted is the one to annotate.
+        const run = store.restoreTask(taskId).currentRun;
+        if (run === undefined) return;
+        id = `interject-${randomUUID()}`;
+        store.beginInterjection({ taskId, interjectionId: id, runId: run.runId, text });
+      }
+      store.fallBackInterjection({
+        taskId,
+        interjectionId: id,
+        reason,
+        noticeEntryId: unique("steer-fallback"),
+        noticeText: steerFallbackNotice(reason, store.loadAppSettings().locale),
+      });
+      await publish();
+    }).catch(() => {
+      logRuntime({ category: "runtime", event: "steer_fallback_record_failed", taskId });
+    });
+  }
+
+  async function convertQueuedTurnToSteer(
+    taskId: TaskId,
+    queueId: string,
+  ): Promise<ConvertQueuedTurnToSteerResponse> {
+    assertOpen();
+    if (managementOperationActive) throw new Error("grok_management_operation_active");
+    const prepared = await enqueueCommand(async () => {
+      assertOpen();
+      const queued = store.listQueuedTurns(taskId).find((candidate) => candidate.queueId === queueId);
+      if (queued === undefined) throw new Error("queued_turn_not_found");
+      const text = queued.text.trim();
+      return Object.freeze({ queued, text, send: prepareSteer(taskId, text) });
+    });
+    if (prepared.send.kind === "unavailable") {
+      return Object.freeze({ status: "unchanged" as const, reason: prepared.send.reason });
+    }
+    const send = prepared.send;
+    const outcome = await sendInterjection(send, prepared.text);
+    return enqueueCommand(async () => {
+      assertOpen();
+      if (outcome === "accepted") {
+        try {
+          store.commitInterjectionSent({
+            taskId,
+            interjectionId: send.interjectionId,
+            entryId: unique("user"),
+            delivered: send.controller.echoedInterjections.has(send.interjectionId),
+            removeQueueId: queueId,
+          });
+          await publish();
+          return Object.freeze({ status: "steered" as const, interjectionId: send.interjectionId });
+        } catch {
+          // The queued turn was dispatched while the request was in flight. The runtime holds the
+          // message too; nothing here can take it back, so the row is closed and the caller told.
+          store.failInterjection({ taskId, interjectionId: send.interjectionId, reason: "queue_dispatched" });
+          await publish();
+          return Object.freeze({ status: "unchanged" as const, reason: "turn_not_running" as const });
+        }
+      }
+      if (outcome === "unsupported") send.controller.steerUnsupported = true;
+      const reason: GuildSteerFallbackReason = outcome === "unsupported" ? "unsupported" : "runtime_error";
+      store.failInterjection({ taskId, interjectionId: send.interjectionId, reason });
+      await publish();
+      return Object.freeze({ status: "unchanged" as const, reason });
+    });
+  }
+
+  /** The runtime acknowledged these requests but never echoed them; the Run is over, so they count as delivered. */
+  function settleInterjectionsAfterRun(taskId: TaskId, runId: RunId): void {
+    for (const row of store.listInterjections(taskId)) {
+      if (row.runId === runId && row.state === "pending") {
+        store.markInterjectionDelivered({ taskId, interjectionId: row.interjectionId });
+      }
+    }
   }
 
   function controllerFor(taskId: TaskId): RuntimeController {
@@ -819,6 +1897,12 @@ export function createLiveDesktopService(
         phase: createRunPhaseTracker(),
         sendsInFlight: 0,
         selectionRefused: false,
+        steerUnsupported: false,
+        rewindUnsupported: false,
+        echoedInterjections: new Set(),
+        checkpointStarts: new Map(),
+        abandonedCheckpointStarts: new Set(),
+        checkpointTail: Promise.resolve(),
       };
       controllers.set(taskId, controller);
     }
@@ -1437,7 +2521,10 @@ export function createLiveDesktopService(
     const taskHistory = legacyReplacementNotice ? recent : beforeReplacement;
     const earliestUser = store.listConversationEntries({ taskId, limit: CONVERSATION_PAGE_SIZE })
       .find(isRecoveryUserEntry);
-    const recentUsers = taskHistory.filter(isRecoveryUserEntry).slice(-6);
+    const rolledBackRuns = new Set<string>(store.listRolledBackRunIds(taskId));
+    const recentUsers = taskHistory
+      .filter((entry) => isRecoveryUserEntry(entry) && !(entry.runId !== undefined && rolledBackRuns.has(entry.runId)))
+      .slice(-6);
     const userHistory = dedupeRecoveryMessages([
       ...(earliestUser === undefined ? [] : [earliestUser.text]),
       ...recentUsers.map((entry) => entry.text),
@@ -1498,6 +2585,7 @@ export function createLiveDesktopService(
       if (earlier.length < CONVERSATION_PAGE_SIZE) break;
     }
     const runCache = new Map<RunId, RunRecord | undefined>();
+    const extras = projectionExtras(taskId);
     const latestToolEntry = new Map<string, string>();
     for (const entry of entries) {
       const toolCallId = entry.kind === "tool" ? metadataString(entry, "toolCallId") : undefined;
@@ -1509,7 +2597,7 @@ export function createLiveDesktopService(
         const toolCallId = entry.kind === "tool" ? metadataString(entry, "toolCallId") : undefined;
         return toolCallId === undefined || latestToolEntry.get(toolCallId) === entry.entryId;
       })
-      .map((entry) => projectEntryCached(entry, runCache, locale));
+      .map((entry) => projectEntryCached(entry, runCache, locale, extras));
     const pending = [...(controllers.get(taskId)?.pendingPermissions.values() ?? [])]
       .map((permission) => projectPermission(permission, locale));
     const queuedTurns = readOncePerBuild(`queue:${taskId}`, () => store.listQueuedTurns(taskId)).map((queued) => Object.freeze({
@@ -1547,6 +2635,7 @@ export function createLiveDesktopService(
         .map((tool) => tool.kind)),
     )];
     const runPhase = runPhaseProjection(controller, summary.activeRunState);
+    const windowCheckpoints = runCheckpointProjections(taskId, entries);
     const latestRunId = [...entries].reverse().find((entry) => entry.runId !== undefined)?.runId;
     const latestRun = latestRunId === undefined
       ? undefined
@@ -1587,6 +2676,9 @@ export function createLiveDesktopService(
       sessionConfigOptions: controller?.sessionConfigOptions ?? Object.freeze([]),
       modelSelection: modelSelectionProjection(taskId, controller),
       ...(runPhase === undefined ? {} : { runPhase }),
+      steer: steerAvailability(taskId, controller),
+      ...(windowCheckpoints.length === 0 ? {} : { runCheckpoints: windowCheckpoints }),
+      rewind: rewindAvailability(taskId, controller),
       ...(latestAuxiliary === undefined
         ? {}
         : {
@@ -1655,6 +2747,49 @@ export function createLiveDesktopService(
     return entries;
   }
 
+  type ProjectionExtras = Readonly<{
+    interjections: ReadonlyMap<string, InterjectionRecord>;
+    rolledBack: ReadonlySet<string>;
+  }>;
+
+  /** Mutable per-task state that is not in the append-only entry rows; read once per projection build. */
+  function projectionExtras(taskId: TaskId): ProjectionExtras {
+    return readOncePerBuild(`extras:${taskId}`, () => {
+      const interjections = new Map<string, InterjectionRecord>();
+      for (const row of store.listInterjections(taskId)) interjections.set(row.interjectionId, row);
+      return Object.freeze({
+        interjections,
+        rolledBack: new Set<string>(store.listRolledBackRunIds(taskId)),
+      });
+    });
+  }
+
+  function interjectionProjection(
+    entry: ConversationEntryRecord,
+    row: InterjectionRecord | undefined,
+  ): TimelineInterjectionProjection | undefined {
+    if (row === undefined) return undefined;
+    if (
+      entry.kind === "user" &&
+      entry.metadata["interjection"] === true &&
+      (row.state === "pending" || row.state === "delivered")
+    ) {
+      return Object.freeze({ interjectionId: row.interjectionId, state: row.state });
+    }
+    if (
+      entry.kind === "notice" &&
+      entry.metadata["interjectionFallback"] === true &&
+      row.state === "fallen_back"
+    ) {
+      return Object.freeze({
+        interjectionId: row.interjectionId,
+        state: "fallen_back" as const,
+        ...(row.reason === undefined ? {} : { reason: row.reason as GuildSteerFallbackReason }),
+      });
+    }
+    return undefined;
+  }
+
   function runForProjection(
     taskId: TaskId,
     runId: RunId,
@@ -1682,15 +2817,19 @@ export function createLiveDesktopService(
     entry: ConversationEntryRecord,
     runCache: Map<RunId, RunRecord | undefined>,
     locale: GuildLocale,
+    extras: ProjectionExtras,
   ): TimelineItemProjection {
     const run = entry.runId === undefined
       ? undefined
       : runForProjection(entry.taskId, entry.runId, runCache);
-    const key = `${entry.revision}\0${run?.state ?? ""}\0${locale}`;
+    const interjectionId = metadataString(entry, "interjectionId");
+    const interjection = interjectionId === undefined ? undefined : extras.interjections.get(interjectionId);
+    const rolledBack = entry.runId !== undefined && extras.rolledBack.has(entry.runId);
+    const key = `${entry.revision}\0${run?.state ?? ""}\0${locale}\0${interjection?.state ?? ""}\0${interjection?.reason ?? ""}\0${rolledBack ? 1 : 0}`;
     const cacheKey = `${entry.taskId}\0${entry.entryId}`;
     const hit = projectedEntryCache.get(cacheKey);
     if (hit !== undefined && hit.key === key) return hit.item;
-    const item = projectEntry(entry, runCache, locale);
+    const item = projectEntry(entry, runCache, locale, interjection, rolledBack);
     projectedEntryCache.delete(cacheKey);
     projectedEntryCache.set(cacheKey, { key, item });
     // Rows older than the live window are not projected on the hot path; bound the memory.
@@ -1728,6 +2867,8 @@ export function createLiveDesktopService(
     entry: ConversationEntryRecord,
     runCache: Map<RunId, RunRecord | undefined>,
     locale: GuildLocale,
+    interjectionRow: InterjectionRecord | undefined,
+    rolledBack: boolean,
   ): TimelineItemProjection {
     const run = entry.runId === undefined
       ? undefined
@@ -1743,6 +2884,7 @@ export function createLiveDesktopService(
             : entry.status === "streaming"
               ? "streaming"
               : "completed";
+    const interjection = interjectionProjection(entry, interjectionRow);
     const base = {
       entryId: entry.entryId,
       taskId: entry.taskId,
@@ -1751,6 +2893,8 @@ export function createLiveDesktopService(
       createdAtMs: entry.createdAtMs,
       updatedAtMs: entry.updatedAtMs,
       status,
+      ...(interjection === undefined ? {} : { interjection }),
+      ...(rolledBack ? { rolledBack: true as const } : {}),
     } as const;
     if (entry.kind === "user" && entry.metadata["continuousInternal"] === true) {
       return Object.freeze({
@@ -2117,6 +3261,7 @@ export function createLiveDesktopService(
       stopReason: null,
     });
     controller.activeRunId = runId;
+    void beginRunCheckpoint(taskId, controller, runId);
     logRuntime({
       category: "prompt",
       event: `continuous_${mission.phase}_started`,
@@ -2353,6 +3498,7 @@ export function createLiveDesktopService(
       idempotencyKey: key("queued-scheduler-dispatch"),
     });
     controller.activeRunId = dispatched.run.runId;
+    void beginRunCheckpoint(taskId, controller, dispatched.run.runId);
     await publish();
     launchPrompt(taskId, controller, session, prompt, dispatched.run.runId);
   }
@@ -2419,6 +3565,9 @@ export function createLiveDesktopService(
     controller.adapterEpoch = adapterEpoch;
     controller.currentAttemptId = attemptId;
     controller.receiveSequence = 0;
+    controller.steerUnsupported = false;
+    controller.rewindUnsupported = false;
+    controller.echoedInterjections.clear();
     controller.contextWindowUsage = undefined;
     controller.contextWindowSize = undefined;
     logRuntime({
@@ -2678,6 +3827,8 @@ export function createLiveDesktopService(
   }
 
   function reconcilePreviousRuntime(taskId: TaskId): void {
+    // A Steer whose request was in flight when the process went away has no known outcome.
+    store.failInterruptedInterjections(taskId);
     const currentEpoch = store.loadCurrentAdapterEpoch(taskId);
     if (currentEpoch !== undefined && currentEpoch.status !== "exited") {
       store.commitAdapterEpoch({
@@ -2847,14 +3998,19 @@ export function createLiveDesktopService(
   }
 
   function localReplayTurns(taskId: TaskId, loadedSessionId: string): readonly LocalReplayTurn[] {
-    const entries = allTaskConversationEntries(taskId);
+    // The runtime drops a rewound branch from its replay, so a rolled-back Run is not a local turn.
+    const rolledBack = new Set<string>(store.listRolledBackRunIds(taskId));
+    const entries = allTaskConversationEntries(taskId)
+      .filter((entry) => entry.runId === undefined || !rolledBack.has(entry.runId));
     const turns = new Map<RunId, LocalReplayTurn>();
     for (const entry of entries) {
       if (
         entry.kind !== "user" ||
         entry.runId === undefined ||
         entry.status !== "complete" ||
-        entry.metadata["hidden"] === true
+        // A Steer belongs to the turn it was sent into; it never opens a turn of its own.
+        entry.metadata["interjection"] === true ||
+        (entry.metadata["hidden"] === true && entry.metadata["replayAnchor"] !== true)
       ) continue;
       const run = safeLoadRun(taskId, entry.runId);
       if (run === undefined || !TERMINAL_RUN_STATES.has(run.state)) {
@@ -2996,7 +4152,7 @@ export function createLiveDesktopService(
 
   function createSink(taskId: TaskId, controller: RuntimeController): AcpV1AdapterSink {
     return Object.freeze({
-      observeSignal: (envelope: XaiSignalEnvelope) => observeRuntimeSignal(controller, envelope),
+      observeSignal: (envelope: XaiSignalEnvelope) => observeRuntimeSignal(taskId, controller, envelope),
       commitSessionEstablished: async (event) => {
         if (controller.adapterEpoch !== event.identity.adapterEpoch) return;
         const attemptId = controller.currentAttemptId;
@@ -3486,6 +4642,126 @@ export function createLiveDesktopService(
           adapterEpoch: event.identity.adapterEpoch,
           reason: event.terminal.classification,
         });
+        afterRunEnded(taskId, controller, runId);
+        await publish();
+      },
+      commitAgentTurnStarted: async (event) => {
+        if (!isCurrentRuntimeIdentity(taskId, controller, event.identity)) {
+          throw new Error("stale_runtime_identity");
+        }
+        // A turn the runtime started itself (for example the prompt it makes from a Steer that
+        // missed its turn) gets a Run of its own, unless one of Guild's is already in flight; the
+        // adapter then drops the turn rather than faulting the session.
+        const current = store.restoreTask(taskId).currentRun;
+        if (
+          controller.activeRunId !== undefined ||
+          controller.promptRunId !== undefined ||
+          (current !== undefined && !TERMINAL_RUN_STATES.has(current.state))
+        ) {
+          logRuntime({
+            category: "prompt",
+            event: "agent_turn_declined",
+            taskId,
+            sessionId: event.identity.sessionId,
+            adapterEpoch: event.identity.adapterEpoch,
+          });
+          throw new Error("agent_turn_overlaps_active_run");
+        }
+        const sessionId = must(parseSessionId(event.identity.sessionId));
+        const adapterEpoch = must(parseAdapterEpoch(event.identity.adapterEpoch));
+        const runId = id(parseRunId, "run");
+        store.createRun({ taskId, runId });
+        try {
+          requireRun(store.applyRun({
+            taskId,
+            runId,
+            event: {
+              type: "scheduler_dispatch",
+              sessionId,
+              adapterEpoch,
+              idempotencyKey: key("agent-turn-dispatch"),
+            },
+          }));
+          const text = event.promptText?.trim();
+          const hasText = text !== undefined && text.length > 0;
+          // A Steer the runtime ran as its own turn is shown once, as the message the user typed.
+          const steered = hasText
+            ? store.listInterjections(taskId).find((row) =>
+                row.startedRunId === undefined &&
+                (row.state === "pending" || row.state === "delivered") &&
+                row.text.trim() === text)
+            : undefined;
+          if (hasText) {
+            store.createConversationEntry({
+              taskId,
+              runId,
+              entryId: unique("user"),
+              kind: "user",
+              text,
+              metadata: {
+                agentStartedTurn: true,
+                ...(steered === undefined
+                  ? {}
+                  : { hidden: true, replayAnchor: true, interjectionId: steered.interjectionId }),
+              },
+              status: "complete",
+            });
+          }
+          controller.activeRunId = runId;
+          controller.replayOrderLastToken = undefined;
+          store.commitPromptAccepted({
+            taskId,
+            runId,
+            sessionId,
+            adapterEpoch,
+            promptSequence: event.identity.promptSequence,
+            idempotencyKey: key("agent-turn-accepted"),
+            ...(hasText
+              ? {
+                  durableNotices: Object.freeze([Object.freeze({
+                    entryId: unique("outbound-prompt-proof"),
+                    text: "Guild outbound prompt replay proof.",
+                    metadata: Object.freeze({
+                      hidden: true,
+                      outboundPromptProof: true,
+                      outboundPromptProofVersion: 2,
+                      outboundPromptSha256: outboundPromptSha256(text, []),
+                      outboundPromptHadResources: false,
+                      outboundPromptRecoveryCapsule: false,
+                    }),
+                  })]),
+                }
+              : {}),
+          });
+          if (steered !== undefined) {
+            store.linkInterjectionStartedRun({
+              taskId,
+              interjectionId: steered.interjectionId,
+              startedRunId: runId,
+            });
+          }
+        } catch (cause: unknown) {
+          controller.activeRunId = undefined;
+          const run = safeLoadRun(taskId, runId);
+          if (run !== undefined && !TERMINAL_RUN_STATES.has(run.state)) {
+            store.applyRun({
+              taskId,
+              runId,
+              event: { type: "launch_failure", idempotencyKey: key("agent-turn-launch-failure") },
+            });
+          }
+          throw cause;
+        }
+        beginPhase(controller, "prompt_sent");
+        logRuntime({
+          category: "prompt",
+          event: "agent_turn_started",
+          taskId,
+          runId,
+          sessionId: event.identity.sessionId,
+          adapterEpoch: event.identity.adapterEpoch,
+        });
+        void beginRunCheckpoint(taskId, controller, runId);
         await publish();
       },
       commitCancelSent: async (event) => {
@@ -4094,6 +5370,7 @@ export function createLiveDesktopService(
         }
       }
       controller.activeRunId = undefined;
+      if (run !== undefined) afterRunEnded(taskId, controller, runId, { dispatchQueue: false });
     }
     endPhase(controller);
     const continuousTask = store.loadContinuousTask(taskId);
@@ -4238,6 +5515,9 @@ export function createLiveDesktopService(
     }[],
   ): Promise<void> {
     try {
+      // The start checkpoint is taken before the agent can touch a file: the prompt waits for it,
+      // but only up to a short bound (see awaitStartCheckpoint).
+      await awaitStartCheckpoint(controller, runId);
       // The stored model and effort are brought up to date between turns, never mid-turn. A refusal
       // keeps the session on its previous selection and never blocks the turn.
       await reconcileRuntimeSelection(taskId, controller, adapter, session).catch(() => {
@@ -4321,6 +5601,7 @@ export function createLiveDesktopService(
         controller.auxiliarySessions.clear();
         clearCancelTimer(controller);
         clearPromptSilenceTimer(controller);
+        afterRunEnded(taskId, controller, runId, { dispatchQueue: false });
       }
       await publish();
     } finally {
@@ -4951,9 +6232,11 @@ export function createLiveDesktopService(
         title,
         owningWindowId: PRIMARY_WINDOW_ID,
       });
+      const rolledBackRuns = new Set<string>(store.listRolledBackRunIds(taskId));
       for (const entry of allTaskConversationEntries(taskId)) {
         if (throughSequence !== undefined && entry.sequence > throughSequence) continue;
         if (entry.status === "streaming" || entry.metadata["hidden"] === true) continue;
+        if (entry.runId !== undefined && rolledBackRuns.has(entry.runId)) continue;
         if (entry.kind === "permission") continue;
         store.createConversationEntry({
           taskId: branchTaskId,
@@ -5301,6 +6584,8 @@ export function createLiveDesktopService(
             store.clearDraft({ taskId, expectedRevision: draft.revision });
           }
           controller.activeRunId = runId;
+          // The working tree is captured before the prompt can reach the agent (see runPrompt).
+          void beginRunCheckpoint(taskId, controller, runId);
           // The prompt goes to the official process first; the projection that shows
           // the new Run follows. A failed launch is still published before it surfaces.
           try {
@@ -5496,11 +6781,11 @@ export function createLiveDesktopService(
         cancellation.session,
       );
     },
-    steerMessage: async () => { throw new Error("steer_not_implemented"); },
-    convertQueuedTurnToSteer: async () => { throw new Error("steer_not_implemented"); },
-    previewRewind: async () => { throw new Error("rewind_not_implemented"); },
-    executeRewind: async () => { throw new Error("rewind_not_implemented"); },
-    loadRunFileDiff: async () => { throw new Error("rewind_not_implemented"); },
+    steerMessage: async (taskId, text) => steerMessage(taskId, text),
+    convertQueuedTurnToSteer: async (taskId, queueId) => convertQueuedTurnToSteer(taskId, queueId),
+    previewRewind: async (taskId, runId) => previewRewind(taskId, runId),
+    executeRewind: async (request) => executeRewind(request),
+    loadRunFileDiff: async (request) => loadRunFileDiff(request),
     decidePermission: async (input) => enqueueCommand(async () => {
       assertOpen();
       const controller = controllerFor(input.taskId);
@@ -6117,6 +7402,11 @@ function replayTurnsFromUpdates(
       throw new Error("session_load_replay_side_effect_event");
     }
     if (payload.type === "user_text_chunk") {
+      // The runtime persisted a Steer as a user chunk inside the turn it steered.
+      if (update.interjection === true) {
+        if (current === undefined) throw new Error("session_load_replay_missing_user_anchor");
+        continue;
+      }
       if (current === undefined || replayTurnHasResponse(current)) {
         current = emptyReplayTurn();
         turns.push(current);
