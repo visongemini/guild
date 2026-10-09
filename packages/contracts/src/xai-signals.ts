@@ -16,6 +16,7 @@ export const XAI_SIGNAL_NOTIFICATIONS = Object.freeze([
   "_x.ai/sessions/changed",
   "_x.ai/session_notification",
   "_x.ai/session/prompt_complete",
+  "_x.ai/session/interjection",
   "_x.ai/session/setup",
   "_x.ai/mcp/init_progress",
   "_x.ai/models/update",
@@ -81,8 +82,13 @@ export type XaiSignal =
       errorType?: XaiIdentifier;
     }>
   | Readonly<{ kind: "response_completed" }>
-  | Readonly<{ kind: "turn_completed"; stopReason?: XaiIdentifier }>
-  | Readonly<{ kind: "prompt_complete"; stopReason?: XaiIdentifier }>
+  | Readonly<{ kind: "turn_completed"; stopReason?: XaiIdentifier; promptId?: XaiIdentifier }>
+  | Readonly<{ kind: "prompt_complete"; stopReason?: XaiIdentifier; promptId?: XaiIdentifier }>
+  /**
+   * The runtime echoed a Steer back (F4). Only the client-made id is kept: the text of the
+   * interjection is Guild's own and is never copied out of the echo.
+   */
+  | Readonly<{ kind: "session_interjection"; interjectionId: XaiIdentifier }>
   | Readonly<{ kind: "model_changed"; modelId: string; reasoningEffort?: string }>
   | Readonly<{ kind: "session_setup"; phase: XaiIdentifier }>
   | Readonly<{ kind: "mcp_init_progress"; connected: number; total: number }>

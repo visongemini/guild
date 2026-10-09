@@ -293,6 +293,53 @@ export type QueuedTurnDispatchResult = {
   readonly entry: ConversationEntryRecord;
 };
 
+export type InterjectionState = "sending" | "pending" | "delivered" | "fallen_back" | "failed";
+
+/** One Steer Guild sent (or tried to send) to the running turn; the text is Guild's own. */
+export type InterjectionRecord = Readonly<{
+  taskId: TaskId;
+  interjectionId: string;
+  runId: RunId;
+  text: string;
+  state: InterjectionState;
+  reason?: string;
+  entryId?: string;
+  queueId?: string;
+  startedRunId?: RunId;
+  createdAtMs: number;
+  updatedAtMs: number;
+}>;
+
+export type RunCheckpointStatus = "capturing" | "captured" | "unavailable" | "rolled_back";
+
+export type RunCheckpointFile = Readonly<{
+  path: string;
+  oldPath?: string;
+  status: "A" | "M" | "D" | "R";
+  /** `null` for a binary file. */
+  adds: number | null;
+  dels: number | null;
+}>;
+
+/** Hidden git refs and the changed-file summary of one Run. */
+export type RunCheckpointRecord = Readonly<{
+  taskId: TaskId;
+  runId: RunId;
+  /** 1-based, assigned in the order Runs got a row. */
+  ordinal: number;
+  startRef?: string;
+  endRef?: string;
+  status: RunCheckpointStatus;
+  detail?: string;
+  files: readonly RunCheckpointFile[];
+  filesTotal: number;
+  adds: number;
+  dels: number;
+  rolledBackAtMs?: number;
+  createdAtMs: number;
+  updatedAtMs: number;
+}>;
+
 export type ContinuousTaskStatus =
   | "active"
   | "paused"
@@ -801,6 +848,94 @@ export interface GuildPersistence {
     readonly catalog: GrokModelCatalog;
     readonly runtimeVersion?: string;
   }): void;
+  // F4 Steer. The conversation entry's metadata is immutable, so delivery state lives in its own row.
+  /** Records the intent before `_x.ai/interject` is sent (state `sending`). Idempotent. */
+  beginInterjection(input: {
+    readonly taskId: TaskId;
+    readonly interjectionId: string;
+    readonly runId: RunId;
+    readonly text: string;
+  }): InterjectionRecord;
+  /**
+   * The runtime accepted the interjection: creates its `user` entry on the Run and moves the row
+   * to `pending` (or `delivered` when the echo already arrived). `removeQueueId` deletes the
+   * queued turn it was converted from, atomically.
+   */
+  commitInterjectionSent(input: {
+    readonly taskId: TaskId;
+    readonly interjectionId: string;
+    readonly entryId: string;
+    readonly delivered: boolean;
+    readonly removeQueueId?: string;
+  }): InterjectionRecord;
+  /** `pending` becomes `delivered`; any other state is returned unchanged. `undefined` if unknown. */
+  markInterjectionDelivered(input: {
+    readonly taskId: TaskId;
+    readonly interjectionId: string;
+  }): InterjectionRecord | undefined;
+  /** Steer was not possible: records why, creates the explanatory `notice` entry, state `fallen_back`. */
+  fallBackInterjection(input: {
+    readonly taskId: TaskId;
+    readonly interjectionId: string;
+    readonly reason: string;
+    readonly noticeEntryId: string;
+    readonly noticeText: string;
+    readonly queueId?: string;
+  }): InterjectionRecord;
+  failInterjection(input: {
+    readonly taskId: TaskId;
+    readonly interjectionId: string;
+    readonly reason: string;
+  }): InterjectionRecord;
+  /** The runtime ran this Steer as its own turn (`interject-fallback-*`): link it to that Run. */
+  linkInterjectionStartedRun(input: {
+    readonly taskId: TaskId;
+    readonly interjectionId: string;
+    readonly startedRunId: RunId;
+  }): InterjectionRecord;
+  /** Startup recovery: rows left in `sending` by a crash become `failed` (`interrupted`). */
+  failInterruptedInterjections(taskId: TaskId): number;
+  loadInterjection(taskId: TaskId, interjectionId: string): InterjectionRecord | undefined;
+  /** Oldest first, newest 200. */
+  listInterjections(taskId: TaskId): readonly InterjectionRecord[];
+  // F2 run checkpoints.
+  /** Gives the Run its checkpoint row (next ordinal). Idempotent: an existing row is returned. */
+  createRunCheckpoint(input: {
+    readonly taskId: TaskId;
+    readonly runId: RunId;
+    readonly startRef?: string;
+    readonly status: "capturing" | "unavailable";
+    readonly detail?: string;
+  }): RunCheckpointRecord;
+  /** Stores the end checkpoint and the changed-file summary. A row that is not `capturing` is returned unchanged. */
+  completeRunCheckpoint(input: {
+    readonly taskId: TaskId;
+    readonly runId: RunId;
+    readonly endRef?: string;
+    readonly status: "captured" | "unavailable";
+    readonly detail?: string;
+    readonly files: readonly RunCheckpointFile[];
+    readonly filesTotal: number;
+    readonly adds: number;
+    readonly dels: number;
+  }): RunCheckpointRecord;
+  loadRunCheckpoint(taskId: TaskId, runId: RunId): RunCheckpointRecord | undefined;
+  /** In ordinal order; `runIds` restricts the result. */
+  listRunCheckpoints(taskId: TaskId, runIds?: readonly RunId[]): readonly RunCheckpointRecord[];
+  /** Marks each Run rolled back (kept for audit); a Run without a row gets one (`unavailable`). */
+  markRunsRolledBack(input: {
+    readonly taskId: TaskId;
+    readonly runIds: readonly RunId[];
+  }): readonly RunCheckpointRecord[];
+  /** Every Run of the task in creation order. */
+  listTaskRuns(taskId: TaskId): readonly RunRecord[];
+  /** Startup recovery: rows left `capturing` by a crash become `unavailable` (`capture_skipped`). */
+  failCapturingRunCheckpoints(taskId: TaskId): number;
+  /** Cheap: the Runs a rewind undid, without decoding any file summary. */
+  listRolledBackRunIds(taskId: TaskId): readonly RunId[];
+  /** Cheap: the next checkpoint ordinal and the number of rows, without decoding any file summary. */
+  nextRunCheckpointOrdinal(taskId: TaskId): number;
+  countRunCheckpoints(taskId: TaskId): number;
   createRun(input: { readonly taskId: TaskId; readonly runId: RunId }): RunRecord;
   applyRun(input: {
     readonly taskId: TaskId;
@@ -845,6 +980,88 @@ export interface GuildPersistence {
   verifyIntegrity(): IntegrityReport;
   backupTo(destinationPath: string): void;
   close(): void;
+}
+
+const MAX_LISTED_INTERJECTIONS = 200;
+const MAX_INTERJECTION_TEXT_LENGTH = 200_000;
+const MAX_CHECKPOINT_FILES_JSON_LENGTH = 262_144;
+
+function parsedInterjectionId(value: unknown): string {
+  if (typeof value !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$/u.test(value)) {
+    throw persistenceError("domain_operation_rejected");
+  }
+  return value;
+}
+
+function parsedInterjectionText(value: unknown): string {
+  if (
+    typeof value !== "string" ||
+    value.trim().length === 0 ||
+    value.length > MAX_INTERJECTION_TEXT_LENGTH ||
+    value.includes("\0")
+  ) {
+    throw persistenceError("domain_operation_rejected");
+  }
+  return value;
+}
+
+function encodeCheckpointFiles(files: readonly RunCheckpointFile[]): string {
+  const canonical = files.map((file) => {
+    if (
+      typeof file.path !== "string" ||
+      file.path.length === 0 ||
+      file.path.length > 4_096 ||
+      (file.oldPath !== undefined && (typeof file.oldPath !== "string" || file.oldPath.length > 4_096)) ||
+      (file.status !== "A" && file.status !== "M" && file.status !== "D" && file.status !== "R") ||
+      (file.adds !== null && (!Number.isSafeInteger(file.adds) || file.adds < 0)) ||
+      (file.dels !== null && (!Number.isSafeInteger(file.dels) || file.dels < 0))
+    ) {
+      throw persistenceError("domain_operation_rejected");
+    }
+    return {
+      path: file.path,
+      ...(file.oldPath === undefined ? {} : { oldPath: file.oldPath }),
+      status: file.status,
+      adds: file.adds,
+      dels: file.dels,
+    };
+  });
+  const json = JSON.stringify(canonical);
+  if (json.length > MAX_CHECKPOINT_FILES_JSON_LENGTH) throw persistenceError("domain_operation_rejected");
+  return json;
+}
+
+function decodeCheckpointFiles(json: string): readonly RunCheckpointFile[] {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(json);
+  } catch (cause: unknown) {
+    throw persistenceError("aggregate_integrity_failed", cause);
+  }
+  if (!Array.isArray(parsed)) throw persistenceError("aggregate_integrity_failed");
+  return Object.freeze(parsed.map((entry): RunCheckpointFile => {
+    if (entry === null || typeof entry !== "object") throw persistenceError("aggregate_integrity_failed");
+    const record = entry as Record<string, unknown>;
+    const status = record["status"];
+    const adds = record["adds"];
+    const dels = record["dels"];
+    if (
+      typeof record["path"] !== "string" ||
+      (status !== "A" && status !== "M" && status !== "D" && status !== "R") ||
+      (adds !== null && typeof adds !== "number") ||
+      (dels !== null && typeof dels !== "number") ||
+      (record["oldPath"] !== undefined && typeof record["oldPath"] !== "string")
+    ) {
+      throw persistenceError("aggregate_integrity_failed");
+    }
+    return Object.freeze({
+      path: record["path"],
+      ...(typeof record["oldPath"] === "string" ? { oldPath: record["oldPath"] } : {}),
+      status,
+      adds,
+      dels,
+    });
+  }));
 }
 
 function freeze<T extends object>(value: T): Readonly<T> {
@@ -3858,6 +4075,472 @@ class SqliteGuildPersistence implements GuildPersistence {
     });
   }
 
+  // ---------------------------------------------------------------------------------------------
+  // F4 Steer
+  // ---------------------------------------------------------------------------------------------
+
+  beginInterjection(input: {
+    readonly taskId: TaskId;
+    readonly interjectionId: string;
+    readonly runId: RunId;
+    readonly text: string;
+  }): InterjectionRecord {
+    const taskId = parsedTaskId(input.taskId);
+    const interjectionId = parsedInterjectionId(input.interjectionId);
+    const runId = parsedRunId(input.runId);
+    const text = parsedInterjectionText(input.text);
+    return this.#immediate(() => {
+      this.#requireWritableConversationTask(taskId);
+      this.#requiredRun(taskId, runId);
+      const existing = this.#selectInterjection(taskId, interjectionId);
+      if (existing !== undefined) {
+        if (existing.runId !== runId || existing.text !== text) {
+          throw persistenceError("aggregate_already_exists");
+        }
+        return existing;
+      }
+      const at = exactNow();
+      this.#database
+        .prepare(`
+          INSERT INTO task_interjections(
+            task_id, interjection_id, run_id, text_content, state, reason, entry_id,
+            queue_id, started_run_id, created_at_ms, updated_at_ms
+          ) VALUES(?, ?, ?, ?, 'sending', NULL, NULL, NULL, NULL, ?, ?)
+        `)
+        .run(taskId, interjectionId, runId, text, at, at);
+      return this.#requiredInterjection(taskId, interjectionId);
+    });
+  }
+
+  commitInterjectionSent(input: {
+    readonly taskId: TaskId;
+    readonly interjectionId: string;
+    readonly entryId: string;
+    readonly delivered: boolean;
+    readonly removeQueueId?: string;
+  }): InterjectionRecord {
+    const taskId = parsedTaskId(input.taskId);
+    const interjectionId = parsedInterjectionId(input.interjectionId);
+    const entryId = parsedEntryId(input.entryId);
+    const removeQueueId = input.removeQueueId === undefined
+      ? undefined
+      : parsedEntryId(input.removeQueueId);
+    return this.#immediate(() => {
+      this.#requireWritableConversationTask(taskId);
+      const row = this.#requiredInterjection(taskId, interjectionId);
+      if (row.state !== "sending") {
+        // A retried commit finds the work already done; any other state is a different outcome.
+        if ((row.state === "pending" || row.state === "delivered") && row.entryId === entryId) {
+          return row;
+        }
+        throw persistenceError("domain_operation_rejected");
+      }
+      const at = exactNow();
+      this.#ensureConversationEntryCreation(taskId, row.runId, {
+        type: "create",
+        entryId,
+        kind: "user",
+        text: row.text,
+        metadata: encodeMetadata({ interjection: true, interjectionId }).value,
+        status: "complete",
+      }, at);
+      this.#touchTaskActivity(taskId, at);
+      if (removeQueueId !== undefined) {
+        const removed = this.#database
+          .prepare("DELETE FROM queued_turns WHERE task_id = ? AND queue_id = ?")
+          .run(taskId, removeQueueId);
+        if (changes(removed.changes) !== 1) {
+          throw persistenceError("persistence_cas_conflict");
+        }
+      }
+      this.#database
+        .prepare(`
+          UPDATE task_interjections
+          SET state = ?, entry_id = ?, updated_at_ms = MAX(updated_at_ms, ?)
+          WHERE task_id = ? AND interjection_id = ? AND state = 'sending'
+        `)
+        .run(input.delivered ? "delivered" : "pending", entryId, at, taskId, interjectionId);
+      return this.#requiredInterjection(taskId, interjectionId);
+    });
+  }
+
+  markInterjectionDelivered(input: {
+    readonly taskId: TaskId;
+    readonly interjectionId: string;
+  }): InterjectionRecord | undefined {
+    const taskId = parsedTaskId(input.taskId);
+    const interjectionId = parsedInterjectionId(input.interjectionId);
+    return this.#immediate(() => {
+      const row = this.#selectInterjection(taskId, interjectionId);
+      if (row === undefined || row.state !== "pending") return row;
+      this.#database
+        .prepare(`
+          UPDATE task_interjections
+          SET state = 'delivered', updated_at_ms = MAX(updated_at_ms, ?)
+          WHERE task_id = ? AND interjection_id = ? AND state = 'pending'
+        `)
+        .run(exactNow(), taskId, interjectionId);
+      return this.#requiredInterjection(taskId, interjectionId);
+    });
+  }
+
+  fallBackInterjection(input: {
+    readonly taskId: TaskId;
+    readonly interjectionId: string;
+    readonly reason: string;
+    readonly noticeEntryId: string;
+    readonly noticeText: string;
+    readonly queueId?: string;
+  }): InterjectionRecord {
+    const taskId = parsedTaskId(input.taskId);
+    const interjectionId = parsedInterjectionId(input.interjectionId);
+    const reason = boundedString(input.reason, 64);
+    const noticeEntryId = parsedEntryId(input.noticeEntryId);
+    const noticeText = parsedText(input.noticeText);
+    const queueId = input.queueId === undefined ? undefined : parsedEntryId(input.queueId);
+    return this.#immediate(() => {
+      this.#requireWritableConversationTask(taskId);
+      const row = this.#requiredInterjection(taskId, interjectionId);
+      if (row.state === "fallen_back") return row;
+      if (row.state !== "sending") throw persistenceError("domain_operation_rejected");
+      const at = exactNow();
+      this.#ensureConversationEntryCreation(taskId, row.runId, {
+        type: "create",
+        entryId: noticeEntryId,
+        kind: "notice",
+        text: noticeText,
+        metadata: encodeMetadata({
+          interjection: true,
+          interjectionId,
+          interjectionFallback: true,
+          reason,
+        }).value,
+        status: "complete",
+      }, at);
+      this.#database
+        .prepare(`
+          UPDATE task_interjections
+          SET state = 'fallen_back', reason = ?, entry_id = ?, queue_id = ?,
+              updated_at_ms = MAX(updated_at_ms, ?)
+          WHERE task_id = ? AND interjection_id = ? AND state = 'sending'
+        `)
+        .run(reason, noticeEntryId, queueId ?? null, at, taskId, interjectionId);
+      return this.#requiredInterjection(taskId, interjectionId);
+    });
+  }
+
+  failInterjection(input: {
+    readonly taskId: TaskId;
+    readonly interjectionId: string;
+    readonly reason: string;
+  }): InterjectionRecord {
+    const taskId = parsedTaskId(input.taskId);
+    const interjectionId = parsedInterjectionId(input.interjectionId);
+    const reason = boundedString(input.reason, 64);
+    return this.#immediate(() => {
+      const row = this.#requiredInterjection(taskId, interjectionId);
+      if (row.state === "failed") return row;
+      if (row.state !== "sending") throw persistenceError("domain_operation_rejected");
+      this.#database
+        .prepare(`
+          UPDATE task_interjections
+          SET state = 'failed', reason = ?, updated_at_ms = MAX(updated_at_ms, ?)
+          WHERE task_id = ? AND interjection_id = ? AND state = 'sending'
+        `)
+        .run(reason, exactNow(), taskId, interjectionId);
+      return this.#requiredInterjection(taskId, interjectionId);
+    });
+  }
+
+  linkInterjectionStartedRun(input: {
+    readonly taskId: TaskId;
+    readonly interjectionId: string;
+    readonly startedRunId: RunId;
+  }): InterjectionRecord {
+    const taskId = parsedTaskId(input.taskId);
+    const interjectionId = parsedInterjectionId(input.interjectionId);
+    const startedRunId = parsedRunId(input.startedRunId);
+    return this.#immediate(() => {
+      const row = this.#requiredInterjection(taskId, interjectionId);
+      if (row.startedRunId === startedRunId) return row;
+      if (row.startedRunId !== undefined) throw persistenceError("aggregate_already_exists");
+      this.#requiredRun(taskId, startedRunId);
+      this.#database
+        .prepare(`
+          UPDATE task_interjections
+          SET started_run_id = ?, updated_at_ms = MAX(updated_at_ms, ?)
+          WHERE task_id = ? AND interjection_id = ? AND started_run_id IS NULL
+        `)
+        .run(startedRunId, exactNow(), taskId, interjectionId);
+      return this.#requiredInterjection(taskId, interjectionId);
+    });
+  }
+
+  failInterruptedInterjections(taskIdInput: TaskId): number {
+    const taskId = parsedTaskId(taskIdInput);
+    return this.#immediate(() => {
+      const updated = this.#database
+        .prepare(`
+          UPDATE task_interjections
+          SET state = 'failed', reason = 'interrupted', updated_at_ms = MAX(updated_at_ms, ?)
+          WHERE task_id = ? AND state = 'sending'
+        `)
+        .run(exactNow(), taskId);
+      return changes(updated.changes);
+    });
+  }
+
+  loadInterjection(taskIdInput: TaskId, interjectionIdInput: string): InterjectionRecord | undefined {
+    this.#assertOpen();
+    return this.#selectInterjection(
+      parsedTaskId(taskIdInput),
+      parsedInterjectionId(interjectionIdInput),
+    );
+  }
+
+  listInterjections(taskIdInput: TaskId): readonly InterjectionRecord[] {
+    this.#assertOpen();
+    const taskId = parsedTaskId(taskIdInput);
+    return Object.freeze(
+      this.#database
+        .prepare(`
+          SELECT * FROM (
+            SELECT rowid AS physical_order, * FROM task_interjections
+            WHERE task_id = ? ORDER BY physical_order DESC LIMIT ?
+          ) ORDER BY physical_order
+        `)
+        .all(taskId, MAX_LISTED_INTERJECTIONS)
+        .map((row) => this.#decodeInterjectionRow(row)),
+    );
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // F2 run checkpoints
+  // ---------------------------------------------------------------------------------------------
+
+  createRunCheckpoint(input: {
+    readonly taskId: TaskId;
+    readonly runId: RunId;
+    readonly startRef?: string;
+    readonly status: "capturing" | "unavailable";
+    readonly detail?: string;
+  }): RunCheckpointRecord {
+    const taskId = parsedTaskId(input.taskId);
+    const runId = parsedRunId(input.runId);
+    const startRef = input.startRef === undefined ? null : boundedString(input.startRef, 512);
+    const detail = input.detail === undefined ? null : boundedString(input.detail, 64);
+    if (input.status !== "capturing" && input.status !== "unavailable") {
+      throw persistenceError("domain_operation_rejected");
+    }
+    if ((input.status === "capturing") !== (startRef !== null)) {
+      throw persistenceError("domain_operation_rejected");
+    }
+    return this.#immediate(() => {
+      this.#requiredRun(taskId, runId);
+      const existing = this.#selectRunCheckpoint(taskId, runId);
+      if (existing !== undefined) return existing;
+      const ordinalRow = this.#database
+        .prepare("SELECT COALESCE(MAX(ordinal), 0) AS last_ordinal FROM run_checkpoints WHERE task_id = ?")
+        .get(taskId);
+      if (ordinalRow === undefined) throw persistenceError("aggregate_integrity_failed");
+      const at = exactNow();
+      this.#database
+        .prepare(`
+          INSERT INTO run_checkpoints(
+            task_id, run_id, ordinal, start_ref, end_ref, status, detail, files_json,
+            files_total, adds, dels, rolled_back_at_ms, created_at_ms, updated_at_ms
+          ) VALUES(?, ?, ?, ?, NULL, ?, ?, '[]', 0, 0, 0, NULL, ?, ?)
+        `)
+        .run(
+          taskId,
+          runId,
+          exactInteger(ordinalRow, "last_ordinal") + 1,
+          startRef,
+          input.status,
+          detail,
+          at,
+          at,
+        );
+      return this.#requiredRunCheckpoint(taskId, runId);
+    });
+  }
+
+  completeRunCheckpoint(input: {
+    readonly taskId: TaskId;
+    readonly runId: RunId;
+    readonly endRef?: string;
+    readonly status: "captured" | "unavailable";
+    readonly detail?: string;
+    readonly files: readonly RunCheckpointFile[];
+    readonly filesTotal: number;
+    readonly adds: number;
+    readonly dels: number;
+  }): RunCheckpointRecord {
+    const taskId = parsedTaskId(input.taskId);
+    const runId = parsedRunId(input.runId);
+    const endRef = input.endRef === undefined ? null : boundedString(input.endRef, 512);
+    const detail = input.detail === undefined ? null : boundedString(input.detail, 64);
+    if (input.status !== "captured" && input.status !== "unavailable") {
+      throw persistenceError("domain_operation_rejected");
+    }
+    if (input.status === "captured" && endRef === null) {
+      throw persistenceError("domain_operation_rejected");
+    }
+    for (const count of [input.filesTotal, input.adds, input.dels]) {
+      if (!Number.isSafeInteger(count) || count < 0) throw persistenceError("domain_operation_rejected");
+    }
+    const filesJson = encodeCheckpointFiles(input.files);
+    return this.#immediate(() => {
+      const existing = this.#requiredRunCheckpoint(taskId, runId);
+      if (existing.status !== "capturing") return existing;
+      this.#database
+        .prepare(`
+          UPDATE run_checkpoints
+          SET end_ref = ?, status = ?, detail = ?, files_json = ?, files_total = ?,
+              adds = ?, dels = ?, updated_at_ms = MAX(updated_at_ms, ?)
+          WHERE task_id = ? AND run_id = ? AND status = 'capturing'
+        `)
+        .run(
+          endRef,
+          input.status,
+          detail,
+          filesJson,
+          input.filesTotal,
+          input.adds,
+          input.dels,
+          exactNow(),
+          taskId,
+          runId,
+        );
+      return this.#requiredRunCheckpoint(taskId, runId);
+    });
+  }
+
+  loadRunCheckpoint(taskIdInput: TaskId, runIdInput: RunId): RunCheckpointRecord | undefined {
+    this.#assertOpen();
+    return this.#selectRunCheckpoint(parsedTaskId(taskIdInput), parsedRunId(runIdInput));
+  }
+
+  listRunCheckpoints(
+    taskIdInput: TaskId,
+    runIds?: readonly RunId[],
+  ): readonly RunCheckpointRecord[] {
+    this.#assertOpen();
+    const taskId = parsedTaskId(taskIdInput);
+    if (runIds === undefined) {
+      return Object.freeze(
+        this.#database
+          .prepare("SELECT * FROM run_checkpoints WHERE task_id = ? ORDER BY ordinal")
+          .all(taskId)
+          .map((row) => this.#decodeRunCheckpointRow(row)),
+      );
+    }
+    // Only the requested rows are decoded, in chunks the SQL parameter limit allows.
+    const wanted = [...new Set(runIds.map(parsedRunId))];
+    const rows: RunCheckpointRecord[] = [];
+    for (let offset = 0; offset < wanted.length; offset += 200) {
+      const chunk = wanted.slice(offset, offset + 200);
+      rows.push(...this.#database
+        .prepare(`SELECT * FROM run_checkpoints WHERE task_id = ? AND run_id IN (${chunk.map(() => "?").join(",")})`)
+        .all(taskId, ...chunk)
+        .map((row) => this.#decodeRunCheckpointRow(row)));
+    }
+    return Object.freeze(rows.sort((a, b) => a.ordinal - b.ordinal));
+  }
+
+  markRunsRolledBack(input: {
+    readonly taskId: TaskId;
+    readonly runIds: readonly RunId[];
+  }): readonly RunCheckpointRecord[] {
+    const taskId = parsedTaskId(input.taskId);
+    const runIds = input.runIds.map(parsedRunId);
+    if (runIds.length === 0 || runIds.length > 1_000) throw persistenceError("domain_operation_rejected");
+    return this.#immediate(() => {
+      const at = exactNow();
+      const marked: RunCheckpointRecord[] = [];
+      for (const runId of runIds) {
+        this.#requiredRun(taskId, runId);
+        if (this.#selectRunCheckpoint(taskId, runId) === undefined) {
+          const ordinalRow = this.#database
+            .prepare("SELECT COALESCE(MAX(ordinal), 0) AS last_ordinal FROM run_checkpoints WHERE task_id = ?")
+            .get(taskId);
+          if (ordinalRow === undefined) throw persistenceError("aggregate_integrity_failed");
+          this.#database
+            .prepare(`
+              INSERT INTO run_checkpoints(
+                task_id, run_id, ordinal, start_ref, end_ref, status, detail, files_json,
+                files_total, adds, dels, rolled_back_at_ms, created_at_ms, updated_at_ms
+              ) VALUES(?, ?, ?, NULL, NULL, 'unavailable', 'capture_skipped', '[]', 0, 0, 0, NULL, ?, ?)
+            `)
+            .run(taskId, runId, exactInteger(ordinalRow, "last_ordinal") + 1, at, at);
+        }
+        this.#database
+          .prepare(`
+            UPDATE run_checkpoints
+            SET status = 'rolled_back', rolled_back_at_ms = ?, updated_at_ms = MAX(updated_at_ms, ?)
+            WHERE task_id = ? AND run_id = ? AND status <> 'rolled_back'
+          `)
+          .run(at, at, taskId, runId);
+        marked.push(this.#requiredRunCheckpoint(taskId, runId));
+      }
+      return Object.freeze(marked);
+    });
+  }
+
+  failCapturingRunCheckpoints(taskIdInput: TaskId): number {
+    const taskId = parsedTaskId(taskIdInput);
+    return this.#immediate(() => {
+      const updated = this.#database
+        .prepare(`
+          UPDATE run_checkpoints
+          SET status = 'unavailable', detail = 'capture_skipped', updated_at_ms = MAX(updated_at_ms, ?)
+          WHERE task_id = ? AND status = 'capturing'
+        `)
+        .run(exactNow(), taskId);
+      return changes(updated.changes);
+    });
+  }
+
+  listRolledBackRunIds(taskIdInput: TaskId): readonly RunId[] {
+    this.#assertOpen();
+    const taskId = parsedTaskId(taskIdInput);
+    return Object.freeze(
+      this.#database
+        .prepare("SELECT run_id FROM run_checkpoints WHERE task_id = ? AND status = 'rolled_back' ORDER BY ordinal")
+        .all(taskId)
+        .map((row) => parsedRunId(exactText(row, "run_id") as RunId)),
+    );
+  }
+
+  nextRunCheckpointOrdinal(taskIdInput: TaskId): number {
+    this.#assertOpen();
+    const row = this.#database
+      .prepare("SELECT COALESCE(MAX(ordinal), 0) AS last_ordinal FROM run_checkpoints WHERE task_id = ?")
+      .get(parsedTaskId(taskIdInput));
+    if (row === undefined) throw persistenceError("aggregate_integrity_failed");
+    return exactInteger(row, "last_ordinal") + 1;
+  }
+
+  countRunCheckpoints(taskIdInput: TaskId): number {
+    this.#assertOpen();
+    const row = this.#database
+      .prepare("SELECT COUNT(*) AS count FROM run_checkpoints WHERE task_id = ?")
+      .get(parsedTaskId(taskIdInput));
+    if (row === undefined) throw persistenceError("aggregate_integrity_failed");
+    return exactInteger(row, "count");
+  }
+
+  listTaskRuns(taskIdInput: TaskId): readonly RunRecord[] {
+    this.#assertOpen();
+    const taskId = parsedTaskId(taskIdInput);
+    return Object.freeze(
+      this.#database
+        .prepare("SELECT * FROM runs WHERE task_id = ? ORDER BY rowid")
+        .all(taskId)
+        .map((row) => this.#decodeRunRow(row).value),
+    );
+  }
+
   createRun(input: { readonly taskId: TaskId; readonly runId: RunId }): RunRecord {
     const taskId = parsedTaskId(input.taskId);
     const runId = parsedRunId(input.runId);
@@ -5975,6 +6658,99 @@ class SqliteGuildPersistence implements GuildPersistence {
       reasoningEffort,
       contextWindow,
       revision: exactInteger(row, "revision"),
+      updatedAtMs: exactInteger(row, "updated_at_ms"),
+    });
+  }
+
+  #selectInterjection(taskId: TaskId, interjectionId: string): InterjectionRecord | undefined {
+    const row = this.#database
+      .prepare("SELECT * FROM task_interjections WHERE task_id = ? AND interjection_id = ?")
+      .get(taskId, interjectionId);
+    return row === undefined ? undefined : this.#decodeInterjectionRow(row);
+  }
+
+  #requiredInterjection(taskId: TaskId, interjectionId: string): InterjectionRecord {
+    const row = this.#selectInterjection(taskId, interjectionId);
+    if (row === undefined) throw persistenceError("aggregate_not_found");
+    return row;
+  }
+
+  #decodeInterjectionRow(row: SqlRow): InterjectionRecord {
+    const task = parseTaskId(exactText(row, "task_id"));
+    const run = parseRunId(exactText(row, "run_id"));
+    const state = exactText(row, "state");
+    if (
+      !task.ok ||
+      !run.ok ||
+      (state !== "sending" && state !== "pending" && state !== "delivered" &&
+        state !== "fallen_back" && state !== "failed")
+    ) {
+      throw persistenceError("aggregate_integrity_failed");
+    }
+    const reason = optionalText(row, "reason");
+    const entryId = optionalText(row, "entry_id");
+    const queueId = optionalText(row, "queue_id");
+    const startedRaw = optionalText(row, "started_run_id");
+    const started = startedRaw === undefined ? undefined : parseRunId(startedRaw);
+    if (started !== undefined && !started.ok) throw persistenceError("aggregate_integrity_failed");
+    return freeze({
+      taskId: task.value,
+      interjectionId: exactText(row, "interjection_id"),
+      runId: run.value,
+      text: exactText(row, "text_content"),
+      state,
+      ...(reason === undefined ? {} : { reason }),
+      ...(entryId === undefined ? {} : { entryId }),
+      ...(queueId === undefined ? {} : { queueId }),
+      ...(started === undefined || !started.ok ? {} : { startedRunId: started.value }),
+      createdAtMs: exactInteger(row, "created_at_ms"),
+      updatedAtMs: exactInteger(row, "updated_at_ms"),
+    });
+  }
+
+  #selectRunCheckpoint(taskId: TaskId, runId: RunId): RunCheckpointRecord | undefined {
+    const row = this.#database
+      .prepare("SELECT * FROM run_checkpoints WHERE task_id = ? AND run_id = ?")
+      .get(taskId, runId);
+    return row === undefined ? undefined : this.#decodeRunCheckpointRow(row);
+  }
+
+  #requiredRunCheckpoint(taskId: TaskId, runId: RunId): RunCheckpointRecord {
+    const row = this.#selectRunCheckpoint(taskId, runId);
+    if (row === undefined) throw persistenceError("aggregate_not_found");
+    return row;
+  }
+
+  #decodeRunCheckpointRow(row: SqlRow): RunCheckpointRecord {
+    const task = parseTaskId(exactText(row, "task_id"));
+    const run = parseRunId(exactText(row, "run_id"));
+    const status = exactText(row, "status");
+    if (
+      !task.ok ||
+      !run.ok ||
+      (status !== "capturing" && status !== "captured" && status !== "unavailable" &&
+        status !== "rolled_back")
+    ) {
+      throw persistenceError("aggregate_integrity_failed");
+    }
+    const startRef = optionalText(row, "start_ref");
+    const endRef = optionalText(row, "end_ref");
+    const detail = optionalText(row, "detail");
+    const rolledBackAtMs = optionalInteger(row, "rolled_back_at_ms");
+    return freeze({
+      taskId: task.value,
+      runId: run.value,
+      ordinal: exactInteger(row, "ordinal"),
+      ...(startRef === undefined ? {} : { startRef }),
+      ...(endRef === undefined ? {} : { endRef }),
+      status,
+      ...(detail === undefined ? {} : { detail }),
+      files: decodeCheckpointFiles(exactText(row, "files_json")),
+      filesTotal: exactInteger(row, "files_total"),
+      adds: exactInteger(row, "adds"),
+      dels: exactInteger(row, "dels"),
+      ...(rolledBackAtMs === undefined ? {} : { rolledBackAtMs }),
+      createdAtMs: exactInteger(row, "created_at_ms"),
       updatedAtMs: exactInteger(row, "updated_at_ms"),
     });
   }

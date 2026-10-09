@@ -17,6 +17,8 @@ import type {
   AcpV1DecodedUpdate,
   AcpV1InitializeResult,
   JsonRpcWriteReceipt,
+  JsonValue,
+  XaiExtensionOutcome,
 } from "@guild/runtime-grok";
 import {
   createLiveDesktopService,
@@ -369,6 +371,9 @@ class ScriptedAdapter implements RuntimeAdapterPort {
   async cancel(): Promise<JsonRpcWriteReceipt> { return writeReceipt(); }
   async close(): Promise<void> { this.state = "closed"; }
   async probeLiveness(): Promise<boolean> { return this.state === "ready"; }
+  async sendExtensionRequest(): Promise<XaiExtensionOutcome<JsonValue>> {
+    return Object.freeze({ status: "unsupported" as const });
+  }
 
   async prompt(session: AcpV1AdapterSession, text: string) {
     this.onPrompt?.(text);

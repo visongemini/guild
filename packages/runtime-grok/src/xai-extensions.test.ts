@@ -10,6 +10,8 @@ import {
   XAI_NOTIFICATION_PARSERS,
   isMethodNotFound,
   parseXaiNotification,
+  parseXaiQueueSnapshot,
+  promptIdOfSessionUpdate,
 } from "./xai-extensions.js";
 
 const parse = (method: string, params: unknown) => parseXaiNotification(method, params, 5);
@@ -37,7 +39,7 @@ describe("_x.ai extension layer", () => {
     assert.deepEqual(accepted, [...XAI_SESSION_NOTIFICATION_SUBTYPES]);
     for (const dropped of [
       "_x.ai/mcp/servers_updated", "_x.ai/mcp/server_status", "_x.ai/mcp_initialized",
-      "_x.ai/settings/update", "_x.ai/announcements/update", "_x.ai/session/interjection",
+      "_x.ai/settings/update", "_x.ai/announcements/update",
       "_x.ai/billing", "x.ai/queue/changed", "queue/changed", "__proto__", "constructor", "toString", "",
     ]) {
       assert.equal(parse(dropped, { sessionId: "s-1", entries: [] }), undefined, dropped);
@@ -134,5 +136,69 @@ describe("_x.ai extension layer", () => {
     assert.equal(isMethodNotFound(new JsonRpcRemoteError({ code: -32601, message: "Method not found" })), true);
     assert.equal(isMethodNotFound(new JsonRpcRemoteError({ code: -32602, message: "Invalid params" })), false);
     assert.equal(isMethodNotFound(new Error("-32601")), false);
+  });
+
+  it("keeps only the client-made id of a Steer echo and drops the echoed text", () => {
+    const echo = parse("_x.ai/session/interjection", {
+      sessionId: "s-1", text: "PRIVATE STEER TEXT", interjectionId: "interject-0f3a",
+    });
+    assert.deepEqual(echo, {
+      sessionId: "s-1",
+      signal: { kind: "session_interjection", interjectionId: "interject-0f3a" },
+      receivedMonotonicMs: 5,
+    });
+    assert.equal(JSON.stringify(echo).includes("PRIVATE"), false);
+    // A runtime that omits the id (older client) or sends an unusable one yields no signal.
+    assert.equal(parse("_x.ai/session/interjection", { sessionId: "s-1", text: "x" }), undefined);
+    assert.equal(parse("_x.ai/session/interjection", { sessionId: "s-1", interjectionId: "!!!" }), undefined);
+    const long = parse("_x.ai/session/interjection", { sessionId: "s-1", interjectionId: `i${"x".repeat(100)}` });
+    assert.equal(long?.signal.kind === "session_interjection" && long.signal.interjectionId.length, 64);
+  });
+
+  it("names the prompt a turn-end signal belongs to", () => {
+    assert.deepEqual(
+      sessionUpdate({ sessionUpdate: "turn_completed", prompt_id: "interject-fallback-019e", stop_reason: "end_turn" })?.signal,
+      { kind: "turn_completed", stopReason: "end_turn", promptId: "interject-fallback-019e" },
+    );
+    assert.deepEqual(
+      parse("_x.ai/session/prompt_complete", { sessionId: "s-1", promptId: "p-9", stopReason: "cancelled" })?.signal,
+      { kind: "prompt_complete", stopReason: "cancelled", promptId: "p-9" },
+    );
+    assert.deepEqual(
+      sessionUpdate({ sessionUpdate: "turn_completed" })?.signal,
+      { kind: "turn_completed" },
+    );
+  });
+
+  it("reads queued prompt text only through the in-memory snapshot parser, bounded", () => {
+    const snapshot = parseXaiQueueSnapshot({
+      sessionId: "s-1",
+      entries: [{ id: "p-1", text: "first" }, { id: "p-2", text: 5 }, { text: "no id" }, null],
+      runningPromptId: "interject-fallback-1",
+      runningText: "run this",
+    });
+    assert.deepEqual(snapshot, {
+      runningPromptId: "interject-fallback-1",
+      runningText: "run this",
+      entries: [{ id: "p-1", text: "first" }],
+    });
+    assert.deepEqual(parseXaiQueueSnapshot({ entries: "nope" }), { entries: [] });
+    assert.equal(parseXaiQueueSnapshot(null), undefined);
+    const huge = parseXaiQueueSnapshot({ entries: [], runningPromptId: "p", runningText: "x".repeat(100_000) });
+    assert.equal(huge?.runningText?.length, 65_536);
+    const bounded = parseXaiQueueSnapshot({ entries: Array.from({ length: 100 }, (_, index) => ({ id: `p-${index}`, text: "t" })) });
+    assert.equal(bounded?.entries.length, 32);
+    // The signal parser never carries the text.
+    assert.equal(JSON.stringify(parse("_x.ai/queue/changed", {
+      sessionId: "s-1", entries: [{ id: "p-1", text: "SECRET QUEUE TEXT", position: 0 }], runningText: "SECRET RUN",
+    })).includes("SECRET"), false);
+  });
+
+  it("reads the prompt id a session/update frame names", () => {
+    assert.equal(promptIdOfSessionUpdate({ sessionId: "s", update: {}, _meta: { promptId: "p-7" } }), "p-7");
+    assert.equal(promptIdOfSessionUpdate({ sessionId: "s", update: {}, _meta: {} }), undefined);
+    assert.equal(promptIdOfSessionUpdate({ sessionId: "s", update: {} }), undefined);
+    assert.equal(promptIdOfSessionUpdate(undefined), undefined);
+    assert.equal(promptIdOfSessionUpdate({ _meta: { promptId: 5 } }), undefined);
   });
 });

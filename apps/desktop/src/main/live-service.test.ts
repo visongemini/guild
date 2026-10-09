@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import { existsSync } from "node:fs";
 import { mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -10,6 +12,7 @@ import type {
   RuntimePromptTerminalPayload,
   RuntimeCommand,
   RuntimeConfigOption,
+  RunId,
   RuntimePlanPayload,
   RuntimeTextChunkPayload,
   SendMessageResponse,
@@ -37,12 +40,15 @@ import {
   type AcpV1PreparedPermissionResponse,
   type JsonRpcInboundResponseWriteReceipt,
   type JsonRpcWriteReceipt,
+  type JsonValue,
+  type XaiExtensionOutcome,
 } from "@guild/runtime-grok";
 import {
   createLiveDesktopService,
   type RuntimeAdapterPort,
   type RuntimeFactory,
 } from "./live-service.js";
+import { checkpointRef, gitCheckpoints, type GitCheckpointPort } from "./git-checkpoints.js";
 
 const services: { close(): Promise<void> }[] = [];
 
@@ -5764,6 +5770,866 @@ describe("live desktop service model selection and phase indicator [F1]", () => 
   });
 });
 
+describe("live desktop service Steer, run checkpoints and rewind [F4, F2]", () => {
+  type CheckpointCaptureResult = Awaited<ReturnType<GitCheckpointPort["capture"]>>;
+
+  /** A scripted git port: records every call in the shared log and lets a test gate or hang captures. */
+  class FakeCheckpoints implements GitCheckpointPort {
+    captureGate: Promise<void> | undefined;
+    hangCaptures = false;
+    observe: () => Promise<string> = async () => "";
+    captureResult: (taskId: string, ordinal: number) => CheckpointCaptureResult = (taskId, ordinal) => ({
+      status: "captured",
+      ref: checkpointRef(taskId, ordinal) ?? "",
+      commit: `c${ordinal}`,
+      tree: `t${ordinal}`,
+    });
+    summaryResult: Awaited<ReturnType<GitCheckpointPort["summarize"]>> = {
+      status: "ok",
+      summary: {
+        files: [{ path: "src/a.ts", status: "M", adds: 3, dels: 1 }],
+        filesTotal: 1, adds: 3, dels: 1, truncated: false,
+      },
+    };
+    readonly restores: Array<Parameters<GitCheckpointPort["restore"]>[0]> = [];
+
+    constructor(readonly log: string[]) {}
+
+    async capture(input: Parameters<GitCheckpointPort["capture"]>[0]): Promise<CheckpointCaptureResult> {
+      this.log.push(`capture:${input.ordinal}:${await this.observe()}`);
+      if (this.hangCaptures) return new Promise<never>(() => undefined);
+      await this.captureGate;
+      return this.captureResult(input.taskId, input.ordinal);
+    }
+
+    async summarize(input: Parameters<GitCheckpointPort["summarize"]>[0]) {
+      this.log.push(`summarize:${input.fromRef}->${input.toRef}`);
+      return this.summaryResult;
+    }
+
+    async fileDiff(input: Parameters<GitCheckpointPort["fileDiff"]>[0]) {
+      this.log.push(`diff:${input.path}`);
+      return { status: "ok" as const, diff: `diff of ${input.path}`, binary: false, truncated: false };
+    }
+
+    async planRewind(): ReturnType<GitCheckpointPort["planRewind"]> {
+      return { status: "unavailable", reason: "git_failed" };
+    }
+
+    async restore(input: Parameters<GitCheckpointPort["restore"]>[0]) {
+      this.restores.push(input);
+      return { restored: [...input.restore], removed: [...input.remove], failed: [] };
+    }
+  }
+
+  async function f24Task(input: {
+    readonly specs?: readonly FakeRuntimeSpec[];
+    readonly checkpoints?: GitCheckpointPort;
+    readonly git?: boolean;
+    readonly extra?: Record<string, unknown>;
+  } = {}) {
+    const root = await mkdtemp(join(tmpdir(), "guild-live-service-f24-"));
+    await mkdir(join(root, "Workspace"));
+    const workspace = await realpath(join(root, "Workspace"));
+    if (input.git === true) {
+      gitIn(workspace, "init", "-q", "-b", "main");
+      gitIn(workspace, "config", "user.name", "Owner");
+      gitIn(workspace, "config", "user.email", "owner@example.test");
+      await writeFile(join(workspace, "a.txt"), "alpha\nbeta\n");
+      await writeFile(join(workspace, "b.txt"), "bravo\n");
+      await writeFile(join(workspace, "keep.txt"), "keep\n");
+      gitIn(workspace, "add", "-A");
+      gitIn(workspace, "commit", "-q", "-m", "initial");
+    }
+    const adapters: FakeAdapter[] = [];
+    const options = {
+      appVersion: "2.2.0-test",
+      databasePath: join(root, "guild.sqlite3"),
+      stagingRoot: join(root, "staging"),
+      initialLocale: "en-US" as const,
+      chooseWorkspace: async () => workspace,
+      runtimeFactory: fakeRuntimeFactory(input.specs ?? [{}], (adapter) => adapters.push(adapter)),
+      ...(input.checkpoints === undefined ? {} : { checkpoints: input.checkpoints }),
+      ...(input.extra ?? {}),
+    };
+    const service = createLiveDesktopService(options);
+    services.push(service);
+    const selected = await service.chooseWorkspace();
+    const task = await service.createTask(selected.workspaces[0]!.workspaceId);
+    return { root, workspace, databasePath: options.databasePath, adapters, options, service, taskId: task.task.taskId };
+  }
+
+  type Setup = Awaited<ReturnType<typeof f24Task>>;
+
+  function gitIn(cwd: string, ...args: string[]): string {
+    return execFileSync("git", args, {
+      cwd,
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        GIT_CONFIG_GLOBAL: "/dev/null",
+        GIT_CONFIG_SYSTEM: "/dev/null",
+        GIT_AUTHOR_NAME: "Owner",
+        GIT_AUTHOR_EMAIL: "owner@example.test",
+        GIT_COMMITTER_NAME: "Owner",
+        GIT_COMMITTER_EMAIL: "owner@example.test",
+      },
+    });
+  }
+
+  const ok = (result: unknown) => Object.freeze({ status: "ok" as const, result: result as JsonValue });
+  const task = async (setup: Setup) => (await setup.service.bootstrap()).activeTask!;
+  const interjections = async (setup: Setup) =>
+    (await task(setup)).timeline.filter((item) => item.interjection !== undefined);
+
+  /** A running turn the fake holds open until the test ends it. */
+  async function holdTurn(setup: Setup, text = "wait-for-cancel"): Promise<RunId> {
+    const sent = await setup.service.sendMessage(setup.taskId, text);
+    await waitForRunState(setup.service, "running");
+    await eventuallyAsync(() => setup.adapters[0]?.isHoldingPrompt === true, "held prompt");
+    return startedRunId(sent);
+  }
+
+  /** The runtime's rewind surface for a task whose prompts are `prompts`, in order. */
+  function rewindRuntime(prompts: readonly string[], calls: Array<Record<string, unknown>> = []) {
+    return (method: string, params: Readonly<Record<string, unknown>>) => {
+      if (method === "_x.ai/rewind/points") {
+        return ok({
+          rewind_points: prompts.map((text, index) => ({
+            prompt_index: index, created_at: "", num_file_snapshots: 0, has_file_changes: false,
+            prompt_preview: text.length > 57 ? `${text.slice(0, 57)}...` : text,
+          })),
+        });
+      }
+      if (method === "_x.ai/rewind/execute") {
+        calls.push({ ...params });
+        const index = Number(params["targetPromptIndex"]);
+        return ok({
+          success: params["force"] === true,
+          target_prompt_index: index,
+          mode: params["mode"],
+          reverted_files: params["mode"] === "all" && params["force"] === true ? ["tracked-by-runtime.txt"] : [],
+          clean_files: params["mode"] === "all" ? ["tracked-by-runtime.txt"] : [],
+          conflicts: [],
+          prompt_text: params["force"] === true ? (prompts[index] ?? null) : null,
+          error: null,
+        });
+      }
+      return Object.freeze({ status: "unsupported" as const });
+    };
+  }
+
+  it("injects a Steer into the running turn, shows it pending, and marks it delivered on the runtime's echo [F4]", async () => {
+    const setup = await f24Task();
+    const runId = await holdTurn(setup);
+    const adapter = setup.adapters[0]!;
+    adapter.extensionHandler = () => ok({ status: "queued" });
+    assert.deepEqual((await task(setup)).steer, { available: true });
+
+    const steered = await setup.service.steerMessage(setup.taskId, "  go left  ");
+    assert.equal(steered.status, "steered");
+    if (steered.status !== "steered") return;
+    assert.deepEqual(adapter.extensionRequests.map((request) => request.method), ["_x.ai/interject"]);
+    assert.deepEqual(adapter.extensionRequests[0]?.params, {
+      sessionId: "fake-session", text: "go left", interjectionId: steered.interjectionId,
+    });
+    assert.match(steered.interjectionId, /^interject-[0-9a-f-]{36}$/u);
+
+    const [pending] = await interjections(setup);
+    assert.equal(pending?.kind, "user");
+    assert.equal(pending?.kind === "user" && pending.text, "go left");
+    assert.equal(pending?.runId, runId);
+    assert.deepEqual(pending?.interjection, { interjectionId: steered.interjectionId, state: "pending" });
+    // The original turn is untouched and an ordinary send during the turn still queues (Guild's own queue).
+    assert.equal((await task(setup)).task.activeRunState, "running");
+    const queued = await setup.service.sendMessage(setup.taskId, "ordinary follow-up");
+    assert.equal(queued.status, "queued");
+    assert.equal(adapter.extensionRequests.length, 1, "a normal send never touches the extension");
+
+    adapter.emitInterjectionEcho("interject-someone-elses");
+    adapter.emitInterjectionEcho(steered.interjectionId);
+    await eventuallyAsync(async () => (await interjections(setup))[0]?.interjection?.state === "delivered", "delivered");
+    await adapter.completeHeldPrompt();
+    await waitForCompleted(setup.service, 1);
+  });
+
+  it("counts an echo that beats the request's own response, and an acknowledged Steer whose echo never came [F4]", async () => {
+    const setup = await f24Task();
+    await holdTurn(setup);
+    const adapter = setup.adapters[0]!;
+    adapter.extensionHandler = (_method, params) => {
+      adapter.emitInterjectionEcho(String(params["interjectionId"]));
+      return ok({ status: "queued" });
+    };
+    const early = await setup.service.steerMessage(setup.taskId, "echo first");
+    assert.equal(early.status, "steered");
+    assert.equal((await interjections(setup))[0]?.interjection?.state, "delivered");
+
+    adapter.extensionHandler = () => ok({ status: "queued" });
+    const silent = await setup.service.steerMessage(setup.taskId, "never echoed");
+    assert.equal(silent.status, "steered");
+    assert.equal((await interjections(setup))[1]?.interjection?.state, "pending");
+    await adapter.completeHeldPrompt();
+    await waitForRunState(setup.service, "completed");
+    // The runtime acknowledged it and the turn is over: it is no longer shown as waiting.
+    assert.deepEqual((await interjections(setup)).map((item) => item.interjection?.state), ["delivered", "delivered"]);
+  });
+
+  it("falls back to the durable queue when the extension is unsupported, records why, and does not ask again [F4]", async () => {
+    const setup = await f24Task();
+    await holdTurn(setup);
+    const adapter = setup.adapters[0]!;
+    // No handler: the runtime answers -32601.
+    const first = await setup.service.steerMessage(setup.taskId, "steer me anyway");
+    assert.deepEqual(first, { status: "queued", queueId: first.status === "queued" ? first.queueId : "", reason: "unsupported" });
+    const projected = await task(setup);
+    assert.deepEqual(projected.queuedTurns.map((queued) => queued.text), ["steer me anyway"]);
+    assert.deepEqual(projected.steer, { available: false, reason: "unsupported" });
+    const [notice] = await interjections(setup);
+    assert.equal(notice?.kind, "notice");
+    assert.equal(notice?.interjection?.state, "fallen_back");
+    assert.equal(notice?.interjection?.reason, "unsupported");
+    assert.equal(notice?.kind === "notice" && /ordinary message/u.test(notice.text), true);
+
+    const second = await setup.service.steerMessage(setup.taskId, "and another");
+    assert.equal(second.status, "queued");
+    assert.equal(adapter.extensionRequests.length, 1, "an unsupported extension is not probed again on this process");
+    assert.deepEqual((await task(setup)).queuedTurns.map((queued) => queued.text), ["steer me anyway", "and another"]);
+
+    // The queue keeps its meaning: the held turn ends, then the messages run in order.
+    await adapter.completeHeldPrompt();
+    await waitForCompleted(setup.service, 2);
+    const texts = (await task(setup)).timeline.flatMap((item) => item.kind === "assistant" ? [item.text] : []);
+    assert.deepEqual(texts, ["reply:steer me anyway", "reply:and another"]);
+  });
+
+  it("sends the text as an ordinary message when no turn is running, with no notice [F4]", async () => {
+    const setup = await f24Task();
+    await setup.service.sendMessage(setup.taskId, "hello");
+    await waitForCompleted(setup.service);
+    await waitForIdle(setup.service);
+    assert.deepEqual((await task(setup)).steer, { available: false, reason: "no_active_run" });
+    const response = await setup.service.steerMessage(setup.taskId, "after the end");
+    assert.equal(response.status, "started");
+    assert.equal(response.reason, "turn_not_running");
+    await waitForCompleted(setup.service, 2);
+    assert.deepEqual(await interjections(setup), []);
+    assert.equal(setup.adapters[0]?.extensionRequests.length, 0);
+    await assert.rejects(setup.service.steerMessage(setup.taskId, "   "), /steer_message_empty/u);
+  });
+
+  it("does not steer a turn that is being cancelled, and falls back with a reason [F4]", async () => {
+    const setup = await f24Task();
+    const runId = await holdTurn(setup);
+    const adapter = setup.adapters[0]!;
+    adapter.extensionHandler = () => ok({ status: "queued" });
+    const gate = deferredPromise();
+    adapter.cancelGate = gate.promise;
+    const cancelling = setup.service.cancelRun(setup.taskId, runId);
+    await waitForRunState(setup.service, "cancel_requested");
+    assert.deepEqual((await task(setup)).steer, { available: false, reason: "turn_not_steerable" });
+    const response = await setup.service.steerMessage(setup.taskId, "too late");
+    assert.equal(response.status, "queued");
+    assert.equal(response.reason, "turn_not_steerable");
+    assert.equal(adapter.extensionRequests.length, 0);
+    assert.equal((await interjections(setup))[0]?.interjection?.reason, "turn_not_steerable");
+    gate.resolve();
+    await cancelling;
+    await waitForCompleted(setup.service, 1);
+  });
+
+  it("falls back with runtime_error when the runtime rejects the interjection, without losing the message [F4]", async () => {
+    const setup = await f24Task();
+    await holdTurn(setup);
+    const adapter = setup.adapters[0]!;
+    adapter.extensionHandler = () => { throw new AcpV1AdapterError("operation_failed"); };
+    const response = await setup.service.steerMessage(setup.taskId, "please take this");
+    assert.equal(response.status, "queued");
+    assert.equal(response.reason, "runtime_error");
+    assert.deepEqual((await task(setup)).queuedTurns.map((queued) => queued.text), ["please take this"]);
+    assert.equal((await interjections(setup))[0]?.interjection?.reason, "runtime_error");
+    // A rejection is not "unsupported": the next Steer is tried again.
+    adapter.extensionHandler = () => ok({ status: "queued" });
+    assert.equal((await setup.service.steerMessage(setup.taskId, "second try")).status, "steered");
+    await adapter.completeHeldPrompt();
+    await waitForCompleted(setup.service, 1);
+  });
+
+  it("turns a queued message into a Steer, and leaves it queued when Steer is not possible [F4]", async () => {
+    const setup = await f24Task();
+    await holdTurn(setup);
+    const adapter = setup.adapters[0]!;
+    const queued = await setup.service.sendMessage(setup.taskId, "make this a steer");
+    assert.equal(queued.status, "queued");
+    if (queued.status !== "queued") return;
+    await assert.rejects(setup.service.convertQueuedTurnToSteer(setup.taskId, "queue-missing"), /queued_turn_not_found/u);
+
+    // Unsupported: the queued turn stays exactly where it was.
+    const refused = await setup.service.convertQueuedTurnToSteer(setup.taskId, queued.queueId);
+    assert.deepEqual(refused, { status: "unchanged", reason: "unsupported" });
+    assert.deepEqual((await task(setup)).queuedTurns.map((item) => item.queueId), [queued.queueId]);
+    assert.deepEqual(await interjections(setup), [], "no notice for a conversion that changed nothing");
+
+    // The process already answered -32601, so the extension is not asked again until it restarts.
+    const requestsBefore = adapter.extensionRequests.length;
+    adapter.extensionHandler = () => ok({ status: "queued" });
+    assert.deepEqual(await setup.service.convertQueuedTurnToSteer(setup.taskId, queued.queueId),
+      { status: "unchanged", reason: "unsupported" });
+    assert.equal(adapter.extensionRequests.length, requestsBefore);
+    await adapter.completeHeldPrompt();
+    await waitForCompleted(setup.service, 1);
+  });
+
+  it("converts a queued message in one step when the runtime supports Steer [F4]", async () => {
+    const setup = await f24Task();
+    await holdTurn(setup);
+    const adapter = setup.adapters[0]!;
+    adapter.extensionHandler = () => ok({ status: "queued" });
+    const queued = await setup.service.sendMessage(setup.taskId, "make this a steer");
+    if (queued.status !== "queued") return assert.fail("expected a queued turn");
+    const converted = await setup.service.convertQueuedTurnToSteer(setup.taskId, queued.queueId);
+    assert.equal(converted.status, "steered");
+    const projected = await task(setup);
+    assert.deepEqual(projected.queuedTurns, []);
+    const [converted_item] = await interjections(setup);
+    assert.equal(converted_item?.kind, "user");
+    assert.equal(converted_item?.interjection?.state, "pending");
+    assert.equal(adapter.extensionRequests[0]?.params["text"], "make this a steer");
+    await adapter.completeHeldPrompt();
+    await waitForRunState(setup.service, "completed");
+  });
+
+  it("accepts a turn the runtime starts itself, shows its output on a Run of the task, and shows the Steer once [F4]", async () => {
+    const setup = await f24Task();
+    const firstRun = await holdTurn(setup);
+    const adapter = setup.adapters[0]!;
+    adapter.extensionHandler = () => ok({ status: "queued" });
+    const steered = await setup.service.steerMessage(setup.taskId, "go left");
+    if (steered.status !== "steered") return assert.fail("expected a Steer");
+    adapter.emitInterjectionEcho(steered.interjectionId);
+    // The turn ends before the runtime reaches a safe point for the Steer: it runs it as its own turn.
+    await adapter.completeHeldPrompt();
+    await waitForIdle(setup.service);
+
+    assert.equal(await adapter.runAgentTurn({ promptId: "interject-fallback-0001", text: "go left", assistant: "Going left" }), "attached");
+    await waitForCompleted(setup.service, 1);
+    const projected = await task(setup);
+    const assistant = projected.timeline.find((item) => item.kind === "assistant");
+    assert.equal(assistant?.kind === "assistant" && assistant.text, "Going left");
+    assert.notEqual(assistant?.runId, firstRun, "the runtime's turn is a Run of its own");
+    assert.equal(projected.task.activeRunState, "completed");
+    assert.deepEqual(
+      projected.timeline.filter((item) => item.kind === "user").map((item) => item.kind === "user" ? item.text : ""),
+      ["wait-for-cancel", "go left"],
+      "the Steer is shown once; the turn's own copy of the message is only a replay anchor",
+    );
+    assert.equal(projected.timeline.some((item) => item.runId === assistant?.runId && item.kind === "user"), false);
+    assert.deepEqual(projected.steer, { available: false, reason: "no_active_run" });
+    // The session stays usable.
+    await setup.service.sendMessage(setup.taskId, "next");
+    await waitForCompleted(setup.service, 2);
+  });
+
+  it("shows an unmatched runtime-started turn with its own message, and declines one while a Run is active [F4]", async () => {
+    const setup = await f24Task();
+    await setup.service.sendMessage(setup.taskId, "hello");
+    await waitForCompleted(setup.service);
+    await waitForIdle(setup.service);
+    const adapter = setup.adapters[0]!;
+    assert.equal(await adapter.runAgentTurn({ promptId: "task-completed-1", text: "a background task finished", assistant: "Noted" }), "attached");
+    await waitForCompleted(setup.service, 2);
+    const userTexts = (await task(setup)).timeline.flatMap((item) => item.kind === "user" ? [item.text] : []);
+    assert.deepEqual(userTexts, ["hello", "a background task finished"]);
+
+    await holdTurn(setup);
+    const outcome = await adapter.runAgentTurn({ promptId: "interject-fallback-2", text: "overlaps", assistant: "ignored" });
+    assert.equal(outcome, "declined");
+    const projected = await task(setup);
+    assert.equal(projected.task.activeRunState, "running", "the active Run is undisturbed");
+    assert.equal(projected.timeline.some((item) => item.kind === "assistant" && item.text === "ignored"), false);
+    await adapter.completeHeldPrompt();
+    await waitForRunState(setup.service, "completed");
+  });
+
+  it("reopens a session whose history holds a Steer and the turn the runtime ran from one [F4]", async () => {
+    const setup = await f24Task({ specs: [{ sessionId: "steer-history-session" }] });
+    await holdTurn(setup);
+    const adapter = setup.adapters[0]!;
+    adapter.extensionHandler = () => ok({ status: "queued" });
+    const steered = await setup.service.steerMessage(setup.taskId, "go left");
+    if (steered.status !== "steered") return assert.fail("expected a Steer");
+    adapter.emitInterjectionEcho(steered.interjectionId);
+    await adapter.completeHeldPrompt();
+    await waitForIdle(setup.service);
+    await adapter.runAgentTurn({ promptId: "interject-fallback-0003", text: "go left", assistant: "Going left" });
+    await waitForCompleted(setup.service, 1);
+    await setup.service.close();
+    services.splice(services.indexOf(setup.service), 1);
+
+    // The runtime persisted the Steer as a user chunk inside the first turn, then the second turn.
+    const reopened = createLiveDesktopService({
+      ...setup.options,
+      stagingRoot: join(setup.root, "staging-reopened"),
+      runtimeFactory: fakeRuntimeFactory([{
+        sessionId: "steer-history-session",
+        resumeFails: true,
+        loadSession: true,
+        replayTurns: [
+          { user: "wait-for-cancel", thought: "waiting", interjections: ["go left"] },
+          { user: "go left", assistant: "Going left" },
+        ],
+      }]),
+    });
+    services.push(reopened);
+    await reopened.bootstrap();
+    const next = await reopened.sendMessage(setup.taskId, "after the restart");
+    assert.equal(next.status, "started");
+    await waitForCompleted(reopened, 2);
+    assert.equal((await reopened.bootstrap()).activeTask?.sessionRecovery, "available");
+  });
+
+  it("leaves no trace of a Steer whose request was lost to a crash [F4]", async () => {
+    const setup = await f24Task({ specs: [{ sessionId: "crash-session" }] });
+    await holdTurn(setup);
+    const adapter = setup.adapters[0]!;
+    // The request never returns, as if the app died while it was in flight.
+    adapter.extensionHandler = () => new Promise<never>(() => undefined);
+    void setup.service.steerMessage(setup.taskId, "lost in flight").catch(() => undefined);
+    await eventuallyAsync(() => adapter.extensionRequests.length === 1);
+    assert.deepEqual(await interjections(setup), [], "no entry exists before the runtime accepted the interjection");
+    await setup.service.close();
+    services.splice(services.indexOf(setup.service), 1);
+    const reopened = createLiveDesktopService({ ...setup.options, runtimeFactory: fakeRuntimeFactory([{ sessionId: "crash-session", resumeFails: false }]) });
+    services.push(reopened);
+    const projected = (await reopened.bootstrap()).activeTask!;
+    assert.deepEqual(projected.timeline.filter((item) => item.interjection !== undefined), []);
+  });
+
+  it("takes the start checkpoint before the prompt can reach the agent, and the end checkpoint after the Run is terminal [F2]", async () => {
+    const log: string[] = [];
+    const checkpoints = new FakeCheckpoints(log);
+    const gate = deferredPromise();
+    checkpoints.captureGate = gate.promise;
+    const latestState = "";
+    const setup = await f24Task({
+      checkpoints,
+      specs: [{ promptEffect: async (text) => { log.push(`prompt:${text}`); } }],
+    });
+    checkpoints.observe = async () => (await setup.service.bootstrap()).activeTask?.task.activeRunState ?? "";
+    void latestState;
+    const sent = await setup.service.sendMessage(setup.taskId, "hello");
+    assert.equal(sent.status, "started");
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    assert.deepEqual(log, ["capture:1:starting"], "the prompt is held back while the start checkpoint is being taken");
+    assert.equal(setup.adapters[0]?.prompts.length, 0);
+    gate.resolve();
+    await waitForCompleted(setup.service);
+    await eventuallyAsync(async () => (await task(setup)).runCheckpoints?.[0]?.status === "captured", "captured");
+    assert.deepEqual(log.map((entry) => entry.replaceAll(setup.taskId, "TASK")), [
+      "capture:1:starting",
+      "prompt:hello",
+      "capture:2:completed",
+      "summarize:refs/guild/checkpoints/TASK/1->refs/guild/checkpoints/TASK/2",
+    ]);
+    const [checkpoint] = (await task(setup)).runCheckpoints ?? [];
+    assert.deepEqual(
+      { ordinal: checkpoint?.ordinal, status: checkpoint?.status, files: checkpoint?.filesChanged, adds: checkpoint?.adds, dels: checkpoint?.dels, rolledBack: checkpoint?.rolledBack },
+      { ordinal: 1, status: "captured", files: 1, adds: 3, dels: 1, rolledBack: false },
+    );
+    assert.deepEqual(checkpoint?.files, [{ path: "src/a.ts", status: "M", adds: 3, dels: 1 }]);
+
+    // The second Run takes the next two ordinals, after the first Run's end checkpoint.
+    await setup.service.sendMessage(setup.taskId, "again");
+    await waitForCompleted(setup.service, 2);
+    await eventuallyAsync(async () => (await task(setup)).runCheckpoints?.[1]?.status === "captured", "second captured");
+    assert.deepEqual(log.filter((entry) => entry.startsWith("capture:")).map((entry) => entry.split(":")[1]), ["1", "2", "3", "4"]);
+    const runId = (await task(setup)).runCheckpoints![0]!.runId;
+    assert.deepEqual(await setup.service.loadRunFileDiff({ taskId: setup.taskId, runId, path: "src/a.ts" }),
+      { status: "ok", path: "src/a.ts", diff: "diff of src/a.ts", binary: false, truncated: false });
+    assert.deepEqual(await setup.service.loadRunFileDiff({ taskId: setup.taskId, runId, path: "src/other.ts" }),
+      { status: "unavailable", reason: "not_in_run" });
+  });
+
+  it("sends the prompt after a bounded wait when the start checkpoint is slow, and discards the late capture [F2]", async () => {
+    const log: string[] = [];
+    const checkpoints = new FakeCheckpoints(log);
+    checkpoints.hangCaptures = true;
+    const setup = await f24Task({
+      checkpoints,
+      extra: { checkpointStartBoundMs: 60 },
+      specs: [{ promptEffect: async (text) => { log.push(`prompt:${text}`); } }],
+    });
+    await setup.service.sendMessage(setup.taskId, "hello");
+    await waitForCompleted(setup.service);
+    assert.match(log[0] ?? "", /^capture:1:/u);
+    assert.equal(log.includes("prompt:hello"), true, "the send is never blocked by a checkpoint for longer than the bound");
+    await eventuallyAsync(async () => (await task(setup)).runCheckpoints?.[0]?.status === "unavailable", "unavailable");
+    assert.equal((await task(setup)).runCheckpoints?.[0]?.detail, "timeout");
+    assert.deepEqual((await task(setup)).runCheckpoints?.[0]?.files, []);
+  });
+
+  it("marks a checkpoint the app quit in the middle of taking as unavailable on the next start [F2]", async () => {
+    const log: string[] = [];
+    const checkpoints = new FakeCheckpoints(log);
+    checkpoints.hangCaptures = true;
+    const setup = await f24Task({
+      checkpoints,
+      extra: { checkpointStartBoundMs: 60 },
+      specs: [{ sessionId: "quit-session" }],
+    });
+    await setup.service.sendMessage(setup.taskId, "hello");
+    await waitForCompleted(setup.service);
+    assert.equal((await task(setup)).runCheckpoints?.[0]?.status, "capturing");
+    await setup.service.close();
+    services.splice(services.indexOf(setup.service), 1);
+    const reopened = createLiveDesktopService({
+      ...setup.options,
+      runtimeFactory: fakeRuntimeFactory([{ sessionId: "quit-session" }]),
+      checkpoints: new FakeCheckpoints([]),
+    });
+    services.push(reopened);
+    const checkpoint = (await reopened.bootstrap()).activeTask?.runCheckpoints?.[0];
+    assert.equal(checkpoint?.status, "unavailable");
+    assert.equal(checkpoint?.detail, "capture_skipped");
+  });
+
+  it("records a checkpoint as unavailable outside a git work tree and for a git failure, and carries on [F2]", async () => {
+    const plain = await f24Task();
+    await plain.service.sendMessage(plain.taskId, "hello");
+    await waitForCompleted(plain.service);
+    await eventuallyAsync(async () => (await task(plain)).runCheckpoints?.[0]?.status === "unavailable", "plain unavailable");
+    assert.equal((await task(plain)).runCheckpoints?.[0]?.detail, "not_a_git_repo");
+
+    const log: string[] = [];
+    const failing = new FakeCheckpoints(log);
+    failing.captureResult = () => ({ status: "unavailable", reason: "too_many_files" });
+    const setup = await f24Task({ checkpoints: failing });
+    await setup.service.sendMessage(setup.taskId, "hello");
+    await waitForCompleted(setup.service);
+    await eventuallyAsync(async () => (await task(setup)).runCheckpoints?.[0]?.status === "unavailable", "failing unavailable");
+    assert.equal((await task(setup)).runCheckpoints?.[0]?.detail, "too_many_files");
+    assert.equal(log.filter((entry) => entry.startsWith("capture:")).length, 1, "no end checkpoint is attempted after the start failed");
+  });
+
+  it("summarizes a real Run's changed files and serves a bounded diff for each [F2]", async () => {
+    const setup = await f24Task({
+      git: true,
+      specs: [{
+        promptEffect: async (text) => {
+          if (text !== "edit-files") return;
+          await writeFile(join(setup_workspace(), "a.txt"), "alpha\nBETA\ngamma\n");
+          await writeFile(join(setup_workspace(), "new.txt"), "brand new\n");
+          await rm(join(setup_workspace(), "b.txt"));
+        },
+      }],
+    });
+    function setup_workspace(): string { return setup.workspace; }
+    await setup.service.sendMessage(setup.taskId, "edit-files");
+    await waitForCompleted(setup.service);
+    await eventuallyAsync(async () => (await task(setup)).runCheckpoints?.[0]?.status === "captured", "captured");
+    const checkpoint = (await task(setup)).runCheckpoints![0]!;
+    assert.deepEqual(
+      checkpoint.files.map((file) => [file.path, file.status, file.adds, file.dels]),
+      [["a.txt", "M", 2, 1], ["b.txt", "D", 0, 1], ["new.txt", "A", 1, 0]],
+    );
+    assert.equal(checkpoint.filesChanged, 3);
+    assert.equal(checkpoint.filesTruncated, false);
+    const diff = await setup.service.loadRunFileDiff({ taskId: setup.taskId, runId: checkpoint.runId, path: "a.txt" });
+    assert.equal(diff.status, "ok");
+    assert.equal(diff.status === "ok" && /^\+BETA$/mu.test(diff.diff), true);
+    assert.equal(gitIn(setup.workspace, "for-each-ref", "refs/guild", "--format=%(refname)").trim().split("\n").length, 2);
+    assert.equal(gitIn(setup.workspace, "diff", "--cached").trim(), "", "the user's index is untouched");
+  });
+
+  it("previews and executes a rewind: official conversation rewind, git file restore, rolled-back Runs, prompt back in the draft [F2]", async () => {
+    const calls: Array<Record<string, unknown>> = [];
+    const setup = await f24Task({
+      git: true,
+      specs: [{
+        promptEffect: async (text) => {
+          if (text !== "edit-files") return;
+          await writeFile(join(setup_workspace(), "a.txt"), "alpha\nBETA\n");
+          await writeFile(join(setup_workspace(), "new.txt"), "brand new\n");
+          await rm(join(setup_workspace(), "b.txt"));
+        },
+      }],
+    });
+    function setup_workspace(): string { return setup.workspace; }
+    await setup.service.sendMessage(setup.taskId, "hello");
+    await waitForCompleted(setup.service, 1);
+    await setup.service.sendMessage(setup.taskId, "edit-files");
+    await waitForCompleted(setup.service, 2);
+    await waitForIdle(setup.service);
+    await eventuallyAsync(async () => (await task(setup)).runCheckpoints?.[1]?.status === "captured", "second captured");
+    const adapter = setup.adapters[0]!;
+    adapter.extensionHandler = rewindRuntime(["hello", "edit-files"], calls);
+    // The user stages something unrelated and edits an unrelated file.
+    await writeFile(join(setup.workspace, "staged.txt"), "staged by the user\n");
+    gitIn(setup.workspace, "add", "staged.txt");
+    await writeFile(join(setup.workspace, "keep.txt"), "keep, edited by the user\n");
+    const stagedBefore = gitIn(setup.workspace, "diff", "--cached");
+    const runIds = (await task(setup)).runCheckpoints!.map((checkpoint) => checkpoint.runId);
+    assert.equal((await task(setup)).rewind?.available, true);
+
+    const preview = await setup.service.previewRewind(setup.taskId, runIds[1]!);
+    assert.equal(preview.status, "ready");
+    if (preview.status !== "ready") return;
+    assert.equal(preview.plan.scope, "conversation_and_files");
+    assert.deepEqual(preview.plan.conversation, {
+      available: true, mode: "conversation_only", targetPromptIndex: 1, promptText: "edit-files",
+    });
+    assert.deepEqual(preview.plan.rolledBackRuns, [runIds[1]]);
+    assert.deepEqual(preview.plan.files, {
+      kind: "git", restore: ["a.txt", "b.txt"], remove: ["new.txt"], conflicts: [], truncated: false,
+    });
+    assert.deepEqual(preview.plan.cannotUndo.map((item) => item.kind), [
+      "network_and_mcp_effects", "git_commits_and_pushes", "memory_writes",
+    ]);
+    assert.equal(preview.plan.cannotUndo.every((item) => item.text.length > 20), true);
+    assert.deepEqual(calls, [{ sessionId: "fake-session", targetPromptIndex: 1, mode: "conversation_only", force: false }]);
+    assert.equal(await readFile(join(setup.workspace, "a.txt"), "utf8"), "alpha\nBETA\n", "a preview changes nothing");
+
+    const executed = await setup.service.executeRewind({ taskId: setup.taskId, runId: runIds[1]! });
+    assert.equal(executed.status, "rolled_back");
+    if (executed.status !== "rolled_back") return;
+    assert.deepEqual(executed.rolledBackRuns, [runIds[1]]);
+    assert.deepEqual([...executed.restoredFiles].sort(), ["a.txt", "b.txt"]);
+    assert.deepEqual(executed.removedFiles, ["new.txt"]);
+    assert.deepEqual(executed.failedFiles, []);
+    assert.equal(executed.draftRestored, true);
+    assert.deepEqual(calls.at(-1), { sessionId: "fake-session", targetPromptIndex: 1, mode: "conversation_only", force: true });
+    assert.equal(await readFile(join(setup.workspace, "a.txt"), "utf8"), "alpha\nbeta\n");
+    assert.equal(await readFile(join(setup.workspace, "b.txt"), "utf8"), "bravo\n");
+    assert.equal(existsSync(join(setup.workspace, "new.txt")), false);
+    assert.equal(await readFile(join(setup.workspace, "keep.txt"), "utf8"), "keep, edited by the user\n");
+    assert.equal(gitIn(setup.workspace, "diff", "--cached"), stagedBefore, "a change the user staged stays staged");
+
+    const after = await task(setup);
+    assert.equal(after.draft, "edit-files");
+    assert.deepEqual(after.runCheckpoints?.map((checkpoint) => [checkpoint.rolledBack, checkpoint.status]), [[false, "captured"], [true, "rolled_back"]]);
+    const rolledBackItems = after.timeline.filter((item) => item.rolledBack === true);
+    assert.equal(rolledBackItems.length > 0 && rolledBackItems.every((item) => item.runId === runIds[1]), true);
+    assert.equal(after.timeline.filter((item) => item.runId === runIds[0]).some((item) => item.rolledBack === true), false);
+    assert.equal(after.timeline.some((item) => item.kind === "notice" && /Rewound/u.test(item.text)), true);
+
+    assert.deepEqual(await setup.service.previewRewind(setup.taskId, runIds[1]!), { status: "refused", reason: "already_rolled_back" });
+    assert.deepEqual(await setup.service.previewRewind(setup.taskId, "run-unknown" as RunId), { status: "refused", reason: "run_not_found" });
+
+    // The session carries on from the rewound conversation, and the next rewind counts the Runs that remain.
+    await setup.service.sendMessage(setup.taskId, "after the rewind");
+    await waitForCompleted(setup.service, 3);
+    await waitForIdle(setup.service);
+    // The runtime dropped the rewound prompt, so its list now holds the surviving ones.
+    adapter.extensionHandler = rewindRuntime(["hello", "after the rewind"]);
+    const preview2 = await setup.service.previewRewind(setup.taskId, runIds[0]!);
+    assert.equal(preview2.status, "ready");
+    const thirdRun = (await task(setup)).runCheckpoints!.at(-1)!.runId;
+    assert.deepEqual(preview2.status === "ready" && preview2.plan.rolledBackRuns, [runIds[0], thirdRun],
+      "later Runs are undone with it, but a Run that was already rolled back is not counted twice");
+  });
+
+  it("refuses a rewind while a Run is active and when the official prompt list does not match Guild's turn order [F2]", async () => {
+    const setup = await f24Task({ git: true });
+    const runId = await holdTurn(setup);
+    assert.deepEqual(await setup.service.previewRewind(setup.taskId, runId), { status: "refused", reason: "run_active" });
+    assert.deepEqual(await setup.service.executeRewind({ taskId: setup.taskId, runId }), { status: "refused", reason: "run_active" });
+    assert.equal((await task(setup)).rewind?.available, false);
+    await setup.adapters[0]!.completeHeldPrompt();
+    await waitForRunState(setup.service, "completed");
+    await waitForIdle(setup.service);
+    await eventuallyAsync(async () => (await task(setup)).runCheckpoints?.[0]?.status === "captured", "captured");
+
+    const adapter = setup.adapters[0]!;
+    // Extra prompt on the official side (for example a turn Guild never saw): the index cannot be trusted.
+    adapter.extensionHandler = rewindRuntime(["wait-for-cancel", "something else"]);
+    assert.deepEqual(await setup.service.previewRewind(setup.taskId, runId), { status: "refused", reason: "prompt_index_mismatch" });
+    // Same count, but the prompt at that index is a different one.
+    adapter.extensionHandler = rewindRuntime(["a different first prompt"]);
+    assert.deepEqual(await setup.service.previewRewind(setup.taskId, runId), { status: "refused", reason: "prompt_index_mismatch" });
+    const requests = adapter.extensionRequests.map((request) => request.method);
+    assert.equal(requests.includes("_x.ai/rewind/execute"), false, "nothing was executed, not even a dry run");
+    adapter.extensionHandler = rewindRuntime(["wait-for-cancel"]);
+    assert.equal((await setup.service.previewRewind(setup.taskId, runId)).status, "ready");
+  });
+
+  it("offers files-only when the runtime has no rewind, labels it, and does not mark the Runs rolled back [F2]", async () => {
+    const setup = await f24Task({
+      git: true,
+      specs: [{
+        promptEffect: async (text) => {
+          if (text === "edit-files") await writeFile(join(setup_workspace(), "a.txt"), "alpha\nCHANGED\n");
+        },
+      }],
+    });
+    function setup_workspace(): string { return setup.workspace; }
+    await setup.service.sendMessage(setup.taskId, "edit-files");
+    await waitForCompleted(setup.service);
+    await waitForIdle(setup.service);
+    await eventuallyAsync(async () => (await task(setup)).runCheckpoints?.[0]?.status === "captured", "captured");
+    const runId = (await task(setup)).runCheckpoints![0]!.runId;
+    // No handler: every _x.ai/rewind/* answers -32601.
+    const preview = await setup.service.previewRewind(setup.taskId, runId);
+    assert.equal(preview.status, "ready");
+    if (preview.status !== "ready") return;
+    assert.equal(preview.plan.scope, "files_only");
+    assert.deepEqual(preview.plan.conversation, { available: false, reason: "unsupported" });
+    assert.deepEqual(preview.plan.files.kind === "git" && preview.plan.files.restore, ["a.txt"]);
+
+    assert.deepEqual(await setup.service.executeRewind({ taskId: setup.taskId, runId }), { status: "refused", reason: "conversation_rewind_unsupported" });
+    assert.equal(await readFile(join(setup.workspace, "a.txt"), "utf8"), "alpha\nCHANGED\n");
+    const filesOnly = await setup.service.executeRewind({ taskId: setup.taskId, runId, scope: "files_only" });
+    assert.equal(filesOnly.status, "rolled_back");
+    if (filesOnly.status !== "rolled_back") return;
+    assert.equal(filesOnly.scope, "files_only");
+    assert.deepEqual(filesOnly.rolledBackRuns, []);
+    assert.equal(filesOnly.draftRestored, false);
+    assert.equal(await readFile(join(setup.workspace, "a.txt"), "utf8"), "alpha\nbeta\n");
+    const after = await task(setup);
+    assert.equal(after.runCheckpoints?.[0]?.rolledBack, false);
+    assert.equal(after.draft, "");
+    assert.equal(after.timeline.some((item) => item.rolledBack === true), false);
+  });
+
+  it("uses the official file rewind (mode all) outside git and says shell file changes cannot be reverted [F2]", async () => {
+    const calls: Array<Record<string, unknown>> = [];
+    const setup = await f24Task();
+    await setup.service.sendMessage(setup.taskId, "hello");
+    await waitForCompleted(setup.service);
+    await waitForIdle(setup.service);
+    await eventuallyAsync(async () => (await task(setup)).runCheckpoints?.[0]?.status === "unavailable", "unavailable");
+    setup.adapters[0]!.extensionHandler = rewindRuntime(["hello"], calls);
+    const runId = (await task(setup)).runCheckpoints![0]!.runId;
+    const preview = await setup.service.previewRewind(setup.taskId, runId);
+    assert.equal(preview.status, "ready");
+    if (preview.status !== "ready") return;
+    assert.deepEqual(preview.plan.conversation, { available: true, mode: "all", targetPromptIndex: 0, promptText: "hello" });
+    assert.deepEqual(preview.plan.files, {
+      kind: "none", reason: "not_a_git_repo", runtimeRestore: ["tracked-by-runtime.txt"], runtimeConflicts: [],
+    });
+    assert.equal(preview.plan.cannotUndo.some((item) => item.kind === "shell_file_changes_without_git"), true);
+    const executed = await setup.service.executeRewind({ taskId: setup.taskId, runId });
+    assert.equal(executed.status, "rolled_back");
+    assert.deepEqual(calls.map((call) => [call["mode"], call["force"]]), [["all", false], ["all", false], ["all", true]]);
+    assert.deepEqual(executed.status === "rolled_back" && executed.restoredFiles, ["tracked-by-runtime.txt"]);
+  });
+
+  it("stops at conflicts the user introduced after a Run unless they are overwritten explicitly [F2]", async () => {
+    const calls: Array<Record<string, unknown>> = [];
+    const setup = await f24Task({
+      git: true,
+      specs: [{
+        promptEffect: async (text) => {
+          if (text === "edit-files") await writeFile(join(setup_workspace(), "a.txt"), "alpha\nBY THE RUN\n");
+        },
+      }],
+    });
+    function setup_workspace(): string { return setup.workspace; }
+    await setup.service.sendMessage(setup.taskId, "edit-files");
+    await waitForCompleted(setup.service);
+    await waitForIdle(setup.service);
+    await eventuallyAsync(async () => (await task(setup)).runCheckpoints?.[0]?.status === "captured", "captured");
+    setup.adapters[0]!.extensionHandler = rewindRuntime(["edit-files"], calls);
+    const runId = (await task(setup)).runCheckpoints![0]!.runId;
+    await writeFile(join(setup.workspace, "a.txt"), "alpha\nBY THE RUN\nand the user's own line\n");
+
+    const preview = await setup.service.previewRewind(setup.taskId, runId);
+    assert.deepEqual(preview.status === "ready" && preview.plan.files.kind === "git" && preview.plan.files.conflicts,
+      [{ path: "a.txt", reason: "modified_after_run" }]);
+    const blocked = await setup.service.executeRewind({ taskId: setup.taskId, runId });
+    assert.deepEqual(blocked, { status: "conflicts", conflicts: [{ path: "a.txt", reason: "modified_after_run" }] });
+    assert.equal(calls.some((call) => call["force"] === true), false, "nothing official was executed either");
+    assert.equal(await readFile(join(setup.workspace, "a.txt"), "utf8"), "alpha\nBY THE RUN\nand the user's own line\n");
+    const forced = await setup.service.executeRewind({ taskId: setup.taskId, runId, overwriteConflicts: true });
+    assert.equal(forced.status, "rolled_back");
+    assert.equal(await readFile(join(setup.workspace, "a.txt"), "utf8"), "alpha\nbeta\n");
+  });
+
+  it("still finishes the rewind and reports every file as failed when the file restore itself throws [F2]", async () => {
+    const throwing: GitCheckpointPort = {
+      ...gitCheckpoints,
+      restore: async () => { throw new Error("disk went away"); },
+    };
+    const setup = await f24Task({
+      git: true,
+      checkpoints: throwing,
+      specs: [{
+        promptEffect: async (text) => {
+          if (text === "edit-files") await writeFile(join(setup_workspace(), "a.txt"), "alpha\nCHANGED\n");
+        },
+      }],
+    });
+    function setup_workspace(): string { return setup.workspace; }
+    await setup.service.sendMessage(setup.taskId, "edit-files");
+    await waitForCompleted(setup.service);
+    await waitForIdle(setup.service);
+    await eventuallyAsync(async () => (await task(setup)).runCheckpoints?.[0]?.status === "captured", "captured");
+    setup.adapters[0]!.extensionHandler = rewindRuntime(["edit-files"]);
+    const runId = (await task(setup)).runCheckpoints![0]!.runId;
+    const executed = await setup.service.executeRewind({ taskId: setup.taskId, runId });
+    assert.equal(executed.status, "rolled_back");
+    if (executed.status !== "rolled_back") return;
+    assert.deepEqual(executed.restoredFiles, []);
+    assert.deepEqual(executed.failedFiles, [{ path: "a.txt", reason: "restore_failed" }]);
+    assert.equal(executed.draftRestored, true, "the conversation half already happened and is not lost");
+    assert.equal((await task(setup)).runCheckpoints?.[0]?.rolledBack, true);
+  });
+
+  it("offers no rewind at all when neither the conversation nor any file can be undone [F2]", async () => {
+    const setup = await f24Task();
+    await setup.service.sendMessage(setup.taskId, "hello");
+    await waitForCompleted(setup.service);
+    await waitForIdle(setup.service);
+    await eventuallyAsync(async () => (await task(setup)).runCheckpoints?.[0]?.status === "unavailable", "unavailable");
+    const runId = (await task(setup)).runCheckpoints![0]!.runId;
+    // Not a git folder and the runtime answers -32601 to every _x.ai/rewind/* request.
+    assert.deepEqual(await setup.service.previewRewind(setup.taskId, runId), { status: "refused", reason: "conversation_rewind_unsupported" });
+  });
+
+  it("leaves rolled-back Runs out of the local history when the session is reopened [F2]", async () => {
+    const setup = await f24Task({ specs: [{ sessionId: "rewind-history-session" }] });
+    await setup.service.sendMessage(setup.taskId, "hello");
+    await waitForCompleted(setup.service, 1);
+    await setup.service.sendMessage(setup.taskId, "to be undone");
+    await waitForCompleted(setup.service, 2);
+    await waitForIdle(setup.service);
+    setup.adapters[0]!.extensionHandler = rewindRuntime(["hello", "to be undone"]);
+    await eventuallyAsync(async () => (await task(setup)).runCheckpoints?.length === 2, "two checkpoints");
+    const runId = (await task(setup)).runCheckpoints![1]!.runId;
+    const executed = await setup.service.executeRewind({ taskId: setup.taskId, runId });
+    assert.equal(executed.status, "rolled_back");
+    await setup.service.close();
+    services.splice(services.indexOf(setup.service), 1);
+
+    // After a rewind the runtime's replay holds only the surviving timeline.
+    const reopened = createLiveDesktopService({
+      ...setup.options,
+      runtimeFactory: fakeRuntimeFactory([{
+        sessionId: "rewind-history-session",
+        resumeFails: true,
+        loadSession: true,
+        replayTurns: [{ user: "hello", assistant: "reply:hello" }],
+      }]),
+    });
+    services.push(reopened);
+    await reopened.bootstrap();
+    assert.equal((await reopened.sendMessage(setup.taskId, "carry on")).status, "started");
+    await waitForCompleted(reopened, 3);
+    const projected = (await reopened.bootstrap()).activeTask!;
+    assert.equal(projected.draft, "to be undone");
+    assert.equal(projected.timeline.filter((item) => item.rolledBack === true).length > 0, true);
+    // A branch made from the task leaves the undone Run behind.
+    const branch = await reopened.forkTask(setup.taskId);
+    assert.equal(branch.timeline.some((item) => item.kind === "user" && item.text === "to be undone"), false);
+    assert.equal(branch.timeline.some((item) => item.kind === "user" && item.text === "hello"), true);
+  });
+});
+
+function deferredPromise(): { readonly promise: Promise<void>; readonly resolve: () => void } {
+  let resolve!: () => void;
+  const promise = new Promise<void>((done) => { resolve = done; });
+  return { promise, resolve };
+}
+
 async function eventuallyAsync(
   predicate: () => boolean | Promise<boolean>,
   label = "condition",
@@ -5990,6 +6856,8 @@ type FakeRuntimeSpec = {
   readonly replayTurns?: readonly Readonly<{
     user: string;
     userChunks?: readonly string[];
+    /** Steers the runtime persisted inside this turn, replayed after its thought. */
+    interjections?: readonly string[];
     assistant?: string;
     thought?: string;
     toolOrder?: "before_assistant" | "after_assistant";
@@ -6015,6 +6883,8 @@ type FakeRuntimeSpec = {
   readonly configOptions?: readonly RuntimeConfigOption[];
   readonly promptResponses?: readonly string[];
   readonly promptDelayMs?: number;
+  /** Runs inside the fake `session/prompt`, before the turn streams: the agent "editing files". */
+  readonly promptEffect?: (text: string) => Promise<void>;
 };
 
 function fakeRuntimeFactory(
@@ -6049,6 +6919,7 @@ function fakeRuntimeFactory(
       spec.promptDelayMs ?? 0,
       spec.modelCatalog,
       spec.configRefusal,
+      spec.promptEffect,
     );
     onCreate?.(adapter);
     return {
@@ -6081,6 +6952,13 @@ class FakeAdapter implements RuntimeAdapterPort {
     }[];
   }> = [];
   streamBurstYielded = false;
+  /** Every `_x.ai/*` request the service sent, in order. */
+  readonly extensionRequests: Array<{ readonly method: string; readonly params: Readonly<Record<string, unknown>> }> = [];
+  /** Answers extension requests; without one every extension is unsupported (-32601). */
+  extensionHandler:
+    | ((method: string, params: Readonly<Record<string, unknown>>) =>
+      XaiExtensionOutcome<JsonValue> | Promise<XaiExtensionOutcome<JsonValue>>)
+    | undefined;
   cancelGate: Promise<void> | undefined;
   cancelFailure: Error | undefined;
   cancelSinkFailures = 0;
@@ -6120,6 +6998,7 @@ class FakeAdapter implements RuntimeAdapterPort {
     private readonly replayTurns: readonly Readonly<{
       user: string;
       userChunks?: readonly string[];
+      interjections?: readonly string[];
       assistant?: string;
       thought?: string;
       toolOrder?: "before_assistant" | "after_assistant";
@@ -6145,6 +7024,7 @@ class FakeAdapter implements RuntimeAdapterPort {
     private readonly promptDelayMs: number,
     private readonly modelCatalog: GrokModelCatalog | undefined,
     private readonly configRefusal: FakeRuntimeSpec["configRefusal"],
+    private readonly promptEffect?: (text: string) => Promise<void>,
   ) {}
 
   /** Delivers one allowlisted runtime signal exactly as the ACP adapter would. */
@@ -6184,6 +7064,95 @@ class FakeAdapter implements RuntimeAdapterPort {
   }
 
   async authenticate(): Promise<void> {}
+
+  async sendExtensionRequest(
+    method: string,
+    params: Readonly<Record<string, unknown>>,
+  ): Promise<XaiExtensionOutcome<JsonValue>> {
+    this.extensionRequests.push(Object.freeze({ method, params }));
+    if (this.state !== "ready") throw new AcpV1AdapterError("transport_lost");
+    if (this.extensionHandler === undefined) return Object.freeze({ status: "unsupported" as const });
+    return this.extensionHandler(method, params);
+  }
+
+  /** True once a `wait-for-cancel` fixture prompt is being held open. */
+  get isHoldingPrompt(): boolean {
+    return this.pendingCancellation !== undefined;
+  }
+
+  /** Ends the prompt a `wait-for-cancel` fixture holds open, the way the runtime ends a turn. */
+  async completeHeldPrompt(stopReason: "end_turn" | "cancelled" = "end_turn"): Promise<void> {
+    const pending = this.pendingCancellation;
+    if (pending === undefined) throw new Error("no held fixture prompt");
+    const terminal: RuntimePromptTerminalPayload = Object.freeze({
+      type: "prompt_terminal",
+      sessionId: pending.identity.sessionId,
+      stopReason,
+      classification: stopReason === "end_turn" ? "completed" : "cancelled",
+      received: received(),
+    });
+    await this.sink.commitPromptTerminal({ identity: pending.identity, terminal });
+    this.pendingCancellation = undefined;
+    pending.resolve(terminal);
+  }
+
+  /** The runtime echoes a Steer back, as `_x.ai/session/interjection` does. */
+  emitInterjectionEcho(interjectionId: string): void {
+    this.emitSignal({ kind: "session_interjection", interjectionId });
+  }
+
+  /**
+   * A turn the runtime starts itself (the prompt it makes from a Steer that missed its turn):
+   * attached through the agent-turn hook, streamed, then ended, with no `session/prompt` involved.
+   */
+  async runAgentTurn(input: {
+    readonly promptId: string;
+    readonly text?: string;
+    readonly assistant?: string;
+    readonly stopReason?: "end_turn" | "cancelled";
+  }): Promise<"attached" | "declined"> {
+    if (this.session === undefined) throw new Error("fake session missing");
+    this.promptSequence += 1;
+    const promptSequence = this.promptSequence;
+    const identity = { adapterEpoch: this.adapterEpoch, sessionId: this.session.sessionId, promptSequence };
+    try {
+      await this.sink.commitAgentTurnStarted?.({
+        identity,
+        agentPromptId: input.promptId,
+        ...(input.text === undefined ? {} : { promptText: input.text }),
+      });
+    } catch {
+      return "declined";
+    }
+    if (input.assistant !== undefined) {
+      await this.sink.commitUpdate({
+        identity: { adapterEpoch: this.adapterEpoch, sessionId: this.session.sessionId },
+        ingestMode: "live",
+        promptSequence,
+        update: {
+          type: "turn",
+          payload: {
+            type: "agent_text_chunk",
+            sessionId: this.session.sessionId,
+            text: input.assistant,
+            received: received(),
+          },
+        },
+      });
+    }
+    const stopReason = input.stopReason ?? "end_turn";
+    await this.sink.commitPromptTerminal({
+      identity,
+      terminal: {
+        type: "prompt_terminal",
+        sessionId: this.session.sessionId,
+        stopReason,
+        classification: stopReason === "end_turn" ? "completed" : "cancelled",
+        received: received(),
+      },
+    });
+    return "attached";
+  }
 
   async officialBilling() {
     this.billingCalls += 1;
@@ -6304,6 +7273,18 @@ class FakeAdapter implements RuntimeAdapterPort {
               type: "agent_thought_chunk",
               sessionId: this.sessionId,
               text: turn.thought,
+              received: received(),
+            },
+          });
+        }
+        for (const steer of turn.interjections ?? []) {
+          updates.push({
+            type: "turn",
+            interjection: true,
+            payload: {
+              type: "user_text_chunk",
+              sessionId: this.sessionId,
+              text: `<user_query>\n${steer}\n</user_query>`,
               received: received(),
             },
           });
@@ -6452,6 +7433,7 @@ class FakeAdapter implements RuntimeAdapterPort {
       throw transportError;
     }
     await this.sink.commitPromptAccepted({ identity, write: writeReceipt() });
+    await this.promptEffect?.(text);
     if (this.promptDelayMs > 0) {
       await new Promise((resolve) => setTimeout(resolve, this.promptDelayMs));
     }

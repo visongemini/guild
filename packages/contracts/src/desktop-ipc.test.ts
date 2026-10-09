@@ -591,3 +591,91 @@ test("per-task runtime settings parse a pinned pair, a full clear, and nothing i
     assert.throws(() => parseDesktopRequest(DESKTOP_IPC_CHANNELS.setTaskRuntimeSettings, rejected));
   }
 });
+
+test("Steer, rewind and run diff requests accept only their exact shape [F4, F2]", () => {
+  const taskId = "task-1";
+  const runId = "run-1";
+  assert.deepEqual(
+    parseDesktopRequest(DESKTOP_IPC_CHANNELS.steerMessage, { taskId, text: "go left\nthen right" }),
+    { taskId, text: "go left\nthen right" },
+  );
+  for (const rejected of [
+    { taskId, text: "" },
+    { taskId, text: "   \n" },
+    { taskId, text: "x".repeat(200_001) },
+    { taskId, text: "a\0b" },
+    { taskId, text: "hi", attachments: [] },
+    { taskId, text: "hi", mode: "continuous" },
+    { taskId: "", text: "hi" },
+    { text: "hi" },
+    null,
+    "hi",
+  ]) {
+    assert.throws(() => parseDesktopRequest(DESKTOP_IPC_CHANNELS.steerMessage, rejected), TypeError, JSON.stringify(rejected));
+  }
+
+  assert.deepEqual(
+    parseDesktopRequest(DESKTOP_IPC_CHANNELS.convertQueuedTurnToSteer, { taskId, queueId: "queue-7" }),
+    { taskId, queueId: "queue-7" },
+  );
+  assert.throws(() => parseDesktopRequest(DESKTOP_IPC_CHANNELS.convertQueuedTurnToSteer, { taskId, queueId: "" }));
+  assert.throws(() => parseDesktopRequest(DESKTOP_IPC_CHANNELS.convertQueuedTurnToSteer, { taskId, queueId: "q", text: "x" }));
+
+  assert.deepEqual(
+    parseDesktopRequest(DESKTOP_IPC_CHANNELS.previewRewind, { taskId, runId }),
+    { taskId, runId },
+  );
+  assert.throws(() => parseDesktopRequest(DESKTOP_IPC_CHANNELS.previewRewind, { taskId, runId, scope: "files_only" }));
+  assert.throws(() => parseDesktopRequest(DESKTOP_IPC_CHANNELS.previewRewind, { taskId }));
+
+  assert.deepEqual(
+    parseDesktopRequest(DESKTOP_IPC_CHANNELS.executeRewind, { taskId, runId }),
+    { taskId, runId },
+  );
+  assert.deepEqual(
+    parseDesktopRequest(DESKTOP_IPC_CHANNELS.executeRewind, {
+      taskId, runId, scope: "files_only", overwriteConflicts: true,
+    }),
+    { taskId, runId, scope: "files_only", overwriteConflicts: true },
+  );
+  for (const rejected of [
+    { taskId, runId, scope: "everything" },
+    { taskId, runId, scope: 1 },
+    { taskId, runId, overwriteConflicts: "yes" },
+    { taskId, runId, force: true },
+    { taskId },
+  ]) {
+    assert.throws(() => parseDesktopRequest(DESKTOP_IPC_CHANNELS.executeRewind, rejected), TypeError, JSON.stringify(rejected));
+  }
+
+  assert.deepEqual(
+    parseDesktopRequest(DESKTOP_IPC_CHANNELS.loadRunFileDiff, { taskId, runId, path: "src/dir/a.ts" }),
+    { taskId, runId, path: "src/dir/a.ts" },
+  );
+  for (const path of ["", "/etc/passwd", "\\windows", "../x", "a/../b", "a/..", "x".repeat(4_097), "a\0b"]) {
+    assert.throws(
+      () => parseDesktopRequest(DESKTOP_IPC_CHANNELS.loadRunFileDiff, { taskId, runId, path }),
+      TypeError,
+      JSON.stringify(path),
+    );
+  }
+  assert.throws(() => parseDesktopRequest(DESKTOP_IPC_CHANNELS.loadRunFileDiff, { taskId, runId, path: "a", oldPath: "b" }));
+});
+
+test("the new request channels are registered invoke channels and unknown names stay denied [F4, F2]", () => {
+  for (const channel of [
+    DESKTOP_IPC_CHANNELS.steerMessage,
+    DESKTOP_IPC_CHANNELS.convertQueuedTurnToSteer,
+    DESKTOP_IPC_CHANNELS.previewRewind,
+    DESKTOP_IPC_CHANNELS.executeRewind,
+    DESKTOP_IPC_CHANNELS.loadRunFileDiff,
+  ]) {
+    assert.match(channel, /^guild:v1:(run|queue):/u);
+    assert.equal((DESKTOP_EVENT_CHANNELS as readonly string[]).includes(channel), false);
+  }
+  assert.throws(
+    () => parseDesktopRequest("guild:v1:run:rewind:undo-everything" as never, { taskId: "task-1" }),
+    /unregistered_channel/u,
+  );
+  assert.equal(new Set(Object.values(DESKTOP_IPC_CHANNELS)).size, Object.values(DESKTOP_IPC_CHANNELS).length, "no channel name is reused");
+});

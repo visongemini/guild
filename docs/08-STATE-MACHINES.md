@@ -337,6 +337,38 @@ unresolved conflict discards/quarantines staging, retains local history and mark
 Live frames arriving before the replay barrier commits are rejected, not buffered into the timeline.
 After commit, a later user send creates a new Run and opens live admission under its own identity.
 
+## 7a. Steer interjections and run checkpoints (Guild 2.2, schema v17)
+
+These two small state machines hang off a Run; they never change the Run's own state.
+
+Interjection (`task_interjections`, one row per `_x.ai/interject` Guild sent):
+
+| From | Event | To |
+|---|---|---|
+| (none) | steer requested on a running, accepted turn | `sending` (intent durable, request not yet answered) |
+| `sending` | runtime answered `queued` (user entry created in the same transaction) | `pending`, or `delivered` when the echo already arrived |
+| `pending` | `_x.ai/session/interjection` echo with the same id, or the Run reaching a terminal state | `delivered` |
+| `sending` | `-32601`, rejection or transport error (notice entry created) | `fallen_back` (the text is then sent as an ordinary message) |
+| `sending` | converted queued turn that could not be steered | `failed` |
+| `sending` | application restart | `failed` (`interrupted`) |
+
+`startedRunId` links a Steer the runtime ran as its own turn to the Run created for that turn.
+A turn the runtime starts itself is attached to a new Run (`queued -> starting` by scheduler dispatch,
+`starting -> running` by the attach, terminal by `turn_completed`) only when no Run of the task is
+non-terminal; otherwise it is declined and its frames are dropped.
+
+Run checkpoint (`run_checkpoints`, one row per Run from schema v17 on):
+
+| From | Event | To |
+|---|---|---|
+| (none) | Run created, start capture begins | `capturing` |
+| `capturing` | start capture fails, times out, or the prompt had already been sent | `unavailable` (reason code kept) |
+| `capturing` | end capture and summary stored after the Run is terminal | `captured` |
+| `capturing` | application restart | `unavailable` (`capture_skipped`) |
+| `captured` / `unavailable` | a rewind undid this or an earlier Run | `rolled_back` (row kept for audit) |
+
+A rewind is only started and executed while no Run is non-terminal and no turn is queued.
+
 ## 8. Required transition tests
 
 Before the first production implementation commit, contract fixtures must cover every legal row and

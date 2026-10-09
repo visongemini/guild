@@ -34,11 +34,12 @@ test("the phase projection accepts only enum-like phases, counts and a bounded t
   assert.equal(isRunPhase("running"), false);
 });
 
-test("the extension allowlist is exactly the F1b set and nothing leaks in by prefix", () => {
+test("the extension allowlist is exactly the F1b set plus the Steer echo and nothing leaks in by prefix", () => {
   assert.deepEqual([...XAI_SIGNAL_NOTIFICATIONS].sort(), [
     "_x.ai/mcp/init_progress",
     "_x.ai/models/update",
     "_x.ai/queue/changed",
+    "_x.ai/session/interjection",
     "_x.ai/session/prompt_complete",
     "_x.ai/session/setup",
     "_x.ai/session_notification",
@@ -48,7 +49,7 @@ test("the extension allowlist is exactly the F1b set and nothing leaks in by pre
     "hook_execution", "hook_run_started", "interaction_resolved", "model_changed", "pending_interaction",
     "response_completed", "retry_state", "tool_call_delta_chunk", "turn_completed",
   ]);
-  for (const forbidden of ["_x.ai/mcp/servers_updated", "_x.ai/mcp/server_status", "_x.ai/settings/update", "_x.ai/session/interjection"]) {
+  for (const forbidden of ["_x.ai/mcp/servers_updated", "_x.ai/mcp/server_status", "_x.ai/settings/update", "_x.ai/session/fork", "_x.ai/rewind/execute"]) {
     assert.equal((XAI_SIGNAL_NOTIFICATIONS as readonly string[]).includes(forbidden), false, forbidden);
   }
 });

@@ -353,6 +353,11 @@ export function createFixtureDesktopService(): DesktopApplicationService {
     preemptQueuedTurn: async () => undefined,
     cancelQueuedTurn: async () => undefined,
     cancelRun: async () => undefined,
+    steerMessage: async () => { throw new Error("fixture_steer_unsupported"); },
+    convertQueuedTurnToSteer: async () => Object.freeze({ status: "unchanged" as const, reason: "unsupported" as const }),
+    previewRewind: async () => Object.freeze({ status: "refused" as const, reason: "runtime_unavailable" as const }),
+    executeRewind: async () => Object.freeze({ status: "refused" as const, reason: "runtime_unavailable" as const }),
+    loadRunFileDiff: async () => Object.freeze({ status: "unavailable" as const, reason: "no_checkpoint" as const }),
     decidePermission: async () => undefined,
     setDraft: async (taskId, text) => {
       if (taskId !== activeTask.task.taskId) throw new Error("fixture_task_not_found");

@@ -1,9 +1,12 @@
 import { performance } from "node:perf_hooks";
 import { types as nodeTypes } from "node:util";
 import {
+  classifyStopReason,
+  freezeRuntimePayload,
   parseGuildGrokContextWindow,
   parseGuildGrokModel,
   parseGuildGrokReasoningEffort,
+  type AcpPromptStopReason,
   type GuildGrokModel,
   type GuildGrokReasoningEffort,
   type RuntimePermissionRequestPayload,
@@ -71,6 +74,8 @@ import {
   XAI_EXTENSION_METHOD_PATTERN,
   isMethodNotFound,
   parseXaiNotification,
+  parseXaiQueueSnapshot,
+  promptIdOfSessionUpdate,
   type XaiExtensionOutcome,
 } from "./xai-extensions.js";
 import type {
@@ -275,6 +280,22 @@ export type AcpV1AdapterSink = {
     readonly identity: AcpV1AdapterPromptIdentity;
     readonly terminal: RuntimePromptTerminalPayload;
   }) => Promise<void>;
+  /**
+   * The runtime started a turn Guild did not send (for example the `interject-fallback-*` prompt it
+   * makes from a Steer that missed its turn): its first turn frame arrived while no prompt of Guild's
+   * was active. Resolve to attach the turn to a Run; the turn's frames then arrive through
+   * `commitUpdate` with the allocated prompt sequence and it ends through `commitPromptTerminal`.
+   * Reject to decline it: the adapter then drops the turn's frames and answers its permission
+   * requests with a cancellation, and the transport stays healthy. Without this hook an unexpected
+   * turn frame is a protocol fault, as before.
+   */
+  readonly commitAgentTurnStarted?: (event: {
+    readonly identity: AcpV1AdapterPromptIdentity;
+    /** The runtime's own id for the turn, from the frames' `_meta.promptId`. */
+    readonly agentPromptId?: string;
+    /** The user message the turn runs, from `_x.ai/queue/changed`; never logged by the adapter. */
+    readonly promptText?: string;
+  }) => Promise<void>;
   readonly commitCancelSent: (event: {
     readonly identity: AcpV1AdapterPromptIdentity;
     readonly write: JsonRpcWriteReceipt;
@@ -358,13 +379,30 @@ type Deferred<T> = {
 
 type ActivePrompt = {
   readonly acceptance: Deferred<void>;
-  readonly handle: JsonRpcRequestHandle;
+  /** The JSON-RPC request of a prompt Guild sent; absent for a turn the runtime started itself. */
+  readonly handle: JsonRpcRequestHandle | undefined;
+  readonly origin: "client" | "agent";
   readonly identity: AcpV1AdapterPromptIdentity;
   cancelOperation: Promise<JsonRpcWriteReceipt> | undefined;
   readonly permissionControllers: Set<AbortController>;
+  /** Settles when the prompt's terminal commit finished or the adapter failed. */
+  readonly settled: Deferred<void>;
+  /** The runtime's id for an agent-started turn, when its frames named one. */
+  readonly agentPromptId: string | undefined;
+  /** An agent-started turn the sink declined: its frames are dropped. */
+  discarded: boolean;
   responseProven: boolean;
   terminalCommitted: boolean;
 };
+
+/** Queue text the runtime announced, kept in memory only to name an agent-started turn. */
+type QueuedPromptTexts = {
+  runningPromptId: string | undefined;
+  runningText: string | undefined;
+  readonly byId: Map<string, string>;
+};
+const MAX_TRACKED_QUEUE_SESSIONS = 16;
+const MAX_TRACKED_QUEUE_TEXTS = 64;
 
 type SessionTransport = {
   readonly identity: AcpV1AdapterSessionIdentity;
@@ -451,6 +489,7 @@ export class AcpV1Adapter {
   private readonly stderrTail: string[] = [];
   private readonly auxiliaryUpdateTails = new Map<string, Promise<void>>();
   private readonly unsupportedExtensions = new Set<string>();
+  private readonly queuedPromptTexts = new Map<string, QueuedPromptTexts>();
 
   constructor(options: AcpV1AdapterOptions) {
     this.adapterEpoch = positiveSafeInteger(options.adapterEpoch, "adapterEpoch");
@@ -877,9 +916,13 @@ export class AcpV1Adapter {
     const active: ActivePrompt = {
       acceptance: deferred<void>(),
       handle,
+      origin: "client",
       identity,
       cancelOperation: undefined,
       permissionControllers: new Set(),
+      settled: deferred<void>(),
+      agentPromptId: undefined,
+      discarded: false,
       responseProven: false,
       terminalCommitted: false,
     };
@@ -931,6 +974,7 @@ export class AcpV1Adapter {
       }
       throw this.normalizeOperationFailure(cause);
     } finally {
+      active.settled.resolve();
       if (!responseAdmitted) {
         responseAdmission.resolve();
         this.responseAdmissions.delete(handle.id);
@@ -1106,7 +1150,7 @@ export class AcpV1Adapter {
     active: ActivePrompt,
   ): Promise<JsonRpcWriteReceipt> {
     try {
-      await active.handle.write;
+      if (active.handle !== undefined) await active.handle.write;
       this.assertSamePrompt(session, active);
       const write = await this.peer.sendNotification(
         ACP_V1_METHODS.sessionCancel,
@@ -1300,7 +1344,7 @@ export class AcpV1Adapter {
         session.identity.sessionId,
         this.receiveTimestamp(),
       );
-      const operation = this.routeUpdate(session, update);
+      const operation = this.routeUpdate(session, update, promptIdOfSessionUpdate(notification.params));
       await operation;
     } catch (cause: unknown) {
       const update = isNonArrayObject(notification.params)
@@ -1352,18 +1396,89 @@ export class AcpV1Adapter {
    * here without being decoded, stored or logged (`_x.ai/mcp/servers_updated` carries secrets).
    */
   private observeExtensionNotification(notification: JsonRpcInboundNotification): void {
-    if (this.sink.observeSignal === undefined || !notification.method.startsWith("_x.ai/")) return;
-    let envelope: XaiSignalEnvelope | undefined;
+    if (!notification.method.startsWith("_x.ai/")) return;
     try {
-      envelope = parseXaiNotification(
+      if (notification.method === "_x.ai/queue/changed") this.noteQueuedPromptTexts(notification.params);
+      const envelope = parseXaiNotification(
         notification.method,
         notification.params,
         this.clock.monotonicMs(),
       );
-      if (envelope !== undefined) this.sink.observeSignal(envelope);
+      if (envelope === undefined) return;
+      // The end of a turn the runtime started itself is only visible here.
+      this.onTurnEndSignal(envelope);
+      this.sink.observeSignal?.(envelope);
     } catch {
       // Display-only signals must never affect the transport.
     }
+  }
+
+  /** Remembers which text each queued prompt carries, so an agent-started turn can be named. */
+  private noteQueuedPromptTexts(params: JsonRpcParams | undefined): void {
+    const snapshot = parseXaiQueueSnapshot(params);
+    const sessionId = isNonArrayObject(params) && typeof params["sessionId"] === "string"
+      ? params["sessionId"]
+      : undefined;
+    if (snapshot === undefined || sessionId === undefined) return;
+    let tracked = this.queuedPromptTexts.get(sessionId);
+    if (tracked === undefined) {
+      tracked = { runningPromptId: undefined, runningText: undefined, byId: new Map() };
+      this.queuedPromptTexts.set(sessionId, tracked);
+      while (this.queuedPromptTexts.size > MAX_TRACKED_QUEUE_SESSIONS) {
+        const oldest = this.queuedPromptTexts.keys().next().value;
+        if (oldest === undefined) break;
+        this.queuedPromptTexts.delete(oldest);
+      }
+    }
+    tracked.runningPromptId = snapshot.runningPromptId;
+    tracked.runningText = snapshot.runningText;
+    for (const entry of snapshot.entries) {
+      tracked.byId.delete(entry.id);
+      tracked.byId.set(entry.id, entry.text);
+    }
+    while (tracked.byId.size > MAX_TRACKED_QUEUE_TEXTS) {
+      const oldest = tracked.byId.keys().next().value;
+      if (oldest === undefined) break;
+      tracked.byId.delete(oldest);
+    }
+  }
+
+  private queuedPromptText(sessionId: string, promptId: string | undefined): string | undefined {
+    const tracked = this.queuedPromptTexts.get(sessionId);
+    if (tracked === undefined) return undefined;
+    if (promptId !== undefined) {
+      if (tracked.runningPromptId === promptId && tracked.runningText !== undefined) {
+        return tracked.runningText;
+      }
+      return tracked.byId.get(promptId);
+    }
+    return tracked.runningText;
+  }
+
+  /** `turn_completed` / `prompt_complete` end a turn that has no JSON-RPC response to wait for. */
+  private onTurnEndSignal(envelope: XaiSignalEnvelope): void {
+    const signal = envelope.signal;
+    if ((signal.kind !== "turn_completed" && signal.kind !== "prompt_complete") || envelope.sessionId === null) {
+      return;
+    }
+    const session = this.sessions.get(envelope.sessionId);
+    if (
+      session === undefined ||
+      session.identity.adapterEpoch !== this.adapterEpoch ||
+      session.phase !== "ready" ||
+      this.sink.commitAgentTurnStarted === undefined
+    ) return;
+    void this.enqueueUpdate(session, () =>
+      this.finishAgentTurn(session, signal.stopReason, signal.promptId)
+    ).catch((cause: unknown) => {
+      if (this.currentState === "ready" && !this.faultQueued) {
+        this.fail(
+          isSinkLikeFailure(cause) ? "sink_fault" : "protocol_fault",
+          { type: "explicit_close", reason: "agent turn completion failed" },
+          true,
+        );
+      }
+    });
   }
 
   private async routeAuxiliaryUpdate(
@@ -1422,7 +1537,12 @@ export class AcpV1Adapter {
         this.unboundPermissionResponses.add(key);
         return { type: "result", result: jsonValue(encodeCancelledPermissionResult()) };
       }
-      const active = session.activePrompt;
+      let active = session.activePrompt;
+      if ((active === undefined || active.responseProven) && this.sink.commitAgentTurnStarted !== undefined) {
+        // A turn the runtime started itself may still be attaching: its frames are on the update tail.
+        await session.updateTail.catch(() => undefined);
+        active = session.activePrompt;
+      }
       if (active === undefined || active.responseProven) {
         throw new AcpV1AdapterError("stale_session_identity");
       }
@@ -1430,6 +1550,14 @@ export class AcpV1Adapter {
       this.assertSamePrompt(session, active);
       if (active.responseProven) {
         throw new AcpV1AdapterError("stale_session_identity");
+      }
+      if (active.discarded) {
+        // The sink declined this agent-started turn: nothing may be asked of the user for it.
+        if (this.pendingPermissionFlushes.has(key) || this.unboundPermissionResponses.has(key)) {
+          throw new AcpV1AdapterError("protocol_fault");
+        }
+        this.unboundPermissionResponses.add(key);
+        return { type: "result", result: jsonValue(encodeCancelledPermissionResult()) };
       }
       const permission = decodePermissionRequest(
         request.id,
@@ -1595,6 +1723,7 @@ export class AcpV1Adapter {
   private routeUpdate(
     session: SessionTransport,
     update: AcpV1DecodedUpdate,
+    promptId?: string,
   ): Promise<void> {
     if (session.phase === "replaying") {
       return this.enqueueUpdate(session, () => this.commitSink(() =>
@@ -1608,7 +1737,10 @@ export class AcpV1Adapter {
       update.type === "media_content" ||
       update.type === "unsupported_content";
     if (turnScoped && (active === undefined || active.responseProven)) {
-      return Promise.reject(new AcpV1AdapterError("stale_session_identity"));
+      if (this.sink.commitAgentTurnStarted === undefined) {
+        return Promise.reject(new AcpV1AdapterError("stale_session_identity"));
+      }
+      return this.routeAgentTurnUpdate(session, update, promptId);
     }
     return this.enqueueUpdate(session, async () => {
       if (session.phase === "committing") {
@@ -1629,6 +1761,134 @@ export class AcpV1Adapter {
         ),
       );
     });
+  }
+
+  /**
+   * A turn frame with no Guild prompt in flight belongs to a turn the runtime started itself. The
+   * frame waits for the previous prompt's terminal commit, then the turn is attached to a Run
+   * through the sink (once, on its first frame) and later frames follow it in order.
+   */
+  private routeAgentTurnUpdate(
+    session: SessionTransport,
+    update: AcpV1DecodedUpdate,
+    promptId: string | undefined,
+  ): Promise<void> {
+    return this.enqueueUpdate(session, async () => {
+      if (session.phase === "committing") {
+        await session.ready.promise;
+      }
+      let active = session.activePrompt;
+      if (active !== undefined && active.responseProven) {
+        await active.settled.promise;
+        active = session.activePrompt;
+      }
+      if (active === undefined) {
+        active = await this.startAgentTurn(session, promptId);
+      }
+      await active.acceptance.promise;
+      this.assertSamePrompt(session, active);
+      if (active.discarded) return;
+      await this.commitSink(() =>
+        this.sink.commitUpdate(
+          freeze({
+            identity: session.identity,
+            ingestMode: "live",
+            promptSequence: active.identity.promptSequence,
+            update,
+          }),
+        ),
+      );
+    });
+  }
+
+  private async startAgentTurn(
+    session: SessionTransport,
+    promptId: string | undefined,
+  ): Promise<ActivePrompt> {
+    if (!Number.isSafeInteger(this.promptSequence + 1)) {
+      throw new AcpV1AdapterError("operation_failed");
+    }
+    this.promptSequence += 1;
+    const identity = freeze({
+      ...session.identity,
+      promptSequence: this.promptSequence,
+    });
+    const active: ActivePrompt = {
+      acceptance: deferred<void>(),
+      handle: undefined,
+      origin: "agent",
+      identity,
+      cancelOperation: undefined,
+      permissionControllers: new Set(),
+      settled: deferred<void>(),
+      agentPromptId: promptId,
+      discarded: false,
+      responseProven: false,
+      terminalCommitted: false,
+    };
+    void active.acceptance.promise.catch(() => undefined);
+    session.activePrompt = active;
+    const promptText = this.queuedPromptText(session.identity.sessionId, promptId);
+    // A declined turn must not poison the ordered sink queue, so the rejection is absorbed here.
+    const outcome = await this.enqueueSink(session, async () => {
+      try {
+        await this.sink.commitAgentTurnStarted!(freeze({
+          identity,
+          ...(promptId === undefined ? {} : { agentPromptId: promptId }),
+          ...(promptText === undefined ? {} : { promptText }),
+        }));
+        return "attached" as const;
+      } catch {
+        return "declined" as const;
+      }
+    });
+    active.discarded = outcome === "declined";
+    active.acceptance.resolve();
+    return active;
+  }
+
+  /** Ends the agent-started turn (if one is running) when the runtime reports its completion. */
+  private async finishAgentTurn(
+    session: SessionTransport,
+    stopReason: string | undefined,
+    promptId: string | undefined,
+  ): Promise<void> {
+    const active = session.activePrompt;
+    if (active === undefined || active.origin !== "agent" || active.responseProven) return;
+    // Both ids known and different: the signal ends another turn. Without an id on one side the
+    // match cannot be proven, so only an id-less pair is accepted.
+    if (active.agentPromptId !== promptId) return;
+    active.responseProven = true;
+    this.abandonPendingPermissionPreparations(active);
+    if (!active.discarded) {
+      const terminal = this.agentTurnTerminal(session, stopReason);
+      await this.enqueueSink(session, () => this.commitSink(() =>
+        this.sink.commitPromptTerminal(freeze({ identity: active.identity, terminal })),
+      ));
+    }
+    this.assertPromptIdentity(session, active);
+    active.terminalCommitted = true;
+    session.activePrompt = undefined;
+    active.settled.resolve();
+  }
+
+  private agentTurnTerminal(
+    session: SessionTransport,
+    stopReason: string | undefined,
+  ): RuntimePromptTerminalPayload {
+    // Anything the runtime reports beyond the ACP stop reasons (for example an error) is a refusal.
+    const known: AcpPromptStopReason =
+      stopReason === "end_turn" || stopReason === "max_tokens" ||
+        stopReason === "max_turn_requests" || stopReason === "cancelled"
+        ? stopReason
+        : stopReason === undefined ? "end_turn" : "refusal";
+    return freezeRuntimePayload({
+      type: "prompt_terminal",
+      sessionId: session.identity.sessionId,
+      received: this.receiveTimestamp(),
+      stopReason: known,
+      classification: classifyStopReason(known),
+    }) as RuntimePromptTerminalPayload;
   }
 
   private enqueueUpdate(session: SessionTransport, operation: () => Promise<void>): Promise<void> {
@@ -1703,6 +1963,7 @@ export class AcpV1Adapter {
     for (const session of this.sessions.values()) {
       session.ready.reject(error);
       session.activePrompt?.acceptance.reject(error);
+      session.activePrompt?.settled.resolve();
       const activeAtFault = session.activePrompt;
       for (const controller of activeAtFault?.permissionControllers ?? []) {
         controller.abort(error);
