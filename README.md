@@ -2,7 +2,7 @@
 
 Guild 是 BDV 独立实现的、双语、本地优先的 macOS 桌面客户端，通过官方 `grok`
 进程使用 Grok，模型列表跟随官方运行时。Guild 2 不接入 MiniMax、Ornith 或其他第三方模型，也不提供
-OpenAI 兼容路由。当前源码版本为 **2.2.0**。
+OpenAI 兼容路由。当前源码版本为 **2.2.1**。
 
 ## 当前状态
 
@@ -21,7 +21,7 @@ Developer ID 签名与公证；开发者可按下方步骤在本机自行构建�
 
 ## 下载与安装
 
-普通用户可以从 GitHub Releases 下载 `Guild-2.2.0-arm64.dmg`，打开 DMG 后将 Guild
+普通用户可以从 GitHub Releases 下载 `Guild-2.2.1-arm64.dmg`，打开 DMG 后将 Guild
 拖入“应用程序”。当前安装包尚未经过 Apple 公证；macOS 首次启动若提示开发者无法
 验证，请在 Finder 中右键 Guild，选择“打开”，并再次确认。不要从第三方网站下载或
 执行来历不明的解除隔离命令。
@@ -35,7 +35,7 @@ cd guild
 npm ci
 npm test
 npm run package:desktop
-open apps/desktop/dist/Guild-2.2.0-arm64.dmg
+open apps/desktop/dist/Guild-2.2.1-arm64.dmg
 ```
 
 `npm ci` 会在首次安装时下载并校验与锁文件一致的 Electron 二进制；桌面构建也会再次
@@ -59,7 +59,7 @@ npm run start:desktop
 npm run package:desktop
 ```
 
-输出位于 `apps/desktop/dist/Guild-2.2.0-arm64.dmg`。未配置 Apple Developer ID
+输出位于 `apps/desktop/dist/Guild-2.2.1-arm64.dmg`。未配置 Apple Developer ID
 时只会生成临时签名构建；为使没有 Team ID 的 Electron 子组件能够启动，该内部构建
 显式关闭了 library validation。它不应作为面向公众的安装包发布。正式发行必须由同一
 Developer ID 签完整个应用、移除这项临时权限并完成公证。
@@ -89,14 +89,14 @@ Guild 自有源码以 [MIT License](LICENSE) 开源。官方 Grok 运行时、�
 ---
 
 Guild is BDV's independently implemented, bilingual, local-first macOS desktop client for
-the official `grok` process. The current source version is **2.2.0**.
+the official `grok` process. The current source version is **2.2.1**.
 
 The current branch contains the complete daily-use core: native workspace selection,
 workspace-owned tasks, multi-turn conversations, cancellation, durable follow-up queues,
 ACP permission choices, official usage display, inline image/audio rendering, local SQLite
 persistence, restart and sleep/wake recovery, bilingual UI, and a verified arm64 DMG build.
 
-Apple Silicon users can download `Guild-2.2.0-arm64.dmg` from GitHub Releases. The current
+Apple Silicon users can download `Guild-2.2.1-arm64.dmg` from GitHub Releases. The current
 build is not Apple-notarized; on first launch, use Finder's **Open** context-menu action and
 confirm macOS's warning. To build from source with Node.js 24 and npm 11:
 
@@ -106,7 +106,7 @@ cd guild
 npm ci
 npm test
 npm run package:desktop
-open apps/desktop/dist/Guild-2.2.0-arm64.dmg
+open apps/desktop/dist/Guild-2.2.1-arm64.dmg
 ```
 
 The install and desktop-build paths both prepare and verify the lockfile-pinned Electron binary.
