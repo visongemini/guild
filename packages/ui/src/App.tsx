@@ -56,6 +56,8 @@ import type {
   ConversationSearchResult,
   RuntimeCommand,
   PromptAttachment,
+  RunPhaseProjection,
+  SetTaskRuntimeSettingsResponse,
   TaskViewProjection,
   TaskSummaryProjection,
   TimelineItemProjection,
@@ -65,7 +67,6 @@ import {
   canonicalGuildExternalUrl,
   nicknameInitial,
   parseGuildNickname,
-  supportsGuildGrokReasoningEffort,
 } from "@guild/contracts/desktop-ipc";
 import {
   createContext,
@@ -111,6 +112,14 @@ import { messagesFor } from "./locales.js";
 import { continuousFooter } from "./continuous-display.js";
 import { ContinuousRoundRecord, ContinuousTaskCard, ContinuousCompletionRecord } from "./ContinuousTask.js";
 import { GrokControlCenter } from "./GrokControlCenter.js";
+import { ModelPicker } from "./ModelPicker.js";
+import { RunPhaseLine } from "./RunPhaseLine.js";
+import {
+  globalDefaultView,
+  modelPickerView,
+  selectionAfterModelChange,
+  type ModelSelectionChange,
+} from "./model-picker.js";
 import { clampContextMenuPosition } from "./popover-bounds.js";
 import { visibleRunStatus, type VisibleRunStatus } from "./run-status.js";
 import {
@@ -740,9 +749,23 @@ export function GuildApp({ api }: GuildAppProps) {
     : latestAssistant?.kind === "assistant"
       ? continuousFooter(latestAssistant.text)?.body ?? latestAssistant.text : "";
   const contextWindow = contextWindowView(activeTask?.contextWindow, projection.locale);
-  const selectedModel = projection.runtimeSettings.availableModels.find(
-    (model) => model.id === projection.runtimeSettings.model,
-  ) ?? projection.runtimeSettings.availableModels[0];
+  const modelCatalog = projection.runtimeSettings.modelCatalog;
+  // The names the active task will use next; the global default when no task is open.
+  const runtimeModelView = modelPickerView({
+    messages,
+    catalog: modelCatalog,
+    selection: activeTask?.modelSelection ?? Object.freeze({
+      modelId: projection.runtimeSettings.model,
+      reasoningEffort: projection.runtimeSettings.reasoningEffort,
+      source: projection.runtimeSettings.model === null ? "runtime" : "global",
+      canChange: false,
+    }),
+  });
+  const globalDefault = globalDefaultView({
+    catalog: modelCatalog,
+    model: projection.runtimeSettings.model,
+    reasoningEffort: projection.runtimeSettings.reasoningEffort,
+  });
   const activePendingSend = activeTask === undefined
     ? undefined
     : pendingSends.get(activeTask.task.taskId);
@@ -1214,6 +1237,23 @@ export function GuildApp({ api }: GuildAppProps) {
     }
   }
 
+  // Deliberately outside run(): the picker shows its own pending state and inline notice, and a
+  // model switch must not block the rest of the window or raise the global error banner.
+  async function applyTaskRuntimeSettings(change: ModelSelectionChange): Promise<SetTaskRuntimeSettingsResponse> {
+    const taskId = projection?.activeTask?.task.taskId;
+    if (taskId === undefined) throw new Error("no_active_task");
+    const response = await api.setTaskRuntimeSettings({
+      taskId,
+      model: change.model,
+      reasoningEffort: change.reasoningEffort,
+    });
+    // A refusal still returns the task with its previous selection, so it is always safe to adopt.
+    setProjection((current) => current === undefined || current.activeTask?.task.taskId !== response.task.task.taskId
+      ? current
+      : { ...current, activeTask: response.task });
+    return response;
+  }
+
   async function setSessionConfigOption(configId: string, value: string | boolean) {
     const taskId = projection?.activeTask?.task.taskId;
     if (taskId === undefined) return;
@@ -1264,8 +1304,8 @@ export function GuildApp({ api }: GuildAppProps) {
   }
 
   async function setRuntimeSettings(
-    model: GuildGrokModel,
-    reasoningEffort: GuildGrokReasoningEffort,
+    model: GuildGrokModel | null,
+    reasoningEffort: GuildGrokReasoningEffort | null,
     permissionMode: GuildGrokPermissionMode,
     startup?: GuildGrokStartupSettings,
   ) {
@@ -1976,6 +2016,7 @@ export function GuildApp({ api }: GuildAppProps) {
               items={activeTimeline}
               pendingUserText={pendingSendForActive?.text}
               runStatus={commandStatus === undefined ? runStatus : undefined}
+              runPhase={commandStatus === undefined ? activeTask.runPhase : undefined}
               locale={projection.locale}
               recentResult={activeTask.recentResult}
               continuousTask={activeTask.continuousTask}
@@ -2265,14 +2306,13 @@ export function GuildApp({ api }: GuildAppProps) {
                   ? messages.contextUsageCompact(contextWindow.usedLabel, contextWindow.sizeLabel, contextWindow.percent)
                   : messages.contextUsageUsedOnly(contextWindow.usedLabel)}</span>}
             </button>
-            <button
-              className="guild-runtime-summary"
-              type="button"
-              title={projection.runtimeVersion}
-              onClick={() => openSettings("grok")}
-            >
-              {(selectedModel?.name ?? projection.runtimeSettings.model)} · {messages.reasoningEffortName(projection.runtimeSettings.reasoningEffort)}
-            </button>
+            <ModelPicker
+              key={activeTask?.task.taskId ?? "no-task"}
+              messages={messages}
+              catalog={modelCatalog}
+              selection={activeTask?.modelSelection}
+              onApply={applyTaskRuntimeSettings}
+            />
           </div>
         </form>
       </main>
@@ -2516,8 +2556,8 @@ export function GuildApp({ api }: GuildAppProps) {
           diagnostics={projection.runtimeDiagnostics}
           runtimeSummary={Array.from(new Set([
             projection.runtimeVersion ?? "Grok Build",
-            selectedModel?.name ?? projection.runtimeSettings.model,
-            messages.reasoningEffortName(projection.runtimeSettings.reasoningEffort),
+            runtimeModelView.modelName,
+            ...(runtimeModelView.effortLabel === undefined ? [] : [runtimeModelView.effortLabel]),
           ])).join(" · ")}
           onClose={closeGrokControlCenter}
           onOpenSessionSettings={() => {
@@ -2629,26 +2669,31 @@ export function GuildApp({ api }: GuildAppProps) {
                   <label className="guild-setting-field">
                     <span className="guild-setting-label">{messages.model}</span>
                     <select
-                      value={projection.runtimeSettings.model}
-                      disabled={busy || !projection.runtimeSettings.canChange}
+                      value={projection.runtimeSettings.model ?? ""}
+                      disabled={busy}
                       onChange={(event) => {
-                        const model = projection.runtimeSettings.availableModels.find(
-                          (candidate) => candidate.id === event.currentTarget.value,
+                        const modelId = event.currentTarget.value;
+                        if (modelId === "") {
+                          void setRuntimeSettings(null, null, projection.runtimeSettings.permissionMode);
+                          return;
+                        }
+                        const change = selectionAfterModelChange(
+                          modelCatalog,
+                          modelId,
+                          projection.runtimeSettings.reasoningEffort,
                         );
-                        if (model === undefined) return;
-                        const currentEffort = projection.runtimeSettings.reasoningEffort;
-                        const reasoningEffort = supportsGuildGrokReasoningEffort(
-                          model.id,
-                          currentEffort,
-                        ) ? currentEffort : model.defaultReasoningEffort;
                         void setRuntimeSettings(
-                          model.id,
-                          reasoningEffort,
+                          change.model,
+                          change.reasoningEffort,
                           projection.runtimeSettings.permissionMode,
                         );
                       }}
                     >
-                      {projection.runtimeSettings.availableModels.map((model) => (
+                      <option value="">{messages.runtimeDefaultOption}</option>
+                      {globalDefault.unlistedModelId !== undefined && (
+                        <option value={globalDefault.unlistedModelId}>{globalDefault.unlistedModelId}</option>
+                      )}
+                      {modelCatalog.models.map((model) => (
                         <option key={model.id} value={model.id}>{model.name}</option>
                       ))}
                     </select>
@@ -2656,16 +2701,21 @@ export function GuildApp({ api }: GuildAppProps) {
                   <label className="guild-setting-field">
                     <span className="guild-setting-label">{messages.reasoningEffort}</span>
                     <select
-                      value={projection.runtimeSettings.reasoningEffort}
-                      disabled={busy || !projection.runtimeSettings.canChange}
+                      value={globalDefault.effortId ?? ""}
+                      disabled={busy || globalDefault.efforts.length === 0}
                       onChange={(event) => void setRuntimeSettings(
                         projection.runtimeSettings.model,
-                        event.currentTarget.value as GuildGrokReasoningEffort,
+                        event.currentTarget.value,
                         projection.runtimeSettings.permissionMode,
                       )}
                     >
-                      {(selectedModel?.reasoningEfforts ?? []).map((effort) => (
-                        <option key={effort} value={effort}>{messages.reasoningEffortName(effort)}</option>
+                      {globalDefault.efforts.length === 0 && (
+                        <option value="">{messages.reasoningFollowsRuntimeDefault}</option>
+                      )}
+                      {globalDefault.efforts.map((effort) => (
+                        <option key={effort.id} value={effort.id}>
+                          {messages.reasoningEffortName(effort.id, effort.label)}
+                        </option>
                       ))}
                     </select>
                   </label>
@@ -3214,6 +3264,8 @@ type TimelineProps = {
   readonly items: readonly TimelineItemProjection[];
   readonly pendingUserText?: string;
   readonly runStatus?: VisibleRunStatus;
+  /** Phase of the running turn; replaces the legacy status line while present. */
+  readonly runPhase?: RunPhaseProjection;
   readonly locale: GuildLocale;
   readonly recentResult?: TaskViewProjection["recentResult"];
   readonly continuousTask?: TaskViewProjection["continuousTask"];
@@ -3223,7 +3275,7 @@ type TimelineProps = {
 /** The newest groups always render fully so growth and scrolling at the bottom stay exact. */
 const LIVE_TAIL_GROUPS = 3;
 
-const Timeline = memo(function Timeline({ items, pendingUserText, runStatus, locale, recentResult, continuousTask, highlightedSequence, onOpenExternal, onPermissionDecision, onBranch, onRetryToDraft, onOpenRuntimeDiagnostics }: TimelineProps) {
+const Timeline = memo(function Timeline({ items, pendingUserText, runStatus, runPhase, locale, recentResult, continuousTask, highlightedSequence, onOpenExternal, onPermissionDecision, onBranch, onRetryToDraft, onOpenRuntimeDiagnostics }: TimelineProps) {
   const messages = messagesFor(locale);
   const groups = useMemo(() => groupTimeline(items), [items]);
   const handlers = useMemo(() => Object.freeze({
@@ -3265,7 +3317,9 @@ const Timeline = memo(function Timeline({ items, pendingUserText, runStatus, loc
       <div className="guild-message-body"><MarkdownText text={pendingUserText} locale={locale} onOpenExternal={onOpenExternal} /></div>
       <SpinnerGap size={12} className="guild-spin" aria-label={messages.connectingRuntime} />
     </article>
-  )}{runStatus !== undefined && <RunStatusLine status={runStatus} locale={locale} />}</div>;
+  )}{runPhase !== undefined
+    ? <RunPhaseLine projection={runPhase} locale={locale} />
+    : runStatus !== undefined && <RunStatusLine status={runStatus} locale={locale} />}</div>;
 }, (previous, next) =>
   previous.items === next.items &&
   previous.pendingUserText === next.pendingUserText &&
@@ -3279,7 +3333,8 @@ const Timeline = memo(function Timeline({ items, pendingUserText, runStatus, loc
   previous.onRetryToDraft === next.onRetryToDraft &&
   previous.onOpenRuntimeDiagnostics === next.onOpenRuntimeDiagnostics &&
   previous.runStatus?.stage === next.runStatus?.stage &&
-  previous.runStatus?.startedAtMs === next.runStatus?.startedAtMs);
+  previous.runStatus?.startedAtMs === next.runStatus?.startedAtMs &&
+  previous.runPhase === next.runPhase);
 
 /** Finished rows can skip layout and paint while off screen (content-visibility: auto). */
 function isSettledTimelineItem(item: TimelineItemProjection): boolean {

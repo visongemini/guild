@@ -1,0 +1,150 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import {
+  EMPTY_GROK_MODEL_CATALOG,
+  defaultReasoningEffortOf,
+  freezeGrokModelCatalog,
+  grokModelById,
+  isOfficialGrokModelId,
+  modelSupportsReasoningEffort,
+  parseGuildGrokContextWindow,
+  parseGuildGrokModel,
+  parseGuildGrokReasoningEffort,
+  resolveEffectiveSelection,
+  runtimeDefaultModelOf,
+  selectionOptionsOf,
+  sessionSelectionOf,
+  type GrokModelCatalog,
+} from "./grok-models.js";
+
+const effort = (id: string, isDefault = false) => ({ id, label: id.toUpperCase(), description: `${id} d`, isDefault });
+const rawCatalog = {
+  runtimeDefaultModelId: "grok-4.7",
+  models: [
+    { id: "grok-4.7", name: "Grok 4.7", description: "frontier", reasoningEfforts: [effort("xhigh"), effort("high", true), effort("medium"), effort("low")], contextWindows: [256_000, 500_000], defaultContextWindow: 256_000, agentType: "grok-build-plan" },
+    { id: "grok-4.7-build-fast", name: "Grok 4.7 Fast", description: "Fast variant. 2x the price.", reasoningEfforts: [effort("high", true)], contextWindows: [256_000] },
+    { id: "grok-4.5", name: "Grok 4.5", reasoningEfforts: [effort("high", true), effort("medium"), effort("low")], contextWindows: [] },
+    { id: "grok-plain", name: "No efforts", reasoningEfforts: [], contextWindows: [] },
+  ],
+};
+
+test("model ids and efforts are bounded identifiers, with xAI models only (D-011)", () => {
+  for (const good of ["grok-4.7", "grok-4.7-build-fast", "grok-5", "grok-code_fast:1", `grok-${"x".repeat(59)}`]) {
+    assert.equal(parseGuildGrokModel(good), good);
+    assert.equal(isOfficialGrokModelId(good), true);
+  }
+  for (const bad of [
+    "", "grok-", "Grok-4.7", "MiniMax-M3", "ornith-1.5", "grok 4.7", "grok-4.7/x", "grok-4.7;", "grok-é",
+    `grok-${"x".repeat(60)}`, "../grok-4.7", "grok-4.7\n", 4, null, undefined, {}, ["grok-4.7"],
+  ]) {
+    assert.throws(() => parseGuildGrokModel(bad), /invalid_grok_model/u, String(bad));
+    if (typeof bad === "string") assert.equal(isOfficialGrokModelId(bad), false, bad);
+  }
+  for (const good of ["xhigh", "high", "low", "ultra", "a", "max-2", "very_high"]) {
+    assert.equal(parseGuildGrokReasoningEffort(good), good);
+  }
+  for (const bad of ["", "High", "1x", "-x", "x y", "a".repeat(33), 1, null]) {
+    assert.throws(() => parseGuildGrokReasoningEffort(bad), /invalid_grok_reasoning_effort/u, String(bad));
+  }
+  assert.equal(parseGuildGrokContextWindow(500_000), 500_000);
+  for (const bad of [0, -1, 1.5, 100_000_001, "500000", Number.NaN, null]) {
+    assert.throws(() => parseGuildGrokContextWindow(bad), /invalid_grok_context_window/u, String(bad));
+  }
+});
+
+test("a catalog is validated strictly, copied and deep-frozen", () => {
+  const catalog = freezeGrokModelCatalog(rawCatalog);
+  assert.equal(Object.isFrozen(catalog), true);
+  assert.equal(Object.isFrozen(catalog.models[0]), true);
+  assert.equal(Object.isFrozen(catalog.models[0]?.reasoningEfforts[0]), true);
+  assert.deepEqual(catalog.models.map((model) => model.id), ["grok-4.7", "grok-4.7-build-fast", "grok-4.5", "grok-plain"]);
+  assert.deepEqual(freezeGrokModelCatalog(JSON.parse(JSON.stringify(catalog))), catalog, "round trips through the JSON cache");
+  assert.deepEqual(freezeGrokModelCatalog({ models: [] }), EMPTY_GROK_MODEL_CATALOG);
+
+  const mutate = (change: (copy: typeof rawCatalog) => void): unknown => {
+    const copy = JSON.parse(JSON.stringify(rawCatalog)) as typeof rawCatalog;
+    change(copy);
+    return copy;
+  };
+  const rejected: Array<[string, unknown]> = [
+    ["not an object", "catalog"],
+    ["extra root key", { ...rawCatalog, extra: 1 }],
+    ["unofficial model", mutate((c) => { c.models[0]!.id = "MiniMax-M3"; })],
+    ["duplicate model", mutate((c) => { c.models[1]!.id = "grok-4.7"; })],
+    ["default not in list", { ...rawCatalog, runtimeDefaultModelId: "grok-9" }],
+    ["two default efforts", mutate((c) => { c.models[0]!.reasoningEfforts[0]!.isDefault = true; })],
+    ["duplicate effort", mutate((c) => { c.models[0]!.reasoningEfforts[1]!.id = "xhigh"; })],
+    ["bad effort id", mutate((c) => { c.models[0]!.reasoningEfforts[0]!.id = "Extra High"; })],
+    ["extra model key", mutate((c) => { (c.models[0] as Record<string, unknown>)["secret"] = "x"; })],
+    ["empty name", mutate((c) => { c.models[0]!.name = ""; })],
+    ["long description", mutate((c) => { c.models[0]!.description = "d".repeat(513); })],
+    ["too many windows", mutate((c) => { c.models[0]!.contextWindows = [1, 2, 3, 4, 5]; })],
+    ["bad window", mutate((c) => { c.models[0]!.contextWindows = [0]; })],
+    ["too many models", { models: Array.from({ length: 33 }, (_, i) => ({ id: `grok-${i}`, name: "n", reasoningEfforts: [], contextWindows: [] })) }],
+  ];
+  for (const [label, value] of rejected) {
+    assert.throws(() => freezeGrokModelCatalog(value), /grok_model_catalog_/u, label);
+  }
+});
+
+test("helpers read defaults, effort support and the runtime default from the catalog", () => {
+  const catalog = freezeGrokModelCatalog(rawCatalog);
+  assert.equal(runtimeDefaultModelOf(catalog)?.id, "grok-4.7");
+  assert.equal(runtimeDefaultModelOf({ models: catalog.models })?.id, "grok-4.7", "falls back to the first model");
+  assert.equal(runtimeDefaultModelOf(undefined), undefined);
+  assert.equal(runtimeDefaultModelOf(EMPTY_GROK_MODEL_CATALOG), undefined);
+  assert.equal(defaultReasoningEffortOf(grokModelById(catalog, "grok-4.5")), "high");
+  assert.equal(defaultReasoningEffortOf(grokModelById(catalog, "grok-plain")), undefined);
+  assert.equal(modelSupportsReasoningEffort(grokModelById(catalog, "grok-4.5"), "xhigh"), false);
+  assert.equal(modelSupportsReasoningEffort(grokModelById(catalog, "grok-4.7"), "xhigh"), true);
+  assert.equal(grokModelById(catalog, "nope"), undefined);
+  assert.equal(grokModelById(catalog, null), undefined);
+});
+
+test("selection is task override, then global default, then the runtime default, and always a valid pair", () => {
+  const catalog: GrokModelCatalog = freezeGrokModelCatalog(rawCatalog);
+  const none = { modelId: null, reasoningEffort: null } as const;
+  assert.deepEqual(resolveEffectiveSelection({ global: none, catalog }), {
+    modelId: "grok-4.7", reasoningEffort: "high", source: "runtime",
+  });
+  assert.deepEqual(resolveEffectiveSelection({ global: none }), {
+    modelId: null, reasoningEffort: null, source: "runtime",
+  });
+  assert.deepEqual(resolveEffectiveSelection({ global: { modelId: "grok-4.5", reasoningEffort: "low" }, catalog }), {
+    modelId: "grok-4.5", reasoningEffort: "low", source: "global",
+  });
+  assert.deepEqual(resolveEffectiveSelection({
+    task: { modelId: "grok-4.7", reasoningEffort: "xhigh" },
+    global: { modelId: "grok-4.5", reasoningEffort: "low" },
+    catalog,
+  }), { modelId: "grok-4.7", reasoningEffort: "xhigh", source: "task" });
+  // A pinned effort the selected model does not offer is replaced by that model's default.
+  assert.deepEqual(resolveEffectiveSelection({
+    task: { modelId: "grok-4.5", reasoningEffort: "xhigh" }, global: none, catalog,
+  }), { modelId: "grok-4.5", reasoningEffort: "high", source: "task" });
+  // A model without efforts has none.
+  assert.deepEqual(resolveEffectiveSelection({
+    global: { modelId: "grok-plain", reasoningEffort: "high" }, catalog,
+  }), { modelId: "grok-plain", reasoningEffort: null, source: "global" });
+  // Task effort only: model still comes from the global default.
+  assert.deepEqual(resolveEffectiveSelection({
+    task: { modelId: null, reasoningEffort: "low" }, global: { modelId: "grok-4.5", reasoningEffort: null }, catalog,
+  }), { modelId: "grok-4.5", reasoningEffort: "low", source: "task" });
+  // Without a catalog the pinned values are kept as they are.
+  assert.deepEqual(resolveEffectiveSelection({ global: { modelId: "grok-4.6", reasoningEffort: "xhigh" } }), {
+    modelId: "grok-4.6", reasoningEffort: "xhigh", source: "global",
+  });
+});
+
+test("the session's own official options give its model and effort", () => {
+  const options = [
+    { id: "model", category: "model", type: "select", currentValue: "grok-4.7" },
+    { id: "reasoning_effort", category: "thought_level", type: "select", currentValue: "low" },
+    { id: "web", category: null, type: "boolean", currentValue: true },
+  ] as const;
+  assert.deepEqual(sessionSelectionOf(options), { modelId: "grok-4.7", reasoningEffort: "low" });
+  assert.equal(selectionOptionsOf(options).model?.id, "model");
+  assert.equal(selectionOptionsOf(options).effort?.id, "reasoning_effort");
+  assert.deepEqual(sessionSelectionOf([]), {});
+  assert.deepEqual(sessionSelectionOf([{ id: "model", category: "model", type: "boolean", currentValue: true }]), {});
+});

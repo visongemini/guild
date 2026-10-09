@@ -1,7 +1,7 @@
 import type { DatabaseSync } from "node:sqlite";
 import { persistenceError } from "./errors.js";
 
-export const SCHEMA_VERSION = 15;
+export const SCHEMA_VERSION = 16;
 
 const MIGRATION_V1 = String.raw`
 CREATE TABLE schema_migrations (
@@ -1003,6 +1003,120 @@ INSERT INTO schema_migrations(version, name, applied_at_ms)
 VALUES(15, 'streaming_write_path_and_context_usage', CAST(unixepoch('subsec') * 1000 AS INTEGER));
 `;
 
+// V16 (F1: model and reasoning effort follow the official runtime list).
+// 1. app_settings no longer hard-codes two models and four efforts. grok_model and
+//    reasoning_effort accept any bounded safe identifier (an official model id starts with
+//    `grok-`), and the empty string is the sentinel for "follow the runtime's advertised
+//    default". Every other column and CHECK is copied unchanged.
+// 2. One-time data rewrite, approved by the owner on 2026-10-09: exactly the old pair
+//    (grok-4.6, xhigh) becomes (grok-4.7, high). Every other pair is left as the owner set it.
+//    revision and updated_at_ms are not touched, like every other migration. A brand-new
+//    database walks V1..V16 and ends on the sentinel instead (MIGRATION_V16_FRESH_INSTALL).
+// 3. task_runtime_settings holds per-task overrides of the global default; a row is an override
+//    and a NULL column inherits. runtime_model_catalog caches the last model list the official
+//    runtime advertised, so the UI can show choices before any session exists.
+const MIGRATION_V16 = String.raw`
+CREATE TABLE guild_meta_next (
+  singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+  schema_version INTEGER NOT NULL CHECK(schema_version = 16),
+  clean_shutdown INTEGER NOT NULL CHECK(clean_shutdown IN (0, 1)),
+  last_integrity_at_ms INTEGER CHECK(last_integrity_at_ms IS NULL OR last_integrity_at_ms >= 0)
+) STRICT;
+
+INSERT INTO guild_meta_next(singleton, schema_version, clean_shutdown, last_integrity_at_ms)
+SELECT singleton, 16, clean_shutdown, last_integrity_at_ms FROM guild_meta;
+
+DROP TABLE guild_meta;
+ALTER TABLE guild_meta_next RENAME TO guild_meta;
+
+CREATE TABLE app_settings_next (
+  singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+  locale TEXT NOT NULL CHECK(locale IN ('zh-CN', 'en-US')),
+  sidebar_width INTEGER NOT NULL CHECK(sidebar_width BETWEEN 220 AND 600),
+  browser_sync_enabled INTEGER NOT NULL CHECK(browser_sync_enabled IN (0, 1)),
+  revision INTEGER NOT NULL CHECK(revision >= 1),
+  updated_at_ms INTEGER NOT NULL CHECK(updated_at_ms >= 0),
+  grok_model TEXT NOT NULL CHECK(grok_model = '' OR (
+    length(grok_model) BETWEEN 1 AND 64
+    AND grok_model GLOB 'grok-*'
+    AND grok_model NOT GLOB '*[^A-Za-z0-9._:-]*'
+  )),
+  reasoning_effort TEXT NOT NULL CHECK(reasoning_effort = '' OR (
+    length(reasoning_effort) BETWEEN 1 AND 32
+    AND reasoning_effort GLOB '[a-z]*'
+    AND reasoning_effort NOT GLOB '*[^a-z0-9_-]*'
+  )),
+  nickname TEXT NOT NULL CHECK(length(nickname) BETWEEN 1 AND 512),
+  avatar_filename TEXT CHECK(avatar_filename IS NULL OR length(avatar_filename) BETWEEN 1 AND 80),
+  restore_last_task INTEGER NOT NULL CHECK(restore_last_task IN (0, 1)),
+  new_task_workspace_mode TEXT NOT NULL CHECK(new_task_workspace_mode IN ('ask', 'last')),
+  last_active_task_id TEXT CHECK(last_active_task_id IS NULL OR length(last_active_task_id) BETWEEN 1 AND 512),
+  last_workspace_id TEXT CHECK(last_workspace_id IS NULL OR length(last_workspace_id) BETWEEN 1 AND 512),
+  permission_mode TEXT NOT NULL CHECK(permission_mode IN (
+    'default', 'acceptEdits', 'auto', 'dontAsk', 'bypassPermissions', 'plan'
+  )),
+  web_search_enabled INTEGER NOT NULL CHECK(web_search_enabled IN (0, 1)),
+  plan_enabled INTEGER NOT NULL CHECK(plan_enabled IN (0, 1)),
+  subagents_enabled INTEGER NOT NULL CHECK(subagents_enabled IN (0, 1)),
+  max_turns INTEGER CHECK(max_turns IS NULL OR max_turns BETWEEN 1 AND 10000),
+  task_notifications_enabled INTEGER NOT NULL CHECK(task_notifications_enabled IN (0, 1))
+) STRICT;
+
+INSERT INTO app_settings_next(
+  singleton, locale, sidebar_width, browser_sync_enabled, revision, updated_at_ms,
+  grok_model, reasoning_effort, nickname, avatar_filename, restore_last_task,
+  new_task_workspace_mode, last_active_task_id, last_workspace_id, permission_mode,
+  web_search_enabled, plan_enabled, subagents_enabled, max_turns,
+  task_notifications_enabled
+)
+SELECT singleton, locale, sidebar_width, browser_sync_enabled, revision, updated_at_ms,
+  grok_model, reasoning_effort, nickname, avatar_filename, restore_last_task,
+  new_task_workspace_mode, last_active_task_id, last_workspace_id, permission_mode,
+  web_search_enabled, plan_enabled, subagents_enabled, max_turns,
+  task_notifications_enabled
+FROM app_settings;
+
+DROP TABLE app_settings;
+ALTER TABLE app_settings_next RENAME TO app_settings;
+
+UPDATE app_settings
+SET grok_model = 'grok-4.7', reasoning_effort = 'high'
+WHERE grok_model = 'grok-4.6' AND reasoning_effort = 'xhigh';
+
+CREATE TABLE task_runtime_settings (
+  task_id TEXT PRIMARY KEY REFERENCES tasks(task_id) ON DELETE RESTRICT,
+  model_id TEXT CHECK(model_id IS NULL OR (
+    length(model_id) BETWEEN 1 AND 64
+    AND model_id GLOB 'grok-*'
+    AND model_id NOT GLOB '*[^A-Za-z0-9._:-]*'
+  )),
+  reasoning_effort TEXT CHECK(reasoning_effort IS NULL OR (
+    length(reasoning_effort) BETWEEN 1 AND 32
+    AND reasoning_effort GLOB '[a-z]*'
+    AND reasoning_effort NOT GLOB '*[^a-z0-9_-]*'
+  )),
+  context_window INTEGER CHECK(context_window IS NULL OR context_window BETWEEN 1 AND 100000000),
+  revision INTEGER NOT NULL CHECK(revision >= 1),
+  updated_at_ms INTEGER NOT NULL CHECK(updated_at_ms >= 0)
+) STRICT;
+
+CREATE TABLE runtime_model_catalog (
+  singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+  catalog_json TEXT NOT NULL CHECK(length(catalog_json) BETWEEN 2 AND 262144),
+  runtime_version TEXT CHECK(runtime_version IS NULL OR length(runtime_version) BETWEEN 1 AND 128),
+  updated_at_ms INTEGER NOT NULL CHECK(updated_at_ms >= 0)
+) STRICT;
+
+INSERT INTO schema_migrations(version, name, applied_at_ms)
+VALUES(16, 'runtime_model_catalog_and_task_settings', CAST(unixepoch('subsec') * 1000 AS INTEGER));
+`;
+
+// Only a database created from scratch (user_version 0) runs this, inside the same transaction
+// as MIGRATION_V16, so a new install follows the runtime default instead of the rewritten pair.
+const MIGRATION_V16_FRESH_INSTALL = String.raw`
+UPDATE app_settings SET grok_model = '', reasoning_effort = '';
+`;
+
 type IntegerRow = Record<string, unknown>;
 
 function exactInteger(row: IntegerRow | undefined, key: string): number {
@@ -1021,6 +1135,7 @@ export function migrateSchema(database: DatabaseSync): void {
   if (version > SCHEMA_VERSION) {
     throw persistenceError("schema_version_unsupported");
   }
+  const freshInstall = version === 0;
   if (version === 0) {
     database.exec("BEGIN IMMEDIATE");
     try {
@@ -1201,6 +1316,19 @@ export function migrateSchema(database: DatabaseSync): void {
       throw persistenceError("schema_integrity_failed", cause);
     }
   }
+  if (version === 15) {
+    database.exec("BEGIN IMMEDIATE");
+    try {
+      database.exec(MIGRATION_V16);
+      if (freshInstall) database.exec(MIGRATION_V16_FRESH_INSTALL);
+      database.exec("PRAGMA user_version = 16");
+      database.exec("COMMIT");
+      version = 16;
+    } catch (cause: unknown) {
+      if (database.isTransaction) database.exec("ROLLBACK");
+      throw persistenceError("schema_integrity_failed", cause);
+    }
+  }
   if (version !== SCHEMA_VERSION) {
     throw persistenceError("schema_integrity_failed");
   }
@@ -1211,7 +1339,7 @@ export function migrateSchema(database: DatabaseSync): void {
     .prepare("SELECT schema_version FROM guild_meta WHERE singleton = 1")
     .get();
   if (
-    migrations.length !== 15 ||
+    migrations.length !== 16 ||
     exactInteger(migrations[0], "version") !== 1 ||
     migrations[0]?.["name"] !== "initial_authoritative_aggregates" ||
     exactInteger(migrations[1], "version") !== 2 ||
@@ -1242,6 +1370,8 @@ export function migrateSchema(database: DatabaseSync): void {
     migrations[13]?.["name"] !== "readd_empty_deleted_workspaces" ||
     exactInteger(migrations[14], "version") !== 15 ||
     migrations[14]?.["name"] !== "streaming_write_path_and_context_usage" ||
+    exactInteger(migrations[15], "version") !== 16 ||
+    migrations[15]?.["name"] !== "runtime_model_catalog_and_task_settings" ||
     exactInteger(meta, "schema_version") !== SCHEMA_VERSION
   ) {
     throw persistenceError("schema_integrity_failed");

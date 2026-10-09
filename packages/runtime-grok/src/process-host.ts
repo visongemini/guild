@@ -5,9 +5,7 @@ import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { performance } from "node:perf_hooks";
 import type {
-  GuildGrokModel,
   GuildGrokPermissionMode,
-  GuildGrokReasoningEffort,
   GuildGrokStartupSettings,
 } from "@guild/contracts";
 import {
@@ -143,8 +141,6 @@ export type GrokProcessHostOptions = {
   readonly maxStderrBytes?: number;
   readonly redactValues?: readonly string[];
   readonly runtimeSettings?: {
-    readonly model: GuildGrokModel;
-    readonly reasoningEffort: GuildGrokReasoningEffort;
     readonly permissionMode: GuildGrokPermissionMode;
     readonly startup?: GuildGrokStartupSettings;
   };

@@ -1,8 +1,11 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
+import type { XaiSignalEnvelope } from "@guild/contracts";
 import {
   AcpV1Adapter,
   AcpV1AdapterError,
+  AcpV1ConfigOptionRefusedError,
+  AcpV1ExtensionRequestError,
   type AcpV1AdapterOptions,
   type AcpV1AdapterSink,
   type AcpV1PeerPort,
@@ -19,7 +22,67 @@ import type { ProcessHostEvent } from "./process-host.js";
 
 type WireMessage = Record<string, unknown>;
 type SinkEvent<Name extends keyof AcpV1AdapterSink> =
-  Parameters<AcpV1AdapterSink[Name]>[0];
+  Parameters<NonNullable<AcpV1AdapterSink[Name]>>[0];
+
+/** Signals the default RecordingSink observer collected; tests that read it run one at a time. */
+const signals: XaiSignalEnvelope[] = [];
+
+function officialModelState(): Record<string, unknown> {
+  const efforts = (ids: readonly string[], descriptions: Readonly<Record<string, string>>) =>
+    ids.map((id) => ({
+      id,
+      value: id,
+      label: { xhigh: "Extra High", high: "High", medium: "Medium", low: "Low" }[id] ?? id,
+      description: descriptions[id],
+      default: id === "high",
+    }));
+  const descriptions = {
+    xhigh: "Maximum reasoning for the hardest tasks.",
+    high: "Thorough reasoning and quality. Recommended.",
+    medium: "Strong quality with a faster turnaround.",
+    low: "Fastest responses. Best for simple tasks.",
+  };
+  const meta = (ids: readonly string[]) => ({
+    totalContextTokens: 256_000,
+    agentType: "grok-build-plan",
+    supportsReasoningEffort: true,
+    reasoningEffort: "high",
+    reasoningEfforts: efforts(ids, descriptions),
+    contextWindows: [256_000, 500_000],
+  });
+  return {
+    currentModelId: "grok-4.7",
+    availableModels: [
+      { modelId: "grok-4.7", name: "Grok 4.7", description: "SpaceXAI's latest frontier model", _meta: meta(["xhigh", "high", "medium", "low"]) },
+      { modelId: "grok-4.7-build-fast", name: "Grok 4.7 Fast", description: "Fast variant. 2x the price.", _meta: meta(["xhigh", "high", "medium", "low"]) },
+      { modelId: "grok-4.5", name: "Grok 4.5", _meta: meta(["high", "medium", "low"]) },
+      { modelId: "MiniMax-M3", name: "MiniMax-M3", description: "OpenAI \u00b7 https://api.minimax.chat/v1", _meta: { totalContextTokens: 200_000, agentType: "grok-build-plan" } },
+      { modelId: "ornith-1.5-35b-a3b-unc", name: "ornith", description: "OpenAI \u00b7 http://100.86.5.125:8080/v1", _meta: { totalContextTokens: 200_000 } },
+    ],
+  };
+}
+
+function officialConfigOptions(model: string, effort: string): unknown[] {
+  return [
+    {
+      id: "model", name: "Model", category: "model", type: "select", currentValue: model,
+      options: [
+        { value: "grok-4.7", name: "Grok 4.7" },
+        { value: "grok-4.7-build-fast", name: "Grok 4.7 Fast" },
+        { value: "grok-4.5", name: "Grok 4.5" },
+      ],
+    },
+    {
+      id: "reasoning_effort", name: "Reasoning Effort", category: "thought_level", type: "select", currentValue: effort,
+      options: [
+        { value: "xhigh", name: "Extra High", description: "Maximum reasoning for the hardest tasks." },
+        { value: "high", name: "High" },
+        { value: "medium", name: "Medium" },
+        { value: "low", name: "Low" },
+      ],
+    },
+  ];
+}
 
 const clock = Object.freeze({
   monotonicMs: () => 123.5,
@@ -98,7 +161,11 @@ class RecordingSink implements AcpV1AdapterSink {
   readonly cancellations: SinkEvent<"commitCancelSent">[] = [];
   readonly interruptions: SinkEvent<"commitTransportInterrupted">[] = [];
   readonly barriers: SinkEvent<"beginReplayBarrier">[] = [];
+  observeSignal?: (envelope: XaiSignalEnvelope) => void = (envelope) => {
+    signals.push(envelope);
+  };
   sessionGate: Promise<void> | undefined;
+  liveUpdateGate: Promise<void> | undefined;
   promptGate: Promise<void> | undefined;
   rejectPromptAcceptance = false;
   permissionGate: Promise<void> | undefined;
@@ -139,6 +206,7 @@ class RecordingSink implements AcpV1AdapterSink {
     this.updates.push(event);
     this.order.push(`update:${event.ingestMode}`);
     if (event.ingestMode === "replay") await this.replayUpdateGate;
+    else await this.liveUpdateGate;
   }
 
   async commitAuxiliaryUpdate(event: SinkEvent<"commitAuxiliaryUpdate">): Promise<void> {
@@ -479,36 +547,59 @@ describe("ACP v1 adapter initialization and durable session establishment", () =
     assert.equal(await adapter.probeLiveness(500), false);
   });
 
-  it("applies only supported official Grok model and reasoning selectors", async () => {
+  it("applies model and reasoning effort through session/set_config_option and context window through set_model", async () => {
     const process = new FakeProcess();
     const sink = new RecordingSink();
     const adapter = await startAdapter(process, sink);
     const session = await newSession(adapter, process);
 
-    const selectingModel = adapter.setModel(session, "grok-4.5");
+    const selectingContext = adapter.setModel(session, "grok-4.7", {
+      reasoningEffort: "medium",
+      contextWindow: 500_000,
+    });
     const model = await waitForOutbound(process, ACP_V1_METHODS.sessionSetModel);
     assert.deepEqual(model.params, {
       sessionId: "session-1",
-      modelId: "grok-4.5",
+      modelId: "grok-4.7",
+      _meta: { reasoningEffort: "medium", contextWindow: 500_000 },
+    });
+    process.emitMessages({ jsonrpc: "2.0", id: model.id, result: { _meta: { model: { Ok: "grok-4.7" } } } });
+    await selectingContext;
+    await assert.rejects(adapter.setModel(session, "MiniMax-M3"), /invalid_grok_model/u);
+    await assert.rejects(adapter.setModel(session, "grok-4.7", { contextWindow: 0 }), /invalid_grok_context_window/u);
+
+    const selectingEffort = adapter.setConfigOption(session, "reasoning_effort", "low");
+    const effort = await waitForOutbound(process, ACP_V1_METHODS.sessionSetConfigOption);
+    assert.deepEqual(effort.params, {
+      sessionId: "session-1",
+      configId: "reasoning_effort",
+      value: "low",
     });
     process.emitMessages({
       jsonrpc: "2.0",
-      id: model.id,
-      result: { _meta: { model: { Ok: { modelId: "grok-4.5" } } } },
+      id: effort.id,
+      result: {
+        configOptions: [
+          {
+            id: "model", name: "Model", category: "model", type: "select", currentValue: "grok-4.7",
+            options: [{ value: "grok-4.7", name: "Grok 4.7" }],
+          },
+          {
+            id: "reasoning_effort", name: "Reasoning Effort", category: "thought_level", type: "select",
+            currentValue: "low",
+            options: [{ value: "high", name: "High" }, { value: "low", name: "Low" }],
+          },
+        ],
+      },
     });
-    await selectingModel;
-
-    const selectingMode = adapter.setMode(session, "grok-4.5", "medium");
-    const mode = await waitForOutbound(process, ACP_V1_METHODS.sessionSetMode);
-    assert.deepEqual(mode.params, {
-      sessionId: "session-1",
-      modeId: "medium",
-    });
-    process.emitMessages({ jsonrpc: "2.0", id: mode.id, result: {} });
-    await selectingMode;
+    const options = await selectingEffort;
+    assert.deepEqual(options.map((option) => [option.id, option.currentValue]), [
+      ["model", "grok-4.7"],
+      ["reasoning_effort", "low"],
+    ]);
 
     const selectingConfig = adapter.setConfigOption(session, "web-search", false);
-    const config = await waitForOutbound(process, ACP_V1_METHODS.sessionSetConfigOption);
+    const config = await waitForOutbound(process, ACP_V1_METHODS.sessionSetConfigOption, 1);
     assert.deepEqual(config.params, {
       sessionId: "session-1",
       configId: "web-search",
@@ -519,12 +610,7 @@ describe("ACP v1 adapter initialization and durable session establishment", () =
       jsonrpc: "2.0",
       id: config.id,
       result: {
-        configOptions: [{
-          id: "web-search",
-          name: "Web search",
-          type: "boolean",
-          currentValue: false,
-        }],
+        configOptions: [{ id: "web-search", name: "Web search", type: "boolean", currentValue: false }],
       },
     });
     assert.deepEqual(await selectingConfig, [{
@@ -533,14 +619,339 @@ describe("ACP v1 adapter initialization and durable session establishment", () =
       type: "boolean",
       currentValue: false,
     }]);
+    await adapter.close();
+  });
 
-    const frameCount = process.frames.length;
+  it("returns config options only after earlier config_option_update snapshots were committed, so a stale snapshot cannot overwrite them", async () => {
+    const process = new FakeProcess();
+    const sink = new RecordingSink();
+    const adapter = await startAdapter(process, sink);
+    const session = await newSession(adapter, process);
+    const gate = deferred<void>();
+    sink.liveUpdateGate = gate.promise;
+
+    const changing = adapter.setConfigOption(session, "reasoning_effort", "medium");
+    const request = await waitForOutbound(process, ACP_V1_METHODS.sessionSetConfigOption);
+    let resolved = false;
+    void changing.then(() => { resolved = true; });
+    // Wire order: the snapshot of the PREVIOUS change (effort still low), then this change's response.
+    process.emitMessages(
+      {
+        jsonrpc: "2.0",
+        method: ACP_V1_METHODS.sessionUpdate,
+        params: {
+          sessionId: "session-1",
+          update: { sessionUpdate: "config_option_update", configOptions: officialConfigOptions("grok-4.5", "low") },
+        },
+      },
+      { jsonrpc: "2.0", id: request.id, result: { configOptions: officialConfigOptions("grok-4.5", "medium") } },
+    );
+    await waitFor(() => sink.updates.length === 1);
+    await immediate();
+    assert.equal(resolved, false, "the change is not reported before the earlier snapshot is committed");
+    gate.resolve();
+    const options = await changing;
+    assert.equal(resolved, true);
+    assert.equal(sink.updates.length, 1, "the stale snapshot was committed first");
+    assert.equal(options.find((option) => option.id === "reasoning_effort")?.currentValue, "medium");
+    await adapter.close();
+  });
+
+  it("reports a runtime refusal of a config change without faulting the session, classifying the switch refusal", async () => {
+    const process = new FakeProcess();
+    const sink = new RecordingSink();
+    const adapter = await startAdapter(process, sink);
+    const session = await newSession(adapter, process);
+
+    const refuse = async (error: Record<string, unknown>, occurrence: number) => {
+      const operation = adapter.setConfigOption(session, "model", "grok-4.6");
+      const request = await waitForOutbound(process, ACP_V1_METHODS.sessionSetConfigOption, occurrence);
+      process.emitMessages({ jsonrpc: "2.0", id: request.id, error });
+      return operation;
+    };
+    const refusal = (reason: string, remoteCode: number) => (cause: unknown) =>
+      cause instanceof AcpV1ConfigOptionRefusedError &&
+      cause.code === "config_option_refused" &&
+      cause.reason === reason &&
+      cause.remoteCode === remoteCode;
+
     await assert.rejects(
-      adapter.setMode(session, "grok-4.5", "xhigh"),
+      refuse({ code: -32602, message: "Invalid params", data: "MODEL_SWITCH_INCOMPATIBLE_AGENT: agent type differs" }, 0),
+      refusal("incompatible_agent", -32602),
+    );
+    await assert.rejects(
+      refuse({ code: -32602, message: "Invalid params", data: { code: "MODEL_SWITCH_INCOMPATIBLE_AGENT" } }, 1),
+      refusal("incompatible_agent", -32602),
+    );
+    await assert.rejects(
+      refuse({ code: -32602, message: "Invalid params", data: "unknown model id" }, 2),
+      refusal("invalid_value", -32602),
+    );
+    await assert.rejects(
+      refuse({ code: -32603, message: "Internal error" }, 3),
+      refusal("other", -32603),
+    );
+    assert.equal(adapter.state, "ready", "a refused switch keeps the adapter and the session usable");
+    assert.equal(process.stopCalls, 0);
+
+    const prompting = adapter.prompt(session, "hello");
+    const prompt = await waitForOutbound(process, ACP_V1_METHODS.sessionPrompt);
+    await assert.rejects(
+      adapter.setConfigOption(session, "model", "grok-4.6"),
+      hasAdapterCode("overlapping_prompt"),
+    );
+    await assert.rejects(adapter.setModel(session, "grok-4.6"), hasAdapterCode("overlapping_prompt"));
+    process.emitMessages({ jsonrpc: "2.0", id: prompt.id, result: { stopReason: "end_turn" } });
+    await prompting;
+    await adapter.close();
+  });
+
+  it("passes the reasoning effort in _meta on session/new and session/resume", async () => {
+    const process = new FakeProcess();
+    const sink = new RecordingSink();
+    const adapter = await startAdapter(process, sink);
+
+    const creating = adapter.newSession("/tmp/project", { reasoningEffort: "high" });
+    const create = await waitForOutbound(process, ACP_V1_METHODS.sessionNew);
+    assert.deepEqual(create.params, {
+      cwd: "/tmp/project",
+      mcpServers: [],
+      _meta: { reasoningEffort: "high" },
+    });
+    process.emitMessages({ jsonrpc: "2.0", id: create.id, result: { sessionId: "session-1" } });
+    await creating;
+
+    const resuming = adapter.resumeSession("session-2", "/tmp/project", { reasoningEffort: "medium" });
+    const resume = await waitForOutbound(process, ACP_V1_METHODS.sessionResume);
+    assert.deepEqual(resume.params, {
+      sessionId: "session-2",
+      cwd: "/tmp/project",
+      mcpServers: [],
+      _meta: { reasoningEffort: "medium" },
+    });
+    process.emitMessages({ jsonrpc: "2.0", id: resume.id, result: {} });
+    await resuming;
+
+    const frames = process.frames.length;
+    await assert.rejects(
+      adapter.newSession("/tmp/project", { reasoningEffort: "Extra High" }),
       hasAdapterCode("operation_failed"),
     );
-    assert.equal(process.frames.length, frameCount);
+    assert.equal(process.frames.length, frames, "an invalid effort is rejected before anything is written");
     await adapter.close();
+  });
+
+  it("decodes the official model list from initialize, session/new and later updates, keeping only official models", async () => {
+    const process = new FakeProcess();
+    const sink = new RecordingSink();
+    const advertised = officialModelState();
+    const adapter = await startAdapter(process, sink, {}, {
+      ...initializeResult,
+      _meta: { modelState: advertised },
+    });
+    const initialized = await adapter.start();
+    assert.deepEqual(initialized.modelCatalog?.models.map((model) => model.id), [
+      "grok-4.7", "grok-4.7-build-fast", "grok-4.5",
+    ]);
+    assert.equal(initialized.modelCatalog?.runtimeDefaultModelId, "grok-4.7");
+    const fast = initialized.modelCatalog?.models[1];
+    assert.equal(fast?.name, "Grok 4.7 Fast");
+    assert.equal(fast?.description, "Fast variant. 2x the price.");
+    assert.deepEqual(fast?.contextWindows, [256_000, 500_000]);
+    assert.deepEqual(fast?.reasoningEfforts.map((effort) => [effort.id, effort.label, effort.isDefault]), [
+      ["xhigh", "Extra High", false],
+      ["high", "High", true],
+      ["medium", "Medium", false],
+      ["low", "Low", false],
+    ]);
+    assert.equal(fast?.reasoningEfforts[1]?.description, "Thorough reasoning and quality. Recommended.");
+    assert.deepEqual(initialized.modelCatalog?.models[2]?.reasoningEfforts.map((effort) => effort.id), ["high", "medium", "low"]);
+    assert.doesNotMatch(JSON.stringify(initialized.modelCatalog), /MiniMax|ornith|api\.minimax|100\.86/u);
+
+    const creating = adapter.newSession("/tmp/project");
+    const create = await waitForOutbound(process, ACP_V1_METHODS.sessionNew);
+    process.emitMessages({
+      jsonrpc: "2.0",
+      id: create.id,
+      result: {
+        sessionId: "session-1",
+        models: advertised,
+        configOptions: officialConfigOptions("grok-4.7", "high"),
+      },
+    });
+    const session = await creating;
+    assert.deepEqual(session.modelCatalog, initialized.modelCatalog);
+    assert.equal(session.contextWindowSize, 256_000);
+    assert.deepEqual(
+      session.configOptions?.map((option) => [option.id, option.category, option.currentValue]),
+      [["model", "model", "grok-4.7"], ["reasoning_effort", "thought_level", "high"]],
+    );
+    assert.deepEqual(sink.sessions[0]?.state.modelCatalog, initialized.modelCatalog);
+
+    // A live selection change arrives as a standard config_option_update.
+    process.emitMessages({
+      jsonrpc: "2.0",
+      method: ACP_V1_METHODS.sessionUpdate,
+      params: {
+        sessionId: "session-1",
+        update: { sessionUpdate: "config_option_update", configOptions: officialConfigOptions("grok-4.7-build-fast", "low") },
+      },
+    });
+    await waitFor(() => sink.updates.length === 1);
+    const update = sink.updates[0]?.update;
+    assert.equal(update?.type, "session_context");
+    assert.equal(update?.type === "session_context" && update.payload.context.kind, "config");
+    await adapter.close();
+  });
+
+  it("probes an unadvertised extension once, treats -32601 as unsupported, and validates the method name", async () => {
+    const process = new FakeProcess();
+    const sink = new RecordingSink();
+    const adapter = await startAdapter(process, sink);
+
+    const unsupported = adapter.sendExtensionRequest("_x.ai/interject", { sessionId: "session-1", text: "x" });
+    const first = await waitForOutbound(process, "_x.ai/interject");
+    assert.deepEqual(first.params, { sessionId: "session-1", text: "x" });
+    process.emitMessages({ jsonrpc: "2.0", id: first.id, error: { code: -32601, message: "Method not found" } });
+    assert.deepEqual(await unsupported, { status: "unsupported" });
+    const frames = process.frames.length;
+    assert.deepEqual(await adapter.sendExtensionRequest("_x.ai/interject", { sessionId: "session-1", text: "y" }), { status: "unsupported" });
+    assert.equal(process.frames.length, frames, "the second call is answered from the per-process memory");
+
+    const supported = adapter.sendExtensionRequest("_x.ai/rewind/points", { sessionId: "session-1" });
+    const points = await waitForOutbound(process, "_x.ai/rewind/points");
+    process.emitMessages({ jsonrpc: "2.0", id: points.id, result: { rewind_points: [] } });
+    assert.deepEqual(await supported, { status: "ok", result: { rewind_points: [] } });
+
+    const failing = adapter.sendExtensionRequest("_x.ai/rewind/execute", { sessionId: "session-1" });
+    const execute = await waitForOutbound(process, "_x.ai/rewind/execute");
+    process.emitMessages({ jsonrpc: "2.0", id: execute.id, error: { code: -32602, message: "Invalid params" } });
+    await assert.rejects(failing, (cause) =>
+      cause instanceof AcpV1ExtensionRequestError && cause.remoteCode === -32602 && cause.code === "extension_request_failed");
+    assert.equal(adapter.state, "ready");
+
+    const written = process.frames.length;
+    for (const bad of ["x.ai/interject", "session/prompt", "_x.ai/", "_x.ai/Upper", "_x.ai/../x", "_x.ai/a b", "_x.ai/a/b/c/d/e"]) {
+      await assert.rejects(adapter.sendExtensionRequest(bad, {}), hasAdapterCode("invalid_adapter_options"), bad);
+    }
+    assert.equal(process.frames.length, written, "invalid extension names are never written");
+    await adapter.close();
+  });
+
+  it("turns only the allowlisted _x.ai notifications into bounded signals and never stores the rest", async () => {
+    signals.length = 0;
+    const process = new FakeProcess();
+    const sink = new RecordingSink();
+    const adapter = await startAdapter(process, sink);
+    const session = await newSession(adapter, process);
+    const notify = (method: string, params: unknown) =>
+      process.emitMessages({ jsonrpc: "2.0", method, params } as WireMessage);
+    const sessionNotification = (update: Record<string, unknown>) =>
+      notify("_x.ai/session_notification", { sessionId: "session-1", update, _meta: { eventId: "e-1" } });
+
+    notify("_x.ai/session/setup", { method: "session/new", phase: "mcp_merge", sessionId: null });
+    notify("_x.ai/mcp/init_progress", { total: 7, connected: 3, sessionId: "session-1" });
+    notify("_x.ai/sessions/changed", {
+      upserted: [{ sessionId: "session-1", activity: "working", cwd: "/secret/path", title: "private title", modelId: "grok-4.7", origin: { kind: "local" } }],
+      removed: [],
+    });
+    notify("_x.ai/queue/changed", {
+      sessionId: "session-1",
+      entries: [{ id: "p-1", version: 0, kind: "prompt", text: "PRIVATE PROMPT TEXT", position: 1 }],
+      runningPromptId: "p-0",
+      runningText: "PRIVATE RUNNING TEXT",
+    });
+    sessionNotification({ sessionUpdate: "hook_run_started", event_name: "user_prompt_submit", prompt_id: "p-1", count: 2 });
+    sessionNotification({
+      sessionUpdate: "hook_execution",
+      event_name: "user_prompt_submit",
+      runs: [
+        { name: "plugin/private-hook-name:user_prompt_submit[0]", status: { status: "success", elapsed_ms: 7965 } },
+        { name: "global/other-hook", status: { status: "failed", elapsed_ms: 12 } },
+      ],
+    });
+    sessionNotification({ sessionUpdate: "tool_call_delta_chunk", tool_call_id: "c-1", tool_index: 0, name: "run_terminal_command" });
+    sessionNotification({ sessionUpdate: "pending_interaction", tool_call_id: "c-1", kind: "permission" });
+    sessionNotification({ sessionUpdate: "interaction_resolved", tool_call_id: "c-1" });
+    sessionNotification({ sessionUpdate: "retry_state", type: "retrying", attempt: 1, max_retries: 15, reason: "reqwest error stream: SECRET-HOST-DETAIL", error_type: "http" });
+    sessionNotification({ sessionUpdate: "response_completed", usage: { input_tokens: 5 }, signature: "SIGNATURE-BLOB" });
+    sessionNotification({ sessionUpdate: "turn_completed", prompt_id: "p-1", stop_reason: "end_turn", usage: { inputTokens: 1 } });
+    sessionNotification({ sessionUpdate: "model_changed", model_id: "grok-4.7", reasoning_effort: "high" });
+    notify("_x.ai/session/prompt_complete", { sessionId: "session-1", promptId: "p-1", stopReason: "end_turn", agentResult: { secret: "AGENT-RESULT" } });
+    notify("_x.ai/models/update", officialModelState());
+
+    // Everything below must be ignored without ever reaching the sink.
+    notify("_x.ai/mcp/servers_updated", { servers: [{ name: "github", env: { GITHUB_TOKEN: "ghp_PLAINTEXT_SECRET" } }] });
+    notify("_x.ai/settings/update", { tips: ["private tip"] });
+    notify("_x.ai/announcements/update", { announcements: [{ message: "hello" }] });
+    notify("_x.ai/mcp/server_status", { sessionId: "session-1", name: "github", detail: "PRIVATE DETAIL" });
+    notify("_x.ai/session/interjection", { sessionId: "session-1", text: "PRIVATE STEER", interjectionId: "i-1" });
+    notify("_x.ai/unknown/future", { sessionId: "session-1", anything: "PRIVATE" });
+    sessionNotification({ sessionUpdate: "session_summary_generated", session_summary: "PRIVATE SUMMARY" });
+    sessionNotification({ sessionUpdate: "future_subtype", payload: "PRIVATE" });
+    notify("not-an-extension/queue/changed", { entries: [] });
+    sessionNotification({ sessionUpdate: "hook_run_started", event_name: "", count: -1 });
+    await waitFor(() => signals.length >= 14);
+    await immediate();
+
+    const kinds = signals.map((envelope) => envelope.signal.kind);
+    assert.deepEqual(kinds, [
+      "session_setup", "mcp_init_progress", "sessions_changed", "queue_changed", "hook_run_started",
+      "hook_execution", "tool_call_delta_chunk", "pending_interaction", "interaction_resolved",
+      "retry_state", "response_completed", "turn_completed", "model_changed", "prompt_complete",
+      "models_update",
+    ]);
+    const byKind = Object.fromEntries(signals.map((envelope) => [envelope.signal.kind, envelope]));
+    assert.deepEqual(byKind["session_setup"], { sessionId: null, signal: { kind: "session_setup", phase: "mcp_merge" }, receivedMonotonicMs: 123.5 });
+    assert.deepEqual(byKind["mcp_init_progress"]?.signal, { kind: "mcp_init_progress", connected: 3, total: 7 });
+    assert.deepEqual(byKind["sessions_changed"]?.signal, { kind: "sessions_changed", sessions: [{ sessionId: "session-1", activity: "working" }] });
+    assert.equal(byKind["sessions_changed"]?.sessionId, null);
+    assert.deepEqual(byKind["queue_changed"]?.signal, { kind: "queue_changed", queued: 1, firstPosition: 1, running: true });
+    assert.deepEqual(byKind["hook_run_started"]?.signal, { kind: "hook_run_started", event: "user_prompt_submit", count: 2 });
+    assert.deepEqual(byKind["hook_execution"]?.signal, { kind: "hook_execution", event: "user_prompt_submit", runs: 2, failed: 1, maxElapsedMs: 7965 });
+    assert.deepEqual(byKind["tool_call_delta_chunk"]?.signal, { kind: "tool_call_delta_chunk", toolName: "run_terminal_command" });
+    assert.deepEqual(byKind["pending_interaction"]?.signal, { kind: "pending_interaction", interaction: "permission" });
+    assert.deepEqual(byKind["retry_state"]?.signal, { kind: "retry_state", active: true, attempt: 1, maxRetries: 15, errorType: "http" });
+    assert.deepEqual(byKind["turn_completed"]?.signal, { kind: "turn_completed", stopReason: "end_turn" });
+    assert.deepEqual(byKind["model_changed"]?.signal, { kind: "model_changed", modelId: "grok-4.7", reasoningEffort: "high" });
+    assert.deepEqual(byKind["prompt_complete"]?.signal, { kind: "prompt_complete", stopReason: "end_turn" });
+    assert.equal(byKind["models_update"]?.sessionId, null);
+    assert.equal(byKind["models_update"]?.signal.kind === "models_update" && byKind["models_update"].signal.catalog.models.length, 3);
+    assert.equal(byKind["queue_changed"]?.sessionId, "session-1");
+
+    const serialized = JSON.stringify(signals);
+    for (const secret of [
+      "PRIVATE", "SECRET-HOST-DETAIL", "SIGNATURE-BLOB", "AGENT-RESULT", "ghp_PLAINTEXT_SECRET", "GITHUB_TOKEN",
+      "private-hook-name", "/secret/path", "private title", "reqwest",
+    ]) {
+      assert.equal(serialized.includes(secret), false, secret);
+    }
+    assert.equal(sink.updates.length, 0, "extension signals are never committed as conversation updates");
+    assert.equal(adapter.state, "ready");
+    void session;
+    await adapter.close();
+  });
+
+  it("keeps working when the sink throws from a signal observer or has none", async () => {
+    const process = new FakeProcess();
+    const sink = new RecordingSink();
+    sink.observeSignal = () => {
+      throw new Error("observer fault");
+    };
+    const adapter = await startAdapter(process, sink);
+    process.emitMessages({ jsonrpc: "2.0", method: "_x.ai/session/setup", params: { phase: "auth", sessionId: null } } as WireMessage);
+    await immediate();
+    assert.equal(adapter.state, "ready");
+    await adapter.close();
+
+    const quietProcess = new FakeProcess();
+    const quietSink = new RecordingSink();
+    delete (quietSink as { observeSignal?: unknown }).observeSignal;
+    const quiet = await startAdapter(quietProcess, quietSink);
+    quietProcess.emitMessages({ jsonrpc: "2.0", method: "_x.ai/session/setup", params: { phase: "auth", sessionId: null } } as WireMessage);
+    await immediate();
+    assert.equal(quiet.state, "ready");
+    await quiet.close();
   });
 
   it("uses finite initialize/auth/new deadlines, exact auth provenance, and withholds the session until sink commit", async () => {

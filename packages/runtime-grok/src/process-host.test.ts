@@ -1110,10 +1110,6 @@ describe("GrokProcessHost execution policy and lifecycle (PC-TRN-001/002/003)", 
         GROK_ACP_PRODUCTION_PROFILE.rules,
         "agent",
         "--no-leader",
-        "--model",
-        "grok-4.6",
-        "--reasoning-effort",
-        "xhigh",
         "stdio",
       ]);
       assert.deepEqual(started.argv, GROK_ACP_PRODUCTION_ARGV);
@@ -1150,7 +1146,7 @@ describe("GrokProcessHost execution policy and lifecycle (PC-TRN-001/002/003)", 
     }
   });
 
-  it("derives a bounded production argv from official Grok runtime settings", async () => {
+  it("derives a bounded production argv from the permission mode", async () => {
     const fixture = await prepareFixture();
     let host: TestHost | undefined;
     let group: number | undefined;
@@ -1161,8 +1157,6 @@ describe("GrokProcessHost execution policy and lifecycle (PC-TRN-001/002/003)", 
         executablePath,
         expectedSha256: sha256Of(await readFile(executablePath)),
         runtimeSettings: {
-          model: "grok-4.5",
-          reasoningEffort: "medium",
           permissionMode: "bypassPermissions",
         },
       });
@@ -1175,10 +1169,6 @@ describe("GrokProcessHost execution policy and lifecycle (PC-TRN-001/002/003)", 
         GROK_ACP_PRODUCTION_PROFILE.rules,
         "agent",
         "--no-leader",
-        "--model",
-        "grok-4.5",
-        "--reasoning-effort",
-        "medium",
         "stdio",
       ]);
       assert.equal(Object.isFrozen(started.argv), true);

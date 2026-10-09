@@ -49,43 +49,26 @@ describe("official Grok ACP production profile", () => {
       GUILD_AGENT_RULES,
       "agent",
       "--no-leader",
-      "--model",
-      "grok-4.6",
-      "--reasoning-effort",
-      "xhigh",
       "stdio",
     ]);
   });
 
-  it("builds only validated official Grok model and reasoning combinations", () => {
-    assert.deepEqual(
-      createGrokAcpProductionArgv({
-        model: "grok-4.5",
-        reasoningEffort: "medium",
-        permissionMode: "bypassPermissions",
-      }),
-      [
-        "--permission-mode",
-        "bypassPermissions",
-        "--rules",
-        GUILD_AGENT_RULES,
-        "agent",
-        "--no-leader",
-        "--model",
-        "grok-4.5",
-        "--reasoning-effort",
-        "medium",
-        "stdio",
-      ],
-    );
-    assert.throws(
-      () => createGrokAcpProductionArgv({
-        model: "grok-4.5",
-        reasoningEffort: "xhigh",
-        permissionMode: "default",
-      }),
-      /unsupported_grok_reasoning_effort/u,
-    );
+  it("never pins a model or reasoning effort at process start (the runtime owns the model list)", () => {
+    const argv = createGrokAcpProductionArgv({ permissionMode: "bypassPermissions" });
+    assert.deepEqual(argv, [
+      "--permission-mode",
+      "bypassPermissions",
+      "--rules",
+      GUILD_AGENT_RULES,
+      "agent",
+      "--no-leader",
+      "stdio",
+    ]);
+    for (const argument of [...argv, ...GROK_ACP_PRODUCTION_ARGV]) {
+      assert.doesNotMatch(argument, /^--(?:model|reasoning-effort|effort)$/u);
+    }
+    assert.equal(Object.hasOwn(GROK_ACP_PRODUCTION_PROFILE, "model"), false);
+    assert.equal(Object.hasOwn(GROK_ACP_PRODUCTION_PROFILE, "reasoningEffort"), false);
   });
 
   it("exports only the fixed structured production policy", () => {
@@ -94,8 +77,6 @@ describe("official Grok ACP production profile", () => {
       rules: GUILD_AGENT_RULES,
       command: "agent",
       noLeader: true,
-      model: "grok-4.6",
-      reasoningEffort: "xhigh",
       startup: {
         webSearchEnabled: true,
         planEnabled: true,
@@ -161,8 +142,6 @@ describe("official Grok ACP production profile", () => {
     ] as const) {
       assert.deepEqual(
         createGrokAcpProductionArgv({
-          model: "grok-4.6",
-          reasoningEffort: "xhigh",
           permissionMode,
         }).slice(0, 2),
         ["--permission-mode", permissionMode],
@@ -170,16 +149,12 @@ describe("official Grok ACP production profile", () => {
     }
     assert.deepEqual(
       createGrokAcpProductionArgv({
-        model: "grok-4.6",
-        reasoningEffort: "xhigh",
         permissionMode: "bypassPermissions",
       }).slice(0, 2),
       ["--permission-mode", "bypassPermissions"],
     );
     assert.throws(
       () => createGrokAcpProductionArgv({
-        model: "grok-4.6",
-        reasoningEffort: "xhigh",
         permissionMode: "always-approve",
       } as never),
       /invalid_grok_permission_mode/u,
@@ -189,8 +164,6 @@ describe("official Grok ACP production profile", () => {
   it("maps official startup behavior settings to exact non-shell CLI arguments", () => {
     assert.deepEqual(
       createGrokAcpProductionArgv({
-        model: "grok-4.6",
-        reasoningEffort: "high",
         permissionMode: "auto",
         startup: {
           webSearchEnabled: false,

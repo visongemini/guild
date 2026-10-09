@@ -1,4 +1,4 @@
-import type { AcpToolKind, GuildGrokManagementAction, GuildGrokPermissionMode, GuildGrokReasoningEffort, GuildLocale, GuildTaskActivity } from "@guild/contracts";
+import type { AcpToolKind, GuildGrokManagementAction, GuildGrokPermissionMode, GuildLocale, GuildModelSwitchRefusalReason, GuildTaskActivity } from "@guild/contracts";
 
 import { WORKSHOP_ZH, WORKSHOP_EN, type WorkshopMessages } from "./workshop-messages.js";
 
@@ -141,7 +141,42 @@ export type GuildMessages = WorkshopMessages & {
   readonly model: string;
   readonly reasoningEffort: string;
   readonly permissionMode: string;
-  readonly reasoningEffortName: (effort: GuildGrokReasoningEffort) => string;
+  /** Localized name for the well-known efforts, else the runtime's own label, else the raw id. */
+  readonly reasoningEffortName: (effort: string, officialLabel?: string) => string;
+  readonly runtimeDefaultOption: string;
+  readonly reasoningFollowsRuntimeDefault: string;
+  readonly modelDefaultName: string;
+  readonly modelPickerTitle: string;
+  readonly modelPickerAria: (summary: string, scope: string, disabled?: string) => string;
+  readonly modelPickerScopeTask: string;
+  readonly modelPickerScopeGlobal: string;
+  readonly modelPickerScopeRuntime: string;
+  readonly modelPickerDisabledNoTask: string;
+  readonly modelPickerDisabledRunning: string;
+  readonly modelPickerDisabledPending: string;
+  readonly modelPickerContext: (sizes: string) => string;
+  readonly modelPickerDefaultMark: string;
+  readonly modelPickerUseDefault: string;
+  readonly modelPickerEmpty: string;
+  readonly modelPickerNoEfforts: string;
+  readonly modelPickerSaved: string;
+  readonly modelPickerRefused: (reason: GuildModelSwitchRefusalReason) => string;
+  readonly runDuration: (seconds: number) => string;
+  readonly runPhaseStartingRuntime: string;
+  readonly runPhaseOpeningSession: string;
+  readonly runPhaseMcp: (connected: number, total: number) => string;
+  readonly runPhasePromptSent: string;
+  readonly runPhasePromptSentSlow: string;
+  readonly runPhaseQueued: (position?: number) => string;
+  readonly runPhaseRunningHooks: (count?: number) => string;
+  readonly runPhaseWaitingForModel: string;
+  readonly runPhaseThinking: string;
+  readonly runPhasePreparingTool: (toolName?: string) => string;
+  readonly runPhaseWaitingForPermission: string;
+  readonly runPhaseRunningTool: (toolName?: string) => string;
+  readonly runPhaseRetrying: (attempt?: number, maxRetries?: number) => string;
+  readonly runPhaseResponding: string;
+  readonly runPhaseTime: (phase: string | undefined, total: string) => string;
   readonly runtimeSettingsBusy: string;
   readonly runtimeSettingsHelp: string;
   readonly webSearch: string;
@@ -370,6 +405,10 @@ const EN_GROK_FIELDS: Readonly<Record<string, string>> = Object.freeze({
   cones: "Sparse checkout cones (one per line)", fullHistory: "Fetch full history",
 });
 
+function pad2(value: number): string {
+  return String(value).padStart(2, "0");
+}
+
 const ZH_CN: GuildMessages = Object.freeze({
   ...WORKSHOP_ZH,
   appName: "GUILD",
@@ -524,14 +563,59 @@ const ZH_CN: GuildMessages = Object.freeze({
   model: "模型",
   reasoningEffort: "推理强度",
   permissionMode: "工具授权",
-  reasoningEffortName: (effort) => ({
+  reasoningEffortName: (effort, officialLabel) => (({
     xhigh: "超高",
     high: "高",
     medium: "中",
     low: "低",
-  })[effort],
-  runtimeSettingsBusy: "任务运行或排队时不能切换模型、推理强度或工具授权。",
-  runtimeSettingsHelp: "仅显示官方 Grok 设置；切换会安全重连空闲会话。",
+  }) as Readonly<Record<string, string>>)[effort] ?? officialLabel ?? effort,
+  runtimeDefaultOption: "运行时默认（推荐）",
+  reasoningFollowsRuntimeDefault: "跟随运行时默认",
+  modelDefaultName: "默认模型",
+  modelPickerTitle: "模型与推理强度",
+  modelPickerAria: (summary, scope, disabled) =>
+    `模型与推理强度：${summary}。${scope}。${disabled === undefined ? "" : `${disabled}。`}`,
+  modelPickerScopeTask: "仅用于当前对话",
+  modelPickerScopeGlobal: "使用你的默认设置",
+  modelPickerScopeRuntime: "使用 Grok 的默认设置",
+  modelPickerDisabledNoTask: "打开一个对话后才能选择模型",
+  modelPickerDisabledRunning: "当前轮次结束后才能更换模型",
+  modelPickerDisabledPending: "正在应用更改",
+  modelPickerContext: (sizes) => `${sizes} 上下文`,
+  modelPickerDefaultMark: "默认",
+  modelPickerUseDefault: "使用默认设置",
+  modelPickerEmpty: "Grok 启动后才会显示可选的模型。",
+  modelPickerNoEfforts: "这个模型没有推理强度设置。",
+  modelPickerSaved: "会话打开时生效。",
+  modelPickerRefused: (reason) => ({
+    incompatible_agent: "对话开始后不能改用这个模型，已保留你之前的选择。",
+    unsupported_value: "Grok 目前没有为这个任务提供该选项，已保留你之前的选择。",
+    unavailable: "Grok 暂时无法切换，已保留你之前的选择。",
+  })[reason],
+  runDuration: (seconds) => seconds < 60
+    ? `${seconds} 秒`
+    : seconds < 3_600
+      ? `${Math.floor(seconds / 60)} 分 ${pad2(seconds % 60)} 秒`
+      : `${Math.floor(seconds / 3_600)} 小时 ${pad2(Math.floor(seconds % 3_600 / 60))} 分 ${pad2(seconds % 60)} 秒`,
+  runPhaseStartingRuntime: "正在启动 Grok",
+  runPhaseOpeningSession: "正在打开会话",
+  runPhaseMcp: (connected, total) => `MCP ${connected}/${total}`,
+  runPhasePromptSent: "已发送",
+  runPhasePromptSentSlow: "已发送 · Grok 尚未接手",
+  runPhaseQueued: (position) => position === undefined ? "排队中" : `排队中 #${position}`,
+  runPhaseRunningHooks: (count) => count === undefined ? "正在运行钩子" : `正在运行钩子（${count}）`,
+  runPhaseWaitingForModel: "等待模型响应",
+  runPhaseThinking: "思考中",
+  runPhasePreparingTool: (toolName) => toolName === undefined ? "正在准备工具" : `正在准备工具 ${toolName}`,
+  runPhaseWaitingForPermission: "等待你的授权",
+  runPhaseRunningTool: (toolName) => toolName === undefined ? "正在运行工具" : `正在运行 ${toolName}`,
+  runPhaseRetrying: (attempt, maxRetries) => attempt === undefined || maxRetries === undefined
+    ? "正在重试"
+    : `正在重试 ${attempt}/${maxRetries}`,
+  runPhaseResponding: "正在回答",
+  runPhaseTime: (phase, total) => phase === undefined ? `共 ${total}` : `${phase} · 共 ${total}`,
+  runtimeSettingsBusy: "任务运行或排队时不能切换工具授权或启动选项。",
+  runtimeSettingsHelp: "仅显示官方 Grok 设置；模型与推理强度在下一轮生效，工具授权和启动选项会安全重连空闲会话。",
   webSearch: "联网搜索",
   webSearchHelp: "允许官方 Grok 使用 Web Search 与 Web Fetch。",
   planMode: "计划模式",
@@ -860,14 +944,59 @@ const EN_US: GuildMessages = Object.freeze({
   model: "Model",
   reasoningEffort: "Reasoning effort",
   permissionMode: "Tool permissions",
-  reasoningEffortName: (effort) => ({
+  reasoningEffortName: (effort, officialLabel) => (({
     xhigh: "Extra high",
     high: "High",
     medium: "Medium",
     low: "Low",
-  })[effort],
-  runtimeSettingsBusy: "Model, reasoning, and tool permissions cannot change while a task is running or queued.",
-  runtimeSettingsHelp: "Only official Grok settings are shown; idle sessions reconnect safely.",
+  }) as Readonly<Record<string, string>>)[effort] ?? officialLabel ?? effort,
+  runtimeDefaultOption: "Runtime default (recommended)",
+  reasoningFollowsRuntimeDefault: "Follows the runtime default",
+  modelDefaultName: "Default model",
+  modelPickerTitle: "Model and reasoning effort",
+  modelPickerAria: (summary, scope, disabled) =>
+    `Model and reasoning effort: ${summary}. ${scope}.${disabled === undefined ? "" : ` ${disabled}.`}`,
+  modelPickerScopeTask: "Set for this conversation",
+  modelPickerScopeGlobal: "Using your default setting",
+  modelPickerScopeRuntime: "Using Grok's default",
+  modelPickerDisabledNoTask: "Open a conversation to choose a model",
+  modelPickerDisabledRunning: "The model can be changed after the current turn finishes",
+  modelPickerDisabledPending: "Applying the change",
+  modelPickerContext: (sizes) => `${sizes} context`,
+  modelPickerDefaultMark: "default",
+  modelPickerUseDefault: "Use default",
+  modelPickerEmpty: "Model choices appear once Grok has started.",
+  modelPickerNoEfforts: "This model has no reasoning effort setting.",
+  modelPickerSaved: "Applies when the session opens.",
+  modelPickerRefused: (reason) => ({
+    incompatible_agent: "This model cannot be used in this conversation after it has started. Your previous selection was kept.",
+    unsupported_value: "Grok does not offer that option for this task right now. Your previous selection was kept.",
+    unavailable: "Grok could not switch right now. Your previous selection was kept.",
+  })[reason],
+  runDuration: (seconds) => seconds < 60
+    ? `${seconds}s`
+    : seconds < 3_600
+      ? `${Math.floor(seconds / 60)}m ${pad2(seconds % 60)}s`
+      : `${Math.floor(seconds / 3_600)}h ${pad2(Math.floor(seconds % 3_600 / 60))}m ${pad2(seconds % 60)}s`,
+  runPhaseStartingRuntime: "Starting Grok",
+  runPhaseOpeningSession: "Opening session",
+  runPhaseMcp: (connected, total) => `MCP ${connected}/${total}`,
+  runPhasePromptSent: "Sent",
+  runPhasePromptSentSlow: "Sent · Grok has not picked it up yet",
+  runPhaseQueued: (position) => position === undefined ? "Queued" : `Queued #${position}`,
+  runPhaseRunningHooks: (count) => count === undefined ? "Running hooks" : `Running hooks (${count})`,
+  runPhaseWaitingForModel: "Waiting for model",
+  runPhaseThinking: "Thinking",
+  runPhasePreparingTool: (toolName) => toolName === undefined ? "Preparing tool" : `Preparing tool ${toolName}`,
+  runPhaseWaitingForPermission: "Waiting for your permission",
+  runPhaseRunningTool: (toolName) => toolName === undefined ? "Running tool" : `Running ${toolName}`,
+  runPhaseRetrying: (attempt, maxRetries) => attempt === undefined || maxRetries === undefined
+    ? "Retrying"
+    : `Retrying ${attempt}/${maxRetries}`,
+  runPhaseResponding: "Responding",
+  runPhaseTime: (phase, total) => phase === undefined ? `total ${total}` : `${phase} · total ${total}`,
+  runtimeSettingsBusy: "Tool permissions and startup options cannot change while a task is running or queued.",
+  runtimeSettingsHelp: "Only official Grok settings are shown. Model and reasoning effort apply from the next turn; tool permissions and startup options reconnect idle sessions safely.",
   webSearch: "Web search",
   webSearchHelp: "Allow the official Grok runtime to use Web Search and Web Fetch.",
   planMode: "Planning",

@@ -123,13 +123,16 @@ for (const pkg of PACKAGES) {
       );
       process.exit(1);
     }
-    const source = join(pkg.src, rel.replace(/\.js$/u, ".ts"));
-    let sourceIsFile = false;
-    try {
-      sourceIsFile = statSync(source).isFile();
-    } catch {
-      sourceIsFile = false;
-    }
+    // A UI test that renders JSX has a .tsx source.
+    const sources = [".ts", ".tsx"].map((extension) => join(pkg.src, rel.replace(/\.js$/u, extension)));
+    const source = sources[0];
+    const sourceIsFile = sources.some((candidate) => {
+      try {
+        return statSync(candidate).isFile();
+      } catch {
+        return false;
+      }
+    });
     if (!sourceIsFile) {
       console.error(
         `test discovery failed: compiled test ${relative(repoRoot, compiled)} has no corresponding source ${relative(repoRoot, source)}`,

@@ -12,6 +12,16 @@ import {
   type WorkspaceId,
 } from "./ids.js";
 import type { RunState } from "./run-events.js";
+import {
+  parseGuildGrokContextWindow,
+  parseGuildGrokModel,
+  parseGuildGrokReasoningEffort,
+  type GrokModelCatalog,
+  type GuildGrokModel,
+  type GuildGrokReasoningEffort,
+  type GuildModelSelectionSource,
+} from "./grok-models.js";
+import type { RunPhaseProjection } from "./run-phase.js";
 import type {
   AcpPermissionOptionKind,
   AcpToolKind,
@@ -38,30 +48,6 @@ export const GUILD_API_VERSION = 1 as const;
 export const GUILD_LOCALES = Object.freeze(["zh-CN", "en-US"] as const);
 export type GuildLocale = (typeof GUILD_LOCALES)[number];
 
-/** PC-ACC-001 / D-011: only xAI Grok models verified through the official process. */
-export const GUILD_GROK_MODELS = Object.freeze([
-  Object.freeze({
-    id: "grok-4.6" as const,
-    name: "Grok 4.6",
-    reasoningEfforts: Object.freeze(["xhigh", "high", "medium", "low"] as const),
-    defaultReasoningEffort: "xhigh" as const,
-  }),
-  Object.freeze({
-    id: "grok-4.5" as const,
-    name: "Grok 4.5",
-    reasoningEfforts: Object.freeze(["high", "medium", "low"] as const),
-    defaultReasoningEffort: "high" as const,
-  }),
-] as const);
-export type GuildGrokModel = (typeof GUILD_GROK_MODELS)[number]["id"];
-export const GUILD_GROK_REASONING_EFFORTS = Object.freeze([
-  "xhigh",
-  "high",
-  "medium",
-  "low",
-] as const);
-export type GuildGrokReasoningEffort =
-  (typeof GUILD_GROK_REASONING_EFFORTS)[number];
 export const GUILD_GROK_PERMISSION_MODES = Object.freeze([
   "default",
   "acceptEdits",
@@ -98,6 +84,7 @@ export const DESKTOP_IPC_CHANNELS = Object.freeze({
   searchConversations: "guild:v1:conversation:search",
   openTaskResource: "guild:v1:task:resource:open",
   setSessionConfigOption: "guild:v1:task:session-config:set",
+  setTaskRuntimeSettings: "guild:v1:task:runtime-settings:set",
   updateWorkspace: "guild:v1:workspace:update",
   updateTask: "guild:v1:task:update",
   sendMessage: "guild:v1:run:send",
@@ -280,6 +267,9 @@ export type TaskViewProjection = {
     }[];
   } | null;
   readonly sessionConfigOptions: readonly RuntimeConfigOption[];
+  readonly modelSelection: TaskModelSelectionProjection;
+  /** Ephemeral phase of the running turn; absent when no turn is running. */
+  readonly runPhase?: RunPhaseProjection;
   readonly auxiliaryActivity?: Readonly<{
     activity: GuildTaskActivity;
     startedAtMs: number;
@@ -387,12 +377,24 @@ export type OfficialUsageProjection =
     };
 
 export type RuntimeSettingsProjection = {
-  readonly model: GuildGrokModel;
-  readonly reasoningEffort: GuildGrokReasoningEffort;
+  /** Global default model; null follows the runtime's advertised default. */
+  readonly model: GuildGrokModel | null;
+  /** Global default reasoning effort; null follows the selected model's advertised default. */
+  readonly reasoningEffort: GuildGrokReasoningEffort | null;
+  /** Last list the official runtime advertised; empty until a runtime has started once. */
+  readonly modelCatalog: GrokModelCatalog;
   readonly permissionMode: GuildGrokPermissionMode;
-  readonly availableModels: typeof GUILD_GROK_MODELS;
   readonly availablePermissionModes: typeof GUILD_GROK_PERMISSION_MODES;
   readonly startup: GuildGrokStartupSettings;
+  readonly canChange: boolean;
+};
+
+/** Model and effort one task will use for its next turn, with where the choice comes from. */
+export type TaskModelSelectionProjection = {
+  readonly modelId: GuildGrokModel | null;
+  readonly reasoningEffort: GuildGrokReasoningEffort | null;
+  readonly source: GuildModelSelectionSource;
+  /** False while a turn runs or the task cannot take a change. */
   readonly canChange: boolean;
 };
 
@@ -502,8 +504,8 @@ export type RefreshUsageRequest = Readonly<Record<string, never>>;
 export type OpenExternalRequest = { readonly url: string };
 export type SetLocaleRequest = { readonly locale: GuildLocale };
 export type SetRuntimeSettingsRequest = {
-  readonly model: GuildGrokModel;
-  readonly reasoningEffort: GuildGrokReasoningEffort;
+  readonly model: GuildGrokModel | null;
+  readonly reasoningEffort: GuildGrokReasoningEffort | null;
   readonly permissionMode: GuildGrokPermissionMode;
   readonly startup: GuildGrokStartupSettings;
 };
@@ -601,6 +603,33 @@ export type SetSessionConfigOptionRequest = {
   readonly configId: string;
   readonly value: string | boolean;
 };
+/** Per-task model and reasoning effort; null for both clears the override (follow the global default). */
+export type SetTaskRuntimeSettingsRequest = {
+  readonly taskId: TaskId;
+  readonly model: GuildGrokModel | null;
+  readonly reasoningEffort: GuildGrokReasoningEffort | null;
+  readonly contextWindow?: number | null;
+};
+export const GUILD_MODEL_SWITCH_REFUSAL_REASONS = Object.freeze([
+  /** The runtime refused the switch because the model needs a different agent type (-32602). */
+  "incompatible_agent",
+  /** The runtime does not offer that model or effort in this session. */
+  "unsupported_value",
+  /** The runtime could not be reached or refused for another reason. */
+  "unavailable",
+] as const);
+export type GuildModelSwitchRefusalReason = (typeof GUILD_MODEL_SWITCH_REFUSAL_REASONS)[number];
+export type SetTaskRuntimeSettingsResponse =
+  /** The runtime confirmed the new selection for the task's live session. */
+  | { readonly status: "applied"; readonly task: TaskViewProjection }
+  /** Saved for the task; there is no live session yet, so it applies when the session opens. */
+  | { readonly status: "saved"; readonly task: TaskViewProjection }
+  /** The runtime refused; the previous selection is kept. */
+  | {
+      readonly status: "refused";
+      readonly reason: GuildModelSwitchRefusalReason;
+      readonly task: TaskViewProjection;
+    };
 export type ChooseAvatarResponse =
   | { readonly status: "cancelled" }
   | { readonly status: "rejected"; readonly reason: GuildAvatarRejectionReason }
@@ -631,6 +660,7 @@ export type DesktopRequestByChannel = {
   readonly [DESKTOP_IPC_CHANNELS.searchConversations]: SearchConversationsRequest;
   readonly [DESKTOP_IPC_CHANNELS.openTaskResource]: OpenTaskResourceRequest;
   readonly [DESKTOP_IPC_CHANNELS.setSessionConfigOption]: SetSessionConfigOptionRequest;
+  readonly [DESKTOP_IPC_CHANNELS.setTaskRuntimeSettings]: SetTaskRuntimeSettingsRequest;
   readonly [DESKTOP_IPC_CHANNELS.updateWorkspace]: UpdateWorkspaceRequest;
   readonly [DESKTOP_IPC_CHANNELS.updateTask]: UpdateTaskRequest;
   readonly [DESKTOP_IPC_CHANNELS.sendMessage]: SendMessageRequest;
@@ -670,6 +700,7 @@ export type DesktopResponseByChannel = {
   readonly [DESKTOP_IPC_CHANNELS.searchConversations]: SearchConversationsResponse;
   readonly [DESKTOP_IPC_CHANNELS.openTaskResource]: EmptyDesktopResponse;
   readonly [DESKTOP_IPC_CHANNELS.setSessionConfigOption]: TaskViewProjection;
+  readonly [DESKTOP_IPC_CHANNELS.setTaskRuntimeSettings]: SetTaskRuntimeSettingsResponse;
   readonly [DESKTOP_IPC_CHANNELS.updateWorkspace]: DesktopBootstrapProjection;
   readonly [DESKTOP_IPC_CHANNELS.updateTask]: DesktopBootstrapProjection;
   readonly [DESKTOP_IPC_CHANNELS.sendMessage]: SendMessageResponse;
@@ -724,6 +755,9 @@ export type GuildRendererApi = Readonly<{
   readonly setSessionConfigOption: (
     request: SetSessionConfigOptionRequest,
   ) => Promise<TaskViewProjection>;
+  readonly setTaskRuntimeSettings: (
+    request: SetTaskRuntimeSettingsRequest,
+  ) => Promise<SetTaskRuntimeSettingsResponse>;
   readonly updateWorkspace: (
     request: UpdateWorkspaceRequest,
   ) => Promise<DesktopBootstrapProjection>;
@@ -803,28 +837,6 @@ export function parseGuildLocale(value: unknown): GuildLocale {
   return value as GuildLocale;
 }
 
-export function parseGuildGrokModel(value: unknown): GuildGrokModel {
-  if (
-    typeof value !== "string" ||
-    !GUILD_GROK_MODELS.some((model) => model.id === value)
-  ) {
-    throw new TypeError("invalid_grok_model");
-  }
-  return value as GuildGrokModel;
-}
-
-export function parseGuildGrokReasoningEffort(
-  value: unknown,
-): GuildGrokReasoningEffort {
-  if (
-    typeof value !== "string" ||
-    !(GUILD_GROK_REASONING_EFFORTS as readonly string[]).includes(value)
-  ) {
-    throw new TypeError("invalid_grok_reasoning_effort");
-  }
-  return value as GuildGrokReasoningEffort;
-}
-
 export function parseGuildGrokPermissionMode(
   value: unknown,
 ): GuildGrokPermissionMode {
@@ -860,17 +872,6 @@ export function parseGuildGrokStartupSettings(value: unknown): GuildGrokStartupS
     subagentsEnabled: record["subagentsEnabled"] as boolean,
     maxTurns: maxTurns as number | null,
   });
-}
-
-export function supportsGuildGrokReasoningEffort(
-  model: GuildGrokModel,
-  reasoningEffort: GuildGrokReasoningEffort,
-): boolean {
-  const definition = GUILD_GROK_MODELS.find((candidate) => candidate.id === model);
-  return definition !== undefined &&
-    (definition.reasoningEfforts as readonly GuildGrokReasoningEffort[]).includes(
-      reasoningEffort,
-    );
 }
 
 export function parseGuildNewTaskWorkspaceMode(
@@ -1079,6 +1080,28 @@ export function parseDesktopRequest<Channel extends DesktopInvokeChannel>(
       const boundedValue = typeof value === "string" ? boundedText(value, 512) : value;
       return Object.freeze({ taskId: boundedId(parsed.value), configId, value: boundedValue }) as DesktopRequestByChannel[Channel];
     }
+    case DESKTOP_IPC_CHANNELS.setTaskRuntimeSettings: {
+      const record = exactRecord(input, ["taskId", "model", "reasoningEffort"], ["contextWindow"]);
+      const parsed = parseTaskId(record["taskId"]);
+      if (!parsed.ok) throw new TypeError("invalid_task_runtime_settings");
+      const model = record["model"] === null ? null : parseGuildGrokModel(record["model"]);
+      const reasoningEffort = record["reasoningEffort"] === null
+        ? null
+        : parseGuildGrokReasoningEffort(record["reasoningEffort"]);
+      const contextWindow = record["contextWindow"] === undefined || record["contextWindow"] === null
+        ? record["contextWindow"] as null | undefined
+        : parseGuildGrokContextWindow(record["contextWindow"]);
+      if (model === null && (reasoningEffort !== null || (contextWindow !== null && contextWindow !== undefined))) {
+        // An override always names its model; only a full clear leaves it out.
+        throw new TypeError("invalid_task_runtime_settings");
+      }
+      return Object.freeze({
+        taskId: boundedId(parsed.value),
+        model,
+        reasoningEffort,
+        ...(contextWindow === undefined ? {} : { contextWindow }),
+      }) as DesktopRequestByChannel[Channel];
+    }
     case DESKTOP_IPC_CHANNELS.updateWorkspace: {
       const record = exactRecord(input, ["workspaceId", "action"]);
       const parsed = parseWorkspaceId(record["workspaceId"]);
@@ -1238,13 +1261,13 @@ export function parseDesktopRequest<Channel extends DesktopInvokeChannel>(
     }
     case DESKTOP_IPC_CHANNELS.setRuntimeSettings: {
       const record = exactRecord(input, ["model", "reasoningEffort", "permissionMode", "startup"]);
-      const model = parseGuildGrokModel(record["model"]);
-      const reasoningEffort = parseGuildGrokReasoningEffort(record["reasoningEffort"]);
+      const model = record["model"] === null ? null : parseGuildGrokModel(record["model"]);
+      const reasoningEffort = record["reasoningEffort"] === null
+        ? null
+        : parseGuildGrokReasoningEffort(record["reasoningEffort"]);
+      if (model === null && reasoningEffort !== null) throw new TypeError("invalid_grok_model");
       const permissionMode = parseGuildGrokPermissionMode(record["permissionMode"]);
       const startup = parseGuildGrokStartupSettings(record["startup"]);
-      if (!supportsGuildGrokReasoningEffort(model, reasoningEffort)) {
-        throw new TypeError("unsupported_grok_reasoning_effort");
-      }
       return Object.freeze({ model, reasoningEffort, permissionMode, startup }) as DesktopRequestByChannel[Channel];
     }
     case DESKTOP_IPC_CHANNELS.setSidebarWidth: {

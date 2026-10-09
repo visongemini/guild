@@ -3,16 +3,17 @@ import { existsSync } from "node:fs";
 import { isMainThread } from "node:worker_threads";
 import {
   createRuntimeTurnEvent,
+  freezeGrokModelCatalog,
   isConstructedRuntimeTurnEvent,
   isTerminalRunState,
   parseAdapterEpoch,
+  parseGuildGrokContextWindow,
   parseGuildGrokModel,
   parseGuildGrokPermissionMode,
   parseGuildGrokReasoningEffort,
   parseGuildGrokStartupSettings,
   parseGuildNewTaskWorkspaceMode,
   parseGuildNickname,
-  supportsGuildGrokReasoningEffort,
   type GuildNewTaskWorkspaceMode,
   parseIdempotencyKey,
   parsePermissionIdentity,
@@ -25,6 +26,7 @@ import {
   type AdapterEpoch,
   type AdapterEpochStatus,
   type IdempotencyKey,
+  type GrokModelCatalog,
   type GuildGrokModel,
   type GuildGrokPermissionMode,
   type GuildGrokReasoningEffort,
@@ -95,6 +97,8 @@ const MAX_ENTRY_ID_LENGTH = 128;
 const MAX_TEXT_BYTES = 1_048_576;
 const MAX_APPEND_BYTES = 262_144;
 const MAX_METADATA_BYTES = 65_536;
+const MAX_MODEL_CATALOG_JSON_LENGTH = 262_144;
+const MAX_RUNTIME_VERSION_LENGTH = 128;
 const MAX_METADATA_DEPTH = 32;
 const MAX_METADATA_MEMBERS = 1_000;
 const MIN_SIDEBAR_WIDTH = 220;
@@ -375,8 +379,9 @@ export type DraftRecord = {
 
 export type AppSettingsRecord = {
   readonly locale: GuildLocale;
-  readonly grokModel: GuildGrokModel;
-  readonly reasoningEffort: GuildGrokReasoningEffort;
+  /** `null` follows the model the official runtime advertises as its default. */
+  readonly grokModel: GuildGrokModel | null;
+  readonly reasoningEffort: GuildGrokReasoningEffort | null;
   readonly permissionMode: GuildGrokPermissionMode;
   readonly startup: GuildGrokStartupSettings;
   readonly sidebarWidth: number;
@@ -391,6 +396,22 @@ export type AppSettingsRecord = {
   readonly revision: number;
   readonly updatedAtMs: number;
 };
+
+/** A row is a per-task override of the global default; a `null` field inherits it. */
+export type TaskRuntimeSettingsRecord = Readonly<{
+  taskId: TaskId;
+  modelId: GuildGrokModel | null;
+  reasoningEffort: GuildGrokReasoningEffort | null;
+  contextWindow: number | null;
+  revision: number;
+  updatedAtMs: number;
+}>;
+
+export type ModelCatalogCacheRecord = Readonly<{
+  catalog: GrokModelCatalog;
+  runtimeVersion?: string;
+  updatedAtMs: number;
+}>;
 
 export type CanonicalTaskRestore = {
   readonly task: TaskAuthority;
@@ -749,8 +770,8 @@ export interface GuildPersistence {
   updateAppSettings(input: {
     readonly expectedRevision: number;
     readonly locale?: GuildLocale;
-    readonly grokModel?: GuildGrokModel;
-    readonly reasoningEffort?: GuildGrokReasoningEffort;
+    readonly grokModel?: GuildGrokModel | null;
+    readonly reasoningEffort?: GuildGrokReasoningEffort | null;
     readonly permissionMode?: GuildGrokPermissionMode;
     readonly startup?: GuildGrokStartupSettings;
     readonly sidebarWidth?: number;
@@ -763,6 +784,23 @@ export interface GuildPersistence {
     readonly lastActiveTaskId?: TaskId | null;
     readonly lastWorkspaceId?: string | null;
   }): AppSettingsRecord;
+  loadTaskRuntimeSettings(taskId: TaskId): TaskRuntimeSettingsRecord | undefined;
+  saveTaskRuntimeSettings(input: {
+    readonly taskId: TaskId;
+    readonly expectedRevision: number;
+    readonly modelId: GuildGrokModel | null;
+    readonly reasoningEffort: GuildGrokReasoningEffort | null;
+    readonly contextWindow: number | null;
+  }): TaskRuntimeSettingsRecord;
+  clearTaskRuntimeSettings(input: {
+    readonly taskId: TaskId;
+    readonly expectedRevision: number;
+  }): void;
+  loadModelCatalogCache(): ModelCatalogCacheRecord | undefined;
+  saveModelCatalogCache(input: {
+    readonly catalog: GrokModelCatalog;
+    readonly runtimeVersion?: string;
+  }): void;
   createRun(input: { readonly taskId: TaskId; readonly runId: RunId }): RunRecord;
   applyRun(input: {
     readonly taskId: TaskId;
@@ -1097,6 +1135,15 @@ function parsedOptionalId(value: string | null): string | undefined {
     throw persistenceError("domain_operation_rejected");
   }
   return value;
+}
+
+function parsedRuntimeSetting<T>(value: unknown, parse: (value: unknown) => T): T | null {
+  if (value === null) return null;
+  try {
+    return parse(value);
+  } catch (cause: unknown) {
+    throw persistenceError("domain_operation_rejected", cause);
+  }
 }
 
 function canonicalMetadataValue(
@@ -3498,8 +3545,8 @@ class SqliteGuildPersistence implements GuildPersistence {
   updateAppSettings(input: {
     readonly expectedRevision: number;
     readonly locale?: GuildLocale;
-    readonly grokModel?: GuildGrokModel;
-    readonly reasoningEffort?: GuildGrokReasoningEffort;
+    readonly grokModel?: GuildGrokModel | null;
+    readonly reasoningEffort?: GuildGrokReasoningEffort | null;
     readonly permissionMode?: GuildGrokPermissionMode;
     readonly startup?: GuildGrokStartupSettings;
     readonly sidebarWidth?: number;
@@ -3514,11 +3561,11 @@ class SqliteGuildPersistence implements GuildPersistence {
   }): AppSettingsRecord {
     const expectedRevision = parsedRevision(input.expectedRevision);
     const locale = input.locale === undefined ? undefined : parsedLocale(input.locale);
-    const grokModel = input.grokModel === undefined
-      ? undefined
+    const grokModel = input.grokModel === undefined || input.grokModel === null
+      ? input.grokModel
       : parseGuildGrokModel(input.grokModel);
-    const reasoningEffort = input.reasoningEffort === undefined
-      ? undefined
+    const reasoningEffort = input.reasoningEffort === undefined || input.reasoningEffort === null
+      ? input.reasoningEffort
       : parseGuildGrokReasoningEffort(input.reasoningEffort);
     const permissionMode = input.permissionMode === undefined
       ? undefined
@@ -3580,8 +3627,8 @@ class SqliteGuildPersistence implements GuildPersistence {
       }
       const next = freeze({
         locale: locale ?? current.locale,
-        grokModel: grokModel ?? current.grokModel,
-        reasoningEffort: reasoningEffort ?? current.reasoningEffort,
+        grokModel: grokModel === undefined ? current.grokModel : grokModel,
+        reasoningEffort: reasoningEffort === undefined ? current.reasoningEffort : reasoningEffort,
         permissionMode: permissionMode ?? current.permissionMode,
         startup: startup ?? current.startup,
         sidebarWidth: sidebarWidth ?? current.sidebarWidth,
@@ -3600,9 +3647,6 @@ class SqliteGuildPersistence implements GuildPersistence {
           ? current.lastWorkspaceId
           : lastWorkspaceId,
       });
-      if (!supportsGuildGrokReasoningEffort(next.grokModel, next.reasoningEffort)) {
-        throw persistenceError("domain_operation_rejected");
-      }
       if (
         next.locale === current.locale &&
         next.grokModel === current.grokModel &&
@@ -3639,8 +3683,8 @@ class SqliteGuildPersistence implements GuildPersistence {
         `)
         .run(
           next.locale,
-          next.grokModel,
-          next.reasoningEffort,
+          next.grokModel ?? "",
+          next.reasoningEffort ?? "",
           next.permissionMode,
           next.startup.webSearchEnabled ? 1 : 0,
           next.startup.planEnabled ? 1 : 0,
@@ -3662,6 +3706,155 @@ class SqliteGuildPersistence implements GuildPersistence {
         throw persistenceError("persistence_cas_conflict");
       }
       return this.#requiredAppSettings();
+    });
+  }
+
+  loadTaskRuntimeSettings(taskIdInput: TaskId): TaskRuntimeSettingsRecord | undefined {
+    this.#assertOpen();
+    const taskId = parsedTaskId(taskIdInput);
+    this.#requiredTaskMetadata(taskId);
+    return this.#selectTaskRuntimeSettings(taskId);
+  }
+
+  saveTaskRuntimeSettings(input: {
+    readonly taskId: TaskId;
+    readonly expectedRevision: number;
+    readonly modelId: GuildGrokModel | null;
+    readonly reasoningEffort: GuildGrokReasoningEffort | null;
+    readonly contextWindow: number | null;
+  }): TaskRuntimeSettingsRecord {
+    const taskId = parsedTaskId(input.taskId);
+    const expectedRevision = parsedRevision(input.expectedRevision, true);
+    const modelId = parsedRuntimeSetting(input.modelId, parseGuildGrokModel);
+    const reasoningEffort = parsedRuntimeSetting(
+      input.reasoningEffort,
+      parseGuildGrokReasoningEffort,
+    );
+    const contextWindow = parsedRuntimeSetting(input.contextWindow, parseGuildGrokContextWindow);
+    // An override with nothing to override is a delete (clearTaskRuntimeSettings).
+    if (modelId === null && reasoningEffort === null && contextWindow === null) {
+      throw persistenceError("domain_operation_rejected");
+    }
+    return this.#immediate(() => {
+      this.#requiredTaskMetadata(taskId);
+      const existing = this.#selectTaskRuntimeSettings(taskId);
+      if (expectedRevision === 0) {
+        if (existing !== undefined) {
+          throw persistenceError("persistence_cas_conflict");
+        }
+        this.#database
+          .prepare(`
+            INSERT INTO task_runtime_settings(
+              task_id, model_id, reasoning_effort, context_window, revision, updated_at_ms
+            ) VALUES(?, ?, ?, ?, 1, ?)
+          `)
+          .run(taskId, modelId, reasoningEffort, contextWindow, exactNow());
+        return this.#requiredTaskRuntimeSettings(taskId);
+      }
+      if (existing === undefined || existing.revision !== expectedRevision) {
+        throw persistenceError("persistence_cas_conflict");
+      }
+      if (
+        existing.modelId === modelId &&
+        existing.reasoningEffort === reasoningEffort &&
+        existing.contextWindow === contextWindow
+      ) {
+        return existing;
+      }
+      const update = this.#database
+        .prepare(`
+          UPDATE task_runtime_settings
+          SET model_id = ?, reasoning_effort = ?, context_window = ?,
+              revision = revision + 1, updated_at_ms = ?
+          WHERE task_id = ? AND revision = ?
+        `)
+        .run(modelId, reasoningEffort, contextWindow, exactNow(), taskId, expectedRevision);
+      if (changes(update.changes) !== 1) {
+        throw persistenceError("persistence_cas_conflict");
+      }
+      return this.#requiredTaskRuntimeSettings(taskId);
+    });
+  }
+
+  clearTaskRuntimeSettings(input: {
+    readonly taskId: TaskId;
+    readonly expectedRevision: number;
+  }): void {
+    const taskId = parsedTaskId(input.taskId);
+    const expectedRevision = parsedRevision(input.expectedRevision);
+    this.#immediate(() => {
+      this.#requiredTaskMetadata(taskId);
+      const cleared = this.#database
+        .prepare("DELETE FROM task_runtime_settings WHERE task_id = ? AND revision = ?")
+        .run(taskId, expectedRevision);
+      if (changes(cleared.changes) !== 1) {
+        throw persistenceError("persistence_cas_conflict");
+      }
+    });
+  }
+
+  /**
+   * The cache is advisory: a row that is missing, unparsable or no longer a valid catalog is
+   * reported as absent, never as an integrity failure, and the next advertised list replaces it.
+   */
+  loadModelCatalogCache(): ModelCatalogCacheRecord | undefined {
+    this.#assertOpen();
+    const row = this.#database
+      .prepare("SELECT * FROM runtime_model_catalog WHERE singleton = 1")
+      .get();
+    if (row === undefined) return undefined;
+    try {
+      const catalog = freezeGrokModelCatalog(JSON.parse(exactText(row, "catalog_json")));
+      const runtimeVersion = optionalText(row, "runtime_version");
+      return freeze({
+        catalog,
+        ...(runtimeVersion === undefined ? {} : { runtimeVersion }),
+        updatedAtMs: exactInteger(row, "updated_at_ms"),
+      });
+    } catch {
+      return undefined;
+    }
+  }
+
+  saveModelCatalogCache(input: {
+    readonly catalog: GrokModelCatalog;
+    readonly runtimeVersion?: string;
+  }): void {
+    this.#assertOpen();
+    let catalogJson: string;
+    try {
+      catalogJson = JSON.stringify(freezeGrokModelCatalog(input.catalog));
+    } catch (cause: unknown) {
+      throw persistenceError("domain_operation_rejected", cause);
+    }
+    if (catalogJson.length > MAX_MODEL_CATALOG_JSON_LENGTH) {
+      throw persistenceError("domain_operation_rejected");
+    }
+    const runtimeVersion = input.runtimeVersion === undefined
+      ? null
+      : boundedString(input.runtimeVersion, MAX_RUNTIME_VERSION_LENGTH);
+    // The runtime re-advertises the same list on every start: an unchanged cache costs no write.
+    const stored = this.#database
+      .prepare("SELECT catalog_json, runtime_version FROM runtime_model_catalog WHERE singleton = 1")
+      .get();
+    if (
+      stored !== undefined &&
+      stored["catalog_json"] === catalogJson &&
+      stored["runtime_version"] === runtimeVersion
+    ) {
+      return;
+    }
+    this.#immediate(() => {
+      this.#database
+        .prepare(`
+          INSERT INTO runtime_model_catalog(singleton, catalog_json, runtime_version, updated_at_ms)
+          VALUES(1, ?, ?, ?)
+          ON CONFLICT(singleton) DO UPDATE SET
+            catalog_json = excluded.catalog_json,
+            runtime_version = excluded.runtime_version,
+            updated_at_ms = excluded.updated_at_ms
+        `)
+        .run(catalogJson, runtimeVersion, exactNow());
     });
   }
 
@@ -4743,6 +4936,10 @@ class SqliteGuildPersistence implements GuildPersistence {
         throw persistenceError("aggregate_integrity_failed");
       }
     }
+    for (const row of this.#database.prepare("SELECT * FROM task_runtime_settings").all()) {
+      this.#decodeTaskRuntimeSettingsRow(row);
+    }
+    // runtime_model_catalog is a cache: a bad row is ignored on load, never an integrity failure.
     this.#requiredAppSettings();
     for (const row of this.#database.prepareUncached("SELECT * FROM committed_envelopes").iterate()) {
       const json = exactText(row, "event_json");
@@ -5752,6 +5949,49 @@ class SqliteGuildPersistence implements GuildPersistence {
     return draft;
   }
 
+  #decodeTaskRuntimeSettingsRow(row: SqlRow): TaskRuntimeSettingsRecord {
+    const task = parseTaskId(exactText(row, "task_id"));
+    if (!task.ok) throw persistenceError("aggregate_integrity_failed");
+    const rawModelId = optionalText(row, "model_id");
+    const rawReasoningEffort = optionalText(row, "reasoning_effort");
+    const rawContextWindow = optionalInteger(row, "context_window");
+    let modelId: GuildGrokModel | null;
+    let reasoningEffort: GuildGrokReasoningEffort | null;
+    let contextWindow: number | null;
+    try {
+      modelId = rawModelId === undefined ? null : parseGuildGrokModel(rawModelId);
+      reasoningEffort = rawReasoningEffort === undefined
+        ? null
+        : parseGuildGrokReasoningEffort(rawReasoningEffort);
+      contextWindow = rawContextWindow === undefined
+        ? null
+        : parseGuildGrokContextWindow(rawContextWindow);
+    } catch (cause: unknown) {
+      throw persistenceError("aggregate_integrity_failed", cause);
+    }
+    return freeze({
+      taskId: task.value,
+      modelId,
+      reasoningEffort,
+      contextWindow,
+      revision: exactInteger(row, "revision"),
+      updatedAtMs: exactInteger(row, "updated_at_ms"),
+    });
+  }
+
+  #selectTaskRuntimeSettings(taskId: TaskId): TaskRuntimeSettingsRecord | undefined {
+    const row = this.#database
+      .prepare("SELECT * FROM task_runtime_settings WHERE task_id = ?")
+      .get(taskId);
+    return row === undefined ? undefined : this.#decodeTaskRuntimeSettingsRow(row);
+  }
+
+  #requiredTaskRuntimeSettings(taskId: TaskId): TaskRuntimeSettingsRecord {
+    const settings = this.#selectTaskRuntimeSettings(taskId);
+    if (settings === undefined) throw persistenceError("aggregate_not_found");
+    return settings;
+  }
+
   #requiredAppSettings(): AppSettingsRecord {
     const row = this.#database
       .prepare("SELECT * FROM app_settings WHERE singleton = 1")
@@ -5772,18 +6012,15 @@ class SqliteGuildPersistence implements GuildPersistence {
     if (browserSync !== 0 && browserSync !== 1) {
       throw persistenceError("aggregate_integrity_failed");
     }
-    let grokModel: GuildGrokModel;
-    let reasoningEffort: GuildGrokReasoningEffort;
+    let grokModel: GuildGrokModel | null;
+    let reasoningEffort: GuildGrokReasoningEffort | null;
     let permissionMode: GuildGrokPermissionMode;
     try {
-      grokModel = parseGuildGrokModel(exactText(row, "grok_model"));
-      reasoningEffort = parseGuildGrokReasoningEffort(
-        exactText(row, "reasoning_effort"),
-      );
+      const storedModel = exactText(row, "grok_model");
+      const storedEffort = exactText(row, "reasoning_effort");
+      grokModel = storedModel === "" ? null : parseGuildGrokModel(storedModel);
+      reasoningEffort = storedEffort === "" ? null : parseGuildGrokReasoningEffort(storedEffort);
       permissionMode = parseGuildGrokPermissionMode(exactText(row, "permission_mode"));
-      if (!supportsGuildGrokReasoningEffort(grokModel, reasoningEffort)) {
-        throw new TypeError("unsupported_grok_reasoning_effort");
-      }
     } catch (cause: unknown) {
       throw persistenceError("aggregate_integrity_failed", cause);
     }

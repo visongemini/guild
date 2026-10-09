@@ -142,6 +142,15 @@ of hard-coded constants. Migrate the `grok_model` CHECK constraints. Show the of
 description (e.g. that `grok-4.7-build-fast` costs 2x). Keep the user's current choice; do not
 silently change it.
 
+#### WP5 status (branch `feature-f1-model-phase`, schema v16, D-054)
+
+Done. The hard-coded `grok-4.6`/`grok-4.5` list is gone from contracts, the ACP profile, the fixture
+service and the CHECK constraints. Verified against the real `grok` 1.0.50 through Guild's own
+runtime path (temporary data directory, two tiny prompts): the list decodes to Grok 4.7, 4.7 Fast
+("Fast variant. 2x the price."), 4.6 and 4.5, each with its own efforts and 256K/500K windows;
+switching model and effort between turns on the same process kept the conversation (the second
+turn recalled a word from the first on a different model).
+
 ## Measurement harness
 
 `scripts/bench/` (node, no Electron UI): open a copy of a given DB and time open/verify, first
