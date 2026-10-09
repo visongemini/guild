@@ -1,7 +1,7 @@
 import type { DatabaseSync } from "node:sqlite";
 import { persistenceError } from "./errors.js";
 
-export const SCHEMA_VERSION = 14;
+export const SCHEMA_VERSION = 15;
 
 const MIGRATION_V1 = String.raw`
 CREATE TABLE schema_migrations (
@@ -943,6 +943,66 @@ INSERT INTO schema_migrations(version, name, applied_at_ms)
 VALUES(14, 'readd_empty_deleted_workspaces', CAST(unixepoch('subsec') * 1000 AS INTEGER));
 `;
 
+// V15 (Guild 2.2 speed plan, WP2/WP3). Metadata-only: no historical row is read or rewritten.
+// 1. The append-only guard no longer compares the whole old text against the new text, which was
+//    O(n) per update and O(n^2) per streamed message. The store only appends with `||`, so the
+//    guard keeps every other column check, requires a strictly increasing revision (a coalesced
+//    stream flush advances it by the number of chunks it covers), and keeps two O(1) text
+//    checks: the byte length never shrinks and the first 64 characters never change.
+// 2. task_context_usage persists the latest exact context occupancy at turn end, so opening a
+//    task no longer scans committed_envelopes.
+const MIGRATION_V15 = String.raw`
+CREATE TABLE guild_meta_next (
+  singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+  schema_version INTEGER NOT NULL CHECK(schema_version = 15),
+  clean_shutdown INTEGER NOT NULL CHECK(clean_shutdown IN (0, 1)),
+  last_integrity_at_ms INTEGER CHECK(last_integrity_at_ms IS NULL OR last_integrity_at_ms >= 0)
+) STRICT;
+
+INSERT INTO guild_meta_next(singleton, schema_version, clean_shutdown, last_integrity_at_ms)
+SELECT singleton, 15, clean_shutdown, last_integrity_at_ms FROM guild_meta;
+
+DROP TABLE guild_meta;
+ALTER TABLE guild_meta_next RENAME TO guild_meta;
+
+DROP TRIGGER conversation_entry_is_append_only;
+CREATE TRIGGER conversation_entry_is_append_only
+BEFORE UPDATE ON conversation_entries
+WHEN NOT (
+  NEW.task_id IS OLD.task_id
+  AND NEW.entry_id IS OLD.entry_id
+  AND NEW.sequence IS OLD.sequence
+  AND NEW.kind IS OLD.kind
+  AND NEW.run_id IS OLD.run_id
+  AND NEW.metadata_json IS OLD.metadata_json
+  AND NEW.metadata_sha256 IS OLD.metadata_sha256
+  AND NEW.initial_fingerprint IS OLD.initial_fingerprint
+  AND NEW.created_at_ms IS OLD.created_at_ms
+  AND NEW.revision > OLD.revision
+  AND NEW.updated_at_ms >= OLD.updated_at_ms
+  AND octet_length(NEW.text_content) >= octet_length(OLD.text_content)
+  AND substr(NEW.text_content, 1, length(substr(OLD.text_content, 1, 64)))
+    = substr(OLD.text_content, 1, 64)
+  AND (
+    (OLD.status = 'streaming' AND NEW.status IN ('streaming', 'complete', 'failed'))
+    OR (OLD.status IN ('complete', 'failed') AND NEW.status IS OLD.status)
+  )
+)
+BEGIN
+  SELECT RAISE(ABORT, 'conversation_entry_not_append_only');
+END;
+
+CREATE TABLE task_context_usage (
+  task_id TEXT PRIMARY KEY REFERENCES tasks(task_id) ON DELETE RESTRICT,
+  session_id TEXT NOT NULL CHECK(length(session_id) > 0),
+  tokens_used INTEGER NOT NULL CHECK(tokens_used >= 0),
+  updated_at_ms INTEGER NOT NULL CHECK(updated_at_ms >= 0)
+) STRICT;
+
+INSERT INTO schema_migrations(version, name, applied_at_ms)
+VALUES(15, 'streaming_write_path_and_context_usage', CAST(unixepoch('subsec') * 1000 AS INTEGER));
+`;
+
 type IntegerRow = Record<string, unknown>;
 
 function exactInteger(row: IntegerRow | undefined, key: string): number {
@@ -1129,6 +1189,18 @@ export function migrateSchema(database: DatabaseSync): void {
       throw persistenceError("schema_integrity_failed", cause);
     }
   }
+  if (version === 14) {
+    database.exec("BEGIN IMMEDIATE");
+    try {
+      database.exec(MIGRATION_V15);
+      database.exec("PRAGMA user_version = 15");
+      database.exec("COMMIT");
+      version = 15;
+    } catch (cause: unknown) {
+      if (database.isTransaction) database.exec("ROLLBACK");
+      throw persistenceError("schema_integrity_failed", cause);
+    }
+  }
   if (version !== SCHEMA_VERSION) {
     throw persistenceError("schema_integrity_failed");
   }
@@ -1139,7 +1211,7 @@ export function migrateSchema(database: DatabaseSync): void {
     .prepare("SELECT schema_version FROM guild_meta WHERE singleton = 1")
     .get();
   if (
-    migrations.length !== 14 ||
+    migrations.length !== 15 ||
     exactInteger(migrations[0], "version") !== 1 ||
     migrations[0]?.["name"] !== "initial_authoritative_aggregates" ||
     exactInteger(migrations[1], "version") !== 2 ||
@@ -1168,6 +1240,8 @@ export function migrateSchema(database: DatabaseSync): void {
     migrations[12]?.["name"] !== "continuous_task_controller" ||
     exactInteger(migrations[13], "version") !== 14 ||
     migrations[13]?.["name"] !== "readd_empty_deleted_workspaces" ||
+    exactInteger(migrations[14], "version") !== 15 ||
+    migrations[14]?.["name"] !== "streaming_write_path_and_context_usage" ||
     exactInteger(meta, "schema_version") !== SCHEMA_VERSION
   ) {
     throw persistenceError("schema_integrity_failed");

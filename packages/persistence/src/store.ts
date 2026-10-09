@@ -1,7 +1,9 @@
-import type { DatabaseSync } from "node:sqlite";
+import type { DatabaseSync, StatementSync } from "node:sqlite";
 import { existsSync } from "node:fs";
 import { isMainThread } from "node:worker_threads";
 import {
+  createRuntimeTurnEvent,
+  isConstructedRuntimeTurnEvent,
   isTerminalRunState,
   parseAdapterEpoch,
   parseGuildGrokModel,
@@ -32,6 +34,7 @@ import {
   type PermissionIdentity,
   type PermissionOutboxCommandId,
   type PermissionOutboxVersion,
+  type RuntimeEnvelope,
   type RuntimePermissionRequestPayload,
   type RuntimeTurnEvent,
   type RunEvent,
@@ -99,6 +102,30 @@ const MAX_SIDEBAR_WIDTH = 600;
 const DEFAULT_CONVERSATION_PAGE_SIZE = 200;
 const MAX_CONVERSATION_PAGE_SIZE = 500;
 const MAX_QUEUED_TURNS_PER_TASK = 32;
+/** Streamed text is written at most this long after the first buffered chunk (WP2). */
+const STREAM_FLUSH_INTERVAL_MS = 100;
+/**
+ * Streamed text commits without a sync, except that a stream commit is synchronous once this
+ * much time has passed since the last synchronous commit of any kind. An OS crash or power loss
+ * therefore cannot lose more than about this much streamed text plus the open window. A process
+ * crash loses only the open window (STREAM_FLUSH_INTERVAL_MS).
+ */
+const STREAM_SYNC_INTERVAL_MS = 2_000;
+/** A coalesced payload must stay inside the 65,536-character runtime payload string limit. */
+const MAX_COALESCED_CHARS = 60_000;
+/**
+ * Stream flushes never run the automatic WAL checkpoint (it can stall a commit for tens of
+ * milliseconds). It runs once the stream has been quiet this long, or when the WAL written by
+ * stream flushes since the last checkpoint is estimated to reach the byte cap.
+ */
+const STREAM_CHECKPOINT_QUIET_MS = 1_000;
+const STREAM_WAL_BYTES_BEFORE_CHECKPOINT = 32 * 1024 * 1024;
+const WAL_AUTOCHECKPOINT_PAGES = 1_000;
+const MAX_CACHED_STATEMENTS = 512;
+const MAX_SEARCH_QUERY_LENGTH = 512;
+const MAX_SEARCH_RESULTS = 500;
+/** Legacy context-token recovery reads at most this many recent terminal Runs of a session. */
+const MAX_LEGACY_CONTEXT_PROBES = 64;
 
 type SqlRow = Record<string, unknown>;
 
@@ -632,6 +659,15 @@ export interface GuildPersistence {
   listConversationEntriesBefore(input: {
     readonly taskId: TaskId;
     readonly beforeSequence: number;
+    readonly limit?: number;
+  }): readonly ConversationEntryRecord[];
+  /**
+   * Visible user and assistant entries of active conversations whose text contains `query`
+   * (case-insensitive), newest conversation activity first, at most `limit` (default 50).
+   * Matching runs in SQL over the stored text, so callers never decode the whole history.
+   */
+  searchConversationEntries(input: {
+    readonly query: string;
     readonly limit?: number;
   }): readonly ConversationEntryRecord[];
   countConversationEntries(taskId: TaskId): number;
@@ -1249,6 +1285,94 @@ function isCoupledPermissionRunEvent(event: RunEvent): boolean {
     event.type === "permission_orphaned";
 }
 
+/**
+ * Prepared-statement cache (WP2). Every store statement is static SQL, so one StatementSync per
+ * SQL text is reused for the life of the connection instead of re-preparing on each call.
+ * Statements run to completion before the next call (no cursor is held across calls), so serial
+ * reuse on the main thread is safe. Cursor-style scans use prepareUncached.
+ */
+class CachedDatabase {
+  readonly #raw: DatabaseSync;
+  readonly #statements = new Map<string, StatementSync>();
+
+  constructor(raw: DatabaseSync) {
+    this.#raw = raw;
+  }
+
+  prepare(sql: string): StatementSync {
+    const cached = this.#statements.get(sql);
+    if (cached !== undefined) return cached;
+    const statement = this.#raw.prepare(sql);
+    if (this.#statements.size >= MAX_CACHED_STATEMENTS) {
+      const oldest = this.#statements.keys().next();
+      if (oldest.done !== true) this.#statements.delete(oldest.value);
+    }
+    this.#statements.set(sql, statement);
+    return statement;
+  }
+
+  prepareUncached(sql: string): StatementSync {
+    return this.#raw.prepare(sql);
+  }
+
+  exec(sql: string): void {
+    this.#raw.exec(sql);
+  }
+
+  get isTransaction(): boolean {
+    return this.#raw.isTransaction;
+  }
+}
+
+/**
+ * One open stream-coalescing window (WP2): consecutive text or thought chunks of one entry that
+ * were admitted but not yet written. Every other store call writes the window first, so the
+ * commit order of the database is the call order of the store. The window is the only state in
+ * which the logical entry (what callers see) is ahead of the stored entry.
+ */
+type StreamWindow = {
+  readonly taskId: TaskId;
+  readonly runId: RunId;
+  readonly entryId: string;
+  readonly payloadType: "agent_text_chunk" | "agent_thought_chunk";
+  readonly messageId: string | null | undefined;
+  readonly sessionId: SessionId;
+  readonly adapterEpoch: AdapterEpoch;
+  readonly run: RunRecord;
+  /** Revision of the stored entry; the flush compare-and-set expects exactly this. */
+  readonly storedRevision: number;
+  readonly storedTextBytes: number;
+  readonly parts: string[];
+  /** Admitted chunks by idempotency key, to answer in-window duplicates and collisions. */
+  readonly admitted: Map<string, RuntimeEnvelope>;
+  lastEvent: RuntimeTurnEvent;
+  lastSequence: number;
+  pendingChars: number;
+  pendingBytes: number;
+  /** What callers observe: stored entry plus every pending chunk. */
+  record: ConversationEntryRecord;
+  timer: ReturnType<typeof setTimeout> | undefined;
+};
+
+/**
+ * The stored aggregates admission consults for live events of one Run. They change only through
+ * store writes, and every write other than a non-terminal live event clears this, so it is valid
+ * exactly while no such write has happened since it was read.
+ */
+type LiveContext = {
+  readonly taskId: TaskId;
+  readonly runId: RunId;
+  readonly run: Loaded<RunRecord>;
+  readonly epoch: AdapterEpochRecord;
+  readonly binding: SessionBindingRecord;
+  readonly authority: TaskAuthority;
+  readonly correlation: PhysicalRecord<PromptCorrelationRecord>;
+};
+
+function escapeLikePattern(value: string): string {
+  return value.replace(/[\\%_]/gu, (character) => `\\${character}`);
+}
+
 function persistenceLeaseError(cause: unknown): PersistenceError {
   return cause instanceof DatabaseLeaseError &&
       cause.code === "database_lease_held"
@@ -1258,16 +1382,26 @@ function persistenceLeaseError(cause: unknown): PersistenceError {
 
 class SqliteGuildPersistence implements GuildPersistence {
   readonly recoveredAfterUncleanShutdown: boolean;
-  readonly #database: DatabaseSync;
+  readonly #database: CachedDatabase;
   readonly #lease: DatabaseLease;
   #closed = false;
+  #stream: StreamWindow | undefined;
+  #liveContext: LiveContext | undefined;
+  #deferredStreamFailure: unknown;
+  /** The connection is configured NORMAL; commits that must survive power loss switch it to FULL. */
+  #synchronousFull = false;
+  #lastSyncAtMs = 0;
+  #autoCheckpoint = true;
+  #streamWalBytes = 0;
+  #lastStreamActivityAtMs = 0;
+  #checkpointTimer: ReturnType<typeof setTimeout> | undefined;
 
   constructor(
     database: DatabaseSync,
     lease: DatabaseLease,
     recoveredAfterUncleanShutdown: boolean,
   ) {
-    this.#database = database;
+    this.#database = new CachedDatabase(database);
     this.#lease = lease;
     this.recoveredAfterUncleanShutdown = recoveredAfterUncleanShutdown;
   }
@@ -1402,7 +1536,7 @@ class SqliteGuildPersistence implements GuildPersistence {
           ORDER BY sequence
         `)
         .all(taskId, limit)
-        .map((row) => this.#decodeConversationEntryRow(row).record),
+        .map((row) => this.#withPendingStream(this.#decodeConversationEntryRow(row).record)),
     );
   }
 
@@ -1437,8 +1571,61 @@ class SqliteGuildPersistence implements GuildPersistence {
           ORDER BY sequence
         `)
         .all(taskId, beforeSequence, limit)
-        .map((row) => this.#decodeConversationEntryRow(row).record),
+        .map((row) => this.#withPendingStream(this.#decodeConversationEntryRow(row).record)),
     );
+  }
+
+  searchConversationEntries(input: {
+    readonly query: string;
+    readonly limit?: number;
+  }): readonly ConversationEntryRecord[] {
+    this.#assertOpen();
+    const needle = typeof input.query === "string" ? input.query.trim() : "";
+    const limit = input.limit ?? 50;
+    if (
+      needle.length > MAX_SEARCH_QUERY_LENGTH ||
+      !Number.isSafeInteger(limit) ||
+      limit < 1 ||
+      limit > MAX_SEARCH_RESULTS
+    ) {
+      throw persistenceError("domain_operation_rejected");
+    }
+    if (needle.length === 0) return Object.freeze([]);
+    // Pending stream text must be searchable, so write the open window first.
+    this.#flushStream();
+    // NOT INDEXED makes this one sequential pass over the table (about 25 ms for 115,000 rows
+    // when cached). The default plan walks the conversation index and fetches rows at random,
+    // which is several times slower when the table is not in the page cache.
+    const visibleEntries = `
+      SELECT entry.*
+      FROM conversation_entries AS entry NOT INDEXED
+      INNER JOIN task_metadata AS task ON task.task_id = entry.task_id
+      INNER JOIN workspaces AS workspace ON workspace.workspace_id = task.workspace_id
+      WHERE task.disposition = 'active'
+        AND workspace.disposition = 'active'
+        AND entry.kind IN ('user', 'assistant')
+        AND json_extract(entry.metadata_json, '$.hidden') IS NOT 1`;
+    const order = "ORDER BY task.last_activity_at_ms DESC, entry.task_id, entry.sequence";
+    // SQL LIKE folds ASCII case only. A needle with cased non-ASCII letters is matched in
+    // JavaScript over the same visible rows, in a cursor, so no result depends on the shortcut.
+    const foldsInSql = needle.toLowerCase() === needle.toUpperCase() ||
+      /^[\u0000-\u007f]*$/u.test(needle);
+    if (foldsInSql) {
+      return Object.freeze(
+        this.#database
+          .prepare(`${visibleEntries} AND entry.text_content LIKE ? ESCAPE '\\' ${order} LIMIT ?`)
+          .all(`%${escapeLikePattern(needle)}%`, limit)
+          .map((row) => this.#decodeConversationEntryRow(row).record),
+      );
+    }
+    const folded = needle.toLowerCase();
+    const matches: ConversationEntryRecord[] = [];
+    for (const row of this.#database.prepareUncached(`${visibleEntries} ${order}`).iterate()) {
+      if (!exactText(row, "text_content").toLowerCase().includes(folded)) continue;
+      matches.push(this.#decodeConversationEntryRow(row).record);
+      if (matches.length >= limit) break;
+    }
+    return Object.freeze(matches);
   }
 
   countConversationEntries(taskIdInput: TaskId): number {
@@ -1458,15 +1645,39 @@ class SqliteGuildPersistence implements GuildPersistence {
     this.#requiredTaskMetadata(taskId);
     const currentSessionId = this.#requiredSession(taskId).value.sessionId;
     if (currentSessionId === undefined) return undefined;
-    const rows = this.#database
+    const persisted = this.#database
+      .prepare("SELECT session_id, tokens_used FROM task_context_usage WHERE task_id = ?")
+      .get(taskId);
+    if (persisted !== undefined && exactText(persisted, "session_id") === currentSessionId) {
+      const used = exactInteger(persisted, "tokens_used");
+      if (used < 0) throw persistenceError("aggregate_integrity_failed");
+      return used;
+    }
+    return this.#recoverContextTokensUsed(taskId, currentSessionId);
+  }
+
+  /**
+   * Databases written before the persisted value existed: read the terminal envelopes of the
+   * session's most recent finished Runs directly by primary key. The envelope table is never
+   * scanned. The next completed turn persists the value and this path stops being used.
+   */
+  #recoverContextTokensUsed(taskId: TaskId, sessionId: SessionId): number | undefined {
+    const terminals = this.#database
       .prepare(`
-        SELECT event_json, event_sha256
-        FROM committed_envelopes
-        WHERE task_id = ?
-        ORDER BY committed_at_ms DESC, receive_sequence DESC
+        SELECT terminal_key FROM prompt_correlations
+        WHERE task_id = ? AND session_id = ? AND status = 'terminal'
+        ORDER BY updated_at_ms DESC, run_id DESC
+        LIMIT ?
       `)
-      .all(taskId);
-    for (const row of rows) {
+      .all(taskId, sessionId, MAX_LEGACY_CONTEXT_PROBES);
+    for (const terminal of terminals) {
+      const row = this.#database
+        .prepare(`
+          SELECT event_json, event_sha256
+          FROM committed_envelopes WHERE task_id = ? AND idempotency_key = ?
+        `)
+        .get(taskId, exactText(terminal, "terminal_key"));
+      if (row === undefined) continue;
       const eventJson = exactText(row, "event_json");
       if (sha256(eventJson) !== exactText(row, "event_sha256")) {
         throw persistenceError("aggregate_integrity_failed");
@@ -1481,7 +1692,7 @@ class SqliteGuildPersistence implements GuildPersistence {
       if (!parsed.ok) throw persistenceError("aggregate_integrity_failed");
       if (
         parsed.value.payload.type === "prompt_terminal" &&
-        parsed.value.payload.sessionId === currentSessionId &&
+        parsed.value.payload.sessionId === sessionId &&
         parsed.value.payload.contextTokensUsed !== undefined
       ) {
         return parsed.value.payload.contextTokensUsed;
@@ -2085,7 +2296,11 @@ class SqliteGuildPersistence implements GuildPersistence {
     readonly replayOrderMarker?: RuntimeReplayOrderMarker;
     readonly terminalFinalizationIdempotencyKey?: IdempotencyKey;
   }): LiveRuntimeEventCommitResult {
-    const parsed = parseRuntimeTurnEvent(input.event);
+    // Events built by createRuntimeTurnEvent were validated and deeply frozen in this process, so
+    // only other values (for example JSON read from outside) need the structural parse.
+    const parsed = isConstructedRuntimeTurnEvent(input.event)
+      ? { ok: true as const, value: input.event }
+      : parseRuntimeTurnEvent(input.event);
     if (!parsed.ok) {
       return freeze({ ok: false, reason: "invalid_runtime_turn_event" });
     }
@@ -2128,19 +2343,29 @@ class SqliteGuildPersistence implements GuildPersistence {
     ) {
       return freeze({ ok: false, reason: "unexpected_terminal_finalization_key" });
     }
-    return this.#immediate(() => {
+    const buffered = this.#acceptStreamChunk(event, mutation, replayOrderMarker);
+    if (buffered !== undefined) return buffered;
+    // Only streamed text may commit without a sync; tools, plans, terminals and the like are durable.
+    const isStreamText =
+      event.payload.type === "agent_text_chunk" || event.payload.type === "agent_thought_chunk";
+    let openedWindow: StreamWindow | undefined;
+    const result = this.#immediate<LiveRuntimeEventCommitResult>(() => {
       const taskId = event.envelope.taskId;
       const runId = event.envelope.runId;
-      this.#requiredTaskMetadata(taskId);
-      const run = this.#requiredRun(taskId, runId);
-      const epoch = this.#selectCurrentAdapterEpoch(taskId)?.record;
+      const known = this.#liveContext;
+      const reuse = known !== undefined && known.taskId === taskId && known.runId === runId
+        ? known
+        : undefined;
+      if (reuse === undefined) this.#requiredTaskMetadata(taskId);
+      const run = reuse?.run ?? this.#requiredRun(taskId, runId);
+      const epoch = reuse?.epoch ?? this.#selectCurrentAdapterEpoch(taskId)?.record;
       if (epoch === undefined) {
         return freeze({ ok: false, reason: "adapter_epoch_absent" });
       }
       if (epoch.status !== "alive") {
         return freeze({ ok: false, reason: "adapter_epoch_not_alive" });
       }
-      const binding = this.#requiredSession(taskId).value;
+      const binding = reuse?.binding ?? this.#requiredSession(taskId).value;
       // Admission compares only this key. The task/key primary key also covers
       // old Runs and adapter epochs without rescanning the task's stream history.
       const committed = this.#database
@@ -2162,7 +2387,7 @@ class SqliteGuildPersistence implements GuildPersistence {
       if (sequenceRow === undefined) {
         throw persistenceError("aggregate_integrity_failed");
       }
-      const authority = this.#requiredTaskAuthority(taskId);
+      const authority = reuse?.authority ?? this.#requiredTaskAuthority(taskId);
       const admission = admitRuntimeTurnEvent(event, {
         binding,
         currentEpoch: epoch.adapterEpoch,
@@ -2189,13 +2414,18 @@ class SqliteGuildPersistence implements GuildPersistence {
         });
       }
 
-      const correlation = this.#requiredPromptCorrelation(taskId, runId);
+      const correlation = reuse?.correlation ?? this.#requiredPromptCorrelation(taskId, runId);
       if (
         correlation.record.sessionId !== event.envelope.sessionId ||
         correlation.record.adapterEpoch !== event.envelope.adapterEpoch ||
         correlation.record.status !== "accepted"
       ) {
         return freeze({ ok: false, reason: "prompt_correlation_mismatch" });
+      }
+      if (event.payload.type !== "prompt_terminal") {
+        // Only terminal events change these aggregates, so the next live event of this Run can
+        // reuse them until some other store call clears the context.
+        this.#liveContext = { taskId, runId, run, epoch, binding, authority, correlation };
       }
 
       let nextRun = run.value;
@@ -2228,6 +2458,19 @@ class SqliteGuildPersistence implements GuildPersistence {
 
       const expectedKind = this.#expectedEntryKind(event);
       const at = exactNow();
+      if (replayOrderMarker === undefined && this.#isCoalescibleChunk(event, mutation)) {
+        // Stream text is written by the coalescing window, not per chunk. Everything above has
+        // admitted this first chunk against stored state; later chunks of the window are admitted
+        // in memory because any other store call writes the window before it changes that state.
+        const target = this.#requireStreamingAppendTarget(taskId, runId, mutation, expectedKind);
+        openedWindow = this.#newStreamWindow(event, mutation, run.value, target.record, at);
+        return freeze({
+          ok: true,
+          duplicate: false,
+          record: openedWindow.record,
+          run: run.value,
+        });
+      }
       const record = this.#applyLiveConversationMutation(
         taskId,
         runId,
@@ -2259,32 +2502,262 @@ class SqliteGuildPersistence implements GuildPersistence {
           throw persistenceError("persistence_cas_conflict");
         }
         this.#persistRun(run, nextRun, at);
+        if (event.payload.contextTokensUsed !== undefined) {
+          this.#database
+            .prepare(`
+              INSERT INTO task_context_usage(task_id, session_id, tokens_used, updated_at_ms)
+              VALUES(?, ?, ?, ?)
+              ON CONFLICT(task_id) DO UPDATE SET
+                session_id = excluded.session_id,
+                tokens_used = excluded.tokens_used,
+                updated_at_ms = excluded.updated_at_ms
+            `)
+            .run(taskId, event.envelope.sessionId, event.payload.contextTokensUsed, at);
+        }
       }
-      const eventJson = JSON.stringify(event);
-      this.#database
-        .prepare(`
-          INSERT INTO committed_envelopes(
-            task_id, idempotency_key, fingerprint, adapter_epoch, ingest_mode,
-            receive_sequence, event_json, event_sha256, committed_at_ms
-          ) VALUES(?, ?, ?, ?, 'live', ?, ?, ?, ?)
-        `)
-        .run(
-          taskId,
-          event.envelope.idempotencyKey,
-          envelopeFingerprint(event.envelope),
-          event.envelope.adapterEpoch,
-          event.envelope.receiveSequence,
-          eventJson,
-          sha256(eventJson),
-          at,
-        );
+      this.#insertCommittedEnvelope(event, at);
       return freeze({
         ok: true,
         duplicate: false,
         record,
         run: nextRun,
       });
+    }, !isStreamText || this.#streamSyncDue(), event.payload.type !== "prompt_terminal");
+    if (openedWindow !== undefined) this.#installStreamWindow(openedWindow);
+    return result;
+  }
+
+  /** One row per committed envelope; a coalesced stream flush stores the event it covers. */
+  #insertCommittedEnvelope(event: RuntimeTurnEvent, committedAtMs: number): void {
+    const eventJson = JSON.stringify(event);
+    this.#database
+      .prepare(`
+        INSERT INTO committed_envelopes(
+          task_id, idempotency_key, fingerprint, adapter_epoch, ingest_mode,
+          receive_sequence, event_json, event_sha256, committed_at_ms
+        ) VALUES(?, ?, ?, ?, 'live', ?, ?, ?, ?)
+      `)
+      .run(
+        event.envelope.taskId,
+        event.envelope.idempotencyKey,
+        envelopeFingerprint(event.envelope),
+        event.envelope.adapterEpoch,
+        event.envelope.receiveSequence,
+        eventJson,
+        sha256(eventJson),
+        committedAtMs,
+      );
+  }
+
+  /**
+   * Text and thought chunks whose entry text equals their payload text are coalesced: the entry
+   * text is appended and ONE envelope is committed per window (WP2). The envelope row carries the
+   * event of the window's last chunk (its receive_sequence and idempotency_key, so the next
+   * admission still sees the gapless last sequence) with the payload text of the whole window.
+   * It therefore stands for the contiguous receive-sequence range ending at its receive_sequence;
+   * earlier keys of the window are not stored. An exact replay of such a key is denied by
+   * sequence staleness, or reported as a collision for the last key of a multi-chunk row, instead
+   * of being reported as a duplicate. In-process keys are random and never replayed.
+   */
+  #isCoalescibleChunk(
+    event: RuntimeTurnEvent,
+    mutation: LiveConversationEntryMutation,
+  ): mutation is Extract<LiveConversationEntryMutation, { readonly type: "append_text" }> {
+    const payload = event.payload;
+    return mutation.type === "append_text" &&
+      (payload.type === "agent_text_chunk" || payload.type === "agent_thought_chunk") &&
+      payload.text === mutation.text;
+  }
+
+  #acceptStreamChunk(
+    event: RuntimeTurnEvent,
+    mutation: LiveConversationEntryMutation,
+    replayOrderMarker: unknown,
+  ): LiveRuntimeEventCommitResult | undefined {
+    const window = this.#stream;
+    if (window === undefined || replayOrderMarker !== undefined) return undefined;
+    const payload = event.payload;
+    const envelope = event.envelope;
+    if (
+      !this.#isCoalescibleChunk(event, mutation) ||
+      (payload.type !== "agent_text_chunk" && payload.type !== "agent_thought_chunk") ||
+      payload.type !== window.payloadType ||
+      payload.messageId !== window.messageId ||
+      mutation.entryId !== window.entryId ||
+      envelope.taskId !== window.taskId ||
+      envelope.runId !== window.runId ||
+      envelope.sessionId !== window.sessionId ||
+      envelope.adapterEpoch !== window.adapterEpoch
+    ) {
+      return undefined;
+    }
+    const known = window.admitted.get(envelope.idempotencyKey);
+    if (known !== undefined) {
+      return envelopeFingerprint(known) === envelopeFingerprint(envelope)
+        ? freeze({ ok: true, duplicate: true, record: window.record, run: window.run })
+        : freeze({ ok: false, reason: "idempotency_collision" });
+    }
+    const chars = mutation.text.length;
+    const bytes = Buffer.byteLength(mutation.text, "utf8");
+    // Anything unusual (gap, stale revision, size limits) is written out and re-judged against
+    // stored state by the ordinary path, which yields the exact historical error.
+    if (
+      envelope.receiveSequence !== window.lastSequence + 1 ||
+      mutation.expectedRevision !== window.record.revision ||
+      window.pendingChars + chars > MAX_COALESCED_CHARS ||
+      window.pendingBytes + bytes > MAX_APPEND_BYTES ||
+      window.storedTextBytes + window.pendingBytes + bytes > MAX_TEXT_BYTES
+    ) {
+      return undefined;
+    }
+    this.#lastStreamActivityAtMs = Date.now();
+    window.parts.push(mutation.text);
+    window.admitted.set(envelope.idempotencyKey, envelope);
+    window.lastEvent = event;
+    window.lastSequence = envelope.receiveSequence;
+    window.pendingChars += chars;
+    window.pendingBytes += bytes;
+    const previous = window.record;
+    window.record = freeze({
+      taskId: previous.taskId,
+      entryId: previous.entryId,
+      sequence: previous.sequence,
+      kind: previous.kind,
+      runId: previous.runId,
+      text: previous.text + mutation.text,
+      metadata: previous.metadata,
+      status: previous.status,
+      revision: previous.revision + 1,
+      createdAtMs: previous.createdAtMs,
+      updatedAtMs: Math.max(this.#lastStreamActivityAtMs, previous.updatedAtMs),
     });
+    return freeze({ ok: true, duplicate: false, record: window.record, run: window.run });
+  }
+
+  #newStreamWindow(
+    event: RuntimeTurnEvent,
+    mutation: Extract<LiveConversationEntryMutation, { readonly type: "append_text" }>,
+    run: RunRecord,
+    stored: ConversationEntryRecord,
+    at: number,
+  ): StreamWindow {
+    const payload = event.payload;
+    if (payload.type !== "agent_text_chunk" && payload.type !== "agent_thought_chunk") {
+      throw persistenceError("domain_operation_rejected");
+    }
+    return {
+      taskId: event.envelope.taskId,
+      runId: event.envelope.runId,
+      entryId: mutation.entryId,
+      payloadType: payload.type,
+      messageId: payload.messageId,
+      sessionId: event.envelope.sessionId,
+      adapterEpoch: event.envelope.adapterEpoch,
+      run,
+      storedRevision: stored.revision,
+      storedTextBytes: Buffer.byteLength(stored.text, "utf8"),
+      parts: [mutation.text],
+      admitted: new Map([[event.envelope.idempotencyKey, event.envelope]]),
+      lastEvent: event,
+      lastSequence: event.envelope.receiveSequence,
+      pendingChars: mutation.text.length,
+      pendingBytes: Buffer.byteLength(mutation.text, "utf8"),
+      record: freeze({
+        ...stored,
+        text: stored.text + mutation.text,
+        revision: stored.revision + 1,
+        updatedAtMs: Math.max(at, stored.updatedAtMs),
+      }),
+      timer: undefined,
+    };
+  }
+
+  #installStreamWindow(window: StreamWindow): void {
+    this.#stream = window;
+    this.#lastStreamActivityAtMs = Date.now();
+    const timer = setTimeout(() => {
+      if (this.#stream !== window) return;
+      try {
+        this.#flushStream();
+      } catch (cause: unknown) {
+        // There is no caller to report to. The next store call rethrows this failure.
+        this.#deferredStreamFailure ??= cause;
+      }
+    }, STREAM_FLUSH_INTERVAL_MS);
+    // A pending window must never keep the process alive; close() and every other store call
+    // write it first, and an abrupt exit loses at most this window.
+    timer.unref?.();
+    window.timer = timer;
+  }
+
+  /** Writes the open window, if any, in one commit and surfaces a failure of an earlier timed write. */
+  #flushStream(): void {
+    const failure = this.#deferredStreamFailure;
+    if (failure !== undefined) {
+      this.#deferredStreamFailure = undefined;
+      throw failure;
+    }
+    const window = this.#stream;
+    if (window === undefined) return;
+    this.#stream = undefined;
+    if (window.timer !== undefined) clearTimeout(window.timer);
+    const chunks = window.parts.length;
+    const text = chunks === 1 ? window.parts[0]! : window.parts.join("");
+    const event = chunks === 1 ? window.lastEvent : this.#coalescedEvent(window, text);
+    // Rewriting the entry row dominates WAL growth: it grows with the stored text.
+    this.#streamWalBytes += window.storedTextBytes + window.pendingBytes + 16_384;
+    const checkpointNow = this.#streamWalBytes >= STREAM_WAL_BYTES_BEFORE_CHECKPOINT;
+    if (checkpointNow) this.#streamWalBytes = 0;
+    this.#transact(() => {
+      const update = this.#database
+        .prepare(`
+          UPDATE conversation_entries
+          SET text_content = text_content || ?, revision = revision + ?, updated_at_ms = ?
+          WHERE task_id = ? AND entry_id = ? AND revision = ? AND status = 'streaming'
+        `)
+        .run(
+          text,
+          chunks,
+          window.record.updatedAtMs,
+          window.taskId,
+          window.entryId,
+          window.storedRevision,
+        );
+      if (changes(update.changes) !== 1) {
+        throw persistenceError("persistence_cas_conflict");
+      }
+      this.#insertCommittedEnvelope(event, exactNow());
+    }, this.#streamSyncDue(), checkpointNow);
+    this.#scheduleQuietCheckpoint();
+  }
+
+  #coalescedEvent(window: StreamWindow, text: string): RuntimeTurnEvent {
+    const last = window.lastEvent;
+    const payload = last.payload;
+    if (payload.type !== "agent_text_chunk" && payload.type !== "agent_thought_chunk") {
+      throw persistenceError("aggregate_integrity_failed");
+    }
+    const created = createRuntimeTurnEvent({
+      taskId: last.envelope.taskId,
+      runId: last.envelope.runId,
+      adapterEpoch: last.envelope.adapterEpoch,
+      ingestMode: "live",
+      receiveSequence: last.envelope.receiveSequence,
+      idempotencyKey: last.envelope.idempotencyKey,
+      payload: { ...payload, text },
+    });
+    if (!created.ok) throw persistenceError("aggregate_integrity_failed");
+    return created.value;
+  }
+
+  /** Callers see the entry as it will be once the open window is written. */
+  #withPendingStream(record: ConversationEntryRecord): ConversationEntryRecord {
+    const window = this.#stream;
+    return window !== undefined &&
+        window.record.entryId === record.entryId &&
+        window.record.taskId === record.taskId
+      ? window.record
+      : record;
   }
 
   createConversationEntry(input: {
@@ -2398,7 +2871,12 @@ class SqliteGuildPersistence implements GuildPersistence {
       if (changes(update.changes) !== 1) {
         throw persistenceError("persistence_cas_conflict");
       }
-      return this.#requiredConversationEntry(taskId, entryId).record;
+      return freeze({
+        ...loaded.record,
+        text: loaded.record.text + text,
+        revision: loaded.record.revision + 1,
+        updatedAtMs: at,
+      });
     });
   }
 
@@ -2444,10 +2922,12 @@ class SqliteGuildPersistence implements GuildPersistence {
     entryIdInput: string,
   ): ConversationEntryRecord {
     this.#assertOpen();
-    return this.#requiredConversationEntry(
-      parsedTaskId(taskIdInput),
-      parsedEntryId(entryIdInput),
-    ).record;
+    return this.#withPendingStream(
+      this.#requiredConversationEntry(
+        parsedTaskId(taskIdInput),
+        parsedEntryId(entryIdInput),
+      ).record,
+    );
   }
 
   listConversationEntries(input: {
@@ -2478,7 +2958,7 @@ class SqliteGuildPersistence implements GuildPersistence {
           LIMIT ?
         `)
         .all(taskId, afterSequence, limit)
-        .map((row) => this.#decodeConversationEntryRow(row).record),
+        .map((row) => this.#withPendingStream(this.#decodeConversationEntryRow(row).record)),
     );
   }
 
@@ -4122,23 +4602,34 @@ class SqliteGuildPersistence implements GuildPersistence {
     });
   }
 
+  /**
+   * Open-time verification (WP3). After an unclean shutdown, or when a dead writer's lease was
+   * reaped, the whole database is verified. After a clean shutdown every aggregate is validated
+   * lazily when it is read (each decoder checks its own SHA-256), so startup does not scan the
+   * history. An explicit verifyIntegrity() call always verifies everything.
+   */
+  verifyAtOpen(): void {
+    if (this.recoveredAfterUncleanShutdown) {
+      this.verifyIntegrity();
+      return;
+    }
+    this.#requiredAppSettings();
+  }
+
   verifyIntegrity(): IntegrityReport {
     this.#assertOpen();
-    const quick = this.#database.prepare("PRAGMA quick_check").all();
+    this.#flushStream();
+    // integrity_check is a superset of quick_check, so recovery runs only the full scan.
+    const structure = this.#database
+      .prepareUncached(
+        this.recoveredAfterUncleanShutdown ? "PRAGMA integrity_check" : "PRAGMA quick_check",
+      )
+      .all();
     if (
-      quick.length !== 1 ||
-      !Object.values(quick[0] ?? {}).includes("ok")
+      structure.length !== 1 ||
+      !Object.values(structure[0] ?? {}).includes("ok")
     ) {
       throw persistenceError("schema_integrity_failed");
-    }
-    if (this.recoveredAfterUncleanShutdown) {
-      const full = this.#database.prepare("PRAGMA integrity_check").all();
-      if (
-        full.length !== 1 ||
-        !Object.values(full[0] ?? {}).includes("ok")
-      ) {
-        throw persistenceError("schema_integrity_failed");
-      }
     }
     if (this.#database.prepare("PRAGMA foreign_key_check").all().length !== 0) {
       throw persistenceError("schema_integrity_failed");
@@ -4164,7 +4655,9 @@ class SqliteGuildPersistence implements GuildPersistence {
     for (const row of this.#database.prepare("SELECT * FROM prompt_correlations").all()) {
       this.#decodePromptCorrelationRow(row);
     }
-    for (const row of this.#database.prepare("SELECT * FROM conversation_entries").all()) {
+    // The two history tables are streamed through a cursor: one row is alive at a time, so the
+    // scan never holds the history in memory.
+    for (const row of this.#database.prepareUncached("SELECT * FROM conversation_entries").iterate()) {
       this.#decodeConversationEntryRow(row);
     }
     for (const row of this.#database.prepare("SELECT * FROM queued_turns").all()) {
@@ -4189,8 +4682,15 @@ class SqliteGuildPersistence implements GuildPersistence {
         throw persistenceError("aggregate_integrity_failed");
       }
     }
+    for (const row of this.#database.prepare("SELECT * FROM task_context_usage").all()) {
+      const parsedTask = parseTaskId(exactText(row, "task_id"));
+      const parsedSession = parseSessionId(exactText(row, "session_id"));
+      if (!parsedTask.ok || !parsedSession.ok || exactInteger(row, "tokens_used") < 0) {
+        throw persistenceError("aggregate_integrity_failed");
+      }
+    }
     this.#requiredAppSettings();
-    for (const row of this.#database.prepare("SELECT * FROM committed_envelopes").all()) {
+    for (const row of this.#database.prepareUncached("SELECT * FROM committed_envelopes").iterate()) {
       const json = exactText(row, "event_json");
       if (sha256(json) !== exactText(row, "event_sha256")) {
         throw persistenceError("aggregate_integrity_failed");
@@ -4229,6 +4729,7 @@ class SqliteGuildPersistence implements GuildPersistence {
 
   backupTo(destinationPath: string): void {
     this.#assertOpen();
+    this.#flushStream();
     if (destinationPath.length === 0 || existsSync(destinationPath)) {
       throw persistenceError("schema_integrity_failed");
     }
@@ -4243,7 +4744,10 @@ class SqliteGuildPersistence implements GuildPersistence {
     if (this.#closed) return;
     let cleanMarked = false;
     let failure: unknown;
+    if (this.#checkpointTimer !== undefined) clearTimeout(this.#checkpointTimer);
+    this.#checkpointTimer = undefined;
     try {
+      this.#flushStream();
       this.#database.exec("BEGIN IMMEDIATE");
       this.#database
         .prepare("UPDATE guild_meta SET clean_shutdown = 1 WHERE singleton = 1")
@@ -4294,21 +4798,74 @@ class SqliteGuildPersistence implements GuildPersistence {
     if (this.#closed) throw persistenceError("persistence_closed");
   }
 
-  #immediate<T>(operation: () => T): T {
+  /**
+   * Every write goes through here. Any open stream window is written first, so commit order is
+   * call order. Commits are synchronous (survive power loss) unless the caller opts out; only
+   * the commits of streamed text and thought chunks opt out. A synchronous commit also makes
+   * every earlier commit durable. Only non-terminal live event commits keep the live admission
+   * context; every other write may change the aggregates it holds and clears it.
+   */
+  #immediate<T>(operation: () => T, durable = true, keepsLiveContext = false): T {
     this.#assertOpen();
     if (this.#database.isTransaction) {
       throw persistenceError("persistence_cas_conflict");
+    }
+    if (!keepsLiveContext) this.#liveContext = undefined;
+    this.#flushStream();
+    return this.#transact(operation, durable);
+  }
+
+  #transact<T>(operation: () => T, durable: boolean, autoCheckpoint = true): T {
+    if (this.#database.isTransaction) {
+      throw persistenceError("persistence_cas_conflict");
+    }
+    if (durable !== this.#synchronousFull) {
+      this.#database.exec(durable ? "PRAGMA synchronous = FULL" : "PRAGMA synchronous = NORMAL");
+      this.#synchronousFull = durable;
+    }
+    if (autoCheckpoint !== this.#autoCheckpoint) {
+      this.#database.exec(
+        `PRAGMA wal_autocheckpoint = ${autoCheckpoint ? WAL_AUTOCHECKPOINT_PAGES : 0}`,
+      );
+      this.#autoCheckpoint = autoCheckpoint;
     }
     this.#database.exec("BEGIN IMMEDIATE");
     try {
       const value = operation();
       this.#database.exec("COMMIT");
+      if (durable) this.#lastSyncAtMs = Date.now();
       return value;
     } catch (cause: unknown) {
       if (this.#database.isTransaction) this.#database.exec("ROLLBACK");
       if (cause instanceof PersistenceError) throw cause;
       throw persistenceError("persistence_cas_conflict", cause);
     }
+  }
+
+  /** Stream commits are synchronous once per STREAM_SYNC_INTERVAL_MS, which bounds power-loss loss. */
+  #streamSyncDue(): boolean {
+    return Date.now() - this.#lastSyncAtMs >= STREAM_SYNC_INTERVAL_MS;
+  }
+
+  /** Quiet-time WAL checkpoint for the stream path; see STREAM_CHECKPOINT_QUIET_MS. */
+  #scheduleQuietCheckpoint(): void {
+    if (this.#checkpointTimer !== undefined) return;
+    const timer = setTimeout(() => {
+      this.#checkpointTimer = undefined;
+      if (this.#closed || this.#database.isTransaction) return;
+      if (Date.now() - this.#lastStreamActivityAtMs < STREAM_CHECKPOINT_QUIET_MS) {
+        this.#scheduleQuietCheckpoint();
+        return;
+      }
+      try {
+        this.#database.prepare("PRAGMA wal_checkpoint(PASSIVE)").get();
+        this.#streamWalBytes = 0;
+      } catch {
+        // The next stream flush or the clean-shutdown checkpoint retries.
+      }
+    }, STREAM_CHECKPOINT_QUIET_MS);
+    timer.unref?.();
+    this.#checkpointTimer = timer;
   }
 
   #decodeWorkspaceRow(row: SqlRow): WorkspaceRecord {
@@ -5036,19 +5593,8 @@ class SqliteGuildPersistence implements GuildPersistence {
         );
       return this.#requiredConversationEntry(taskId, mutation.entryId).record;
     }
-    const loaded = this.#requiredConversationEntry(taskId, mutation.entryId);
-    if (
-      loaded.record.runId !== runId ||
-      (expectedKind !== undefined && loaded.record.kind !== expectedKind) ||
-      loaded.record.revision !== mutation.expectedRevision
-    ) {
-      throw persistenceError("persistence_cas_conflict");
-    }
     if (mutation.type === "append_text") {
-      if (loaded.record.status !== "streaming") {
-        throw persistenceError("domain_operation_rejected");
-      }
-      parsedText(loaded.record.text + mutation.text);
+      const target = this.#requireStreamingAppendTarget(taskId, runId, mutation, expectedKind);
       const update = this.#database
         .prepare(`
           UPDATE conversation_entries
@@ -5059,29 +5605,69 @@ class SqliteGuildPersistence implements GuildPersistence {
       if (changes(update.changes) !== 1) {
         throw persistenceError("persistence_cas_conflict");
       }
-    } else {
-      if (loaded.record.status === mutation.status) return loaded.record;
-      if (loaded.record.status !== "streaming") {
-        throw persistenceError("domain_operation_rejected");
-      }
-      const update = this.#database
-        .prepare(`
-          UPDATE conversation_entries
-          SET status = ?, revision = revision + 1, updated_at_ms = ?
-          WHERE task_id = ? AND entry_id = ? AND revision = ? AND status = 'streaming'
-        `)
-        .run(
-          mutation.status,
-          at,
-          taskId,
-          mutation.entryId,
-          mutation.expectedRevision,
-        );
-      if (changes(update.changes) !== 1) {
-        throw persistenceError("persistence_cas_conflict");
-      }
+      return freeze({
+        ...target.record,
+        text: target.record.text + mutation.text,
+        revision: target.record.revision + 1,
+        updatedAtMs: at,
+      });
     }
-    return this.#requiredConversationEntry(taskId, mutation.entryId).record;
+    const loaded = this.#requiredConversationEntry(taskId, mutation.entryId);
+    if (
+      loaded.record.runId !== runId ||
+      (expectedKind !== undefined && loaded.record.kind !== expectedKind) ||
+      loaded.record.revision !== mutation.expectedRevision
+    ) {
+      throw persistenceError("persistence_cas_conflict");
+    }
+    if (loaded.record.status === mutation.status) return loaded.record;
+    if (loaded.record.status !== "streaming") {
+      throw persistenceError("domain_operation_rejected");
+    }
+    const update = this.#database
+      .prepare(`
+        UPDATE conversation_entries
+        SET status = ?, revision = revision + 1, updated_at_ms = ?
+        WHERE task_id = ? AND entry_id = ? AND revision = ? AND status = 'streaming'
+      `)
+      .run(
+        mutation.status,
+        at,
+        taskId,
+        mutation.entryId,
+        mutation.expectedRevision,
+      );
+    if (changes(update.changes) !== 1) {
+      throw persistenceError("persistence_cas_conflict");
+    }
+    return freeze({
+      ...loaded.record,
+      status: mutation.status,
+      revision: loaded.record.revision + 1,
+      updatedAtMs: at,
+    });
+  }
+
+  /** The stored entry an append may extend, read once and checked in the historical order. */
+  #requireStreamingAppendTarget(
+    taskId: TaskId,
+    runId: RunId,
+    mutation: Extract<LiveConversationEntryMutation, { readonly type: "append_text" }>,
+    expectedKind: ConversationEntryKind | undefined,
+  ): PhysicalRecord<ConversationEntryRecord> {
+    const loaded = this.#requiredConversationEntry(taskId, mutation.entryId);
+    if (
+      loaded.record.runId !== runId ||
+      (expectedKind !== undefined && loaded.record.kind !== expectedKind) ||
+      loaded.record.revision !== mutation.expectedRevision
+    ) {
+      throw persistenceError("persistence_cas_conflict");
+    }
+    if (loaded.record.status !== "streaming") {
+      throw persistenceError("domain_operation_rejected");
+    }
+    parsedText(loaded.record.text + mutation.text);
+    return loaded;
   }
 
   #decodeDraftRow(row: SqlRow): DraftRecord {
@@ -5632,8 +6218,11 @@ function configureConnection(database: DatabaseSync): void {
   if (journal?.["journal_mode"] !== "wal") {
     throw persistenceError("storage_configuration_failed");
   }
+  // NORMAL under WAL: a commit is atomic and ordered but not fsynced, so an OS crash or power loss
+  // may roll back to an earlier commit. Commits that must be durable switch the connection to
+  // FULL for their own commit (see #immediate); stream text does not.
   database.exec(`
-    PRAGMA synchronous = FULL;
+    PRAGMA synchronous = NORMAL;
     PRAGMA foreign_keys = ON;
     PRAGMA trusted_schema = OFF;
     PRAGMA recursive_triggers = ON;
@@ -5645,7 +6234,7 @@ function configureConnection(database: DatabaseSync): void {
   const trustedSchema = database.prepare("PRAGMA trusted_schema").get();
   const lockingMode = database.prepare("PRAGMA locking_mode").get();
   if (
-    synchronous?.["synchronous"] !== 2 ||
+    synchronous?.["synchronous"] !== 1 ||
     foreignKeys?.["foreign_keys"] !== 1 ||
     trustedSchema?.["trusted_schema"] !== 0 ||
     lockingMode?.["locking_mode"] !== "exclusive"
@@ -5688,6 +6277,8 @@ export function openGuildPersistence(
 
   try {
     configureConnection(database);
+    // Migrations and the dirty-shutdown marker are durable like every non-stream write.
+    database.exec("PRAGMA synchronous = FULL");
     migrateSchema(database);
     if (!databaseAlreadyExisted && initialLocale !== undefined) {
       const initialized = database
@@ -5707,7 +6298,7 @@ export function openGuildPersistence(
       lease,
       cleanShutdown === 0 || lease.recoveredStaleOwner,
     );
-    store.verifyIntegrity();
+    store.verifyAtOpen();
     database.exec("BEGIN IMMEDIATE");
     try {
       const dirty = database
@@ -5721,6 +6312,7 @@ export function openGuildPersistence(
       if (database.isTransaction) database.exec("ROLLBACK");
       throw cause;
     }
+    database.exec("PRAGMA synchronous = NORMAL");
     return store;
   } catch (cause: unknown) {
     if (database.isTransaction) {

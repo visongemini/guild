@@ -3746,6 +3746,9 @@ export function createLiveDesktopService(
   }
 
   function notePromptActivity(taskId: TaskId, controller: RuntimeController): void {
+    // The silence watchdog is opt-in (tests and diagnostics). Without it there is nothing to
+    // re-arm, so skip the Run reload this check used to repeat for every streamed chunk.
+    if (options.promptSilenceMs === undefined) return;
     const adapter = controller.adapter;
     const runId = controller.activeRunId;
     if (adapter === undefined || runId === undefined || controller.pendingPermissions.size > 0) return;
@@ -4406,23 +4409,20 @@ export function createLiveDesktopService(
       assertOpen();
       const locale = store.loadAppSettings().locale;
       const results = [];
-      for (const workspace of store.listWorkspaces({ includeArchived: true })) {
-        if (workspace.disposition !== "active") continue;
-        for (const task of store.listTasks({ workspaceId: workspace.workspaceId })) {
-          for (const match of conversationMatches(allTaskConversationEntries(task.taskId), query, locale)) {
+      // The store matches in SQL and returns only candidate entries; the same JavaScript matcher
+      // as before confirms each one and builds the snippet.
+      for (const entry of store.searchConversationEntries({ query, limit: 50 })) {
+        for (const match of conversationMatches([entry], query, locale)) {
+          const task = store.loadTaskMetadata(entry.taskId);
           results.push(Object.freeze({
             taskId: task.taskId,
             workspaceId: must(parseWorkspaceId(task.workspaceId)),
             taskTitle: task.title,
-            workspaceName: workspace.displayName,
+            workspaceName: store.loadWorkspace(task.workspaceId).displayName,
             ...match,
             updatedAtMs: task.lastActivityAtMs,
           }));
-          if (results.length >= 50) break;
-          }
-          if (results.length >= 50) break;
         }
-        if (results.length >= 50) break;
       }
       results.sort((a, b) => b.updatedAtMs - a.updatedAtMs);
       return Object.freeze({ results: Object.freeze(results) });

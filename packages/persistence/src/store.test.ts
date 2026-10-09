@@ -369,13 +369,13 @@ describe("main-only SQLite persistence", () => {
     );
   });
 
-  it("creates a WAL database whose application tables are STRICT at schema v14", (t) => {
+  it("creates a WAL database whose application tables are STRICT at schema v15", (t) => {
     const path = temporaryDatabase(t);
     const store = baseStore(path);
     store.close();
     const raw = new DatabaseSync(path);
     assert.equal(raw.prepare("PRAGMA journal_mode").get()?.["journal_mode"], "wal");
-    assert.equal(raw.prepare("PRAGMA user_version").get()?.["user_version"], 14);
+    assert.equal(raw.prepare("PRAGMA user_version").get()?.["user_version"], 15);
     const strictByTable = new Map(
       raw
         .prepare("PRAGMA table_list")
@@ -402,6 +402,7 @@ describe("main-only SQLite persistence", () => {
       "app_settings",
       "session_context_windows",
       "continuous_tasks",
+      "task_context_usage",
     ]) {
       assert.equal(strictByTable.get(table), 1, `${table} must be STRICT`);
     }
@@ -1087,7 +1088,7 @@ describe("main-only SQLite persistence", () => {
     const reopened = openGuildPersistence({ path });
     assert.equal(reopened.loadRun(taskId, runId).state, "completed");
     assert.equal(reopened.loadConversationEntry(taskId, "live-assistant-1").text, "Hello");
-    assert.equal(reopened.verifyIntegrity().schemaVersion, 14);
+    assert.equal(reopened.verifyIntegrity().schemaVersion, 15);
     reopened.close();
   });
 
@@ -1134,7 +1135,7 @@ describe("main-only SQLite persistence", () => {
     const next = store.commitLiveRuntimeEvent({ event: eventAt(257), mutation });
     assert.equal(next.ok, true);
     assert.equal(next.record?.text, "x".repeat(257));
-    assert.equal(store.verifyIntegrity().schemaVersion, 14);
+    assert.equal(store.verifyIntegrity().schemaVersion, 15);
     store.close();
   });
 
@@ -1146,6 +1147,7 @@ describe("main-only SQLite persistence", () => {
     const raw = new DatabaseSync(path);
     raw.exec(`
       PRAGMA foreign_keys = OFF;
+      DROP TABLE task_context_usage;
       DROP TABLE continuous_tasks;
       DROP TABLE queued_turns;
       DROP TABLE session_context_windows;
@@ -1170,7 +1172,7 @@ describe("main-only SQLite persistence", () => {
         PRIMARY KEY(task_id, idempotency_key),
         UNIQUE(task_id, adapter_epoch, receive_sequence)
       ) STRICT;
-      DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14);
+      DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
       CREATE TABLE guild_meta_v1 (
         singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
         schema_version INTEGER NOT NULL CHECK(schema_version = 1),
@@ -1186,7 +1188,7 @@ describe("main-only SQLite persistence", () => {
     raw.close();
 
     const migrated = openGuildPersistence({ path });
-    assert.equal(migrated.verifyIntegrity().schemaVersion, 14);
+    assert.equal(migrated.verifyIntegrity().schemaVersion, 15);
     assert.equal(migrated.loadRun(taskId, runId).state, "queued");
     assert.throws(
       () => migrated.loadTaskMetadata(taskId),
@@ -1331,7 +1333,7 @@ describe("main-only SQLite persistence", () => {
     });
     assert.equal(secondDispatch.run.runId, secondQueuedRunId);
     assert.equal(store.listQueuedTurns(taskId).length, 0);
-    assert.equal(store.verifyIntegrity().schemaVersion, 14);
+    assert.equal(store.verifyIntegrity().schemaVersion, 15);
     store.close();
   });
 
@@ -1680,7 +1682,7 @@ describe("main-only SQLite persistence", () => {
     recovered.close();
   });
 
-  it("rejects a stored aggregate whose SHA-256 was tampered", (t) => {
+  it("rejects a stored aggregate whose SHA-256 was tampered when it is read or after an unclean shutdown", (t) => {
     const path = temporaryDatabase(t);
     const store = baseStore(path);
     store.close();
@@ -1690,6 +1692,28 @@ describe("main-only SQLite persistence", () => {
       .run("0".repeat(64), taskId, runId);
     raw.close();
 
+    // WP3: a clean start validates lazily, so open succeeds and the first read of the aggregate
+    // (or an explicit full verification) reports the tamper.
+    const lazy = openGuildPersistence({ path });
+    assert.equal(lazy.recoveredAfterUncleanShutdown, false);
+    assert.throws(
+      () => lazy.loadRun(taskId, runId),
+      (error: unknown) =>
+        error instanceof PersistenceError &&
+        error.code === "aggregate_integrity_failed",
+    );
+    assert.throws(
+      () => lazy.verifyIntegrity(),
+      (error: unknown) =>
+        error instanceof PersistenceError &&
+        error.code === "aggregate_integrity_failed",
+    );
+    lazy.close();
+
+    // After an unclean shutdown the open itself verifies every aggregate.
+    const marker = new DatabaseSync(path);
+    marker.prepare("UPDATE guild_meta SET clean_shutdown = 0 WHERE singleton = 1").run();
+    marker.close();
     assert.throws(
       () => openGuildPersistence({ path }),
       (error: unknown) =>
@@ -2686,5 +2710,651 @@ describe("main-only SQLite persistence", () => {
       /permission_decision_immutable/u,
     );
     raw.close();
+  });
+  describe("streaming write path (WP2) and startup/read path (WP3)", () => {
+    const streamReceived = { wallClockIso: "2026-10-09T12:00:00.000Z", monotonicMs: 1 } as const;
+
+    function textChunk(
+      sequence: number,
+      text: string,
+      options: {
+        readonly type?: "agent_text_chunk" | "agent_thought_chunk";
+        readonly messageId?: string;
+        readonly idempotencyKey?: ReturnType<typeof key>;
+      } = {},
+    ) {
+      return must(createRuntimeTurnEvent({
+        taskId,
+        runId,
+        adapterEpoch: epoch,
+        ingestMode: "live",
+        receiveSequence: sequence,
+        idempotencyKey: options.idempotencyKey ?? key("stream-chunk"),
+        payload: {
+          type: options.type ?? "agent_text_chunk",
+          sessionId,
+          received: streamReceived,
+          ...(options.messageId === undefined ? {} : { messageId: options.messageId }),
+          text,
+        },
+      }));
+    }
+
+    /** Creates an entry from its first chunk, then appends the rest the way the live service does. */
+    function streamChunks(
+      store: GuildPersistence,
+      entryId: string,
+      texts: readonly string[],
+      firstSequence: number,
+      options: { readonly type?: "agent_text_chunk" | "agent_thought_chunk"; readonly messageId?: string } = {},
+    ) {
+      const kind = options.type === "agent_thought_chunk" ? "thought" : "assistant";
+      let sequence = firstSequence;
+      const created = store.commitLiveRuntimeEvent({
+        event: textChunk(sequence, texts[0]!, options),
+        mutation: { type: "create", entryId, kind, text: texts[0]!, status: "streaming" },
+      });
+      assert.equal(created.ok, true, created.ok ? "" : created.reason);
+      let record = created.record!;
+      for (const text of texts.slice(1)) {
+        sequence += 1;
+        const appended = store.commitLiveRuntimeEvent({
+          event: textChunk(sequence, text, options),
+          mutation: { type: "append_text", entryId, expectedRevision: record.revision, text },
+        });
+        assert.equal(appended.ok, true, appended.ok ? "" : appended.reason);
+        record = appended.record!;
+      }
+      return { record, lastSequence: sequence };
+    }
+
+    function terminalEvent(sequence: number, tokens?: number, forRun = runId) {
+      return must(createRuntimeTurnEvent({
+        taskId,
+        runId: forRun,
+        adapterEpoch: epoch,
+        ingestMode: "live",
+        receiveSequence: sequence,
+        idempotencyKey: key("stream-terminal"),
+        payload: {
+          type: "prompt_terminal",
+          sessionId,
+          received: streamReceived,
+          stopReason: "end_turn",
+          classification: "completed",
+          ...(tokens === undefined ? {} : { contextTokensUsed: tokens }),
+        },
+      }));
+    }
+
+    function rawRows<T extends Record<string, unknown>>(path: string, sql: string, ...parameters: string[]): T[] {
+      const raw = new DatabaseSync(path);
+      try {
+        return raw.prepare(sql).all(...parameters) as T[];
+      } finally {
+        raw.close();
+      }
+    }
+
+    it("coalesces a 2,000-chunk burst into one entry write and one envelope [WP2]", (t) => {
+      const path = temporaryDatabase(t);
+      const store = liveReadyStore(path);
+      const texts = Array.from({ length: 2_000 }, (_, index) => ["a", "。", "ing", "x,"][index % 4]!);
+      const { record, lastSequence } = streamChunks(store, "burst-entry", texts, 1);
+      const expected = texts.join("");
+      // Revision still counts chunks, so callers' compare-and-set tokens are unchanged.
+      assert.equal(record.revision, 2_000);
+      assert.equal(record.text, expected);
+      // Every reader sees the pending tail before it is written.
+      assert.equal(store.loadConversationEntry(taskId, "burst-entry").text, expected);
+      assert.equal(store.loadConversationEntry(taskId, "burst-entry").revision, 2_000);
+      assert.equal(store.listRecentConversationEntries({ taskId }).at(-1)?.text, expected);
+      assert.equal(store.listConversationEntries({ taskId }).at(-1)?.text, expected);
+      assert.equal(store.countConversationEntries(taskId), 1);
+      store.close();
+
+      const stored = rawRows<{ text_content: string; revision: number; status: string }>(
+        path,
+        "SELECT text_content, revision, status FROM conversation_entries WHERE entry_id = 'burst-entry'",
+      );
+      assert.equal(stored.length, 1);
+      assert.equal(stored[0]!.text_content === expected, true);
+      assert.equal(stored[0]!.revision, 2_000);
+      assert.equal(stored[0]!.status, "streaming");
+      const envelopes = rawRows<{ receive_sequence: number; event_json: string }>(
+        path,
+        "SELECT receive_sequence, event_json FROM committed_envelopes WHERE task_id = 'task-1' ORDER BY receive_sequence",
+      );
+      // One row for the create and ONE for the 1,999 appended chunks, ending at the last sequence.
+      assert.deepEqual(envelopes.map((row) => row.receive_sequence), [1, lastSequence]);
+      const merged = JSON.parse(envelopes[1]!.event_json) as { payload: { text: string } };
+      assert.equal(merged.payload.text, texts.slice(1).join(""));
+
+      const reopened = openGuildPersistence({ path });
+      assert.equal(reopened.verifyIntegrity().schemaVersion, 15);
+      // Admission continues from the last covered sequence, so the stream resumes gaplessly.
+      const next = reopened.commitLiveRuntimeEvent({
+        event: textChunk(lastSequence + 1, "!"),
+        mutation: { type: "append_text", entryId: "burst-entry", expectedRevision: 2_000, text: "!" },
+      });
+      assert.equal(next.ok, true, next.ok ? "" : next.reason);
+      assert.equal(next.record?.text, `${expected}!`);
+      reopened.close();
+    });
+
+    it("writes the open window before any other store call, in call order [WP2]", (t) => {
+      const path = temporaryDatabase(t);
+      const store = liveReadyStore(path);
+      const { lastSequence } = streamChunks(store, "ordered-entry", ["a", "b", "c", "d"], 1);
+      // A tool update is a boundary. Admission requires the last stored sequence to be 3, which
+      // is only true if the pending window was written before this event was judged.
+      const toolEvent = must(createRuntimeTurnEvent({
+        taskId,
+        runId,
+        adapterEpoch: epoch,
+        ingestMode: "live",
+        receiveSequence: lastSequence + 1,
+        idempotencyKey: key("tool-boundary"),
+        payload: {
+          type: "tool_call_create",
+          sessionId,
+          received: streamReceived,
+          toolCallId: "tool-boundary",
+          title: "Read",
+        },
+      }));
+      const tool = store.commitLiveRuntimeEvent({
+        event: toolEvent,
+        mutation: {
+          type: "create",
+          entryId: "tool-entry",
+          kind: "tool",
+          text: "Read",
+          status: "complete",
+        },
+      });
+      assert.equal(tool.ok, true, tool.ok ? "" : tool.reason);
+      store.close();
+
+      const entries = rawRows<{ entry_id: string; sequence: number; text_content: string }>(
+        path,
+        "SELECT entry_id, sequence, text_content FROM conversation_entries ORDER BY sequence",
+      );
+      assert.deepEqual(entries.map((entry) => [entry.entry_id, entry.text_content]), [
+        ["ordered-entry", "abcd"],
+        ["tool-entry", "Read"],
+      ]);
+      const envelopes = rawRows<{ receive_sequence: number; committed_at_ms: number }>(
+        path,
+        "SELECT receive_sequence, committed_at_ms FROM committed_envelopes ORDER BY receive_sequence",
+      );
+      assert.deepEqual(envelopes.map((row) => row.receive_sequence), [1, 4, 5]);
+      assert.equal(
+        envelopes.every((row, index) => index === 0 || row.committed_at_ms >= envelopes[index - 1]!.committed_at_ms),
+        true,
+      );
+    });
+
+    it("judges unusual chunks against stored state without losing pending text [WP2]", (t) => {
+      const path = temporaryDatabase(t);
+      const store = liveReadyStore(path);
+      const first = textChunk(1, "a", { messageId: "message-1" });
+      assert.equal(store.commitLiveRuntimeEvent({
+        event: first,
+        mutation: { type: "create", entryId: "edge-entry", kind: "assistant", text: "a", status: "streaming" },
+      }).ok, true);
+      const second = textChunk(2, "b", { messageId: "message-1" });
+      const append = (event: ReturnType<typeof textChunk>, expectedRevision: number, text: string) =>
+        store.commitLiveRuntimeEvent({
+          event,
+          mutation: { type: "append_text", entryId: "edge-entry", expectedRevision, text },
+        });
+      const textAfter = (result: ReturnType<typeof append>) =>
+        result.ok ? result.record?.text : result.reason;
+      assert.equal(append(second, 1, "b").ok, true);
+      const third = textChunk(3, "c", { messageId: "message-1" });
+      assert.equal(textAfter(append(third, 2, "c")), "abc");
+
+      // In-window duplicate and collision are answered from memory.
+      const duplicate = append(third, 2, "c");
+      assert.equal(duplicate.ok && duplicate.duplicate, true);
+      assert.equal(duplicate.ok ? duplicate.record?.text : "", "abc");
+      assert.deepEqual(
+        append(textChunk(3, "different", { messageId: "message-1", idempotencyKey: third.envelope.idempotencyKey }), 3, "different"),
+        { ok: false, reason: "idempotency_collision" },
+      );
+
+      // A gap and a stale revision are judged by the ordinary path, with the historical results.
+      assert.deepEqual(append(textChunk(9, "z", { messageId: "message-1" }), 3, "z"), {
+        ok: false,
+        reason: "out_of_order_receive_sequence",
+      });
+      assert.throws(
+        () => append(textChunk(4, "d", { messageId: "message-1" }), 1, "d"),
+        (error: unknown) =>
+          error instanceof PersistenceError && error.code === "persistence_cas_conflict",
+      );
+      // Nothing pending was lost by either rejection, and the stream continues.
+      assert.equal(store.loadConversationEntry(taskId, "edge-entry").text, "abc");
+      assert.equal(textAfter(append(textChunk(4, "d", { messageId: "message-1" }), 3, "d")), "abcd");
+
+      // A different protocol message id ends the window; so does an entry of another kind.
+      assert.equal(textAfter(append(textChunk(5, "e", { messageId: "message-2" }), 4, "e")), "abcde");
+      const thought = store.commitLiveRuntimeEvent({
+        event: textChunk(6, "t", { type: "agent_thought_chunk" }),
+        mutation: { type: "create", entryId: "edge-thought", kind: "thought", text: "t", status: "streaming" },
+      });
+      assert.equal(thought.ok, true, thought.ok ? "" : thought.reason);
+      assert.equal(store.loadConversationEntry(taskId, "edge-entry").text, "abcde");
+      store.close();
+
+      const envelopes = rawRows<{ receive_sequence: number; event_json: string }>(
+        path,
+        "SELECT receive_sequence, event_json FROM committed_envelopes ORDER BY receive_sequence",
+      );
+      // create(1), window b+c (2..3) written by the gap probe, window d (4) written by the
+      // message-id change, window e (5) written by the thought entry, thought create (6).
+      assert.deepEqual(envelopes.map((row) => row.receive_sequence), [1, 3, 4, 5, 6]);
+      const merged = JSON.parse(envelopes[1]!.event_json) as { payload: { text: string; messageId: string } };
+      assert.equal(merged.payload.text, "bc");
+      assert.equal(merged.payload.messageId, "message-1");
+      const single = JSON.parse(envelopes[2]!.event_json) as { payload: { text: string } };
+      assert.equal(single.payload.text, "d");
+    });
+
+    it("never admits a chunk from state cached before another write changed it [WP2]", (t) => {
+      const warm = (store: GuildPersistence) => {
+        const { record, lastSequence } = streamChunks(store, "stale-entry", ["a", "b", "c"], 1);
+        const next = (sequence: number, expectedRevision: number) => store.commitLiveRuntimeEvent({
+          event: textChunk(sequence, "z"),
+          mutation: { type: "append_text", entryId: "stale-entry", expectedRevision, text: "z" },
+        });
+        // The live context is warm here; the chunk is admitted.
+        assert.equal(next(lastSequence + 1, record.revision).ok, true);
+        return () => next(lastSequence + 2, record.revision + 1);
+      };
+
+      // Interrupting the Run is a write that is not a live event: the context must be dropped.
+      const interruptedStore = liveReadyStore(temporaryDatabase(t));
+      const lateChunk = warm(interruptedStore);
+      const interrupted = interruptedStore.applyRun({
+        taskId,
+        runId,
+        event: { type: "application_quit", idempotencyKey: key("stale-quit") },
+      });
+      assert.equal(interrupted.ok, true, interrupted.ok ? "" : interrupted.reason);
+      assert.equal(lateChunk().ok, false);
+      assert.equal(interruptedStore.loadConversationEntry(taskId, "stale-entry").text, "abcz");
+      interruptedStore.close();
+
+      // The same holds for an adapter epoch that exits after a warm admission.
+      const exitedStore = liveReadyStore(temporaryDatabase(t));
+      const lateAfterExit = warm(exitedStore);
+      const current = exitedStore.loadCurrentAdapterEpoch(taskId)!;
+      exitedStore.commitAdapterEpoch({
+        taskId,
+        sessionId,
+        adapterEpoch: epoch,
+        expectedRevision: current.revision,
+        status: "exited",
+      });
+      assert.equal(lateAfterExit().ok, false);
+      exitedStore.close();
+    });
+
+    it("limits the crash window to unwritten stream text; boundaries and terminals are durable [WP2]", (t) => {
+      const spec = { taskId: "task-1", runId: "run-1", sessionId: "session-1" };
+      const script = String.raw`
+        const { openGuildPersistence } = await import(process.env.GUILD_CRASH_PERSISTENCE_URL);
+        const { createRuntimeTurnEvent } = await import(process.env.GUILD_CRASH_CONTRACTS_URL);
+        const spec = JSON.parse(process.env.GUILD_CRASH_SPEC);
+        const store = openGuildPersistence({ path: process.env.GUILD_CRASH_DATABASE_PATH });
+        let sequence = 0;
+        const event = (payload) => {
+          sequence += 1;
+          const created = createRuntimeTurnEvent({
+            taskId: spec.taskId, runId: spec.runId, adapterEpoch: 1, ingestMode: "live",
+            receiveSequence: sequence, idempotencyKey: "crash-" + sequence + "-" + Math.random(),
+            payload: { sessionId: spec.sessionId, received: { wallClockIso: "2026-10-09T12:00:00.000Z", monotonicMs: 1 }, ...payload },
+          });
+          if (!created.ok) throw new Error(created.reason);
+          return created.value;
+        };
+        const chunk = (text) => event({ type: "agent_text_chunk", text });
+        let record = store.commitLiveRuntimeEvent({
+          event: chunk("A"),
+          mutation: { type: "create", entryId: "crash-entry", kind: "assistant", text: "A", status: "streaming" },
+        }).record;
+        for (const text of ["B", "C", "D"]) {
+          const result = store.commitLiveRuntimeEvent({
+            event: chunk(text),
+            mutation: { type: "append_text", entryId: "crash-entry", expectedRevision: record.revision, text },
+          });
+          if (!result.ok) throw new Error(result.reason);
+          record = result.record;
+        }
+        if (spec.scenario === "timer") await new Promise((resolve) => setTimeout(resolve, 400));
+        if (spec.scenario === "boundary") {
+          store.applyRun({ taskId: spec.taskId, runId: spec.runId, event: { type: "user_cancel", idempotencyKey: "crash-cancel" } });
+        }
+        if (spec.scenario === "terminal") {
+          const result = store.commitLiveRuntimeEvent({
+            event: event({ type: "prompt_terminal", stopReason: "end_turn", classification: "completed", contextTokensUsed: 777 }),
+            mutation: { type: "finalize", entryId: "crash-entry", expectedRevision: record.revision, status: "complete" },
+            terminalFinalizationIdempotencyKey: "crash-terminal-finalized",
+          });
+          if (!result.ok) throw new Error(result.reason);
+        }
+        process.kill(process.pid, "SIGKILL");
+      `;
+      const crashed = (scenario: string) => {
+        const path = temporaryDatabase(t);
+        liveReadyStore(path).close();
+        const child = spawnSync(process.execPath, ["--input-type=module", "--eval", script], {
+          encoding: "utf8",
+          env: {
+            ...process.env,
+            GUILD_CRASH_DATABASE_PATH: path,
+            GUILD_CRASH_SPEC: JSON.stringify({ ...spec, scenario }),
+            GUILD_CRASH_PERSISTENCE_URL: new URL("./index.js", import.meta.url).href,
+            GUILD_CRASH_CONTRACTS_URL: import.meta.resolve("@guild/contracts"),
+          },
+          timeout: 20_000,
+        });
+        assert.equal(child.signal, "SIGKILL", child.stderr);
+        const recovered = openGuildPersistence({ path });
+        // The unclean open verified the whole database, so no row is torn.
+        assert.equal(recovered.recoveredAfterUncleanShutdown, true);
+        return recovered;
+      };
+
+      // No boundary: the entry exists (its create is written immediately), the window is gone.
+      let recovered = crashed("pending");
+      assert.equal(recovered.loadConversationEntry(taskId, "crash-entry").text, "A");
+      assert.equal(recovered.loadConversationEntry(taskId, "crash-entry").revision, 1);
+      assert.equal(recovered.loadRun(taskId, runId).state, "running");
+      recovered.close();
+
+      // The 100 ms timer writes the window without any other call.
+      recovered = crashed("timer");
+      assert.equal(recovered.loadConversationEntry(taskId, "crash-entry").text, "ABCD");
+      assert.equal(recovered.loadConversationEntry(taskId, "crash-entry").revision, 4);
+      recovered.close();
+
+      // Any other store call is a boundary: the window is written before the cancel is.
+      recovered = crashed("boundary");
+      assert.equal(recovered.loadConversationEntry(taskId, "crash-entry").text, "ABCD");
+      assert.equal(recovered.loadRun(taskId, runId).state, "cancel_requested");
+      recovered.close();
+
+      // A completed Run is never lost: terminal Run, correlation, final text and context tokens.
+      recovered = crashed("terminal");
+      assert.equal(recovered.loadRun(taskId, runId).state, "completed");
+      assert.equal(recovered.loadPromptCorrelation(taskId, runId).status, "terminal");
+      const entry = recovered.loadConversationEntry(taskId, "crash-entry");
+      assert.equal(entry.text, "ABCD");
+      assert.equal(entry.status, "complete");
+      assert.equal(recovered.loadLatestContextTokensUsed(taskId), 777);
+      recovered.close();
+    });
+
+    it("migrates a v14 database to the O(1) append guard without rewriting history [WP2]", (t) => {
+      const path = temporaryDatabase(t);
+      const seeded = conversationStore(path);
+      seeded.createConversationEntry({
+        taskId, entryId: "history-1", kind: "user", status: "complete", text: "Hello history", metadata: {},
+      });
+      const streaming = seeded.createConversationEntry({
+        taskId, entryId: "history-2", kind: "assistant", status: "streaming", text: "Héllo ", metadata: {},
+      });
+      seeded.appendConversationEntryText({
+        taskId, entryId: "history-2", expectedRevision: streaming.record.revision, text: "world",
+      });
+      seeded.close();
+
+      const snapshot = () => JSON.stringify(rawRows(
+        path,
+        `SELECT task_id, entry_id, sequence, kind, text_content, metadata_json, metadata_sha256,
+                initial_fingerprint, status, revision, created_at_ms, updated_at_ms
+         FROM conversation_entries ORDER BY sequence`,
+      ));
+      const before = snapshot();
+
+      const downgrade = new DatabaseSync(path);
+      downgrade.exec(`
+        DROP TRIGGER conversation_entry_is_append_only;
+        CREATE TRIGGER conversation_entry_is_append_only
+        BEFORE UPDATE ON conversation_entries
+        WHEN NOT (
+          NEW.task_id IS OLD.task_id AND NEW.entry_id IS OLD.entry_id
+          AND NEW.sequence IS OLD.sequence AND NEW.kind IS OLD.kind
+          AND NEW.run_id IS OLD.run_id AND NEW.metadata_json IS OLD.metadata_json
+          AND NEW.metadata_sha256 IS OLD.metadata_sha256
+          AND NEW.initial_fingerprint IS OLD.initial_fingerprint
+          AND NEW.created_at_ms IS OLD.created_at_ms
+          AND NEW.revision = OLD.revision + 1
+          AND NEW.updated_at_ms >= OLD.updated_at_ms
+          AND substr(NEW.text_content, 1, length(OLD.text_content)) = OLD.text_content
+          AND (
+            (OLD.status = 'streaming' AND NEW.status IN ('streaming', 'complete', 'failed'))
+            OR (OLD.status IN ('complete', 'failed') AND NEW.status IS OLD.status)
+          )
+        )
+        BEGIN
+          SELECT RAISE(ABORT, 'conversation_entry_not_append_only');
+        END;
+        DROP TABLE task_context_usage;
+        DELETE FROM schema_migrations WHERE version = 15;
+        CREATE TABLE guild_meta_v14 (
+          singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+          schema_version INTEGER NOT NULL CHECK(schema_version = 14),
+          clean_shutdown INTEGER NOT NULL CHECK(clean_shutdown IN (0, 1)),
+          last_integrity_at_ms INTEGER CHECK(last_integrity_at_ms IS NULL OR last_integrity_at_ms >= 0)
+        ) STRICT;
+        INSERT INTO guild_meta_v14(singleton, schema_version, clean_shutdown, last_integrity_at_ms)
+        SELECT singleton, 14, clean_shutdown, last_integrity_at_ms FROM guild_meta;
+        DROP TABLE guild_meta;
+        ALTER TABLE guild_meta_v14 RENAME TO guild_meta;
+        PRAGMA user_version = 14;
+      `);
+      // The v14 guard rejects a revision jump, which a coalesced flush needs.
+      assert.throws(
+        () => downgrade.exec(
+          "UPDATE conversation_entries SET text_content = text_content || 'x', revision = revision + 3 WHERE entry_id = 'history-2'",
+        ),
+        /conversation_entry_not_append_only/u,
+      );
+      downgrade.close();
+
+      const migrated = openGuildPersistence({ path });
+      assert.equal(migrated.verifyIntegrity().schemaVersion, 15);
+      migrated.close();
+      assert.equal(snapshot(), before, "migration must not read-modify historical rows");
+
+      const raw = new DatabaseSync(path);
+      assert.equal(raw.prepare("PRAGMA user_version").get()?.["user_version"], 15);
+      assert.match(
+        String(raw.prepare("SELECT sql FROM sqlite_schema WHERE name = 'conversation_entry_is_append_only'").get()?.["sql"]),
+        /octet_length/u,
+      );
+
+      const append = "UPDATE conversation_entries SET text_content = text_content || 'x', revision = revision + 3 WHERE entry_id = 'history-2'";
+      raw.exec(append);
+      const rejected = [
+        "UPDATE conversation_entries SET text_content = 'short', revision = revision + 1 WHERE entry_id = 'history-2'",
+        "UPDATE conversation_entries SET text_content = 'Jéllo worldxxxxxxxxxxxx', revision = revision + 1 WHERE entry_id = 'history-2'",
+        "UPDATE conversation_entries SET text_content = text_content || 'y' WHERE entry_id = 'history-2'",
+        "UPDATE conversation_entries SET revision = revision + 1, status = 'streaming' WHERE entry_id = 'history-1'",
+        "UPDATE conversation_entries SET kind = 'notice', revision = revision + 1 WHERE entry_id = 'history-2'",
+      ];
+      for (const statement of rejected) {
+        assert.throws(() => raw.exec(statement), /conversation_entry_not_append_only/u, statement);
+      }
+      assert.equal(
+        raw.prepare("SELECT text_content FROM conversation_entries WHERE entry_id = 'history-2'").get()?.["text_content"],
+        "Héllo worldx",
+      );
+      raw.close();
+    });
+
+    it("searches visible user and assistant text in SQL without decoding the history [WP3]", (t) => {
+      const path = temporaryDatabase(t);
+      const store = conversationStore(path);
+      const second = must(parseTaskId("task-2"));
+      store.createConversationTask({
+        taskId: second, workspaceId, title: "Second task", owningWindowId: windowId,
+      });
+      const add = (task: typeof taskId, entryId: string, kind: "user" | "assistant" | "tool" | "thought", text: string, metadata = {}) =>
+        store.createConversationEntry({ taskId: task, entryId, kind, status: "complete", text, metadata });
+      add(taskId, "a-1", "user", "Find the Needle in 100%_done\\path");
+      add(taskId, "a-2", "assistant", "plain reply");
+      add(taskId, "a-hidden", "user", "needle hidden marker", { hidden: true });
+      add(taskId, "a-tool", "tool", "needle in a tool title");
+      add(taskId, "a-thought", "thought", "needle thought");
+      for (const until = Date.now() + 3; Date.now() < until;) {
+        // Conversation activity is ordered by millisecond timestamp.
+      }
+      add(second, "b-1", "assistant", "Another NEEDLE, newer activity");
+      add(second, "b-cjk", "user", "数据库搜索 Éclair");
+      const found = (query: string, limit?: number) =>
+        store.searchConversationEntries({ query, ...(limit === undefined ? {} : { limit }) })
+          .map((entry) => `${entry.taskId}:${entry.entryId}`);
+
+      // ASCII is case-insensitive; hidden, tool and thought entries are never returned;
+      // the conversation with the newest activity comes first.
+      assert.deepEqual(found("needle"), ["task-2:b-1", "task-1:a-1"]);
+      assert.deepEqual(found("  NeEdLe  ", 1), ["task-2:b-1"]);
+      // LIKE metacharacters and the escape character are matched literally.
+      assert.deepEqual(found("100%_done\\path"), ["task-1:a-1"]);
+      assert.deepEqual(found("%"), ["task-1:a-1"]);
+      assert.deepEqual(found("_"), ["task-1:a-1"]);
+      assert.deepEqual(found("100_done"), []);
+      // CJK has no case; cased non-ASCII letters keep full case-insensitive matching.
+      assert.deepEqual(found("搜索"), ["task-2:b-cjk"]);
+      assert.deepEqual(found("éclair"), ["task-2:b-cjk"]);
+      assert.deepEqual(found("ÉCLAIR"), ["task-2:b-cjk"]);
+      assert.deepEqual(found(""), []);
+      assert.deepEqual(found("   "), []);
+      assert.deepEqual(found("absent"), []);
+      for (const bad of [{ query: "x".repeat(513) }, { query: "x", limit: 0 }, { query: "x", limit: 501 }]) {
+        assert.throws(
+          () => store.searchConversationEntries(bad),
+          (error: unknown) =>
+            error instanceof PersistenceError && error.code === "domain_operation_rejected",
+        );
+      }
+
+      // Archived conversations are not searched; restoring them brings the matches back.
+      const metadata = store.loadTaskMetadata(second);
+      const archived = store.archiveTask({ taskId: second, expectedRevision: metadata.revision });
+      assert.deepEqual(found("needle"), ["task-1:a-1"]);
+      store.unarchiveTask({ taskId: second, expectedRevision: archived.revision });
+      assert.deepEqual(found("needle"), ["task-2:b-1", "task-1:a-1"]);
+      store.close();
+    });
+
+    it("searches stream text that has not been written yet [WP3]", (t) => {
+      const store = liveReadyStore(temporaryDatabase(t));
+      streamChunks(store, "pending-search", ["first ", "second ", "uniqueneedle"], 1);
+      assert.deepEqual(
+        store.searchConversationEntries({ query: "UNIQUENEEDLE" }).map((entry) => entry.text),
+        ["first second uniqueneedle"],
+      );
+      store.close();
+    });
+
+    it("persists the latest context occupancy at turn end and recovers it for older databases [WP3]", (t) => {
+      const path = temporaryDatabase(t);
+      let store = liveReadyStore(path);
+      assert.equal(store.loadLatestContextTokensUsed(taskId), undefined);
+      const commitTerminal = (forRun: typeof runId, sequence: number, tokens?: number) => {
+        const result = store.commitLiveRuntimeEvent({
+          event: terminalEvent(sequence, tokens, forRun),
+          mutation: {
+            type: "create",
+            entryId: `terminal-${forRun}`,
+            kind: "notice",
+            text: "",
+            metadata: { hidden: true },
+            status: "complete",
+          },
+          terminalFinalizationIdempotencyKey: key("terminal-finalized"),
+        });
+        assert.equal(result.ok, true, result.ok ? "" : result.reason);
+      };
+      commitTerminal(runId, 1, 4_321);
+      assert.equal(store.loadLatestContextTokensUsed(taskId), 4_321);
+      store.close();
+
+      store = openGuildPersistence({ path });
+      assert.equal(store.loadLatestContextTokensUsed(taskId), 4_321);
+      store.close();
+
+      // A database written before the value was persisted: the envelope is found through the
+      // session's terminal Run by primary key.
+      const stripped = new DatabaseSync(path);
+      stripped.exec("DELETE FROM task_context_usage");
+      stripped.close();
+      store = openGuildPersistence({ path });
+      assert.equal(store.loadLatestContextTokensUsed(taskId), 4_321);
+
+      const turn = (nextRun: string, promptSequence: number, sequence: number, tokens?: number) => {
+        const next = must(parseRunId(nextRun));
+        store.createRun({ taskId, runId: next });
+        const dispatched = store.applyRun({
+          taskId,
+          runId: next,
+          event: { type: "scheduler_dispatch", sessionId, adapterEpoch: epoch, idempotencyKey: key("turn-dispatch") },
+        });
+        assert.equal(dispatched.ok, true, dispatched.ok ? "" : dispatched.reason);
+        store.commitPromptAccepted({
+          taskId, runId: next, sessionId, adapterEpoch: epoch, promptSequence,
+          idempotencyKey: key("turn-accepted"),
+        });
+        commitTerminal(next, sequence, tokens);
+      };
+      // A turn without a usage report keeps the previous exact value; a later report replaces it.
+      turn("run-2", 2, 2);
+      assert.equal(store.loadLatestContextTokensUsed(taskId), 4_321);
+      turn("run-3", 3, 3, 9_000);
+      assert.equal(store.loadLatestContextTokensUsed(taskId), 9_000);
+      store.close();
+
+      const reopened = openGuildPersistence({ path });
+      assert.equal(reopened.loadLatestContextTokensUsed(taskId), 9_000);
+      assert.equal(reopened.verifyIntegrity().schemaVersion, 15);
+      reopened.close();
+    });
+
+    it("verifies history after an unclean shutdown but only lazily after a clean one [WP3]", (t) => {
+      const path = temporaryDatabase(t);
+      const seeded = liveReadyStore(path);
+      streamChunks(seeded, "verify-entry", ["a", "b", "c"], 1);
+      seeded.close();
+
+      const raw = new DatabaseSync(path);
+      raw.prepare("UPDATE committed_envelopes SET event_sha256 = ? WHERE receive_sequence = 1").run("0".repeat(64));
+      raw.close();
+
+      // Clean start: the history is not scanned, so open succeeds and unrelated reads work.
+      const lazy = openGuildPersistence({ path });
+      assert.equal(lazy.recoveredAfterUncleanShutdown, false);
+      assert.equal(lazy.loadConversationEntry(taskId, "verify-entry").text, "abc");
+      assert.throws(
+        () => lazy.verifyIntegrity(),
+        (error: unknown) =>
+          error instanceof PersistenceError && error.code === "aggregate_integrity_failed",
+      );
+      lazy.close();
+
+      const marker = new DatabaseSync(path);
+      marker.prepare("UPDATE guild_meta SET clean_shutdown = 0 WHERE singleton = 1").run();
+      marker.close();
+      assert.throws(
+        () => openGuildPersistence({ path }),
+        (error: unknown) =>
+          error instanceof PersistenceError && error.code === "aggregate_integrity_failed",
+      );
+    });
   });
 });

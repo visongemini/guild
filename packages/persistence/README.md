@@ -8,8 +8,14 @@ Schema v1 stores canonical Run and SessionBinding records plus permission
 decisions and their exact-response outbox. The forward-only v2 migration adds
 workspace-owned task metadata, conversation entries, drafts, adapter/prompt
 correlation, and the singleton application settings row. SQLite is opened in WAL
-mode with `synchronous=FULL`, foreign keys, defensive mode, disabled trusted
-schema, integrity checks, and a clean-shutdown marker. A private sidecar SQLite
+mode with `synchronous=NORMAL`, foreign keys, defensive mode, disabled trusted
+schema, integrity checks, and a clean-shutdown marker. Every commit except
+streamed text switches the connection to `synchronous=FULL` for its own commit,
+and a synchronous commit also makes every earlier commit durable; streamed text
+is synchronous at least once per second (docs/18 describes the crash window).
+After a clean shutdown startup validates aggregates lazily as they are read;
+after an unclean shutdown or a reaped writer lease it verifies the whole
+database, streaming the history tables through a cursor. A private sidecar SQLite
 connection holds an OS-backed exclusive lock for the canonical path, while the
 authoritative database connection holds a second exclusive lock on the actual
 database inode and performs every application read and write. This dual lock
@@ -92,6 +98,24 @@ validated live envelope together with exactly one typed conversation mutation.
 Terminal commits also finalize the prompt correlation and Run in that same
 unit. A failed conversation compare-and-set therefore cannot leave a committed
 envelope or terminal Run behind, and an exact event retry cannot append twice.
+
+Consecutive text or thought chunks of one entry are coalesced. The first chunk
+creates the entry and is committed at once; later chunks are admitted against
+stored state once, then in memory, and written in one commit every 100 ms or
+before any other store call, whichever is first. That commit appends the text,
+advances the entry revision by the number of chunks (revisions still count
+chunks), and stores one envelope: the last chunk's receive sequence and
+idempotency key with the payload text of the whole window. The row therefore
+stands for the contiguous receive-sequence range ending at its sequence, and
+admission still sees a gapless last sequence. Readers of conversation entries
+see pending text before it is written. The text append guard in the database
+no longer compares the whole old text; it requires an increasing revision, a
+non-shrinking byte length and an unchanged first 64 characters, because the
+store only ever appends with `||`.
+
+The latest exact context occupancy is stored with the terminal commit, so
+opening a task does not read envelopes. Conversation search matches in SQL over
+the stored entry text.
 
 Replay-to-history is deliberately not exposed by this basic live commit API.
 Replay remains a staging-only product gap until a separate reconciler can prove

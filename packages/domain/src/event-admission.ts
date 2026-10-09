@@ -7,6 +7,7 @@ import {
   ADAPTER_EPOCH_STATUSES,
   epochStatusIsExited,
   FIRST_RECEIVE_SEQUENCE,
+  isConstructedRuntimeTurnEvent,
   isTerminalRunState,
   kindRequiresToolCallId,
   kindRequiresWindowId,
@@ -148,13 +149,21 @@ export function admitRuntimeTurnEvent(
   event: RuntimeTurnEvent,
   context: AdmissionContext,
 ): RuntimeTurnAdmissionResult {
-  const parsed = parseRuntimeTurnEvent(event);
-  if (!parsed.ok) return deny("invalid_runtime_turn_event");
+  // An event built by createRuntimeTurnEvent in this process was validated and deeply frozen
+  // there; revalidating it per chunk would only repeat that work. Any other value is parsed.
+  let admitted: RuntimeTurnEvent;
+  if (isConstructedRuntimeTurnEvent(event)) {
+    admitted = event;
+  } else {
+    const parsed = parseRuntimeTurnEvent(event);
+    if (!parsed.ok) return deny("invalid_runtime_turn_event");
+    admitted = parsed.value;
+  }
   const safeContext = canonicalizeAdmissionContext(context);
   if (safeContext === undefined) return deny("invalid_admission_context");
-  const admission = admitRuntimeEnvelope(parsed.value.envelope, safeContext);
+  const admission = admitRuntimeEnvelope(admitted.envelope, safeContext);
   if (admission.ok === false) return admission;
-  return Object.freeze({ ...admission, event: parsed.value });
+  return Object.freeze({ ...admission, event: admitted });
 }
 
 const ADMISSION_CONTEXT_KEYS = Object.freeze([

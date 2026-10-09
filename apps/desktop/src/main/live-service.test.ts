@@ -181,7 +181,9 @@ describe("live desktop service", () => {
       await completed;
       const final = await service.bootstrap();
       assert.equal(final.activeTask?.task.activeRunState, "completed");
-      const expected = Array.from({ length: 512 }, (_, index) => String(index) + ",").join("");
+      // WP2: a chunk is accepted in microseconds now, so the burst must be long enough to outlast
+      // the 8 ms yield slice and the 16 ms display cadence for partial output to be observable.
+      const expected = Array.from({ length: 6000 }, (_, index) => String(index) + ",").join("");
       const answer = final.activeTask?.timeline.find((entry) => entry.kind === "assistant");
       assert.equal(answer?.kind === "assistant" ? answer.text : "", expected);
       assert.ok(observed.some((value) => value.length > 0 && value.length < expected.length),
@@ -6645,7 +6647,7 @@ class FakeAdapter implements RuntimeAdapterPort {
     }
     if (text === "stream-burst") setImmediate(() => { this.streamBurstYielded = true; });
     const responseChunks = text === "stream-burst"
-      ? Array.from({ length: 512 }, (_, index) => String(index) + ",")
+      ? Array.from({ length: 6000 }, (_, index) => String(index) + ",")
       : [this.promptResponses?.[promptSequence - 1] ?? `reply:${text}`];
     for (const chunk of responseChunks) {
       const payload: RuntimeTextChunkPayload = Object.freeze({

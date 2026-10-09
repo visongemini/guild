@@ -3,6 +3,7 @@ import { describe, it } from "node:test";
 import type { Result } from "./ids.js";
 import {
   createRuntimeTurnEvent,
+  isConstructedRuntimeTurnEvent,
   parseRuntimeTurnEvent,
   type RuntimeTurnEvent,
   type RuntimeTurnEventInput,
@@ -392,5 +393,22 @@ describe("runtime turn event", () => {
         reason: "invalid_runtime_turn_event",
       });
     }
+  });
+
+  it("recognizes only events built by this module as constructed", () => {
+    const event = create({
+      type: "agent_text_chunk",
+      sessionId: "session-1",
+      received,
+      text: "hello",
+    });
+    assert.equal(isConstructedRuntimeTurnEvent(event), true);
+    assert.equal(isConstructedRuntimeTurnEvent(must(parseRuntimeTurnEvent(event))), true);
+    const roundTripped = JSON.parse(JSON.stringify(event)) as unknown;
+    assert.equal(isConstructedRuntimeTurnEvent(roundTripped), false);
+    assert.equal(isConstructedRuntimeTurnEvent({ ...event }), false);
+    assert.equal(isConstructedRuntimeTurnEvent(null), false);
+    assert.equal(isConstructedRuntimeTurnEvent("event"), false);
+    assert.equal(isConstructedRuntimeTurnEvent(must(parseRuntimeTurnEvent(roundTripped))), true);
   });
 });

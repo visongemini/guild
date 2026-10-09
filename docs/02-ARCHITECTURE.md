@@ -181,6 +181,9 @@ notarization when Guild is publicly distributed.
 - SQLite is owned by main and uses forward-only schema migrations. Rollback restores a verified
   pre-migration snapshot; it does not run unsafe down-migrations.
 - Messages append atomically; run terminal state and final message commit in one transaction.
+- Streamed assistant text and thought chunks are coalesced in main memory and written in one
+  commit per window of at most 100 ms, or before the next store call of any kind. Everything
+  else commits synchronously. The crash window is defined in `docs/18-SPEED-PLAN-2.2.md`.
 - Drafts, queued turns, permissions, and recovery checkpoints are durable.
 - A permission decision is committed once with an exact outcome, cause, optional orphan cause,
   command ID, and outbox version. SQLite changes that commitment only from `NULL` to one value
