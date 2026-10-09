@@ -75,9 +75,10 @@ function currentRunUser(
     ...queuedTurns.map((turn) => turn.createdAtMs),
     Number.POSITIVE_INFINITY,
   );
+  // A Steer message belongs to a turn that is already running; it is not the message that started it.
   return [...items].reverse().find(
     (item): item is TimelineUser =>
-      item.kind === "user" && item.createdAtMs < firstQueuedAtMs,
+      item.kind === "user" && item.interjection === undefined && item.createdAtMs < firstQueuedAtMs,
   );
 }
 

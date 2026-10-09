@@ -114,3 +114,13 @@ function permission(sequence: number, runId: RunId): TimelineItemProjection {
     options: Object.freeze([]),
   });
 }
+
+test("a Steer message is not the user message that started the turn", () => {
+  const user = (entryId: string, createdAtMs: number, extra: Record<string, unknown> = {}) => ({
+    entryId, taskId: "t", runId: "r1", sequence: createdAtMs, createdAtMs, updatedAtMs: createdAtMs, status: "completed", kind: "user", text: entryId, ...extra,
+  }) as unknown as import("@guild/contracts").TimelineItemProjection;
+  const thought = { entryId: "th", taskId: "t", runId: "r1", sequence: 2_500, createdAtMs: 2_500, updatedAtMs: 2_600, status: "streaming", kind: "thought", text: "x", startedAtMs: 2_500, elapsedMs: 100 } as unknown as import("@guild/contracts").TimelineItemProjection;
+  const items = [user("u1", 1_000), thought, user("steer", 3_000, { interjection: { interjectionId: "i1", state: "pending" } })];
+  // The turn is already thinking; the Steer message right after it must not bring "waiting for Grok" back.
+  assert.equal(visibleRunStatus("running", items, []), undefined);
+});

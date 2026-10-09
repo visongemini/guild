@@ -57,9 +57,10 @@ test("counts and the tool name are substituted when present", () => {
   assert.equal(label(EN, projection("running_hooks", { hookCount: 3 })), "Running hooks (3)");
   assert.equal(label(ZH, projection("running_hooks", { hookCount: 3 })), "\u6b63\u5728\u8fd0\u884c\u94a9\u5b50\uff083\uff09");
   assert.equal(label(EN, projection("preparing_tool", { toolName: "Bash" })), "Preparing tool Bash");
-  assert.equal(label(ZH, projection("preparing_tool", { toolName: "Bash" })), "\u6b63\u5728\u51c6\u5907\u5de5\u5177 Bash");
+  // Chinese names the action, not the runtime's tool: Bash runs a command (see tool-names.test.ts for the full table).
+  assert.equal(label(ZH, projection("preparing_tool", { toolName: "Bash" })), "\u51c6\u5907\u8fd0\u884c\u547d\u4ee4");
   assert.equal(label(EN, projection("running_tool", { toolName: "Bash" })), "Running Bash");
-  assert.equal(label(ZH, projection("running_tool", { toolName: "Bash" })), "\u6b63\u5728\u8fd0\u884c Bash");
+  assert.equal(label(ZH, projection("running_tool", { toolName: "Bash" })), "\u6b63\u5728\u8fd0\u884c\u547d\u4ee4");
   assert.equal(label(EN, projection("retrying", { attempt: 2, maxRetries: 5 })), "Retrying 2/5");
   assert.equal(label(ZH, projection("retrying", { attempt: 2, maxRetries: 5 })), "\u6b63\u5728\u91cd\u8bd5 2/5");
   // A half-known retry shows the bare label rather than a guessed ratio.
@@ -168,4 +169,16 @@ test("seconds floor at the boundary and never go negative", () => {
   assert.equal(describeRunPhase(input, TURN_START - 5_000, EN).phaseSeconds, 0);
   const unknown = Object.freeze({ phase: "thinking" as const, turnStartedAtMs: 0, phaseStartedAtMs: 0 });
   assert.equal(describeRunPhase(unknown, 1_800_000_000_000, EN).timeText, "total 0s");
+});
+
+test("a tool phase keeps the runtime's own tool name for a tooltip, other phases have none", () => {
+  const now = TURN_START + 6_000;
+  assert.equal(describeRunPhase(projection("running_tool", { toolName: "run_terminal_command" }), now, ZH).toolTitle, "run_terminal_command");
+  assert.equal(describeRunPhase(projection("preparing_tool", { toolName: "figma_get_design" }), now, ZH).toolTitle, "figma_get_design");
+  assert.equal(describeRunPhase(projection("running_tool"), now, ZH).toolTitle, undefined);
+  assert.equal(describeRunPhase(projection("thinking", { toolName: "Bash" }), now, ZH).toolTitle, undefined);
+  // An unknown tool shows the generic label while the raw name stays reachable.
+  const unknown = describeRunPhase(projection("running_tool", { toolName: "figma_get_design" }), now, ZH);
+  assert.equal(unknown.label, "\u6b63\u5728\u8fd0\u884c\u5de5\u5177");
+  assert.equal(unknown.toolTitle, "figma_get_design");
 });

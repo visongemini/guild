@@ -1,8 +1,10 @@
 import type { AcpToolKind, GuildGrokManagementAction, GuildGrokPermissionMode, GuildLocale, GuildModelSwitchRefusalReason, GuildTaskActivity } from "@guild/contracts";
 
 import { WORKSHOP_ZH, WORKSHOP_EN, type WorkshopMessages } from "./workshop-messages.js";
+import { createChangeMessages, type ChangeMessages } from "./change-messages.js";
+import { ZH_TOOL_ACTION, classifyToolName } from "./tool-names.js";
 
-export type GuildMessages = WorkshopMessages & {
+export type GuildMessages = WorkshopMessages & ChangeMessages & {
   readonly appName: string;
   readonly loading: string;
   readonly newTask: string;
@@ -411,6 +413,7 @@ function pad2(value: number): string {
 
 const ZH_CN: GuildMessages = Object.freeze({
   ...WORKSHOP_ZH,
+  ...createChangeMessages("zh-CN"),
   appName: "Guild",
   loading: "正在载入 Guild",
   newTask: "新建任务",
@@ -430,7 +433,7 @@ const ZH_CN: GuildMessages = Object.freeze({
   queueReady: "按回车排到下一条",
   queuedNext: "接下来",
   queuedFirst: "下一条",
-  preemptQueued: "立即插队",
+  preemptQueued: "打断并先做",
   preemptingQueued: "正在停止当前任务…",
   cancelQueued: "取消这条排队消息",
   selectWorkspaceFirst: "选择工作区后才能发送",
@@ -606,9 +609,16 @@ const ZH_CN: GuildMessages = Object.freeze({
   runPhaseRunningHooks: (count) => count === undefined ? "正在运行钩子" : `正在运行钩子（${count}）`,
   runPhaseWaitingForModel: "等待模型响应",
   runPhaseThinking: "思考中",
-  runPhasePreparingTool: (toolName) => toolName === undefined ? "正在准备工具" : `正在准备工具 ${toolName}`,
+  // A tool the runtime names in its own words is shown as what it does; an unknown one stays a generic "tool" (the raw name rides in the tooltip).
+  runPhasePreparingTool: (toolName) => {
+    const action = classifyToolName(toolName);
+    return action === undefined ? "正在准备工具" : `准备${ZH_TOOL_ACTION[action]}`;
+  },
   runPhaseWaitingForPermission: "等待你的授权",
-  runPhaseRunningTool: (toolName) => toolName === undefined ? "正在运行工具" : `正在运行 ${toolName}`,
+  runPhaseRunningTool: (toolName) => {
+    const action = classifyToolName(toolName);
+    return action === undefined ? "正在运行工具" : `正在${ZH_TOOL_ACTION[action]}`;
+  },
   runPhaseRetrying: (attempt, maxRetries) => attempt === undefined || maxRetries === undefined
     ? "正在重试"
     : `正在重试 ${attempt}/${maxRetries}`,
@@ -792,6 +802,7 @@ const ZH_CN: GuildMessages = Object.freeze({
 
 const EN_US: GuildMessages = Object.freeze({
   ...WORKSHOP_EN,
+  ...createChangeMessages("en-US"),
   appName: "Guild",
   loading: "Loading Guild",
   newTask: "New task",

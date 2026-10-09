@@ -3,7 +3,9 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 import type { RunPhaseProjection } from "@guild/contracts";
 import { renderToStaticMarkup } from "react-dom/server";
-import { RunPhaseLine } from "./RunPhaseLine.js";
+import { RunPhaseLine, RunPhaseLineView } from "./RunPhaseLine.js";
+import { messagesFor } from "./locales.js";
+import { describeRunPhase, describeRunPhaseTrail, advanceRunPhaseHistory, startRunPhaseHistory } from "./run-phase-display.js";
 
 const TURN_START = 1_000_000;
 
@@ -36,7 +38,7 @@ test("the live region is the label only, never the ticking time", () => {
   const markup = render({ phase: "running_tool", toolName: "Bash" }, TURN_START + 35_000);
   assert.equal(markup.match(/role="status"/gu)?.length, 1);
   assert.equal(markup.match(/aria-live="polite"/gu)?.length, 1);
-  assert.match(markup, /<span class="guild-run-label" role="status" aria-live="polite">Running Bash<\/span>/u);
+  assert.match(markup, /<span class="guild-run-label" role="status" aria-live="polite" title="Bash">Running Bash<\/span>/u);
   assert.doesNotMatch(markup, /<time[^>]*role=/u);
 });
 
@@ -77,4 +79,37 @@ test("the timeline shows the phase line instead of the legacy status line and re
   assert.match(app, /runPhase !== undefined\s*\?\s*<RunPhaseLine projection=\{runPhase\} locale=\{locale\} \/>\s*:\s*runStatus !== undefined && <RunStatusLine/u);
   assert.match(app, /previous\.runPhase === next\.runPhase/u);
   assert.match(app, /runPhase=\{commandStatus === undefined \? activeTask\.runPhase : undefined\}/u);
+});
+
+test("the trail reads in the order things happened and ends with the phase running now", () => {
+  const messages = messagesFor("zh-CN");
+  const phase = (name: RunPhaseProjection["phase"], started: number): RunPhaseProjection =>
+    ({ phase: name, turnStartedAtMs: TURN_START, phaseStartedAtMs: TURN_START + started });
+  let history = startRunPhaseHistory(phase("running_hooks", 0));
+  history = advanceRunPhaseHistory(history, phase("waiting_for_model", 2_000));
+  history = advanceRunPhaseHistory(history, phase("thinking", 7_000));
+  const now = TURN_START + 19_000;
+  const display = describeRunPhase(history.last, now, messages);
+  const markup = renderToStaticMarkup(
+    <RunPhaseLineView
+      display={display}
+      trail={describeRunPhaseTrail(history, messages)}
+      totalText={messages.runPhaseTime(undefined, messages.runDuration(display.totalSeconds))}
+      elapsedText={messages.runDuration(display.phaseSeconds)}
+    />,
+  );
+  const hooks = markup.indexOf("\u6b63\u5728\u8fd0\u884c\u94a9\u5b50 2 \u79d2");
+  const waiting = markup.indexOf("\u7b49\u5f85\u6a21\u578b\u54cd\u5e94 5 \u79d2");
+  const thinking = markup.indexOf("\u601d\u8003\u4e2d</span>");
+  assert.ok(hooks >= 0 && waiting > hooks && thinking > waiting, `order in ${markup}`);
+  assert.match(markup, /<span class="guild-run-trail" aria-hidden="true">/u);
+  assert.match(markup, /<span class="guild-run-current"><span class="guild-run-label"[^>]*>\u601d\u8003\u4e2d<\/span><span class="guild-run-elapsed" aria-hidden="true">12 \u79d2<\/span><\/span>/u);
+});
+
+test("an unknown tool shows the generic label and keeps the raw name in the title", () => {
+  const markup = render({ phase: "running_tool", toolName: "figma_get_design" }, TURN_START + 35_000, "zh-CN");
+  assert.match(markup, /title="figma_get_design">\u6b63\u5728\u8fd0\u884c\u5de5\u5177<\/span>/u);
+  const known = render({ phase: "running_tool", toolName: "Read" }, TURN_START + 35_000, "zh-CN");
+  assert.match(known, /title="Read">\u6b63\u5728\u8bfb\u53d6<\/span>/u);
+  assert.doesNotMatch(render({ phase: "thinking" }, TURN_START + 35_000), /title=/u);
 });
