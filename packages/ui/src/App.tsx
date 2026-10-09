@@ -3564,7 +3564,8 @@ export const ToolRow = memo(function ToolRow({ item, locale }: {
   </div>;
 });
 
-const TimelineItem = memo(function TimelineItem({ item, locale, onOpenExternal, onPermissionDecision, onBranch, onRetryToDraft, onOpenRuntimeDiagnostics, interruptedUser, canRetry }: {
+/** Exported for tests. */
+export const TimelineItem = memo(function TimelineItem({ item, locale, onOpenExternal, onPermissionDecision, onBranch, onRetryToDraft, onOpenRuntimeDiagnostics, interruptedUser, canRetry }: {
   readonly item: TimelineItemProjection;
   readonly locale: GuildLocale;
   readonly canRetry: boolean;
@@ -3610,8 +3611,10 @@ const TimelineItem = memo(function TimelineItem({ item, locale, onOpenExternal, 
     ? continuousFooter(item.text)
     : undefined;
   const body = footer?.body ?? item.text;
+  // A streaming answer may already have text in the overlay while its projection is still empty.
+  const streamingAssistant = item.kind === "assistant" && item.status === "streaming";
   return <article className={`guild-message guild-message-${item.kind}`}>
-    {body.length > 0 && <div className="guild-message-body"><MessageBody entryId={item.entryId} text={body} streaming={item.kind === "assistant" && item.status === "streaming"} locale={locale} onOpenExternal={onOpenExternal} /></div>}
+    {(body.length > 0 || streamingAssistant) && <div className="guild-message-body"><MessageBody entryId={item.entryId} text={body} streaming={streamingAssistant} locale={locale} onOpenExternal={onOpenExternal} /></div>}
     {footer !== undefined && <ContinuousRoundRecord footer={footer} locale={locale} />}
     {(item.kind === "user" || item.kind === "assistant") && (
       <MessageActions

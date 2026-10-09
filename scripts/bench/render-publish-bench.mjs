@@ -156,7 +156,7 @@ async function stream() {
   await service.sendMessage(taskId, scenario === "mixed" ? "bench-mixed" : "bench-text");
   await Promise.race([
     completed,
-    new Promise((_, reject) => setTimeout(() => reject(new Error("bench_wait_timeout")), 120_000)),
+    new Promise((_, reject) => setTimeout(() => reject(new Error("bench_wait_timeout")), 120_000).unref()),
   ]);
   // Let trailing throttled publishes drain so their cost is counted.
   await new Promise((resolveTimer) => setTimeout(resolveTimer, 700));

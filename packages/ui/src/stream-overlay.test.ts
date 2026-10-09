@@ -3,7 +3,7 @@ import test from "node:test";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import type { StreamDeltaEvent, TimelineItemProjection } from "@guild/contracts";
-import { MessageBody, StreamOverlayContext } from "./App.js";
+import { MessageBody, StreamOverlayContext, TimelineItem } from "./App.js";
 import {
   MAX_OVERLAY_ENTRIES,
   mergeStreamText,
@@ -185,4 +185,30 @@ test("a streaming message body renders snapshot plus overlay, and a finished one
   assert.match(renderToStaticMarkup(createElement(MessageBody, {
     entryId: "assistant-1", text: "plain snapshot", streaming: true, locale: "en-US", onOpenExternal: () => undefined,
   })), /plain snapshot/u);
+});
+
+test("a streaming answer shows overlay text even while its projected text is still empty", () => {
+  const { store: overlays } = store();
+  overlays.apply(delta({ offset: 0, appendText: "First words", revision: 1 }));
+  overlays.flush();
+  const noop = () => undefined;
+  const html = (projected: TimelineItemProjection) => renderToStaticMarkup(
+    createElement(StreamOverlayContext.Provider, { value: overlays },
+      createElement(TimelineItem, {
+        item: projected,
+        locale: "en-US",
+        canRetry: false,
+        onOpenExternal: noop,
+        onPermissionDecision: async () => undefined,
+        onBranch: async () => undefined,
+        onRetryToDraft: noop,
+        onOpenRuntimeDiagnostics: noop,
+      })));
+  assert.match(html(item({ text: "" })), /First words/u);
+  assert.match(html(item({ text: "First" })), /First words/u);
+  // Once the entry stops streaming the projection alone is authoritative.
+  assert.doesNotMatch(html(item({ text: "Final", status: "completed" })), /First words/u);
+  assert.match(html(item({ text: "Final", status: "completed" })), /Final/u);
+  // A completed empty answer renders no body, exactly as before.
+  assert.doesNotMatch(html(item({ text: "", status: "completed" })), /guild-message-body/u);
 });

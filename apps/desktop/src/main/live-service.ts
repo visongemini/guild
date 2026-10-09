@@ -445,6 +445,16 @@ export function createLiveDesktopService(
   const projectedEntryCache = new Map<string, { readonly key: string; readonly item: TimelineItemProjection }>();
   const terminalRunCache = new Map<RunId, RunRecord>();
   const workbenchCache = new Map<string, { readonly key: string; readonly value: TaskViewProjection["workbench"] }>();
+  // Reads repeated within one synchronous projection build (the active task is summarized for the
+  // sidebar and again for its own view) are fetched once. Unset outside a build.
+  let buildReadMemo: Map<string, unknown> | undefined;
+  function readOncePerBuild<T>(key: string, read: () => T): T {
+    if (buildReadMemo === undefined) return read();
+    if (buildReadMemo.has(key)) return buildReadMemo.get(key) as T;
+    const value = read();
+    buildReadMemo.set(key, value);
+    return value;
+  }
   let activeTaskHydrated = false;
   let allowAutoSelectActiveTask = true;
   const avatarPreviews = new Map<string, string>();
@@ -695,6 +705,8 @@ export function createLiveDesktopService(
               resolve();
             }
           } catch (cause: unknown) {
+            // The failed flush may not have refreshed the sidebar; the next one must rebuild it.
+            publishStructural = true;
             publishOperation = undefined;
             publishQueued = false;
             reject(cause);
@@ -848,6 +860,15 @@ export function createLiveDesktopService(
    */
   function buildBootstrap(restoreHistory = false, reuseSidebar = false): DesktopBootstrapProjection {
     assertOpen();
+    buildReadMemo = new Map();
+    try {
+      return buildBootstrapUnmemoized(restoreHistory, reuseSidebar);
+    } finally {
+      buildReadMemo = undefined;
+    }
+  }
+
+  function buildBootstrapUnmemoized(restoreHistory: boolean, reuseSidebar: boolean): DesktopBootstrapProjection {
     const settings = store.loadAppSettings();
     hydrateActiveTask(settings);
     const workspaces = reuseSidebar && sidebarCache !== undefined
@@ -936,7 +957,7 @@ export function createLiveDesktopService(
         tasks: Object.freeze(workspace.tasks.map((task) => {
           if (task.taskId !== activeTaskId && !controllers.has(task.taskId)) return task;
           try {
-            return taskSummary(store.loadTaskMetadata(task.taskId), true);
+            return taskSummary(readOncePerBuild(`meta:${task.taskId}`, () => store.loadTaskMetadata(task.taskId)), true);
           } catch {
             return task;
           }
@@ -1024,7 +1045,9 @@ export function createLiveDesktopService(
     metadata: ReturnType<GuildPersistence["loadTaskMetadata"]>,
     includeRunState = false,
   ) {
-    const restored = includeRunState ? store.restoreTask(metadata.taskId) : undefined;
+    const restored = includeRunState
+      ? readOncePerBuild(`restore:${metadata.taskId}`, () => store.restoreTask(metadata.taskId))
+      : undefined;
     const activity = currentTaskActivity(controllers.get(metadata.taskId));
     return Object.freeze({
       taskId: metadata.taskId,
@@ -1033,7 +1056,7 @@ export function createLiveDesktopService(
       pinned: metadata.pinned,
       archived: metadata.disposition === "archived",
       updatedAtMs: metadata.lastActivityAtMs,
-      queuedTurnCount: store.listQueuedTurns(metadata.taskId).length,
+      queuedTurnCount: readOncePerBuild(`queue:${metadata.taskId}`, () => store.listQueuedTurns(metadata.taskId)).length,
       ...(restored?.currentRun === undefined
         ? {}
         : { activeRunState: restored.currentRun.state }),
@@ -1153,7 +1176,7 @@ export function createLiveDesktopService(
   }
 
   function taskView(taskId: TaskId, projectedPageDepth = 1): TaskViewProjection {
-    const metadata = store.loadTaskMetadata(taskId);
+    const metadata = readOncePerBuild(`meta:${taskId}`, () => store.loadTaskMetadata(taskId));
     if (metadata.disposition === "deleted") throw new Error("task_deleted");
     const workspace = store.loadWorkspace(metadata.workspaceId);
     const summary = taskSummary(metadata, true);
@@ -1191,7 +1214,7 @@ export function createLiveDesktopService(
       .map((entry) => projectEntryCached(entry, runCache, locale));
     const pending = [...(controllers.get(taskId)?.pendingPermissions.values() ?? [])]
       .map((permission) => projectPermission(permission, locale));
-    const queuedTurns = store.listQueuedTurns(taskId).map((queued) => Object.freeze({
+    const queuedTurns = readOncePerBuild(`queue:${taskId}`, () => store.listQueuedTurns(taskId)).map((queued) => Object.freeze({
       queueId: queued.queueId,
       text: queued.text,
       createdAtMs: queued.createdAtMs,
