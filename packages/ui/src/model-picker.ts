@@ -206,11 +206,13 @@ export function modelPickerView(input: {
   const models = catalog.models.map((candidate, index): ModelRowView => {
     const contextSizes = formatContextWindows(candidate.contextWindows);
     const selected = candidate.id === modelId;
+    // The price tag always follows the runtime's own statement, whatever language the description is shown in.
     const priceMultiplier = officialPriceMultiplier(candidate.description);
+    const description = messages.modelDescription(candidate.id, candidate.description);
     return Object.freeze({
       id: candidate.id,
       name: candidate.name,
-      ...(candidate.description === undefined ? {} : { description: candidate.description }),
+      ...(description === undefined ? {} : { description }),
       ...(priceMultiplier === undefined ? {} : { priceMultiplier }),
       ...(contextSizes === undefined ? {} : { contextLabel: messages.modelPickerContext(contextSizes) }),
       selected,

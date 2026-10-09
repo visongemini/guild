@@ -1,4 +1,5 @@
 import { ArrowUpRightIcon as ArrowUpRight } from "@phosphor-icons/react/ArrowUpRight";
+import { ArrowUUpLeftIcon as ArrowUUpLeft } from "@phosphor-icons/react/ArrowUUpLeft";
 import { AppearanceSettings, useAppearance } from "./appearance.js";
 import { CaretLeftIcon as CaretLeft } from "@phosphor-icons/react/CaretLeft";
 import { ArchiveIcon as Archive } from "@phosphor-icons/react/Archive";
@@ -54,6 +55,11 @@ import type {
   GuildNewTaskWorkspaceMode,
   GuildRendererApi,
   AcpToolKind,
+  GuildSteerFallbackReason,
+  LoadRunFileDiffResponse,
+  RewindAvailabilityProjection,
+  RunCheckpointProjection,
+  RunId,
   ConversationSearchResult,
   RuntimeCommand,
   PromptAttachment,
@@ -115,7 +121,16 @@ import { continuousFooter } from "./continuous-display.js";
 import { ContinuousRoundRecord, ContinuousTaskCard, ContinuousCompletionRecord } from "./ContinuousTask.js";
 import { GrokControlCenter } from "./GrokControlCenter.js";
 import { ModelPicker } from "./ModelPicker.js";
+import { RewindDialog } from "./RewindDialog.js";
+import { RunChangesCard, type RunCardData } from "./RunChangesCard.js";
+import { RunDiffView } from "./RunDiffView.js";
+import { RolledBackBlock } from "./RolledBackBlock.js";
 import { RunPhaseLine } from "./RunPhaseLine.js";
+import { groupEntries, segmentTimeline, type TimelineRow } from "./rolled-back.js";
+import { attentionStripTasks } from "./attention-tasks.js";
+import type { RolledBackResult } from "./rewind-flow.js";
+import { cardAnchors, latestChangedRun } from "./run-changes.js";
+import { composerEnterAction, steerButtonState } from "./steer.js";
 import {
   globalDefaultView,
   modelPickerView,
@@ -253,6 +268,10 @@ export function GuildApp({ api }: GuildAppProps) {
   const [renameDraft, setRenameDraft] = useState("");
   const [renameError, setRenameError] = useState(false);
   const [contextUsageOpen, setContextUsageOpen] = useState(false);
+  const [rewindTarget, setRewindTarget] = useState<{ readonly runId: RunId }>();
+  const rewindReturnFocus = useRef<HTMLElement | null>(null);
+  const [runDiff, setRunDiff] = useState<{ readonly runId: RunId; readonly path: string | undefined }>();
+  const [steerNotice, setSteerNotice] = useState<string>();
   const [bannyPlacement, setBannyPlacement] = useState<BannyPlacement>(
     () => readBannyPlacement(window.localStorage),
   );
@@ -325,6 +344,8 @@ export function GuildApp({ api }: GuildAppProps) {
     readonly pinTask: (task: TaskSummaryProjection) => void;
     readonly archiveTask: (task: TaskSummaryProjection) => void;
     readonly openContextMenu: (event: ReactMouseEvent, menu: ContextMenuSeed) => void;
+    readonly viewRunDiff: (runId: RunId, path?: string) => void;
+    readonly openRewind: (runId: RunId, trigger: HTMLElement) => void;
   }>(undefined as never);
   latestHandlers.current = {
     openExternal,
@@ -348,6 +369,8 @@ export function GuildApp({ api }: GuildAppProps) {
       setRenameError(false);
       openContextMenu(event, menu, setContextMenu);
     },
+    viewRunDiff,
+    openRewind: openRewindDialog,
   };
   const stableHandlers = useMemo(() => Object.freeze({
     onOpenExternal: (url: string) => void latestHandlers.current.openExternal(url),
@@ -368,6 +391,8 @@ export function GuildApp({ api }: GuildAppProps) {
     onArchiveTask: (task: TaskSummaryProjection) => latestHandlers.current.archiveTask(task),
     onContextMenu: (event: ReactMouseEvent, menu: ContextMenuSeed) =>
       latestHandlers.current.openContextMenu(event, menu),
+    onViewRunDiff: (runId: RunId, path?: string) => latestHandlers.current.viewRunDiff(runId, path),
+    onRewind: (runId: RunId, trigger: HTMLElement) => latestHandlers.current.openRewind(runId, trigger),
   }), []);
   const activeWorkspaceCache = useRef(new WeakMap<WorkspaceProjection, WorkspaceProjection>());
   const activeWorkspaces = useMemo(() => (projection?.workspaces ?? [])
@@ -718,6 +743,23 @@ export function GuildApp({ api }: GuildAppProps) {
     };
   }, []);
 
+  // Per-task UI that must not leak into another task: an open rewind, a shown run diff, a Steer notice.
+  const openTaskIdForReset = projection?.activeTask?.task.taskId;
+  useEffect(() => {
+    setRewindTarget(undefined);
+    setRunDiff(undefined);
+    setSteerNotice(undefined);
+  }, [openTaskIdForReset]);
+  useEffect(() => {
+    if (steerNotice === undefined) return;
+    const timeout = window.setTimeout(() => setSteerNotice(undefined), 8_000);
+    return () => window.clearTimeout(timeout);
+  }, [steerNotice]);
+  const loadRunDiff = useCallback((runId: RunId, path: string): Promise<LoadRunFileDiffResponse> =>
+    openTaskIdForReset === undefined
+      ? Promise.reject(new Error("no_active_task"))
+      : api.loadRunFileDiff({ taskId: openTaskIdForReset, runId, path }), [api, openTaskIdForReset]);
+
   if (projection === undefined) {
     const loadingMessages = messagesFor(
       navigator.language.toLowerCase().startsWith("zh") ? "zh-CN" : "en-US",
@@ -918,16 +960,24 @@ export function GuildApp({ api }: GuildAppProps) {
     activeTimeline,
     activeTask?.queuedTurns ?? Object.freeze([]),
   );
-  const attentionTasks = projection.workspaces
-    .flatMap((workspace) => workspace.tasks)
-    .filter((task) => !task.archived && (
-      isLiveRunState(task.activeRunState) ||
-      (task.queuedTurnCount ?? 0) > 0 ||
-      task.activeRunState === "failed" ||
-      task.activeRunState === "interrupted"
-    ))
-    .sort((a, b) => b.updatedAtMs - a.updatedAtMs)
-    .slice(0, 4);
+  // Only other tasks that are working or waiting for the user: nothing failed, interrupted or cancelled, and never the open task.
+  const attentionTasks = attentionStripTasks(
+    projection.workspaces.flatMap((workspace) => workspace.tasks),
+    activeTask?.task.taskId,
+  );
+  const steerAvailable = running && activeTask?.steer?.available === true;
+  const steerButton = steerButtonState({
+    running,
+    steerAvailable,
+    draft,
+    busy,
+    sendPending: activePendingSend !== undefined,
+    hasAttachments: promptAttachments.length > 0,
+  });
+  const changedRun = latestChangedRun(activeTask?.runCheckpoints);
+  const runDiffCheckpoint = runDiff === undefined
+    ? undefined
+    : activeTask?.runCheckpoints?.find((checkpoint) => checkpoint.runId === runDiff.runId);
 
   async function retryBootstrap() {
     setError(undefined);
@@ -1079,7 +1129,8 @@ export function GuildApp({ api }: GuildAppProps) {
     await sendComposerText(draft);
   }
 
-  async function sendComposerText(sourceText: string) {
+  /** "send" queues while a turn runs (Enter); "steer" puts the message into the running turn (Option+Enter). */
+  async function sendComposerText(sourceText: string, mode: "send" | "steer" = "send") {
     const text = sourceText.trim();
     if (
       busy ||
@@ -1087,7 +1138,8 @@ export function GuildApp({ api }: GuildAppProps) {
       activeTask === undefined ||
       pendingSends.has(activeTask.task.taskId) ||
       !activeTask.canSend ||
-      (running && promptAttachments.length > 0)
+      (running && promptAttachments.length > 0) ||
+      (mode === "steer" && !steerAvailable)
     ) return;
     if (isComposerTextTooLong(sourceText)) {
       setError("message");
@@ -1109,14 +1161,22 @@ export function GuildApp({ api }: GuildAppProps) {
     ));
     try {
       await api.setDraft({ taskId, text: submittedDraft });
-      await api.sendMessage({
-        taskId,
-        text,
-        ...(submittedAttachments.length === 0 ? {} : { attachments: submittedAttachments }),
-        ...(submittedContinuousMode ? { mode: "continuous" as const } : {}),
-      });
+      if (mode === "steer") {
+        const steered = await api.steerMessage({ taskId, text });
+        // The runtime could not take it mid-turn: the message was queued or sent instead, and the person is told.
+        if (steered.status !== "steered" && activeTaskIdRef.current === taskId) {
+          setSteerNotice(messages.steerNotice(steered.status, steered.reason));
+        }
+      } else {
+        await api.sendMessage({
+          taskId,
+          text,
+          ...(submittedAttachments.length === 0 ? {} : { attachments: submittedAttachments }),
+          ...(submittedContinuousMode ? { mode: "continuous" as const } : {}),
+        });
+      }
       const emptyAttachments = Object.freeze([]) as readonly PromptAttachment[];
-      if (activeTaskIdRef.current === taskId) {
+      if (activeTaskIdRef.current === taskId && mode === "send") {
         if (submittedContinuousMode) setContinuousMode(false);
         setPromptAttachments((current) => shouldClearSubmittedAttachments({
           activeTaskId: activeTaskIdRef.current,
@@ -1210,6 +1270,73 @@ export function GuildApp({ api }: GuildAppProps) {
     await run(async () => {
       await api.preemptQueuedTurn({ taskId, queueId });
     });
+  }
+
+  // Tells the running turn about a queued message now instead of waiting for the turn to end.
+  async function convertQueuedToSteer(queueId: string) {
+    const taskId = projection?.activeTask?.task.taskId;
+    if (taskId === undefined) return;
+    await run(async () => {
+      const response = await api.convertQueuedTurnToSteer({ taskId, queueId });
+      if (response.status === "unchanged") setSteerNotice(messages.steerNotice("unchanged", response.reason));
+    });
+  }
+
+  function viewRunDiff(runId: RunId, path?: string) {
+    setRunDiff({ runId, path });
+    setWorkbenchTab("review");
+    setWorkbenchOpen(true);
+  }
+
+  function scrollToRunCard(runId: RunId) {
+    const card = conversation.current?.querySelector<HTMLElement>(`[data-run-card="${runId}"]`);
+    if (card === null || card === undefined) return;
+    // Scrolling away from the bottom must not be undone by the stick-to-bottom logic.
+    autoScrollPinned.current = false;
+    card.scrollIntoView({ block: "center" });
+    // A short highlight shows which card the button meant; the class is a plain transition, not a looping animation.
+    card.classList.add("flash");
+    window.setTimeout(() => card.classList.remove("flash"), 1_400);
+  }
+
+  function openRewindDialog(runId: RunId, trigger: HTMLElement) {
+    rewindReturnFocus.current = trigger;
+    setRewindTarget({ runId });
+  }
+
+  function closeRewindDialog(rewound: boolean) {
+    setRewindTarget(undefined);
+    const trigger = rewindReturnFocus.current;
+    rewindReturnFocus.current = null;
+    queueMicrotask(() => {
+      if (rewound) {
+        const input = composerInput.current;
+        input?.focus();
+        input?.setSelectionRange(input.value.length, input.value.length);
+      } else {
+        trigger?.focus();
+      }
+    });
+  }
+
+  // The unsent text is saved first so the restored prompt is merged with it, never over it.
+  async function executeRewind(request: Parameters<GuildRendererApi["executeRewind"]>[0]) {
+    await persistCurrentDraft();
+    return api.executeRewind(request);
+  }
+
+  // The main process put the undone prompt into the task draft; read it back into the composer.
+  async function adoptRewoundTask(_result: RolledBackResult) {
+    const taskId = projection?.activeTask?.task.taskId;
+    if (taskId === undefined) return;
+    try {
+      const task = await api.openTask({ taskId });
+      if (activeTaskIdRef.current !== task.task.taskId) return;
+      setProjection((current) => current === undefined ? current : { ...current, activeTask: task });
+      setDraft(task.draft);
+    } catch {
+      setError("operation");
+    }
   }
 
   async function authorizeSessionReplacement() {
@@ -1955,6 +2082,18 @@ export function GuildApp({ api }: GuildAppProps) {
             )}
           </div>
           <div className="guild-top-actions">
+            {changedRun !== undefined && (
+              <button
+                className="guild-ghost-button guild-changes-summary"
+                type="button"
+                title={messages.changesSummaryTitle(changedRun.filesChanged)}
+                onClick={() => scrollToRunCard(changedRun.runId)}
+              >
+                <FileText size={14} aria-hidden="true" />{messages.changesSummaryLabel}
+                <span className="n">{changedRun.filesChanged}</span>
+                <span className="a">+{changedRun.adds}</span><span className="d">{"\u2212"}{changedRun.dels}</span>
+              </button>
+            )}
             <button
               ref={workbenchTrigger}
               className={`guild-icon-button guild-workbench-trigger ${workbenchOpen ? "active" : ""}`}
@@ -2018,20 +2157,17 @@ export function GuildApp({ api }: GuildAppProps) {
               <button
                 key={task.taskId}
                 type="button"
-                className={task.taskId === activeTask?.task.taskId ? "active" : undefined}
                 onClick={() => void openTask(task.taskId)}
               >
                 <span className={`guild-task-state ${sidebarTaskStatus(task)}`} aria-hidden="true">
                   <TaskStatusGlyph status={sidebarTaskStatus(task)} />
                 </span>
                 <strong>{task.title}</strong>
-                <small>{isLiveRunState(task.activeRunState)
-                  ? messages.activeActivity(task.activeActivity ?? "working")
-                  : (task.queuedTurnCount ?? 0) > 0
-                    ? messages.queuedNext
-                    : task.activeRunState === "failed"
-                      ? messages.commandFailed
-                      : messages.commandInterrupted}</small>
+                <small className={sidebarTaskStatus(task) === "permission" ? "wait" : undefined}>
+                  {sidebarTaskStatus(task) === "permission"
+                    ? messages.taskMetaPermission
+                    : messages.activeActivity(task.activeActivity ?? "working")}
+                </small>
               </button>
             ))}
           </nav>
@@ -2078,6 +2214,8 @@ export function GuildApp({ api }: GuildAppProps) {
               locale={projection.locale}
               recentResult={activeTask.recentResult}
               continuousTask={activeTask.continuousTask}
+              runCheckpoints={activeTask.runCheckpoints}
+              rewind={activeTask.rewind}
               running={running}
               highlightedSequence={searchNavigation?.results[searchNavigation.index]?.taskId === activeTask.task.taskId
                 ? searchNavigation.results[searchNavigation.index]?.sequence : undefined}
@@ -2086,6 +2224,8 @@ export function GuildApp({ api }: GuildAppProps) {
               onBranch={stableHandlers.onBranch}
               onRetryToDraft={stableHandlers.onRetryToDraft}
               onOpenRuntimeDiagnostics={stableHandlers.onOpenRuntimeDiagnostics}
+              onViewRunDiff={stableHandlers.onViewRunDiff}
+              onRewind={stableHandlers.onRewind}
             />
           )}
           {commandStatus !== undefined && <CommandStatusLine status={commandStatus} locale={projection.locale} />}
@@ -2203,16 +2343,29 @@ export function GuildApp({ api }: GuildAppProps) {
                           {messages.preemptingQueued}
                         </span>
                       ) : isLiveRunState(activeTask.task.activeRunState) ? (
-                        <button
-                          type="button"
-                          className="guild-queue-priority"
-                          disabled={busy}
-                          aria-label={`${messages.preemptQueued}: ${queued.text}`}
-                          onClick={() => void preemptQueuedTurn(queued.queueId)}
-                        >
-                          <ArrowUp size={12} />
-                          {messages.preemptQueued}
-                        </button>
+                        <>
+                          {steerAvailable && (
+                            <button
+                              type="button"
+                              className="guild-queue-steer"
+                              disabled={busy}
+                              title={messages.convertToSteerHelp}
+                              aria-label={`${messages.convertToSteer}: ${queued.text}`}
+                              onClick={() => void convertQueuedToSteer(queued.queueId)}
+                            >{messages.convertToSteer}</button>
+                          )}
+                          <button
+                            type="button"
+                            className="guild-queue-priority"
+                            disabled={busy}
+                            title={messages.preemptQueuedHelp}
+                            aria-label={`${messages.preemptQueued}: ${queued.text}`}
+                            onClick={() => void preemptQueuedTurn(queued.queueId)}
+                          >
+                            <ArrowUp size={12} />
+                            {messages.preemptQueued}
+                          </button>
+                        </>
                       ) : index === 0 ? (
                         <span className="guild-queued-next-badge">{messages.queuedFirst}</span>
                       ) : null}
@@ -2224,6 +2377,7 @@ export function GuildApp({ api }: GuildAppProps) {
                 })}
               </div>
             )}
+            {steerNotice !== undefined && <p className="guild-steer-notice" role="status">{steerNotice}</p>}
             {promptAttachments.length > 0 && (
               <div className="guild-prompt-attachments" aria-label={messages.attachedFiles}>
                 {promptAttachments.map((attachment) => (
@@ -2278,17 +2432,20 @@ export function GuildApp({ api }: GuildAppProps) {
                   setDismissedSlashDraft(draft);
                   return;
                 }
-                if (
-                  event.key === "Enter" &&
-                  !event.shiftKey &&
-                  !event.nativeEvent.isComposing &&
-                  event.nativeEvent.keyCode !== 229
-                ) {
-                  event.preventDefault();
-                  event.currentTarget.form?.requestSubmit();
-                }
+                const enter = composerEnterAction({
+                  key: event.key,
+                  shiftKey: event.shiftKey,
+                  altKey: event.altKey,
+                  isComposing: event.nativeEvent.isComposing,
+                  keyCode: event.nativeEvent.keyCode,
+                }, { steerAvailable });
+                if (enter === "none") return;
+                event.preventDefault();
+                // Enter queues behind the running turn as it always has; Option+Enter steers it.
+                if (enter === "steer") void sendComposerText(draft, "steer");
+                else event.currentTarget.form?.requestSubmit();
               }}
-              placeholder={activeTask === undefined ? messages.selectWorkspaceFirst : pendingSendForActive !== undefined ? messages.connectingRuntime : running ? messages.queuePlaceholder : messages.composerPlaceholder}
+              placeholder={activeTask === undefined ? messages.selectWorkspaceFirst : pendingSendForActive !== undefined ? messages.connectingRuntime : running ? (steerAvailable ? messages.queueSteerPlaceholder : messages.queuePlaceholder) : messages.composerPlaceholder}
               aria-label={messages.composerPlaceholder}
               aria-controls={slashMenuOpen ? "guild-slash-menu" : undefined}
               aria-expanded={slashMenuOpen}
@@ -2375,6 +2532,16 @@ export function GuildApp({ api }: GuildAppProps) {
                 selection={activeTask?.modelSelection}
                 onApply={applyTaskRuntimeSettings}
               />
+              {steerButton.visible && (
+                <button
+                  type="button"
+                  className="guild-steer"
+                  disabled={steerButton.disabled}
+                  aria-keyshortcuts="Alt+Enter"
+                  title={steerButton.needsText ? messages.steerNeedsText : messages.steerHelp}
+                  onClick={() => void sendComposerText(draft, "steer")}
+                >{messages.steerAction}<kbd aria-hidden="true">{messages.steerShortcut}</kbd></button>
+              )}
               {running ? (
                 <button className="guild-send guild-stop" type="button" disabled={busy || activeTask?.task.activeRunState === "cancel_requested"} onClick={() => void cancelActiveRun()} aria-label={messages.stop} title={messages.stop}><Stop size={12} weight="fill" /></button>
               ) : (
@@ -2387,6 +2554,7 @@ export function GuildApp({ api }: GuildAppProps) {
           <div className="guild-composer-hints">
             <span><b>↩</b> {running ? messages.hintQueue : messages.hintSend}</span>
             <span><b>⇧↩</b> {messages.hintNewline}</span>
+            {steerAvailable && <span><b>{messages.steerShortcut}</b> {messages.hintSteer}</span>}
             <span><b>/</b> {messages.hintCommands}</span>
           </div>
         </form>
@@ -2440,6 +2608,17 @@ export function GuildApp({ api }: GuildAppProps) {
             <button type="button" role="tab" aria-selected={workbenchTab === "review"} className={workbenchTab === "review" ? "selected" : ""} onClick={() => setWorkbenchTab("review")}><GitDiff size={15} />{messages.review}<span>{visibleWorkbench?.diffs.length ?? 0}</span></button>
           </div>
           <div className="guild-workbench-body">
+            {workbenchTab === "review" && runDiff !== undefined && runDiffCheckpoint !== undefined && (
+              <RunDiffView
+                key={runDiff.runId}
+                messages={messages}
+                checkpoint={runDiffCheckpoint}
+                path={runDiff.path}
+                onSelect={(path) => setRunDiff({ runId: runDiff.runId, path })}
+                onClose={() => setRunDiff(undefined)}
+                load={loadRunDiff}
+              />
+            )}
             <label className="guild-workbench-scope">{messages.evidenceScope}<select value={workbenchScope}
               onChange={(event) => setWorkbenchScope(event.currentTarget.value as "loaded" | "latest")}>
               <option value="loaded">{messages.loadedHistory}</option><option value="latest">{messages.latestRound}</option>
@@ -2998,6 +3177,20 @@ export function GuildApp({ api }: GuildAppProps) {
         </div>
       )}
 
+      {rewindTarget !== undefined && activeTask !== undefined && (
+        <RewindDialog
+          key={`${activeTask.task.taskId}:${rewindTarget.runId}`}
+          taskId={activeTask.task.taskId}
+          runId={rewindTarget.runId}
+          messages={messages}
+          preview={() => api.previewRewind({ taskId: activeTask.task.taskId, runId: rewindTarget.runId })}
+          execute={executeRewind}
+          onRolledBack={(result) => void adoptRewoundTask(result)}
+          onClose={closeRewindDialog}
+          onDialogKeyDown={handleDialogKeyDown}
+        />
+      )}
+
       {discardConfirm && (
         <div className="guild-dialog-backdrop" role="presentation" onPointerDown={() => setDiscardConfirm(false)}>
           <div className="guild-confirm-card" role="alertdialog" aria-modal="true" aria-label={messages.discardChanges} onPointerDown={(event) => event.stopPropagation()} onKeyDown={(event) => handleDialogKeyDown(event, () => setDiscardConfirm(false))}>
@@ -3348,6 +3541,10 @@ type TimelineHandlers = Readonly<{
   onBranch: (item: TimelineItemProjection) => Promise<void>;
   onRetryToDraft: (item: TimelineItemProjection) => void;
   onOpenRuntimeDiagnostics: () => void;
+  /** Opens the workbench diff of a run, on one file when a path is given (F2). */
+  onViewRunDiff?: (runId: RunId, path?: string) => void;
+  /** Opens the rewind dialog for a run; `trigger` gets focus back when it is cancelled (F2). */
+  onRewind?: (runId: RunId, trigger: HTMLElement) => void;
 }>;
 
 type TimelineProps = {
@@ -3359,6 +3556,9 @@ type TimelineProps = {
   readonly locale: GuildLocale;
   readonly recentResult?: TaskViewProjection["recentResult"];
   readonly continuousTask?: TaskViewProjection["continuousTask"];
+  /** Changed-file summaries of the runs in the loaded window; each finished run with changes gets a card. */
+  readonly runCheckpoints?: readonly RunCheckpointProjection[];
+  readonly rewind?: RewindAvailabilityProjection;
   readonly highlightedSequence?: number;
   /** A run is live: its turn is not finished, so it shows no duration yet. */
   readonly running: boolean;
@@ -3367,12 +3567,29 @@ type TimelineProps = {
 /** The newest groups always render fully so growth and scrolling at the bottom stay exact. */
 const LIVE_TAIL_GROUPS = 3;
 
-export const Timeline = memo(function Timeline({ items, pendingUserText, runStatus, runPhase, locale, recentResult, continuousTask, highlightedSequence, running, onOpenExternal, onPermissionDecision, onBranch, onRetryToDraft, onOpenRuntimeDiagnostics }: TimelineProps) {
+export const Timeline = memo(function Timeline({ items, pendingUserText, runStatus, runPhase, locale, recentResult, continuousTask, runCheckpoints, rewind, highlightedSequence, running, onOpenExternal, onPermissionDecision, onBranch, onRetryToDraft, onOpenRuntimeDiagnostics, onViewRunDiff, onRewind }: TimelineProps) {
   const messages = messagesFor(locale);
   const groups = useMemo(() => groupTimeline(items), [items]);
   const handlers = useMemo(() => Object.freeze({
-    onOpenExternal, onPermissionDecision, onBranch, onRetryToDraft, onOpenRuntimeDiagnostics,
-  }), [onOpenExternal, onPermissionDecision, onBranch, onRetryToDraft, onOpenRuntimeDiagnostics]);
+    onOpenExternal, onPermissionDecision, onBranch, onRetryToDraft, onOpenRuntimeDiagnostics, onViewRunDiff, onRewind,
+  }), [onOpenExternal, onPermissionDecision, onBranch, onRetryToDraft, onOpenRuntimeDiagnostics, onViewRunDiff, onRewind]);
+  // A finished run's card hangs under its last answer. The data objects keep their identity while their
+  // inputs do, so streaming into a later run does not re-render the cards above it.
+  const cardCache = useRef(new Map<string, RunCardData>());
+  const liveRunId = running ? items.findLast((item) => item.runId !== undefined)?.runId : undefined;
+  const cards = useMemo(() => {
+    const next = new Map<string, RunCardData>();
+    for (const [entryId, checkpoint] of cardAnchors(items, runCheckpoints)) {
+      if (checkpoint.runId === liveRunId) continue;
+      const cached = cardCache.current.get(checkpoint.runId);
+      const data = cached !== undefined && cached.checkpoint === checkpoint && cached.rewind === rewind
+        ? cached
+        : Object.freeze({ checkpoint, rewind });
+      cardCache.current.set(checkpoint.runId, data);
+      next.set(entryId, data);
+    }
+    return next;
+  }, [items, runCheckpoints, rewind, liveRunId]);
   const completionSequence = continuousTask?.lastRunId !== undefined &&
     ["completed", "stopped"].includes(continuousTask.status)
     ? items.findLast((item) => item.runId === continuousTask.lastRunId)?.sequence : undefined;
@@ -3399,8 +3616,9 @@ export const Timeline = memo(function Timeline({ items, pendingUserText, runStat
     return labels;
   }, [items, messages, running]);
   const lastAnswerEntryId = useMemo(() => items.findLast((item) => item.kind === "assistant")?.entryId, [items]);
-  return <div className="guild-timeline">{groups.map((group, index) => {
-    const entries = group.type === "activity" ? group.items : [group.item];
+  const segments = useMemo(() => segmentTimeline(groups), [groups]);
+  const renderRow = ({ group, index }: TimelineRow) => {
+    const entries = groupEntries(group);
     const first = entries[0]!;
     const sequence = first.sequence;
     const single = group.type === "single" ? group.item : undefined;
@@ -3427,8 +3645,17 @@ export const Timeline = memo(function Timeline({ items, pendingUserText, runStat
       }
       completionTask={continuousTask !== undefined && completionSequence !== undefined &&
         entries.some((item) => item.sequence === completionSequence) ? continuousTask : undefined}
+      card={entries.map((entry) => cards.get(entry.entryId)).find((card) => card !== undefined)}
     />;
-  })}{pendingUserText !== undefined && (
+  };
+  return <div className="guild-timeline">{segments.map((segment) => segment.type === "row"
+    ? renderRow(segment.row)
+    : <RolledBackBlock
+        key={`rolled-${segment.firstSequence}`}
+        segment={segment}
+        messages={messages}
+        containsHighlight={segment.rows.some((row) => groupEntries(row.group).some((entry) => entry.sequence === highlightedSequence))}
+      >{() => segment.rows.map(renderRow)}</RolledBackBlock>)}{pendingUserText !== undefined && (
     <article className="guild-message guild-message-user guild-message-pending" aria-busy="true">
       <div className="guild-message-body"><MarkdownText text={pendingUserText} locale={locale} onOpenExternal={onOpenExternal} /></div>
       <SpinnerGap size={12} className="guild-spin" aria-label={messages.connectingRuntime} />
@@ -3442,6 +3669,8 @@ export const Timeline = memo(function Timeline({ items, pendingUserText, runStat
   previous.locale === next.locale &&
   previous.recentResult === next.recentResult &&
   previous.continuousTask === next.continuousTask &&
+  previous.runCheckpoints === next.runCheckpoints &&
+  previous.rewind === next.rewind &&
   previous.highlightedSequence === next.highlightedSequence &&
   previous.running === next.running &&
   previous.onOpenExternal === next.onOpenExternal &&
@@ -3449,6 +3678,8 @@ export const Timeline = memo(function Timeline({ items, pendingUserText, runStat
   previous.onBranch === next.onBranch &&
   previous.onRetryToDraft === next.onRetryToDraft &&
   previous.onOpenRuntimeDiagnostics === next.onOpenRuntimeDiagnostics &&
+  previous.onViewRunDiff === next.onViewRunDiff &&
+  previous.onRewind === next.onRewind &&
   previous.runStatus?.stage === next.runStatus?.stage &&
   previous.runStatus?.startedAtMs === next.runStatus?.startedAtMs &&
   previous.runPhase === next.runPhase);
@@ -3473,9 +3704,11 @@ type TimelineGroupRowProps = {
   readonly interruptedUser: TimelineItemProjection | undefined;
   readonly canRetry: boolean;
   readonly completionTask: TaskViewProjection["continuousTask"];
+  /** The changed-files card of the run that ends in this row (F2). */
+  readonly card: RunCardData | undefined;
 };
 
-const TimelineGroupRow = memo(function TimelineGroupRow({ group, sequence, highlighted, settled, locale, handlers, lastTurn, turnMeta, interruptedUser, canRetry, completionTask }: TimelineGroupRowProps) {
+const TimelineGroupRow = memo(function TimelineGroupRow({ group, sequence, highlighted, settled, locale, handlers, lastTurn, turnMeta, interruptedUser, canRetry, completionTask, card }: TimelineGroupRowProps) {
   const className = [
     highlighted ? "guild-timeline-group search-highlight" : "guild-timeline-group",
     settled ? "settled" : "",
@@ -3487,7 +3720,10 @@ const TimelineGroupRow = memo(function TimelineGroupRow({ group, sequence, highl
     style={settled ? { containIntrinsicBlockSize: `auto ${estimateTimelineGroupHeight(group)}px` } : undefined}
   >
     {group.type === "activity"
-      ? <ActivityGroupView items={group.items} locale={locale} />
+      ? <>
+          <ActivityGroupView items={group.items} locale={locale} />
+          {card !== undefined && <div className="guild-turn-slot"><RunCardView card={card} locale={locale} onViewRunDiff={handlers.onViewRunDiff} onRewind={handlers.onRewind} /></div>}
+        </>
       : <TimelineItem
           item={group.item}
           locale={locale}
@@ -3500,6 +3736,9 @@ const TimelineGroupRow = memo(function TimelineGroupRow({ group, sequence, highl
           canRetry={canRetry}
           lastTurn={lastTurn}
           turnMeta={turnMeta}
+          card={card}
+          onViewRunDiff={handlers.onViewRunDiff}
+          onRewind={handlers.onRewind}
         />}
     {completionTask !== undefined && <ContinuousCompletionRecord task={completionTask} locale={locale} />}
   </div>;
@@ -3514,6 +3753,7 @@ const TimelineGroupRow = memo(function TimelineGroupRow({ group, sequence, highl
   previous.interruptedUser === next.interruptedUser &&
   previous.canRetry === next.canRetry &&
   previous.completionTask === next.completionTask &&
+  previous.card === next.card &&
   sameTimelineGroup(previous.group, next.group));
 
 function sameTimelineGroup(
@@ -3783,12 +4023,16 @@ export const ToolRow = memo(function ToolRow({ item, locale }: {
 });
 
 /** Exported for tests. */
-export const TimelineItem = memo(function TimelineItem({ item, locale, onOpenExternal, onPermissionDecision, onBranch, onRetryToDraft, onOpenRuntimeDiagnostics, interruptedUser, canRetry, lastTurn = false, turnMeta }: {
+export const TimelineItem = memo(function TimelineItem({ item, locale, onOpenExternal, onPermissionDecision, onBranch, onRetryToDraft, onOpenRuntimeDiagnostics, interruptedUser, canRetry, lastTurn = false, turnMeta, card, onViewRunDiff, onRewind }: {
   readonly item: TimelineItemProjection;
   readonly locale: GuildLocale;
   readonly canRetry: boolean;
   readonly lastTurn?: boolean;
   readonly turnMeta?: string;
+  /** The changed-files card to show in this answer's footer when it is its run's last answer (F2). */
+  readonly card?: RunCardData;
+  readonly onViewRunDiff?: (runId: RunId, path?: string) => void;
+  readonly onRewind?: (runId: RunId, trigger: HTMLElement) => void;
   readonly onOpenExternal: (url: string) => void;
   readonly onPermissionDecision: (
     item: Extract<TimelineItemProjection, { readonly kind: "permission" }>,
@@ -3827,14 +4071,32 @@ export const TimelineItem = memo(function TimelineItem({ item, locale, onOpenExt
       </div>
     </article>;
   }
+  // A Steer that the runtime could not take: say so plainly instead of the stored sentence.
+  if (item.kind === "notice" && item.interjection?.state === "fallen_back") {
+    return <article className="guild-message guild-message-notice guild-message-interjection-notice" role="status">
+      <span className="guild-interjection-tag">{messages.interjectionTag}</span>
+      <span className="guild-interjection-state fallen_back">{messages.interjectionState("fallen_back")}</span>
+      {item.interjection.reason !== undefined
+        ? <span>{messages.interjectionReason(item.interjection.reason)}</span>
+        : <span>{item.text}</span>}
+    </article>;
+  }
   const footer = item.kind === "assistant" && item.status === "completed"
     ? continuousFooter(item.text)
     : undefined;
   const body = footer?.body ?? item.text;
   // A streaming answer may already have text in the overlay while its projection is still empty.
   const streamingAssistant = item.kind === "assistant" && item.status === "streaming";
-  return <article className={`guild-message guild-message-${item.kind}`}>
+  const interjection = item.kind === "user" ? item.interjection : undefined;
+  return <article className={`guild-message guild-message-${item.kind}${interjection === undefined ? "" : " guild-message-interjection"}`}>
     {(body.length > 0 || streamingAssistant) && <div className="guild-message-body"><MessageBody entryId={item.entryId} text={body} streaming={streamingAssistant} locale={locale} onOpenExternal={onOpenExternal} /></div>}
+    {interjection !== undefined && <div className="guild-interjection-meta">
+      <span className="guild-interjection-tag">{messages.interjectionTag}</span>
+      <span className={`guild-interjection-state ${interjection.state}`}>
+        {interjection.state === "pending" && <span className="guild-mini-spin" aria-hidden="true" />}
+        {messages.interjectionState(interjection.state)}
+      </span>
+    </div>}
     {footer !== undefined && <ContinuousRoundRecord footer={footer} locale={locale} />}
     {item.kind === "user" && (
       <MessageActions
@@ -3846,7 +4108,14 @@ export const TimelineItem = memo(function TimelineItem({ item, locale, onOpenExt
       />
     )}
     {item.kind === "assistant" && !streamingAssistant && (
-      <TurnFooter item={item} messages={messages} lastTurn={lastTurn} meta={turnMeta} onBranch={onBranch} />
+      <TurnFooter
+        item={item}
+        messages={messages}
+        lastTurn={lastTurn}
+        meta={turnMeta}
+        onBranch={onBranch}
+        slot={card === undefined ? undefined : <RunCardView card={card} locale={locale} onViewRunDiff={onViewRunDiff} onRewind={onRewind} />}
+      />
     )}
   </article>;
 });
@@ -3875,11 +4144,28 @@ function MessageActions({ item, messages, canRetry, onBranch, onRetryToDraft }: 
   </div>;
 }
 
+const NO_RUN_DIFF = () => undefined;
+
+/** The changed-files card of a run, wired to the timeline's handlers. */
+function RunCardView({ card, locale, onViewRunDiff, onRewind }: {
+  readonly card: RunCardData;
+  readonly locale: GuildLocale;
+  readonly onViewRunDiff?: ((runId: RunId, path?: string) => void) | undefined;
+  readonly onRewind?: ((runId: RunId, trigger: HTMLElement) => void) | undefined;
+}) {
+  return <RunChangesCard
+    data={card}
+    messages={messagesFor(locale)}
+    onViewDiff={onViewRunDiff ?? NO_RUN_DIFF}
+    onRewind={onRewind ?? NO_RUN_DIFF}
+  />;
+}
+
 /**
  * The row under a finished answer: copy and branch as labelled ghost buttons (visible on hover and
- * focus, always for the newest answer) with the turn's duration on the right. `slot` is the
- * extension point for the per-turn changed-files card and "revert to before this turn"; nothing
- * renders there until those features exist, so no placeholder is shown.
+ * focus, always for the newest answer) with the turn's duration on the right. `slot` holds the
+ * per-turn changed-files card (with "rewind to before this turn"); nothing renders there for a
+ * turn without file changes, so no placeholder is shown.
  */
 function TurnFooter({ item, messages, lastTurn, meta, onBranch, slot }: {
   readonly item: TimelineItemProjection;

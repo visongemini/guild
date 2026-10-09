@@ -81,7 +81,8 @@ test("queued follow-ups can explicitly interrupt the active Run and take over ne
   assert.match(source, /messages\.preemptQueued/);
   assert.match(source, /messages\.preemptingQueued/);
   assert.match(source, /messages\.cancelQueued/);
-  assert.match(locales, /preemptQueued: "立即插队"/);
+  assert.match(locales, /preemptQueued: "打断并先做"/);
+  assert.doesNotMatch(locales, /立即插队/, "the old wording sounded like the new Steer action");
   assert.match(locales, /preemptingQueued: "正在停止当前任务…"/);
 });
 

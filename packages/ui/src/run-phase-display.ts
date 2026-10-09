@@ -22,6 +22,8 @@ export type RunPhaseDisplay = Readonly<{
   softNotice: boolean;
   /** For example "23s . total 35s" or "total 12s". */
   timeText: string;
+  /** The runtime's own tool name, kept for a tooltip because the label may show it in plain words or as a generic "tool". */
+  toolTitle: string | undefined;
 }>;
 
 function elapsedSeconds(nowMs: number, startedAtMs: number): number {
@@ -77,9 +79,13 @@ export function describeRunPhase(
     phaseSeconds !== totalSeconds;
   const softNotice = projection.phase === "prompt_sent" &&
     nowMs - projection.phaseStartedAtMs >= RUN_PHASE_SENT_NOTICE_MS;
+  const toolTitle = projection.phase === "preparing_tool" || projection.phase === "running_tool"
+    ? projection.toolName
+    : undefined;
   return Object.freeze({
     phase: projection.phase,
     label: runPhaseLabel(projection, softNotice, messages),
+    toolTitle,
     totalSeconds,
     phaseSeconds,
     showPhaseSeconds,
@@ -134,7 +140,10 @@ export function advanceRunPhaseHistory(
 
 export type RunPhaseTrailDisplay = Readonly<{ key: string; text: string }>;
 
-/** Trail items as text; phases shorter than one whole second add nothing and are left out. */
+/**
+ * Trail items as text, oldest first, so the line reads left to right in the order things happened and
+ * ends with the phase that is running now. Phases shorter than one whole second add nothing and are left out.
+ */
 export function describeRunPhaseTrail(
   history: RunPhaseHistory,
   messages: GuildMessages,
