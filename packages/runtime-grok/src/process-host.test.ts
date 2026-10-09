@@ -943,7 +943,8 @@ describe("GrokProcessHost execution policy and lifecycle (PC-TRN-001/002/003)", 
       assert.equal(childEnvironment.GROK_CLAUDE_RULES_ENABLED, "false");
       assert.equal(childEnvironment.GROK_CURSOR_AGENTS_ENABLED, "false");
       assert.equal(childEnvironment.GROK_CURSOR_RULES_ENABLED, "false");
-      assert.equal(childEnvironment.OPENVIKING_RECALL_COMPRESS, "off");
+      assert.equal(childEnvironment.OPENVIKING_MEMORY_ENABLED, "0");
+      assert.equal(childEnvironment.OPENVIKING_URL, "http://127.0.0.1:9");
       await bounded(host.waitForTermination());
     } finally {
       await cleanup(host, group);
@@ -975,19 +976,33 @@ describe("GrokProcessHost execution policy and lifecycle (PC-TRN-001/002/003)", 
     assert.equal(environment.GROK_CLAUDE_MCPS_ENABLED, undefined);
   });
 
-  it("always turns off OpenViking recall compression and ignores any parent value", () => {
-    assert.equal(buildChildEnvironment().OPENVIKING_RECALL_COMPRESS, "off");
-    assert.equal(buildChildEnvironment({ OPENVIKING_RECALL_COMPRESS: "on" }).OPENVIKING_RECALL_COMPRESS, "off");
-    assert.equal(buildChildEnvironment({ OPENVIKING_RECALL_COMPRESS: undefined }).OPENVIKING_RECALL_COMPRESS, "off");
-    // Only the one Guild-owned value is injected; other plugin variables stay outside the allowlist.
-    const environment = buildChildEnvironment({
-      OPENVIKING_RECALL_COMPRESS: "auto",
-      OPENVIKING_URL: "http://127.0.0.1:1933",
-      PATH: "/usr/bin",
-    });
-    assert.equal(environment.OPENVIKING_URL, undefined);
-    assert.equal(environment.OPENVIKING_RECALL_COMPRESS, "off");
-    assert.equal(Object.isFrozen(environment), true);
+  it("keeps OpenViking memory out of Guild sessions and ignores any parent value", () => {
+    const expected = {
+      OPENVIKING_MEMORY_ENABLED: "0",
+      OPENVIKING_CONFIG_FILE: "/dev/null",
+      OPENVIKING_CLI_CONFIG_FILE: "/dev/null",
+      OPENVIKING_URL: "http://127.0.0.1:9",
+      OPENVIKING_BASE_URL: "http://127.0.0.1:9",
+    };
+    for (const parent of [
+      {},
+      {
+        OPENVIKING_MEMORY_ENABLED: "1",
+        OPENVIKING_CONFIG_FILE: "/Users/someone/.openviking/ov.conf",
+        OPENVIKING_URL: "http://127.0.0.1:1933",
+        OPENVIKING_API_KEY: "secret",
+        OPENVIKING_BEARER_TOKEN: "secret",
+        PATH: "/usr/bin",
+      },
+    ]) {
+      const environment = buildChildEnvironment(parent);
+      for (const [key, value] of Object.entries(expected)) assert.equal(environment[key], value, key);
+      // Credentials are never inherited: they stay outside the allowlist.
+      assert.equal(environment.OPENVIKING_API_KEY, undefined);
+      assert.equal(environment.OPENVIKING_BEARER_TOKEN, undefined);
+      assert.equal(environment.OPENVIKING_RECALL_COMPRESS, undefined);
+      assert.equal(Object.isFrozen(environment), true);
+    }
   });
 
   it("rejects invalid environment input before spawning without leaking values", async () => {

@@ -6268,6 +6268,34 @@ describe("live desktop service Steer, run checkpoints and rewind [F4, F2]", () =
     assert.deepEqual((await task(setup)).runCheckpoints?.[0]?.files, []);
   });
 
+  it("sends after a brief wait and discards a start checkpoint that the first tool call overtakes [F2]", async () => {
+    const log: string[] = [];
+    const checkpoints = new FakeCheckpoints(log);
+    const gate = deferredPromise();
+    checkpoints.captureGate = gate.promise;
+    const setup = await f24Task({
+      checkpoints,
+      specs: [{ toolCallOnPrompt: true, promptEffect: async (text) => { log.push(`prompt:${text}`); } }],
+    });
+    const sentAt = performance.now();
+    try {
+      await setup.service.sendMessage(setup.taskId, "hello");
+      // The capture is held open by the test, so a prompt seen here was not blocked by it.
+      for (const deadline = Date.now() + 10_000; !log.includes("prompt:hello") && Date.now() < deadline;) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      assert.ok(log.includes("prompt:hello"), "prompt sent while the capture is still running");
+      const waited = performance.now() - sentAt;
+      assert.ok(waited < 5_000, `the send waited ${Math.round(waited)} ms for the checkpoint`);
+      assert.match(log[0] ?? "", /^capture:1:/u);
+    } finally {
+      gate.resolve();
+    }
+    await waitForCompleted(setup.service);
+    await eventuallyAsync(async () => (await task(setup)).runCheckpoints?.[0]?.status === "unavailable", "unavailable");
+    assert.equal((await task(setup)).runCheckpoints?.[0]?.detail, "timeout");
+  });
+
   it("marks a checkpoint the app quit in the middle of taking as unavailable on the next start [F2]", async () => {
     const log: string[] = [];
     const checkpoints = new FakeCheckpoints(log);
@@ -6885,6 +6913,8 @@ type FakeRuntimeSpec = {
   readonly promptDelayMs?: number;
   /** Runs inside the fake `session/prompt`, before the turn streams: the agent "editing files". */
   readonly promptEffect?: (text: string) => Promise<void>;
+  /** The fake agent announces an edit tool call as soon as the prompt is accepted. */
+  readonly toolCallOnPrompt?: boolean;
 };
 
 function fakeRuntimeFactory(
@@ -6921,6 +6951,7 @@ function fakeRuntimeFactory(
       spec.configRefusal,
       spec.promptEffect,
     );
+    adapter.toolCallOnPrompt = spec.toolCallOnPrompt ?? false;
     onCreate?.(adapter);
     return {
       runtimeVersion: "Fake Grok 1.0",
@@ -6931,6 +6962,7 @@ function fakeRuntimeFactory(
 
 class FakeAdapter implements RuntimeAdapterPort {
   state = "created";
+  toolCallOnPrompt = false;
   newSessionCalls = 0;
   billingCalls = 0;
   billingFailure: string | undefined;
@@ -7433,6 +7465,25 @@ class FakeAdapter implements RuntimeAdapterPort {
       throw transportError;
     }
     await this.sink.commitPromptAccepted({ identity, write: writeReceipt() });
+    if (this.toolCallOnPrompt) {
+      await this.sink.commitUpdate({
+        identity,
+        ingestMode: "live",
+        promptSequence,
+        update: {
+          type: "turn",
+          payload: {
+            type: "tool_call_create",
+            sessionId: session.sessionId,
+            toolCallId: `edit-${promptSequence}`,
+            title: "Edit src/a.ts",
+            kind: "edit",
+            status: "in_progress",
+            received: received(),
+          },
+        },
+      });
+    }
     await this.promptEffect?.(text);
     if (this.promptDelayMs > 0) {
       await new Promise((resolve) => setTimeout(resolve, this.promptDelayMs));

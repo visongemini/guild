@@ -53,6 +53,9 @@ Baseline: 2.1.6 (`b010cd2` + test commits), branch `guild-2.2-speed`.
    memory plugin hook `plugin/openviking-memory/hooks:user_prompt_submit`, which by default spawns a
    `claude -p` digest compressor and takes 12-16 s per prompt. With compression off the same hook takes
    0.3-0.5 s and still injects the recalled context (only not rewritten). The plugin itself is untouched.
+   Amended 2026-10-10: Guild now disables OpenViking completely in its grok processes
+   (hooks no-op, config files and MCP URL pointed at nothing); see D-052. Measured with real grok:
+   no OpenViking commands, no recall or capture during the turn, "Reply OK" in 5.4 s.
 
 Acceptance: measured spawn-to-ready under 1 s on a warm machine (was 5.3 s median);
 time from Send to `session/prompt` on the wire under 100 ms when prewarmed.

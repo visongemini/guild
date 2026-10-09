@@ -188,17 +188,23 @@ describe("live desktop service streaming publication", () => {
     assert.equal(delivered?.kind === "tool" ? delivered.toolStatus : "", "completed");
   });
 
-  it("starts the prompt before it publishes the new Run", async () => {
-    const order: string[] = [];
+  it("starts the prompt promptly and shows the new message without waiting on projections", async () => {
+    // Sending may give the start checkpoint a short head start, during which a scheduled projection
+    // can already show the message; what matters is that the prompt reaches the runtime quickly and
+    // that the message is visible, not which of the two happens first.
+    let promptAt: number | undefined;
+    let shownAt: number | undefined;
     const harness = await startHarness(async () => undefined, (projection) => {
-      const user = projection.activeTask?.timeline.find((item) => item.kind === "user");
-      if (user !== undefined && !order.includes("projection:user")) order.push("projection:user");
+      const user = projection.activeTask?.timeline.find((item) => item.kind === "user" && item.text === "ordering");
+      if (user !== undefined && shownAt === undefined) shownAt = performance.now();
     }, (text) => {
-      order.push(`prompt:${text}`);
+      if (text === "ordering" && promptAt === undefined) promptAt = performance.now();
     });
+    const sentAt = performance.now();
     await harness.send("ordering");
     await harness.completed();
-    assert.deepEqual(order.slice(0, 2), ["prompt:ordering", "projection:user"]);
+    assert.ok(promptAt !== undefined && shownAt !== undefined, "prompt started and message shown");
+    assert.ok(promptAt - sentAt < 1_500, `prompt started ${Math.round(promptAt - sentAt)} ms after send`);
   });
 
   it("refreshes the sidebar for structural changes that happen while another task streams", async () => {

@@ -575,8 +575,10 @@ once per process:
   prewarm is not retried for 15 s, and it is not shown as task activity.
 - Official usage borrows an already authenticated live process instead of starting an extra one, and
   falls back to a dedicated process only if the borrowed call fails.
-- The child environment carries the fixed Guild-owned value `OPENVIKING_RECALL_COMPRESS=off` (see
-  `docs/18-SPEED-PLAN-2.2.md`).
+- The child environment carries fixed Guild-owned values that keep OpenViking memory out of Guild
+  sessions entirely (amended 2026-10-10, owner: OpenViking is for Claude Code and Codex only):
+  `OPENVIKING_MEMORY_ENABLED=0`, both config file paths set to `/dev/null`, and the MCP URL set to a
+  closed local port. This replaced the earlier `OPENVIKING_RECALL_COMPRESS=off`.
 
 ## D-053 — Stream text as deltas and publish full projections only on structural change
 
@@ -713,6 +715,12 @@ Rewind (`previewRewind`, `executeRewind`)
 Residual risks: `git push --mirror` would publish `refs/guild/*`; checkpoint refs are not pruned; a Steer
 that races a queued turn's dispatch can reach the runtime twice; a Guild send racing a runtime-started
 turn fails the new Run with the usual "send again" notice.
+
+Amendment (2026-10-10): the prompt no longer waits up to 3.5 s for the start checkpoint. It
+waits at most 400 ms (typical repositories capture in 0.1-0.3 s; a 2,900-file repository measured
+~240 ms), then goes out while a slower capture continues. A `tool_call_create` that arrives before
+the capture settles marks that Run's start checkpoint unavailable, so a capture that might contain
+the agent's first edit is never offered for rewind.
 
 ## D-056 — A task can work in its own git worktree; Guild runs the git, and merges only through a read-only check and `git merge --no-ff`
 

@@ -218,6 +218,8 @@ const ECHOED_INTERJECTION_LIMIT = 64;
  * the agent may already have changed files.
  */
 const DEFAULT_CHECKPOINT_START_BOUND_MS = 3_000;
+/** How long a send may wait for its start checkpoint before the prompt goes out anyway. */
+const CHECKPOINT_START_WAIT_MS = 400;
 const DEFAULT_CHECKPOINT_END_TIMEOUT_MS = 10_000;
 /** Stays well inside the 256 KiB the store allows for one Run's file summary. */
 const CHECKPOINT_FILES_JSON_BUDGET = 200_000;
@@ -414,6 +416,8 @@ type RuntimeController = {
   readonly checkpointStarts: Map<RunId, Promise<void>>;
   /** Runs whose prompt went out before their start checkpoint finished: that capture is discarded. */
   readonly abandonedCheckpointStarts: Set<RunId>;
+  /** Runs whose start checkpoint capture has finished (captured or unavailable). */
+  readonly settledCheckpointStarts: Set<RunId>;
   /** Captures of one task run strictly one after another, in the order the Runs happened. */
   checkpointTail: Promise<void>;
 };
@@ -947,7 +951,8 @@ export function createLiveDesktopService(
   /**
    * Captures the working tree for a Run that was just created, before its prompt is sent: the
    * row is created synchronously (so the Run has its ordinal), the capture runs after earlier
-   * captures of the task, and `runPrompt` waits for it (bounded) before `session/prompt`.
+   * captures of the task, gets a short head start before `session/prompt` and otherwise runs
+   * alongside it (see awaitStartCheckpointBriefly and markStartCheckpointLateIfPending).
    * Never throws; a failed capture only marks the Run's checkpoint unavailable.
    */
   function beginRunCheckpoint(taskId: TaskId, controller: RuntimeController, runId: RunId): Promise<void> {
@@ -979,23 +984,41 @@ export function createLiveDesktopService(
       if (result.status !== "captured") completeCheckpointUnavailable(taskId, runId, result.reason);
     });
     controller.checkpointStarts.set(runId, operation);
+    void operation.then(
+      () => controller.settledCheckpointStarts.add(runId),
+      () => controller.settledCheckpointStarts.add(runId),
+    );
     return operation;
   }
 
-  /** Waits for a Run's start checkpoint, but not longer than the bound; a late capture is discarded. */
-  async function awaitStartCheckpoint(controller: RuntimeController, runId: RunId): Promise<void> {
+  /**
+   * Gives the start capture a short head start (typical repositories finish in 0.1-0.3 s) without
+   * ever holding a send for long; a capture still running afterwards is guarded by
+   * markStartCheckpointLateIfPending instead of being dropped.
+   */
+  async function awaitStartCheckpointBriefly(controller: RuntimeController, runId: RunId): Promise<void> {
     const start = controller.checkpointStarts.get(runId);
     if (start === undefined) return;
     let timer: ReturnType<typeof setTimeout> | undefined;
-    const outcome = await Promise.race([
-      start.then(() => "ready" as const, () => "ready" as const),
-      new Promise<"late">((resolve) => {
-        timer = setTimeout(() => resolve("late"), checkpointStartBoundMs + 500);
+    await Promise.race([
+      start.catch(() => undefined),
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, CHECKPOINT_START_WAIT_MS);
         timer.unref?.();
       }),
     ]);
     if (timer !== undefined) clearTimeout(timer);
-    if (outcome === "late") controller.abandonedCheckpointStarts.add(runId);
+  }
+
+  /**
+   * A start capture that outlives the brief wait keeps running alongside the prompt: the model needs
+   * seconds before its first tool call. If a tool call does arrive first, the tree may already
+   * contain the agent's edits, so that Run's start checkpoint is discarded (marked unavailable)
+   * instead of offering a wrong rewind.
+   */
+  function markStartCheckpointLateIfPending(controller: RuntimeController, runId: RunId): void {
+    if (!controller.checkpointStarts.has(runId) || controller.settledCheckpointStarts.has(runId)) return;
+    controller.abandonedCheckpointStarts.add(runId);
   }
 
   /** After the Run is terminal: the end checkpoint and the stored changed-file summary. */
@@ -1004,6 +1027,7 @@ export function createLiveDesktopService(
       try {
         controller.checkpointStarts.delete(runId);
         controller.abandonedCheckpointStarts.delete(runId);
+        controller.settledCheckpointStarts.delete(runId);
         const row = store.loadRunCheckpoint(taskId, runId);
         if (row === undefined || row.status !== "capturing" || row.startRef === undefined) return;
         const cwd = workspacePathOf(taskId);
@@ -1994,6 +2018,7 @@ export function createLiveDesktopService(
         echoedInterjections: new Set(),
         checkpointStarts: new Map(),
         abandonedCheckpointStarts: new Set(),
+        settledCheckpointStarts: new Set(),
         checkpointTail: Promise.resolve(),
       };
       controllers.set(taskId, controller);
@@ -5158,6 +5183,7 @@ export function createLiveDesktopService(
         activity: "planning",
       });
     } else if (payload.type === "tool_call_create") {
+      markStartCheckpointLateIfPending(controller, runId);
       const toolKind = payload.kind ?? "other";
       logRuntime({
         category: "prompt",
@@ -5657,9 +5683,9 @@ export function createLiveDesktopService(
     }[],
   ): Promise<void> {
     try {
-      // The start checkpoint is taken before the agent can touch a file: the prompt waits for it,
-      // but only up to a short bound (see awaitStartCheckpoint).
-      await awaitStartCheckpoint(controller, runId);
+      // The start checkpoint gets a short head start; one that is still running continues alongside
+      // the prompt and is discarded if a tool call arrives first (markStartCheckpointLateIfPending).
+      await awaitStartCheckpointBriefly(controller, runId);
       // The stored model and effort are brought up to date between turns, never mid-turn. A refusal
       // keeps the session on its previous selection and never blocks the turn.
       await reconcileRuntimeSelection(taskId, controller, adapter, session).catch(() => {

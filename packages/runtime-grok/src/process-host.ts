@@ -185,13 +185,18 @@ const ENVIRONMENT_DENYLIST = new Set([
   "NODE_OPTIONS", "NODE_PATH", "ELECTRON_RUN_AS_NODE", "BASH_ENV", "ENV", "ZDOTDIR",
 ]);
 /**
- * Fixed Guild-owned values, never inherited from the parent. The user's OpenViking memory
- * plugin otherwise runs a `claude -p` digest compressor inside every prompt hook (measured
- * 12-16 s per prompt); with compression off the hook takes under 0.5 s and still injects the
- * recalled context.
+ * Fixed Guild-owned values, never inherited from the parent. OpenViking memory is for Claude
+ * Code and Codex only (owner decision, 2026-10-10), but grok imports the OpenViking Claude
+ * plugin. These values turn every plugin hook into a no-op (no recall, no capture), point its
+ * config files at nothing, and point its MCP proxy at a closed local port, so a Guild session
+ * can neither read nor write the memory store.
  */
 const GUILD_OWNED_CHILD_ENVIRONMENT = Object.freeze({
-  OPENVIKING_RECALL_COMPRESS: "off",
+  OPENVIKING_MEMORY_ENABLED: "0",
+  OPENVIKING_CONFIG_FILE: "/dev/null",
+  OPENVIKING_CLI_CONFIG_FILE: "/dev/null",
+  OPENVIKING_URL: "http://127.0.0.1:9",
+  OPENVIKING_BASE_URL: "http://127.0.0.1:9",
 } as const);
 const DISABLED_EXTERNAL_INSTRUCTION_IMPORTS = Object.freeze([
   "GROK_CLAUDE_AGENTS_ENABLED",
