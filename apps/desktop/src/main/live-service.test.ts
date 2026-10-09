@@ -5136,6 +5136,326 @@ describe("live desktop service", () => {
   });
 });
 
+describe("live desktop service runtime reuse and prewarm", () => {
+  async function eventually(predicate: () => boolean, label: string): Promise<void> {
+    const deadline = Date.now() + 3_000;
+    while (!predicate()) {
+      if (Date.now() > deadline) assert.fail(`condition not reached: ${label}`);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+  }
+
+  /** Runs a service to an idle task that already has a durable session, like a normal session of use. */
+  async function idleTask(specs: readonly FakeRuntimeSpec[] = []) {
+    const root = await mkdtemp(join(tmpdir(), "guild-live-service-reuse-"));
+    const workspace = join(root, "Workspace");
+    await mkdir(workspace);
+    const adapters: FakeAdapter[] = [];
+    const service = createLiveDesktopService({
+      appVersion: "2.0.0-test",
+      databasePath: join(root, "guild.sqlite3"),
+      stagingRoot: join(root, "staging"),
+      chooseWorkspace: async () => workspace,
+      runtimeFactory: fakeRuntimeFactory(specs, (adapter) => adapters.push(adapter)),
+    });
+    services.push(service);
+    const bootstrapped = await service.chooseWorkspace();
+    const task = await service.createTask(bootstrapped.workspaces[0]!.workspaceId);
+    await service.sendMessage(task.task.taskId, "first");
+    await waitForCompleted(service);
+    // The completed projection can be visible a moment before the prompt bookkeeping settles.
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    return { root, workspace, service, adapters, taskId: task.task.taskId, workspaceId: bootstrapped.workspaces[0]!.workspaceId };
+  }
+
+  /** Two tasks with durable sessions, then a clean restart: the shape in which prewarm applies. */
+  async function restartedWithTasks(
+    specs: readonly FakeRuntimeSpec[] = [],
+    taskCount = 1,
+    overrides: { readonly prewarmRetryMs?: number } = {},
+  ) {
+    const root = await mkdtemp(join(tmpdir(), "guild-live-service-prewarm-"));
+    const workspace = join(root, "Workspace");
+    await mkdir(workspace);
+    const databasePath = join(root, "guild.sqlite3");
+    const first = createLiveDesktopService({
+      appVersion: "2.0.0-test",
+      databasePath,
+      stagingRoot: join(root, "staging"),
+      chooseWorkspace: async () => workspace,
+      runtimeFactory: fakeRuntimeFactory(),
+    });
+    services.push(first);
+    const initial = await first.chooseWorkspace();
+    const workspaceId = initial.workspaces[0]!.workspaceId;
+    const taskIds = [];
+    for (let index = 0; index < taskCount; index += 1) {
+      const task = await first.createTask(workspaceId);
+      await first.sendMessage(task.task.taskId, `seed-${index}`);
+      await waitForCompleted(first);
+      taskIds.push(task.task.taskId);
+    }
+    await first.close();
+    services.splice(services.indexOf(first), 1);
+    const adapters: FakeAdapter[] = [];
+    const reopened = createLiveDesktopService({
+      appVersion: "2.0.0-test",
+      databasePath,
+      stagingRoot: join(root, "staging"),
+      chooseWorkspace: async () => undefined,
+      runtimeFactory: fakeRuntimeFactory(specs, (adapter) => adapters.push(adapter)),
+      ...overrides,
+    });
+    services.push(reopened);
+    return { root, service: reopened, adapters, taskIds, workspaceId };
+  }
+
+  const startedAndConfigured = (adapter: FakeAdapter | undefined): boolean =>
+    adapter !== undefined && adapter.state === "ready" && adapter.selectedModes.length > 0;
+
+  it("keeps a healthy idle runtime across system resume and only probes it", async () => {
+    const { service, adapters, taskId } = await idleTask();
+    await service.handleLifecycleEvent("suspend");
+    await service.handleLifecycleEvent("resume");
+
+    assert.equal(adapters.length, 1);
+    assert.equal(adapters[0]!.state, "ready");
+    assert.equal(adapters[0]!.probeCalls, 1);
+    await service.sendMessage(taskId, "after-wake");
+    await waitForCompleted(service, 2);
+    assert.equal(adapters.length, 1, "the next message must not pay a cold start");
+    assert.deepEqual(adapters[0]!.prompts.map((prompt) => prompt.text), ["first", "after-wake"]);
+  });
+
+  it("closes an idle runtime that no longer answers the resume probe and restarts it lazily", async () => {
+    const { root, service, adapters, taskId } = await idleTask();
+    adapters[0]!.livenessAnswer = false;
+    await service.handleLifecycleEvent("resume");
+
+    assert.equal(adapters[0]!.probeCalls, 1);
+    assert.equal(adapters[0]!.state, "closed");
+    const diagnostics = await waitForText(join(root, "diagnostics", "runtime.jsonl"), "resume_probe_failed");
+    assert.match(diagnostics, /"event":"resume_probe_failed"/u);
+    await service.sendMessage(taskId, "after-wake");
+    await waitForCompleted(service, 2);
+    assert.equal(adapters.length, 2);
+    assert.deepEqual(adapters[1]!.prompts.map((prompt) => prompt.text), ["after-wake"]);
+  });
+
+  it("still closes the runtime of a Run that was active at suspend and never replays its prompt", async () => {
+    const { service, adapters, taskId } = await idleTask();
+    await service.sendMessage(taskId, "ignore-cancel");
+    await waitForRunState(service, "running");
+    await service.handleLifecycleEvent("suspend");
+    await service.handleLifecycleEvent("resume");
+
+    const interrupted = await waitForRunState(service, "interrupted");
+    assert.equal(interrupted.activeTask?.canSend, true);
+    assert.equal(adapters[0]!.state, "closed");
+    assert.equal(adapters[0]!.probeCalls, 0, "a runtime that served a Run is closed, not probed");
+    await service.sendMessage(taskId, "after-wake");
+    await waitForCompleted(service, 2);
+    assert.equal(adapters.length, 2);
+    assert.deepEqual(adapters[1]!.prompts.map((prompt) => prompt.text), ["after-wake"]);
+  });
+
+  it("prewarms the restored active task without sending a prompt", async () => {
+    const { service, adapters, taskIds } = await restartedWithTasks();
+    const projection = await service.bootstrap();
+    assert.equal(projection.activeTask?.task.taskId, taskIds[0]);
+
+    await eventually(() => startedAndConfigured(adapters[0]), "prewarm finished");
+    assert.equal(adapters.length, 1);
+    assert.equal(adapters[0]!.prompts.length, 0, "prewarm must never send a prompt");
+
+    await service.sendMessage(taskIds[0]!, "now");
+    await waitForCompleted(service, 2);
+    assert.equal(adapters.length, 1, "send reuses the prewarmed process");
+    assert.deepEqual(adapters[0]!.prompts.map((prompt) => prompt.text), ["now"]);
+  });
+
+  it("shares one start between a prewarm and a concurrent send", async () => {
+    const { service, adapters, taskIds } = await restartedWithTasks([{ startDelayMs: 150 }]);
+    await service.bootstrap();
+    await eventually(() => adapters.length === 1, "prewarm began");
+    assert.notEqual(adapters[0]!.state, "ready", "the start is still in flight");
+
+    const sent = await service.sendMessage(taskIds[0]!, "while-warming");
+    assert.equal(sent.status, "started");
+    await waitForCompleted(service, 2);
+    assert.equal(adapters.length, 1, "send must join the in-flight start, not begin another");
+    assert.deepEqual(adapters[0]!.prompts.map((prompt) => prompt.text), ["while-warming"]);
+  });
+
+  it("does not show a prewarm as task activity until a send joins it", async () => {
+    const { service, adapters, taskIds } = await restartedWithTasks([{ startDelayMs: 250 }]);
+    await service.bootstrap();
+    await eventually(() => adapters.length === 1, "prewarm began");
+    const during = await service.bootstrap();
+    assert.equal(during.workspaces[0]?.tasks.find((task) => task.taskId === taskIds[0])?.activeActivity, undefined);
+
+    const sending = service.sendMessage(taskIds[0]!, "join");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const joined = await service.bootstrap();
+    assert.equal(joined.workspaces[0]?.tasks.find((task) => task.taskId === taskIds[0])?.activeActivity, "working");
+    await sending;
+    await waitForCompleted(service, 2);
+  });
+
+  it("does not prewarm brand-new, archived, or deleted tasks", async () => {
+    const { service, adapters, taskIds, workspaceId } = await restartedWithTasks([], 2);
+    await service.bootstrap();
+    await eventually(() => startedAndConfigured(adapters[0]), "active task prewarmed");
+    const baseline = adapters.length;
+    assert.equal(baseline, 1);
+
+    const fresh = await service.createTask(workspaceId);
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    assert.equal(adapters.length, baseline, "a task without a session has nothing to resume");
+    await service.setDraft(fresh.task.taskId, "typing in a new task");
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    assert.equal(adapters.length, baseline);
+
+    await service.updateTask({ taskId: taskIds[1]!, action: "archive" });
+    await assert.rejects(service.openTask(taskIds[1]!), /task_not_active/u);
+    await service.updateTask({ taskId: taskIds[0]!, action: "delete" });
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    assert.equal(adapters.length, baseline);
+  });
+
+  it("backs off after a failed prewarm without blocking a real send", async () => {
+    const { service, adapters, taskIds } = await restartedWithTasks([
+      { startFailure: "runtime unavailable" },
+      {},
+    ]);
+    await service.bootstrap();
+    await eventually(() => adapters.length === 1, "failed prewarm attempted");
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    for (let index = 0; index < 3; index += 1) {
+      await service.bootstrap();
+      await service.setDraft(taskIds[0]!, `typing ${index}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    assert.equal(adapters.length, 1, "a failed prewarm must not retry on every keystroke");
+
+    await service.sendMessage(taskIds[0]!, "real use");
+    await waitForCompleted(service, 2);
+    assert.equal(adapters.length, 2, "an explicit send is never throttled");
+  });
+
+  it("prewarms again after a resume fences an in-flight prewarm", async () => {
+    const { service, adapters, taskIds } = await restartedWithTasks([{ startDelayMs: 150 }, {}]);
+    await service.bootstrap();
+    await eventually(() => adapters.length === 1, "prewarm began");
+    await service.handleLifecycleEvent("suspend");
+    await service.handleLifecycleEvent("resume");
+
+    await eventually(() => startedAndConfigured(adapters[1]), "prewarm restarted after resume");
+    assert.equal(adapters[0]!.state, "closed");
+    assert.equal(adapters[1]!.prompts.length, 0);
+    await service.sendMessage(taskIds[0]!, "after-wake");
+    await waitForCompleted(service, 2);
+    assert.equal(adapters.length, 2);
+  });
+
+  it("retries a failed prewarm when the user starts typing once the back-off has passed", async () => {
+    const { service, adapters, taskIds } = await restartedWithTasks(
+      [{ startFailure: "runtime unavailable" }, {}],
+      1,
+      { prewarmRetryMs: 60 },
+    );
+    await service.bootstrap();
+    await eventually(() => adapters.length === 1, "failed prewarm attempted");
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    assert.equal(adapters.length, 1);
+
+    await service.setDraft(taskIds[0]!, "about to type");
+    await eventually(() => startedAndConfigured(adapters[1]), "typing prewarmed the task");
+    assert.equal(adapters[1]!.prompts.length, 0);
+    await service.sendMessage(taskIds[0]!, "go");
+    await waitForCompleted(service, 2);
+    assert.equal(adapters.length, 2);
+  });
+
+  it("releases an unused prewarmed runtime when another task becomes active but keeps a used one", async () => {
+    const { service, adapters, taskIds } = await restartedWithTasks([], 2);
+    await service.bootstrap();
+    await eventually(() => startedAndConfigured(adapters[0]), "last active task prewarmed");
+
+    await service.openTask(taskIds[0]!);
+    await eventually(() => startedAndConfigured(adapters[1]), "selected task prewarmed");
+    await eventually(() => adapters[0]!.state === "closed", "unused prewarm released");
+
+    await service.sendMessage(taskIds[0]!, "use it");
+    await waitForCompleted(service, 2);
+    await service.openTask(taskIds[1]!);
+    await eventually(() => startedAndConfigured(adapters[2]), "other task prewarmed again");
+    assert.equal(adapters[1]!.state, "ready", "a runtime that served a message stays alive");
+    assert.equal(adapters.length, 3);
+  });
+
+  it("lets archive and settings changes wait for a prewarm instead of failing", async () => {
+    const { service, adapters, taskIds } = await restartedWithTasks([{ startDelayMs: 120 }]);
+    await service.bootstrap();
+    await eventually(() => adapters.length === 1, "prewarm began");
+    const updated = await service.setRuntimeSettings("grok-4.5", "medium", "default", {
+      webSearchEnabled: true,
+      planEnabled: true,
+      subagentsEnabled: true,
+      maxTurns: null,
+    });
+    assert.equal(updated.runtimeSettings.model, "grok-4.5");
+
+    await service.openTask(taskIds[0]!);
+    await eventually(() => adapters.length === 2, "second prewarm began");
+    await service.updateTask({ taskId: taskIds[0]!, action: "archive" });
+    await eventually(() => adapters[1]!.state === "closed", "archived task's runtime closed");
+    const after = await service.bootstrap();
+    assert.equal(after.workspaces[0]?.tasks.find((task) => task.taskId === taskIds[0])?.archived, true);
+  });
+
+  for (const failing of [false, true]) {
+    it(`${failing ? "falls back to a dedicated process when the live runtime cannot answer" : "borrows a live runtime"} for official usage`, async () => {
+      const root = await mkdtemp(join(tmpdir(), "guild-live-service-usage-live-"));
+      const workspace = join(root, "Workspace");
+      await mkdir(workspace);
+      const adapters: FakeAdapter[] = [];
+      let dedicatedFetches = 0;
+      const service = createLiveDesktopService({
+        appVersion: "2.0.0-test",
+        databasePath: join(root, "guild.sqlite3"),
+        stagingRoot: join(root, "staging"),
+        chooseWorkspace: async () => workspace,
+        runtimeFactory: fakeRuntimeFactory([], (adapter) => {
+          if (failing) adapter.billingFailure = "billing unavailable on this process";
+          adapters.push(adapter);
+        }),
+        usageFetcher: async () => {
+          dedicatedFetches += 1;
+          return Object.freeze({ creditUsagePercent: 9 });
+        },
+      });
+      services.push(service);
+      const initial = await service.chooseWorkspace();
+      const task = await service.createTask(initial.workspaces[0]!.workspaceId);
+      await service.sendMessage(task.task.taskId, "hello");
+      await waitForCompleted(service);
+
+      const refreshed = await service.refreshUsage();
+      assert.equal(refreshed.usage.status, "available");
+      assert.equal(adapters[0]!.billingCalls, 1);
+      if (failing) {
+        assert.equal(dedicatedFetches, 1);
+        if (refreshed.usage.status === "available") assert.equal(refreshed.usage.usedLabel, "已使用 9%");
+      } else {
+        assert.equal(dedicatedFetches, 0, "no extra official process while a live one can answer");
+        if (refreshed.usage.status === "available") assert.equal(refreshed.usage.usedLabel, "已使用 0%");
+      }
+      assert.equal(adapters.length, 1);
+    });
+  }
+});
+
 async function waitForCompleted(
   service: ReturnType<typeof createLiveDesktopService>,
   expectedAssistantCount = 1,
@@ -5366,6 +5686,10 @@ function fakeRuntimeFactory(
 class FakeAdapter implements RuntimeAdapterPort {
   state = "created";
   newSessionCalls = 0;
+  billingCalls = 0;
+  billingFailure: string | undefined;
+  probeCalls = 0;
+  livenessAnswer = true;
   readonly selectedModels: string[] = [];
   readonly selectedModes: Array<{
     readonly model: string;
@@ -5475,7 +5799,14 @@ class FakeAdapter implements RuntimeAdapterPort {
   async authenticate(): Promise<void> {}
 
   async officialBilling() {
+    this.billingCalls += 1;
+    if (this.billingFailure !== undefined) throw new Error(this.billingFailure);
     return Object.freeze({ creditUsagePercent: 0 });
+  }
+
+  async probeLiveness(): Promise<boolean> {
+    this.probeCalls += 1;
+    return this.state === "ready" && this.livenessAnswer;
   }
 
   async setModel(_session: AcpV1AdapterSession, model: "grok-4.6" | "grok-4.5"): Promise<void> {

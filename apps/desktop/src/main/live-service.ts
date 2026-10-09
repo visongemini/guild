@@ -101,9 +101,11 @@ import {
   inspectDisplayImageBytes,
 } from "./profile-image.js";
 import {
+  invalidateOfficialGrokRuntimeCache,
   locateOfficialGrokRuntime,
   resolveOfficialGrokEnvironment,
 } from "./runtime-locator.js";
+import { warmOfficialGrokRuntime } from "./runtime-warmup.js";
 import {
   SESSION_RECOVERY_CONTEXT_REQUIRED,
   assertWorkspaceFolderExists,
@@ -132,6 +134,12 @@ const REPLACEMENT_RECOVERY_CAPSULE_MAX_LENGTH = 12_000;
 const REPLAY_STAGING_MAX_UPDATES = 10_000;
 const REPLAY_STAGING_MAX_BYTES = 32 * 1024 * 1024;
 const PLAN_DISPLAY_MAX_CHARS = 64 * 1024;
+/** A failed prewarm is not retried for this long, so typing in a broken task cannot spawn in a loop. */
+const PREWARM_RETRY_BACKOFF_MS = 15_000;
+/** A healthy local process answers a liveness probe in about a millisecond. */
+const RESUME_LIVENESS_PROBE_MS = 2_000;
+/** Bound on borrowing a live adapter for the official usage call before spawning a dedicated one. */
+const LIVE_USAGE_TIMEOUT_MS = 10_000;
 
 export type WorkspaceChooser = () => Promise<string | undefined>;
 
@@ -168,6 +176,8 @@ export type RuntimeAdapterPort = {
     }[],
   ): Promise<RuntimeTurnPayload & { readonly type: "prompt_terminal" }>;
   cancel(session: AcpV1AdapterSession): Promise<JsonRpcWriteReceipt>;
+  /** Local stdio round trip; `false` means the process no longer answers. Never closes the adapter. */
+  probeLiveness(timeoutMs: number): Promise<boolean>;
   close(): Promise<void>;
 };
 
@@ -221,6 +231,8 @@ export type LiveDesktopServiceOptions = {
   readonly cancelGraceMs?: number;
   readonly promptSilenceMs?: number;
   readonly promptSettleMs?: number;
+  /** Minimum delay before a failed background prewarm of the same task is retried. */
+  readonly prewarmRetryMs?: number;
   readonly diagnosticsRoot?: string;
 };
 
@@ -267,6 +279,10 @@ type RuntimeController = {
     adapterEpoch: AdapterEpoch;
   }>>;
   startOperation: Promise<AcpV1AdapterSession> | undefined;
+  /** True while the only reason `startOperation` runs is a background prewarm. */
+  startIsPrewarm: boolean;
+  /** True from a successful prewarm until the first real use; only such a process may be released. */
+  prewarmOnly: boolean;
   cancelTimer: ReturnType<typeof setTimeout> | undefined;
   promptSilenceTimer: ReturnType<typeof setTimeout> | undefined;
   contextWindowUsage: { readonly used: number; readonly size?: number } | undefined;
@@ -375,6 +391,7 @@ export function createLiveDesktopService(
   const listeners = new Set<(projection: DesktopBootstrapProjection) => void>();
   const controllers = new Map<TaskId, RuntimeController>();
   const persistedContextTokens = new Map<TaskId, number | null>();
+  const prewarmFailedAtMs = new Map<TaskId, number>();
   const conversationPageDepths = new Map<TaskId, number>();
   const scheduledQueuedTasks = new Map<TaskId, Promise<void>>();
   const scheduledContinuousTasks = new Map<TaskId, Promise<void>>();
@@ -417,6 +434,10 @@ export function createLiveDesktopService(
     mkdir(options.stagingRoot, { recursive: true, mode: 0o700 }),
     mkdir(mediaRoot, { recursive: true, mode: 0o700 }),
   ]);
+  if (options.runtimeFactory === undefined) {
+    // Locate, stage and first-execute the official binary off the critical path.
+    void warmOfficialGrokRuntime(options.stagingRoot).catch(() => undefined);
+  }
 
   let maintenance = false;
   function assertOpen(): void {
@@ -507,6 +528,8 @@ export function createLiveDesktopService(
         replayStaging: undefined,
         replayAbortAcks: new Map(),
         startOperation: undefined,
+        startIsPrewarm: false,
+        prewarmOnly: false,
         cancelTimer: undefined,
         promptSilenceTimer: undefined,
         contextWindowUsage: undefined,
@@ -780,6 +803,48 @@ export function createLiveDesktopService(
     return true;
   }
 
+  /**
+   * Official usage is an account-level question. A ready official process already authenticated
+   * for some task can answer it, so borrow it instead of starting a whole extra process; fall
+   * back to a dedicated one only if the borrowed call fails. Every request is still made by the
+   * official Grok process, and Guild never reads its auth file.
+   */
+  async function fetchUsageSnapshot(signal: AbortSignal): Promise<AcpV1OfficialBillingSnapshot> {
+    const adapter = liveUsageAdapter();
+    if (adapter !== undefined) {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      let abort: (() => void) | undefined;
+      try {
+        return await Promise.race([
+          adapter.officialBilling(),
+          new Promise<never>((_resolve, reject) => {
+            timer = setTimeout(() => reject(new Error("live_usage_timeout")), LIVE_USAGE_TIMEOUT_MS);
+            abort = () => reject(signal.reason instanceof Error ? signal.reason : new Error("operation_aborted"));
+            if (signal.aborted) abort();
+            else signal.addEventListener("abort", abort, { once: true });
+          }),
+        ]);
+      } catch {
+        throwIfAborted(signal);
+      } finally {
+        if (timer !== undefined) clearTimeout(timer);
+        if (abort !== undefined) signal.removeEventListener("abort", abort);
+      }
+    }
+    return usageFetcher(signal);
+  }
+
+  function liveUsageAdapter(): RuntimeAdapterPort | undefined {
+    let busy: RuntimeAdapterPort | undefined;
+    for (const controller of controllers.values()) {
+      const adapter = controller.adapter;
+      if (adapter === undefined || adapter.state !== "ready" || controller.session === undefined) continue;
+      if (controller.promptRunId === undefined) return adapter;
+      busy ??= adapter;
+    }
+    return busy;
+  }
+
   function projectOfficialUsage(locale: GuildLocale): OfficialUsageProjection {
     if (usageLoading) return Object.freeze({ status: "loading" });
     const snapshot = usageSnapshot;
@@ -863,7 +928,10 @@ export function createLiveDesktopService(
     const auxiliary = [...controller.auxiliarySessions.values()]
       .sort((a, b) => b.updatedAtMs - a.updatedAtMs)[0];
     if (auxiliary !== undefined) return auxiliary.activity;
-    if (controller.promptRunId !== undefined || controller.startOperation !== undefined) return "working";
+    if (
+      controller.promptRunId !== undefined ||
+      (controller.startOperation !== undefined && !controller.startIsPrewarm)
+    ) return "working";
     return undefined;
   }
 
@@ -1244,19 +1312,121 @@ export function createLiveDesktopService(
     }
   }
 
-  async function ensureSession(taskId: TaskId): Promise<AcpV1AdapterSession> {
+  /**
+   * One shared start per task. A background prewarm and a user action join the same in-flight
+   * promise; a prewarm never sends a prompt, and only the first real use pins the process.
+   */
+  async function ensureSession(taskId: TaskId, prewarm = false): Promise<AcpV1AdapterSession> {
     if (managementOperationActive) throw new Error("grok_management_operation_active");
     const controller = controllerFor(taskId);
+    if (!prewarm) controller.prewarmOnly = false;
     if (controller.session !== undefined && controller.adapter?.state === "ready") {
       return controller.session;
     }
-    if (controller.startOperation !== undefined) return controller.startOperation;
+    if (controller.startOperation !== undefined) {
+      if (!prewarm) controller.startIsPrewarm = false;
+      return controller.startOperation;
+    }
+    controller.startIsPrewarm = prewarm;
+    controller.prewarmOnly = prewarm;
     controller.startOperation = startRuntime(taskId, controller);
     try {
       return await controller.startOperation;
     } finally {
       controller.startOperation = undefined;
+      controller.startIsPrewarm = false;
     }
+  }
+
+  /**
+   * Starts the official process, initializes it, authenticates and resumes the task's existing
+   * session in the background, without sending a prompt. Only a task whose durable binding is
+   * waiting for restore is prewarmed: a brand-new task has no session to resume, and creating
+   * one here would leave an empty official session behind for a task the user may discard.
+   */
+  function prewarmTask(taskId: TaskId): void {
+    if (closed || closing || maintenance || managementOperationActive) return;
+    const failedAtMs = prewarmFailedAtMs.get(taskId);
+    if (failedAtMs !== undefined && Date.now() - failedAtMs < (options.prewarmRetryMs ?? PREWARM_RETRY_BACKOFF_MS)) return;
+    const existing = controllers.get(taskId);
+    if (
+      existing !== undefined &&
+      (existing.startOperation !== undefined ||
+        (existing.session !== undefined && existing.adapter?.state === "ready"))
+    ) return;
+    try {
+      const metadata = store.loadTaskMetadata(taskId);
+      if (
+        metadata.disposition !== "active" ||
+        store.loadWorkspace(metadata.workspaceId).disposition !== "active" ||
+        store.loadSessionBinding(taskId).state !== "restore_pending"
+      ) return;
+    } catch {
+      return;
+    }
+    const startedGeneration = runtimeGeneration;
+    void ensureSession(taskId, true).then(
+      () => {
+        if (closed || closing) return;
+        prewarmFailedAtMs.delete(taskId);
+        // The user may have moved on while the process was starting.
+        if (activeTaskId !== taskId) releaseUnusedPrewarms(activeTaskId);
+      },
+      () => {
+        if (closed || closing) return;
+        // A resume closed this start on purpose; that is not a failure of the task.
+        if (runtimeGeneration !== startedGeneration) {
+          if (activeTaskId === taskId) prewarmTask(taskId);
+          return;
+        }
+        prewarmFailedAtMs.set(taskId, Date.now());
+        logRuntime({ category: "runtime", event: "prewarm_failed", taskId });
+      },
+    );
+  }
+
+  /**
+   * Browsing must not accumulate idle official processes: a prewarmed process that was never
+   * used is closed when another task becomes active. It restarts from the durable binding.
+   */
+  function releaseUnusedPrewarms(keepTaskId: TaskId | undefined): void {
+    for (const [taskId, controller] of controllers) {
+      if (
+        taskId === keepTaskId ||
+        !controller.prewarmOnly ||
+        controller.startOperation !== undefined ||
+        controller.activeRunId !== undefined ||
+        controller.promptRunId !== undefined ||
+        controller.pendingPermissions.size > 0
+      ) continue;
+      controller.prewarmOnly = false;
+      // Never wait for the process to exit inside a command: Grok takes about a second to stop.
+      void closeController(taskId, controller).catch(() => undefined).then(() => {
+        if (
+          controllers.get(taskId) === controller &&
+          controller.startOperation === undefined &&
+          controller.adapter?.state !== "ready"
+        ) controllers.delete(taskId);
+      });
+    }
+  }
+
+  function onActiveTaskChanged(taskId: TaskId): void {
+    releaseUnusedPrewarms(taskId);
+    prewarmTask(taskId);
+  }
+
+  /** Commands that stop, close or inspect every runtime wait for background starts to settle first. */
+  async function settlePrewarmStarts(taskIds?: readonly TaskId[]): Promise<void> {
+    const starts: Promise<unknown>[] = [];
+    for (const [taskId, controller] of controllers) {
+      if (
+        controller.startIsPrewarm &&
+        controller.startOperation !== undefined &&
+        (taskIds === undefined || taskIds.includes(taskId))
+      ) starts.push(controller.startOperation.catch(() => undefined));
+    }
+    await Promise.all(starts);
   }
 
   function scheduleQueuedDispatch(taskId: TaskId): Promise<void> {
@@ -3807,6 +3977,62 @@ export function createLiveDesktopService(
     }
   }
 
+  /**
+   * After the machine wakes, a process that was serving a Run (or was still starting) is closed:
+   * its Run was just terminalized and a prompt that may still be in flight inside it must not
+   * overlap the next one. An idle healthy process is kept and only has to prove, with a local
+   * stdio round trip, that it still answers; this keeps the next message free of a cold start.
+   * A process that does not answer is closed and restarts lazily from the durable binding.
+   */
+  async function recoverRuntimesAfterResume(
+    interruptedTaskIds: ReadonlySet<TaskId>,
+  ): Promise<void> {
+    const recoveries: Promise<unknown>[] = [];
+    for (const [taskId, controller] of controllers) {
+      const adapter = controller.adapter;
+      if (adapter === undefined) continue;
+      const hadWork =
+        interruptedTaskIds.has(taskId) ||
+        controller.activeRunId !== undefined ||
+        controller.promptRunId !== undefined ||
+        controller.pendingPermissions.size > 0 ||
+        controller.startOperation !== undefined;
+      recoveries.push(
+        hadWork || adapter.state !== "ready"
+          ? adapter.close()
+          : probeIdleRuntimeAfterResume(taskId, controller, adapter),
+      );
+    }
+    await Promise.allSettled(recoveries);
+  }
+
+  async function probeIdleRuntimeAfterResume(
+    taskId: TaskId,
+    controller: RuntimeController,
+    adapter: RuntimeAdapterPort,
+  ): Promise<void> {
+    const alive = await adapter.probeLiveness(RESUME_LIVENESS_PROBE_MS).catch(() => false);
+    if (alive || controller.adapter !== adapter) return;
+    logRuntime({
+      category: "recovery",
+      event: "resume_probe_failed",
+      taskId,
+      ...(controller.adapterEpoch === undefined ? {} : { adapterEpoch: controller.adapterEpoch }),
+      reason: "process_fault",
+    });
+    // An alive process with dead stdio is a transport fault, not an ordinary close.
+    controller.closeInterruptionOverride = Object.freeze({
+      reason: "process_fault",
+      diagnostic: Object.freeze({
+        stderrTail: Object.freeze([]),
+        stderrCapturedBytes: 0,
+        stderrDroppedBytes: 0,
+      }),
+    });
+    await adapter.close().catch(() => undefined);
+    controller.closeInterruptionOverride = undefined;
+  }
+
   async function closeController(
     taskId: TaskId,
     controller: RuntimeController,
@@ -3969,6 +4195,7 @@ export function createLiveDesktopService(
       // PC-CONV-002: renderer reload loses its cache; restore its requested history once.
       // Normal publish() calls keep sending only the bounded live tail.
       const projection = buildBootstrap(true);
+      if (activeTaskId !== undefined) prewarmTask(activeTaskId);
       for (const workspace of projection.workspaces.filter((candidate) => !candidate.archived)) {
         for (const task of workspace.tasks.filter((candidate) => !candidate.archived)) {
           scheduleQueuedDispatch(task.taskId);
@@ -4058,6 +4285,7 @@ export function createLiveDesktopService(
       conversationPageDepths.set(taskId, 1);
       persistTaskSelection(taskId);
       await publish();
+      onActiveTaskChanged(taskId);
       return taskView(taskId);
     }),
     openTask: async (taskId, sequence) => enqueueCommand(async () => {
@@ -4083,6 +4311,7 @@ export function createLiveDesktopService(
       persistTaskSelection(taskId);
       await publish();
       scheduleQueuedDispatch(taskId);
+      onActiveTaskChanged(taskId);
       // The renderer may have evicted this task from its bounded cache.
       return taskView(taskId, conversationPageDepths.get(taskId) ?? 1);
     }),
@@ -4149,6 +4378,7 @@ export function createLiveDesktopService(
       conversationPageDepths.set(branchTaskId, 1);
       persistTaskSelection(branchTaskId);
       await publish();
+      onActiveTaskChanged(branchTaskId);
       return taskView(branchTaskId);
     }),
     exportTask: async (taskId, format) => enqueueCommand(async () => {
@@ -4269,6 +4499,7 @@ export function createLiveDesktopService(
         return buildBootstrap();
       }
       const tasks = store.listTasks({ workspaceId });
+      await settlePrewarmStarts(tasks.map((task) => task.taskId));
       for (const task of tasks) assertTaskInactive(task.taskId);
       await Promise.all(
         tasks.map(async (task) => {
@@ -4319,6 +4550,7 @@ export function createLiveDesktopService(
         await publish();
         return buildBootstrap();
       }
+      await settlePrewarmStarts([taskId]);
       assertTaskInactive(taskId);
       const controller = controllers.get(taskId);
       if (controller !== undefined) {
@@ -4670,6 +4902,8 @@ export function createLiveDesktopService(
         expectedRevision: current?.revision ?? 0,
         text,
       });
+      // Typing in the composer is the strongest sign that a send is coming.
+      if (taskId === activeTaskId) prewarmTask(taskId);
     }),
     authorizeSessionReplacement: async (taskId) => {
       await enqueueCommand(async () => {
@@ -4725,7 +4959,7 @@ export function createLiveDesktopService(
           await publish();
           let next: AcpV1OfficialBillingSnapshot | undefined;
           try {
-            next = await usageFetcher(abortController.signal);
+            next = await fetchUsageSnapshot(abortController.signal);
           } catch {
             next = undefined;
           }
@@ -4784,6 +5018,7 @@ export function createLiveDesktopService(
       ) {
         return buildBootstrap();
       }
+      await settlePrewarmStarts();
       if (!runtimeSettingsCanChange()) throw new Error("runtime_settings_change_unavailable");
       runtimeGeneration += 1;
       const closes = [...controllers.values()]
@@ -4888,6 +5123,7 @@ export function createLiveDesktopService(
       const destination = await options.chooseUserDataBackupPath?.();
       if (destination === undefined) return Object.freeze({ status: "cancelled" as const });
       assertOpen();
+      await settlePrewarmStarts();
       assertMaintenanceIdle();
       maintenance = true;
       try {
@@ -4911,6 +5147,7 @@ export function createLiveDesktopService(
       const source = await options.chooseUserDataRestorePath?.();
       if (source === undefined) return Object.freeze({ status: "cancelled" as const });
       assertOpen();
+      await settlePrewarmStarts();
       assertMaintenanceIdle();
       maintenance = true;
       try {
@@ -4933,6 +5170,7 @@ export function createLiveDesktopService(
       assertOpen();
       const managementCommand = buildGrokManagementCommand(request);
       if (managementOperationActive) throw new Error("grok_management_operation_active");
+      await settlePrewarmStarts();
       if (!runtimeSettingsCanChange()) throw new Error("grok_management_change_unavailable");
       const selectedTaskId = request.taskId ?? activeTaskId;
       if (selectedTaskId === undefined) throw new Error("grok_management_workspace_required");
@@ -5005,6 +5243,7 @@ export function createLiveDesktopService(
           })).catch(() => undefined);
           for (const controller of controllers.values()) clearPromptSilenceTimer(controller);
         }
+        const interruptedTaskIds = new Set<TaskId>();
         for (const workspace of store.listWorkspaces({ includeArchived: true })) {
           for (const task of store.listTasks({
             workspaceId: workspace.workspaceId,
@@ -5012,6 +5251,7 @@ export function createLiveDesktopService(
           })) {
             const run = store.restoreTask(task.taskId).currentRun;
             if (run === undefined || TERMINAL_RUN_STATES.has(run.state)) continue;
+            interruptedTaskIds.add(task.taskId);
             store.applyRun({
               taskId: task.taskId,
               runId: run.runId,
@@ -5019,11 +5259,7 @@ export function createLiveDesktopService(
             });
           }
         }
-        if (event === "resume") {
-          await Promise.allSettled(
-            [...controllers.values()].map((controller) => controller.adapter?.close()),
-          );
-        }
+        if (event === "resume") await recoverRuntimesAfterResume(interruptedTaskIds);
         await publish();
         if (event === "resume") {
           for (const workspace of store.listWorkspaces()) {
@@ -5031,6 +5267,7 @@ export function createLiveDesktopService(
               scheduleQueuedDispatch(task.taskId);
             }
           }
+          if (activeTaskId !== undefined) prewarmTask(activeTaskId);
         }
       });
     },
@@ -5438,6 +5675,12 @@ async function createProductionRuntime(input: {
     stagingRoot: input.stagingRoot,
     baseEnvironment: runtimeEnvironment,
     runtimeSettings: input.runtimeSettings,
+  });
+  host.onEvent((event) => {
+    // A binary that failed its pin or its spawn may have been replaced; locate it afresh next time.
+    if (event.type === "preflight_failure" || event.type === "spawn_failure") {
+      invalidateOfficialGrokRuntimeCache();
+    }
   });
   if (process.env["GUILD_DESKTOP_DEBUG"] === "1") {
     host.onEvent((event) => {
