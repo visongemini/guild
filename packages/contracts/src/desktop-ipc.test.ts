@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  DESKTOP_EVENT_CHANNELS,
   DESKTOP_IPC_CHANNELS,
   GUILD_GROK_MODELS,
+  GUILD_STREAM_DELTA_LIMITS,
   GUILD_GROK_PERMISSION_MODES,
   GUILD_MAX_MESSAGE_LENGTH,
   parseDesktopRequest,
@@ -11,6 +13,7 @@ import {
   parseGuildGrokReasoningEffort,
   parseGuildLocale,
   parseGuildNickname,
+  parseStreamDeltaEvent,
 } from "./desktop-ipc.js";
 
 test("desktop IPC accepts only closed request shapes", () => {
@@ -469,4 +472,77 @@ test("profile and general settings stay closed and validate nicknames", () => {
   assert.throws(() =>
     parseDesktopRequest(DESKTOP_IPC_CHANNELS.openRuntimeDiagnostics, { path: "/tmp" }),
   );
+});
+
+const validDelta = Object.freeze({
+  taskId: "task-1",
+  runId: "run-1",
+  entryId: "assistant-1",
+  kind: "assistant",
+  offset: 0,
+  appendText: "hello",
+  revision: 1,
+  updatedAtMs: 1_700_000_000_000,
+});
+
+test("stream delta channel is registered once and is a main-to-renderer event", () => {
+  assert.equal(DESKTOP_IPC_CHANNELS.streamDelta, "guild:v1:event:stream-delta");
+  assert.ok(DESKTOP_EVENT_CHANNELS.includes(DESKTOP_IPC_CHANNELS.streamDelta));
+  assert.ok(DESKTOP_EVENT_CHANNELS.includes(DESKTOP_IPC_CHANNELS.projectionChanged));
+  assert.equal(new Set(DESKTOP_EVENT_CHANNELS).size, DESKTOP_EVENT_CHANNELS.length);
+  const registered = Object.values(DESKTOP_IPC_CHANNELS);
+  assert.equal(new Set(registered).size, registered.length, "channel strings are unique");
+  for (const channel of registered) assert.match(channel, /^guild:v1:[a-z-]+(?::[a-z-]+)*$/u);
+  // An event channel is never accepted as a renderer request.
+  assert.throws(() => parseDesktopRequest(DESKTOP_IPC_CHANNELS.streamDelta as never, {}));
+});
+
+test("stream delta validation accepts exactly the closed event shape", () => {
+  const parsed = parseStreamDeltaEvent({ ...validDelta });
+  assert.deepEqual(parsed, validDelta);
+  assert.equal(Object.isFrozen(parsed), true);
+  const { runId: _runId, ...withoutRun } = validDelta;
+  assert.deepEqual(parseStreamDeltaEvent(withoutRun), withoutRun);
+  assert.equal(parseStreamDeltaEvent({ ...validDelta, kind: "thought" }).kind, "thought");
+  assert.equal(
+    parseStreamDeltaEvent({ ...validDelta, appendText: "你好\u{1F600}" }).appendText,
+    "你好\u{1F600}",
+  );
+});
+
+test("stream delta validation rejects unknown, malformed, and oversized events", () => {
+  const bad = (patch: Record<string, unknown>) =>
+    assert.throws(() => parseStreamDeltaEvent({ ...validDelta, ...patch }), TypeError, JSON.stringify(patch));
+  bad({ extra: true });
+  bad({ kind: "tool" });
+  bad({ kind: "user" });
+  bad({ taskId: "" });
+  bad({ taskId: 7 });
+  bad({ runId: "" });
+  bad({ runId: undefined });
+  bad({ entryId: "" });
+  bad({ entryId: "e".repeat(513) });
+  bad({ offset: -1 });
+  bad({ offset: 1.5 });
+  bad({ offset: GUILD_STREAM_DELTA_LIMITS.maxOffset + 1 });
+  bad({ offset: Number.NaN });
+  bad({ offset: Number.POSITIVE_INFINITY });
+  bad({ revision: 0 });
+  bad({ revision: "1" });
+  bad({ updatedAtMs: -1 });
+  bad({ appendText: "" });
+  bad({ appendText: "a\0b" });
+  bad({ appendText: 12 });
+  bad({ appendText: "x".repeat(GUILD_STREAM_DELTA_LIMITS.maxAppendTextLength + 1) });
+  const largest = "x".repeat(GUILD_STREAM_DELTA_LIMITS.maxAppendTextLength);
+  assert.equal(parseStreamDeltaEvent({ ...validDelta, appendText: largest }).appendText.length, largest.length);
+  const missing = { ...validDelta } as Record<string, unknown>;
+  delete missing["entryId"];
+  assert.throws(() => parseStreamDeltaEvent(missing), TypeError);
+  assert.throws(() => parseStreamDeltaEvent(null), TypeError);
+  assert.throws(() => parseStreamDeltaEvent([validDelta]), TypeError);
+  assert.throws(() => parseStreamDeltaEvent("delta"), TypeError);
+  assert.throws(() => parseStreamDeltaEvent(Object.create({ ...validDelta })), TypeError);
+  const symbolKeyed = { ...validDelta, [Symbol("x")]: 1 };
+  assert.throws(() => parseStreamDeltaEvent(symbolKeyed), TypeError);
 });

@@ -707,7 +707,12 @@ describe("live desktop service", () => {
     const runningSummary = running.workspaces
       .flatMap((candidate) => candidate.tasks)
       .find((candidate) => candidate.taskId === task.task.taskId);
-    assert.equal(runningSummary?.activeActivity, "working");
+    // The prompt now reaches the runtime before the first projection, so the fixture's
+    // first thought chunk may already have arrived; either is a live activity.
+    assert.ok(
+      runningSummary?.activeActivity === "working" || runningSummary?.activeActivity === "thinking",
+      `expected a live activity, saw ${String(runningSummary?.activeActivity)}`,
+    );
 
     await assert.rejects(
       service.runGrokManagement({ action: "version", taskId: task.task.taskId }),

@@ -44,6 +44,7 @@ import {
   type OfficialUsageProjection,
   type PermissionIdentity,
   type RunId,
+  type StreamDeltaEvent,
   type RuntimePermissionRequestPayload,
   type RuntimeCommand,
   type RuntimeConfigOption,
@@ -56,6 +57,7 @@ import {
   type TaskViewProjection,
   type TimelineToolContent,
   type TimelineItemProjection,
+  type WorkspaceProjection,
   type WindowId,
   type WorkspaceId,
   type ChooseAvatarResponse,
@@ -132,6 +134,15 @@ const REPLACEMENT_RECOVERY_CAPSULE_MAX_LENGTH = 12_000;
 const REPLAY_STAGING_MAX_UPDATES = 10_000;
 const REPLAY_STAGING_MAX_BYTES = 32 * 1024 * 1024;
 const PLAN_DISPLAY_MAX_CHARS = 64 * 1024;
+/** While authored text streams, full projections are rebuilt at most this often. */
+const STREAM_PUBLISH_INTERVAL_MS = 250;
+/** Streaming deltas for one entry are merged for at most one animation frame. */
+const STREAM_DELTA_COALESCE_MS = 16;
+const STREAM_DELTA_FLUSH_CHARS = 32 * 1024;
+const STREAM_LIVE_ENTRY_LIMIT = 32;
+/** More changed rows than this are cheaper to reload in one query than row by row. */
+const ENTRY_CACHE_BULK_RELOAD_ROWS = 48;
+const TERMINAL_RUN_CACHE_LIMIT = 512;
 
 export type WorkspaceChooser = () => Promise<string | undefined>;
 
@@ -336,6 +347,16 @@ type AuxiliarySessionState = {
   readonly tools: Map<string, { kind: AcpToolKind; status: AcpToolStatus }>;
 };
 
+type PendingStreamDelta = {
+  readonly taskId: TaskId;
+  readonly runId: RunId;
+  readonly entryId: string;
+  readonly kind: "assistant" | "thought";
+  readonly offset: number;
+  text: string;
+  revision: number;
+};
+
 type ToolProjectionState = Readonly<{
   runtimeReplayKind: "tool" | "plan";
   title: string;
@@ -407,8 +428,23 @@ export function createLiveDesktopService(
   let commandTail: Promise<void> = Promise.resolve();
   let publishOperation: Promise<void> | undefined;
   let publishQueued = false;
+  // True when a pending flush was requested by a structural change. A flush that
+  // only follows streamed text may reuse the cached sidebar projection.
+  let publishStructural = false;
   let streamPublishOperation: Promise<void> | undefined;
+  let streamPublishTimer: ReturnType<typeof setTimeout> | undefined;
+  let lastFullPublishAtMs = Number.NEGATIVE_INFINITY;
+  let lastProjectionBuildMs = 0;
   let lastStreamYieldAt = performance.now();
+  const deltaListeners = new Set<(delta: StreamDeltaEvent) => void>();
+  const liveStreamEntries = new Map<string, { length: number; revision: number }>();
+  const pendingStreamDeltas = new Map<string, PendingStreamDelta>();
+  let streamDeltaTimer: ReturnType<typeof setTimeout> | undefined;
+  let sidebarCache: readonly WorkspaceProjection[] | undefined;
+  let entryCache: { readonly taskId: TaskId; entries: Map<string, ConversationEntryRecord> } | undefined;
+  const projectedEntryCache = new Map<string, { readonly key: string; readonly item: TimelineItemProjection }>();
+  const terminalRunCache = new Map<RunId, RunRecord>();
+  const workbenchCache = new Map<string, { readonly key: string; readonly value: TaskViewProjection["workbench"] }>();
   let activeTaskHydrated = false;
   let allowAutoSelectActiveTask = true;
   const avatarPreviews = new Map<string, string>();
@@ -616,7 +652,14 @@ export function createLiveDesktopService(
     return true;
   }
 
+  /** Structural change: new entry, tool/permission/run-state change, sidebar or settings change. */
   function publish(): Promise<void> {
+    if (closed || closing || maintenance) return Promise.resolve();
+    publishStructural = true;
+    return requestPublish();
+  }
+
+  function requestPublish(): Promise<void> {
     if (closed || closing || maintenance) return Promise.resolve();
     publishQueued = true;
     if (publishOperation !== undefined) return publishOperation;
@@ -631,8 +674,20 @@ export function createLiveDesktopService(
           }
           try {
             publishQueued = false;
-            const projection = buildBootstrap();
+            const reuseSidebar = !publishStructural;
+            publishStructural = false;
+            const buildStartedAt = performance.now();
+            const projection = buildBootstrap(false, reuseSidebar);
+            lastProjectionBuildMs = performance.now() - buildStartedAt;
+            // Deltas are delivered before the snapshot that contains their text.
+            flushStreamDeltas();
             for (const listener of [...listeners]) listener(projection);
+            lastFullPublishAtMs = performance.now();
+            if (streamPublishTimer !== undefined) {
+              // This projection already carries every chunk committed so far.
+              clearTimeout(streamPublishTimer);
+              streamPublishTimer = undefined;
+            }
             if (publishQueued) {
               flush();
             } else {
@@ -651,38 +706,168 @@ export function createLiveDesktopService(
     return publishOperation;
   }
 
-  function scheduleStreamPublish(): void {
-    // One observed promise per batch; do not retain a handler for every chunk.
-    if (streamPublishOperation !== undefined) return;
+  /** Non-blocking structural publish for callers that sit inside the one-at-a-time update queue. */
+  let scheduledPublishObserved: Promise<void> | undefined;
+  function schedulePublish(): void {
+    // One observed promise per batch; do not retain a handler for every update.
     const operation = publish();
-    streamPublishOperation = operation;
+    if (scheduledPublishObserved === operation) return;
+    scheduledPublishObserved = operation;
     void operation.then(() => {
-      if (streamPublishOperation === operation) streamPublishOperation = undefined;
+      if (scheduledPublishObserved === operation) scheduledPublishObserved = undefined;
     }, () => {
-      if (streamPublishOperation === operation) streamPublishOperation = undefined;
+      if (scheduledPublishObserved === operation) scheduledPublishObserved = undefined;
       logRuntime({ category: "runtime", event: "stream_projection_failed" });
     });
   }
 
-  function buildBootstrap(restoreHistory = false): DesktopBootstrapProjection {
+  /**
+   * Streamed text changes only the tail of one entry, which the delta channel already
+   * carries. A full projection is rebuilt at most once per interval (longer when the
+   * last build was slow) to refresh derived state and to resynchronize the renderer.
+   */
+  function scheduleStreamPublish(): void {
+    if (streamPublishTimer !== undefined || closed || closing || maintenance) return;
+    const interval = Math.max(STREAM_PUBLISH_INTERVAL_MS, lastProjectionBuildMs * 4);
+    const wait = Math.max(0, lastFullPublishAtMs + interval - performance.now());
+    streamPublishTimer = setTimeout(() => {
+      streamPublishTimer = undefined;
+      const operation = requestPublish();
+      streamPublishOperation = operation;
+      void operation.then(() => {
+        if (streamPublishOperation === operation) streamPublishOperation = undefined;
+      }, () => {
+        if (streamPublishOperation === operation) streamPublishOperation = undefined;
+        logRuntime({ category: "runtime", event: "stream_projection_failed" });
+      });
+    }, wait);
+  }
+
+  /**
+   * Single hook called by the text/thought chunk handler after the chunk is committed.
+   * Sends a small delta to the renderer and decides which kind of publish follows.
+   */
+  function publishStreamChunk(input: Readonly<{
+    taskId: TaskId;
+    runId: RunId;
+    kind: "assistant" | "thought";
+    entryId: string;
+    text: string;
+    created: boolean;
+    duplicate: boolean;
+    committedLength: number;
+  }>): void {
+    if (input.duplicate) return;
+    emitStreamDelta(input);
+    if (input.created) schedulePublish();
+    else scheduleStreamPublish();
+  }
+
+  function emitStreamDelta(input: Readonly<{
+    taskId: TaskId;
+    runId: RunId;
+    kind: "assistant" | "thought";
+    entryId: string;
+    text: string;
+    created: boolean;
+    committedLength: number;
+  }>): void {
+    let live = liveStreamEntries.get(input.entryId);
+    if (live === undefined) {
+      live = {
+        length: input.created ? 0 : Math.max(0, input.committedLength - input.text.length),
+        revision: 0,
+      };
+      liveStreamEntries.set(input.entryId, live);
+      while (liveStreamEntries.size > STREAM_LIVE_ENTRY_LIMIT) {
+        const oldest = liveStreamEntries.keys().next().value;
+        if (oldest === undefined) break;
+        liveStreamEntries.delete(oldest);
+      }
+    }
+    const offset = live.length;
+    live.length += input.text.length;
+    live.revision += 1;
+    if (input.text.length === 0 || deltaListeners.size === 0 || input.taskId !== activeTaskId) return;
+    const pending = pendingStreamDeltas.get(input.entryId);
+    if (pending === undefined) {
+      pendingStreamDeltas.set(input.entryId, {
+        taskId: input.taskId,
+        runId: input.runId,
+        entryId: input.entryId,
+        kind: input.kind,
+        offset,
+        text: input.text,
+        revision: live.revision,
+      });
+    } else {
+      pending.text += input.text;
+      pending.revision = live.revision;
+    }
+    if ((pendingStreamDeltas.get(input.entryId)?.text.length ?? 0) >= STREAM_DELTA_FLUSH_CHARS) {
+      flushStreamDeltas();
+    } else if (streamDeltaTimer === undefined) {
+      streamDeltaTimer = setTimeout(flushStreamDeltas, STREAM_DELTA_COALESCE_MS);
+    }
+  }
+
+  function flushStreamDeltas(): void {
+    if (streamDeltaTimer !== undefined) {
+      clearTimeout(streamDeltaTimer);
+      streamDeltaTimer = undefined;
+    }
+    if (pendingStreamDeltas.size === 0) return;
+    const batch = [...pendingStreamDeltas.values()];
+    pendingStreamDeltas.clear();
+    if (closed || closing || maintenance) return;
+    for (const pending of batch) {
+      if (pending.taskId !== activeTaskId) continue;
+      const event: StreamDeltaEvent = Object.freeze({
+        taskId: pending.taskId,
+        runId: pending.runId,
+        entryId: pending.entryId,
+        kind: pending.kind,
+        offset: pending.offset,
+        appendText: pending.text,
+        revision: pending.revision,
+        updatedAtMs: Date.now(),
+      });
+      for (const listener of [...deltaListeners]) {
+        try {
+          listener(event);
+        } catch {
+          // A delivery fault must never fault task persistence; the next projection resynchronizes.
+        }
+      }
+    }
+  }
+
+  /**
+   * `reuseSidebar` is set only for projections that follow streamed text, where no task,
+   * workspace, queue or draft row changed. Tasks with a live controller are still refreshed.
+   */
+  function buildBootstrap(restoreHistory = false, reuseSidebar = false): DesktopBootstrapProjection {
     assertOpen();
     const settings = store.loadAppSettings();
     hydrateActiveTask(settings);
-    const workspaces = store.listWorkspaces({ includeArchived: true }).map((workspace) => {
-      const workspaceId = must(parseWorkspaceId(workspace.workspaceId));
-      const tasks = store.listTasks({ workspaceId, includeArchived: true })
-        .filter((task) => !isPristineNewTask(task.taskId))
-        .map((task) => {
-          const taskId = must(parseTaskId(task.taskId));
-          return taskSummary(task, taskId === activeTaskId || controllers.has(taskId));
+    const workspaces = reuseSidebar && sidebarCache !== undefined
+      ? refreshLiveSidebarTasks(sidebarCache)
+      : store.listWorkspaces({ includeArchived: true }).map((workspace) => {
+          const workspaceId = must(parseWorkspaceId(workspace.workspaceId));
+          const tasks = store.listTasks({ workspaceId, includeArchived: true })
+            .filter((task) => !isPristineNewTask(task.taskId))
+            .map((task) => {
+              const taskId = must(parseTaskId(task.taskId));
+              return taskSummary(task, taskId === activeTaskId || controllers.has(taskId));
+            });
+          return Object.freeze({
+            workspaceId,
+            name: workspace.displayName,
+            archived: workspace.disposition === "archived",
+            tasks: Object.freeze(tasks),
+          });
         });
-      return Object.freeze({
-        workspaceId,
-        name: workspace.displayName,
-        archived: workspace.disposition === "archived",
-        tasks: Object.freeze(tasks),
-      });
-    });
+    sidebarCache = workspaces;
     if (activeTaskId === undefined && allowAutoSelectActiveTask) {
       activeTaskId = workspaces.filter((workspace) => !workspace.archived)
         .flatMap((workspace) => workspace.tasks)
@@ -736,6 +921,27 @@ export function createLiveDesktopService(
         ),
       }),
       ...(managementProgress === undefined ? {} : { grokManagementProgress: managementProgress }),
+    });
+  }
+
+  function refreshLiveSidebarTasks(
+    cached: readonly WorkspaceProjection[],
+  ): readonly WorkspaceProjection[] {
+    return cached.map((workspace) => {
+      if (!workspace.tasks.some((task) => task.taskId === activeTaskId || controllers.has(task.taskId))) {
+        return workspace;
+      }
+      return Object.freeze({
+        ...workspace,
+        tasks: Object.freeze(workspace.tasks.map((task) => {
+          if (task.taskId !== activeTaskId && !controllers.has(task.taskId)) return task;
+          try {
+            return taskSummary(store.loadTaskMetadata(task.taskId), true);
+          } catch {
+            return task;
+          }
+        })),
+      });
     });
   }
 
@@ -953,10 +1159,12 @@ export function createLiveDesktopService(
     const summary = taskSummary(metadata, true);
     const locale = store.loadAppSettings().locale;
     const loadedPageDepth = conversationPageDepths.get(taskId) ?? 1;
-    let entries = [...store.listRecentConversationEntries({
-      taskId,
-      limit: CONVERSATION_PAGE_SIZE,
-    })];
+    let entries = projectedPageDepth <= 1
+      ? [...recentEntriesCached(taskId)]
+      : [...store.listRecentConversationEntries({
+          taskId,
+          limit: CONVERSATION_PAGE_SIZE,
+        })];
     for (let page = 1; page < projectedPageDepth; page += 1) {
       const firstSequence = entries[0]?.sequence;
       if (firstSequence === undefined || firstSequence <= 1) break;
@@ -980,7 +1188,7 @@ export function createLiveDesktopService(
         const toolCallId = entry.kind === "tool" ? metadataString(entry, "toolCallId") : undefined;
         return toolCallId === undefined || latestToolEntry.get(toolCallId) === entry.entryId;
       })
-      .map((entry) => projectEntry(entry, runCache, locale));
+      .map((entry) => projectEntryCached(entry, runCache, locale));
     const pending = [...(controllers.get(taskId)?.pendingPermissions.values() ?? [])]
       .map((permission) => projectPermission(permission, locale));
     const queuedTurns = store.listQueuedTurns(taskId).map((queued) => Object.freeze({
@@ -1018,12 +1226,15 @@ export function createLiveDesktopService(
         .map((tool) => tool.kind)),
     )];
     const latestRunId = [...entries].reverse().find((entry) => entry.runId !== undefined)?.runId;
-    const latestRun = latestRunId === undefined ? undefined : safeLoadRun(taskId, latestRunId);
+    const latestRun = latestRunId === undefined
+      ? undefined
+      : runForProjection(taskId, latestRunId, runCache);
     const recentResult = latestRunId !== undefined && latestRun !== undefined && TERMINAL_RUN_STATES.has(latestRun.state)
       ? Object.freeze({
           runId: latestRunId,
           state: latestRun.state as "completed" | "failed" | "cancelled" | "interrupted",
-          workbench: buildTaskWorkbench(
+          workbench: cachedWorkbench(
+            `${taskId}\0run`,
             workspace.canonicalPath,
             entries.filter((entry) => entry.runId === latestRunId),
           ),
@@ -1062,10 +1273,7 @@ export function createLiveDesktopService(
               toolKinds: Object.freeze(auxiliaryToolKinds),
             }),
           }),
-      workbench: buildTaskWorkbench(
-        workspace.canonicalPath,
-        entries,
-      ),
+      workbench: cachedWorkbench(`${taskId}\0all`, workspace.canonicalPath, entries),
       ...(recentResult === undefined ? {} : { recentResult }),
       ...(continuousTask === undefined
         ? {}
@@ -1088,18 +1296,118 @@ export function createLiveDesktopService(
     });
   }
 
+  /**
+   * The newest page of rows. A row whose stamp is unchanged was already decoded and
+   * integrity-verified when it was cached, so only rows written since are read again.
+   */
+  function recentEntriesCached(taskId: TaskId): readonly ConversationEntryRecord[] {
+    const stamps = store.listRecentConversationEntryStamps({
+      taskId,
+      limit: CONVERSATION_PAGE_SIZE,
+    });
+    if (entryCache === undefined || entryCache.taskId !== taskId) {
+      entryCache = { taskId, entries: new Map() };
+    }
+    const cache = entryCache;
+    let stale = 0;
+    for (const stamp of stamps) {
+      const hit = cache.entries.get(stamp.entryId);
+      if (hit === undefined || hit.revision !== stamp.revision || hit.sequence !== stamp.sequence) {
+        stale += 1;
+      }
+    }
+    let entries: readonly ConversationEntryRecord[];
+    if (stale > ENTRY_CACHE_BULK_RELOAD_ROWS) {
+      entries = store.listRecentConversationEntries({ taskId, limit: CONVERSATION_PAGE_SIZE });
+    } else {
+      entries = stamps.map((stamp) => {
+        const hit = cache.entries.get(stamp.entryId);
+        return hit !== undefined && hit.revision === stamp.revision && hit.sequence === stamp.sequence
+          ? hit
+          : store.loadConversationEntry(taskId, stamp.entryId);
+      });
+    }
+    cache.entries = new Map(entries.map((entry) => [entry.entryId, entry]));
+    return entries;
+  }
+
+  function runForProjection(
+    taskId: TaskId,
+    runId: RunId,
+    runCache: Map<RunId, RunRecord | undefined>,
+  ): RunRecord | undefined {
+    if (runCache.has(runId)) return runCache.get(runId);
+    // Terminal states are absorbing, so a terminal record never needs a second read.
+    let run = terminalRunCache.get(runId);
+    if (run === undefined) {
+      run = safeLoadRun(taskId, runId);
+      if (run !== undefined && TERMINAL_RUN_STATES.has(run.state)) {
+        terminalRunCache.set(runId, run);
+        while (terminalRunCache.size > TERMINAL_RUN_CACHE_LIMIT) {
+          const oldest = terminalRunCache.keys().next().value;
+          if (oldest === undefined) break;
+          terminalRunCache.delete(oldest);
+        }
+      }
+    }
+    runCache.set(runId, run);
+    return run;
+  }
+
+  function projectEntryCached(
+    entry: ConversationEntryRecord,
+    runCache: Map<RunId, RunRecord | undefined>,
+    locale: GuildLocale,
+  ): TimelineItemProjection {
+    const run = entry.runId === undefined
+      ? undefined
+      : runForProjection(entry.taskId, entry.runId, runCache);
+    const key = `${entry.revision}\0${run?.state ?? ""}\0${locale}`;
+    const cacheKey = `${entry.taskId}\0${entry.entryId}`;
+    const hit = projectedEntryCache.get(cacheKey);
+    if (hit !== undefined && hit.key === key) return hit.item;
+    const item = projectEntry(entry, runCache, locale);
+    projectedEntryCache.delete(cacheKey);
+    projectedEntryCache.set(cacheKey, { key, item });
+    // Rows older than the live window are not projected on the hot path; bound the memory.
+    while (projectedEntryCache.size > CONVERSATION_PAGE_SIZE * 2) {
+      const oldest = projectedEntryCache.keys().next().value;
+      if (oldest === undefined) break;
+      projectedEntryCache.delete(oldest);
+    }
+    return item;
+  }
+
+  function cachedWorkbench(
+    scope: string,
+    workspacePath: string,
+    entries: readonly ConversationEntryRecord[],
+  ): TaskViewProjection["workbench"] {
+    let key = workspacePath;
+    for (const entry of entries) {
+      if (entry.kind === "tool") key += `|${entry.entryId}:${entry.revision}`;
+    }
+    const hit = workbenchCache.get(scope);
+    if (hit !== undefined && hit.key === key) return hit.value;
+    const value = buildTaskWorkbench(workspacePath, entries);
+    workbenchCache.delete(scope);
+    workbenchCache.set(scope, { key, value });
+    while (workbenchCache.size > 16) {
+      const oldest = workbenchCache.keys().next().value;
+      if (oldest === undefined) break;
+      workbenchCache.delete(oldest);
+    }
+    return value;
+  }
+
   function projectEntry(
     entry: ConversationEntryRecord,
     runCache: Map<RunId, RunRecord | undefined>,
     locale: GuildLocale,
   ): TimelineItemProjection {
-    let run: RunRecord | undefined;
-    if (entry.runId !== undefined) {
-      if (!runCache.has(entry.runId)) {
-        runCache.set(entry.runId, safeLoadRun(entry.taskId, entry.runId));
-      }
-      run = runCache.get(entry.runId);
-    }
+    const run = entry.runId === undefined
+      ? undefined
+      : runForProjection(entry.taskId, entry.runId, runCache);
     const status = run?.state === "cancelled"
       ? "cancelled"
       : run?.state === "interrupted"
@@ -2530,7 +2838,7 @@ export function createLiveDesktopService(
           });
         }
         notePromptActivity(taskId, controller);
-        await publish();
+        schedulePublish();
       },
       preparePermissionResponse: async (event) => {
         if (!isCurrentRuntimeIdentity(taskId, controller, event.identity)) {
@@ -3155,7 +3463,16 @@ export function createLiveDesktopService(
       controller.streamingEntries.set(committed.record.kind, committed.record);
     }
     if (payload.type === "agent_text_chunk" || payload.type === "agent_thought_chunk") {
-      scheduleStreamPublish();
+      publishStreamChunk({
+        taskId,
+        runId,
+        kind: payload.type === "agent_text_chunk" ? "assistant" : "thought",
+        entryId: committed.record?.entryId ?? mutation.entryId,
+        text: payload.text,
+        created: mutation.type === "create",
+        duplicate: committed.duplicate,
+        committedLength: committed.record?.text.length ?? 0,
+      });
       // The adapter keeps commits ordered. Yield during a buffered burst so
       // publication, cancellation and process events can run between commits.
       if (performance.now() - lastStreamYieldAt >= 8) {
@@ -3163,7 +3480,8 @@ export function createLiveDesktopService(
         lastStreamYieldAt = performance.now();
       }
     } else {
-      await publish();
+      // Tool, plan and sub-agent updates must not hold the one-at-a-time update queue.
+      schedulePublish();
     }
   }
 
@@ -4462,8 +4780,18 @@ export function createLiveDesktopService(
             store.clearDraft({ taskId, expectedRevision: draft.revision });
           }
           controller.activeRunId = runId;
-          await publish();
-          launchPrompt(taskId, controller, session, prompt, runId, resources);
+          // The prompt goes to the official process first; the projection that shows
+          // the new Run follows. A failed launch is still published before it surfaces.
+          try {
+            launchPrompt(taskId, controller, session, prompt, runId, resources);
+          } catch (cause: unknown) {
+            await publish().catch(() => undefined);
+            throw cause;
+          }
+          // The Run is already started, so a projection fault must not look like a failed send.
+          await publish().catch(() => {
+            logRuntime({ category: "runtime", event: "stream_projection_failed" });
+          });
           return Object.freeze({ status: "started" as const, runId });
           });
           if (result.status === "retry_prompt") {
@@ -5039,6 +5367,11 @@ export function createLiveDesktopService(
       listeners.add(listener);
       return () => listeners.delete(listener);
     },
+    subscribeStreamDeltas: (listener) => {
+      assertOpen();
+      deltaListeners.add(listener);
+      return () => deltaListeners.delete(listener);
+    },
     close: async () => {
       if (closed || closing) return;
       closing = true;
@@ -5069,10 +5402,16 @@ export function createLiveDesktopService(
       if (maintenance && controllerClosures.some((result) => result.status === "rejected")) {
         throw new Error("restore_controller_close_failed");
       }
+      if (streamPublishTimer !== undefined) clearTimeout(streamPublishTimer);
+      streamPublishTimer = undefined;
+      if (streamDeltaTimer !== undefined) clearTimeout(streamDeltaTimer);
+      streamDeltaTimer = undefined;
+      pendingStreamDeltas.clear();
       await streamPublishOperation?.catch(() => undefined);
       if (maintenance) await diagnosticLog.flush();
       else await diagnosticLog.flush().catch(() => undefined);
       listeners.clear();
+      deltaListeners.clear();
       store.close();
       closed = true;
       closing = false;

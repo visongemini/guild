@@ -115,3 +115,44 @@ export function streamingActivity(
     ? "thinking"
     : "working";
 }
+
+const ACTIVITY_ROW_HEIGHT_PX = 18;
+const MESSAGE_LINE_HEIGHT_PX = 24.3;
+const MESSAGE_CHARS_PER_LINE = 112;
+const USER_CHARS_PER_LINE = 76;
+
+/**
+ * Placeholder block size for an off-screen finished row (content-visibility: auto). The browser
+ * remembers a row's real size after it first renders, so this only has to keep the scroll
+ * extent close to the truth before then. Wide (CJK) characters count double.
+ */
+export function estimateTimelineGroupHeight(group: TimelineGroup): number {
+  if (group.type === "activity") return ACTIVITY_ROW_HEIGHT_PX;
+  const item = group.item;
+  switch (item.kind) {
+    case "permission": return 72;
+    case "media": return 220;
+    case "notice":
+    case "error": return Math.max(20, Math.ceil(textLineCount(item.text, MESSAGE_CHARS_PER_LINE + 16)) * 19);
+    case "user": return 34 + Math.ceil(textLineCount(item.text, USER_CHARS_PER_LINE) * MESSAGE_LINE_HEIGHT_PX);
+    case "thought":
+    case "tool": return ACTIVITY_ROW_HEIGHT_PX;
+    case "assistant": return Math.ceil(
+      textLineCount(item.text, MESSAGE_CHARS_PER_LINE) * MESSAGE_LINE_HEIGHT_PX + paragraphGaps(item.text) * 8 + 14,
+    );
+  }
+}
+
+function textLineCount(text: string, charsPerLine: number): number {
+  let lines = 0;
+  for (const line of text.split("\n")) {
+    let width = 0;
+    for (const character of line) width += (character.codePointAt(0) ?? 0) > 0x2e7f ? 2 : 1;
+    lines += Math.max(1, Math.ceil(width / charsPerLine));
+  }
+  return lines;
+}
+
+function paragraphGaps(text: string): number {
+  return (text.match(/\n\s*\n/gu) ?? []).length;
+}

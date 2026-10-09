@@ -68,18 +68,24 @@ import {
   supportsGuildGrokReasoningEffort,
 } from "@guild/contracts/desktop-ipc";
 import {
+  createContext,
   memo,
   startTransition,
+  useCallback,
+  useContext,
   useEffect,
   useLayoutEffect,
   useMemo,
   useRef,
   useState,
+  useSyncExternalStore,
   type DragEvent as ReactDragEvent,
   type FormEvent,
   type KeyboardEvent as ReactKeyboardEvent,
   type MouseEvent as ReactMouseEvent,
   type PointerEvent as ReactPointerEvent,
+  type SetStateAction,
+  type SyntheticEvent,
 } from "react";
 import ReactMarkdown from "react-markdown";
 import { createPortal } from "react-dom";
@@ -97,11 +103,9 @@ import { slashCommandStatus, type SlashCommandStatus } from "./command-status.js
 import { observeExternalComposerInput } from "./composer-external-input.js";
 import { contextWindowView } from "./context-window.js";
 import {
-  isConversationPinnedToBottom,
   mergeTimelineWindows,
   retainTimelineWindow,
   scrollTopAfterPrepend,
-  shouldLoadEarlierConversation,
 } from "./conversation-scroll.js";
 import { messagesFor } from "./locales.js";
 import { continuousFooter } from "./continuous-display.js";
@@ -131,11 +135,16 @@ import {
 import {
   activityGroupState,
   activityToolKinds,
+  estimateTimelineGroupHeight,
   groupTimeline,
   isBareSymbolReply,
   streamingActivity,
 } from "./timeline.js";
 import { promptAttachmentsEqual, shouldClearSubmittedAttachments } from "./composer-submission.js";
+import { createFrameScheduler } from "./frame-scheduler.js";
+import { mergeStreamText, StreamOverlayStore, type StreamOverlayRecord } from "./stream-overlay.js";
+import { StreamingMarkdownSplitter } from "./streaming-markdown.js";
+import { replaceEqualDeep } from "./structural-sharing.js";
 
 const BANNY_ASSET_URL = new URL("./assets/banny.png", import.meta.url).href;
 const WORKBENCH_WIDTH_STORAGE_KEY = "guild:v1:workbench-width";
@@ -167,7 +176,15 @@ type CommandPaletteItem = Readonly<{
 
 export function GuildApp({ api }: GuildAppProps) {
   const [appearance, setAppearance] = useAppearance();
-  const [projection, setProjection] = useState<DesktopBootstrapProjection>();
+  const [projection, setProjectionState] = useState<DesktopBootstrapProjection>();
+  // Every projection, pushed or returned by a command, is merged into the previous one so
+  // unchanged tasks, rows and workbench data keep their identity and memoized children skip.
+  const setProjection = useCallback((update: SetStateAction<DesktopBootstrapProjection | undefined>) => {
+    setProjectionState((current) => {
+      const next = typeof update === "function" ? update(current) : update;
+      return current === undefined || next === undefined ? next : replaceEqualDeep(current, next);
+    });
+  }, []);
   const [draft, setDraft] = useState("");
   const [promptAttachments, setPromptAttachments] = useState<readonly PromptAttachment[]>([]);
   const [continuousMode, setContinuousMode] = useState(false);
@@ -229,6 +246,8 @@ export function GuildApp({ api }: GuildAppProps) {
   const [slashCommandIndex, setSlashCommandIndex] = useState(0);
   const [dismissedSlashDraft, setDismissedSlashDraft] = useState<string>();
   const conversation = useRef<HTMLElement>(null);
+  const timelineTopSentinel = useRef<HTMLDivElement>(null);
+  const timelineBottomSentinel = useRef<HTMLDivElement>(null);
   const composerInput = useRef<HTMLTextAreaElement>(null);
   const draftRef = useRef(draft);
   draftRef.current = draft;
@@ -236,6 +255,7 @@ export function GuildApp({ api }: GuildAppProps) {
   const autoScrollTaskId = useRef<string | undefined>(undefined);
   const seenWorkspaceIds = useRef<Set<string>>(new Set());
   const activeTaskIdRef = useRef<string | undefined>(undefined);
+  const streamOverlay = useMemo(() => new StreamOverlayStore(() => activeTaskIdRef.current), []);
   const sendInFlightRef = useRef<ReadonlySet<string>>(new Set());
   const operationInFlightRef = useRef(false);
   const loadingEarlierTimelineRef = useRef(false);
@@ -254,6 +274,87 @@ export function GuildApp({ api }: GuildAppProps) {
     retainTimelineWindow(retainedTimelines.current, task.task.taskId, merged);
     return merged;
   }, [projection?.activeTask?.task.taskId, projection?.activeTask?.timeline]);
+  useLayoutEffect(() => {
+    streamOverlay.reconcile(activeTimeline);
+  }, [streamOverlay, activeTimeline]);
+  // Stable callbacks for memoized children. They always call the closures of the latest
+  // render, so row components do not re-render when unrelated state changes.
+  const latestHandlers = useRef<{
+    readonly openExternal: (url: string) => Promise<void>;
+    readonly decidePermission: (
+      item: Extract<TimelineItemProjection, { readonly kind: "permission" }>,
+      decision: { readonly type: "cancelled" } | { readonly type: "selected"; readonly optionId: string },
+    ) => Promise<void>;
+    readonly branchFromMessage: (item: TimelineItemProjection) => Promise<void>;
+    readonly retryMessageToDraft: (item: TimelineItemProjection) => void;
+    readonly openRuntimeDiagnostics: () => void;
+    readonly loadEarlierTimeline: () => Promise<void>;
+    readonly openTask: (taskId: TaskSummaryProjection["taskId"]) => Promise<void>;
+    readonly createTask: (workspaceId: string) => Promise<void>;
+    readonly toggleWorkspace: (workspaceId: string) => void;
+    readonly beginBannyDrag: (event: ReactDragEvent<HTMLElement>) => void;
+    readonly endBannyDrag: () => void;
+    readonly seatBanny: (taskId: TaskSummaryProjection["taskId"]) => void;
+    readonly pinTask: (task: TaskSummaryProjection) => void;
+    readonly archiveTask: (task: TaskSummaryProjection) => void;
+    readonly openContextMenu: (event: ReactMouseEvent, menu: ContextMenuSeed) => void;
+  }>(undefined as never);
+  latestHandlers.current = {
+    openExternal,
+    decidePermission,
+    branchFromMessage,
+    retryMessageToDraft,
+    openRuntimeDiagnostics: () => void api.openRuntimeDiagnostics({}),
+    loadEarlierTimeline,
+    openTask: (taskId) => openTask(taskId),
+    createTask: (workspaceId) => createTask(workspaceId),
+    toggleWorkspace: (workspaceId) => setExpandedWorkspaces((current) => toggleSet(current, workspaceId)),
+    beginBannyDrag,
+    endBannyDrag,
+    seatBanny,
+    pinTask: (task) => void updateTaskFromSidebar(task, task.pinned ? "unpin" : "pin"),
+    archiveTask: (task) => void updateTaskFromSidebar(task, "archive"),
+    openContextMenu: (event, menu) => {
+      setConfirmDelete(false);
+      setRenamingTask(false);
+      setRenameError(false);
+      openContextMenu(event, menu, setContextMenu);
+    },
+  };
+  const stableHandlers = useMemo(() => Object.freeze({
+    onOpenExternal: (url: string) => void latestHandlers.current.openExternal(url),
+    onPermissionDecision: (
+      item: Extract<TimelineItemProjection, { readonly kind: "permission" }>,
+      decision: { readonly type: "cancelled" } | { readonly type: "selected"; readonly optionId: string },
+    ) => latestHandlers.current.decidePermission(item, decision),
+    onBranch: (item: TimelineItemProjection) => latestHandlers.current.branchFromMessage(item),
+    onRetryToDraft: (item: TimelineItemProjection) => latestHandlers.current.retryMessageToDraft(item),
+    onOpenRuntimeDiagnostics: () => latestHandlers.current.openRuntimeDiagnostics(),
+    onToggleWorkspace: (workspaceId: string) => latestHandlers.current.toggleWorkspace(workspaceId),
+    onOpenTask: (taskId: TaskSummaryProjection["taskId"]) => void latestHandlers.current.openTask(taskId),
+    onNewTask: (workspaceId: string) => void latestHandlers.current.createTask(workspaceId),
+    onBannyDragStart: (event: ReactDragEvent<HTMLElement>) => latestHandlers.current.beginBannyDrag(event),
+    onBannyDragEnd: () => latestHandlers.current.endBannyDrag(),
+    onBannyDrop: (taskId: TaskSummaryProjection["taskId"]) => latestHandlers.current.seatBanny(taskId),
+    onPinTask: (task: TaskSummaryProjection) => latestHandlers.current.pinTask(task),
+    onArchiveTask: (task: TaskSummaryProjection) => latestHandlers.current.archiveTask(task),
+    onContextMenu: (event: ReactMouseEvent, menu: ContextMenuSeed) =>
+      latestHandlers.current.openContextMenu(event, menu),
+  }), []);
+  const activeWorkspaceCache = useRef(new WeakMap<WorkspaceProjection, WorkspaceProjection>());
+  const activeWorkspaces = useMemo(() => (projection?.workspaces ?? [])
+    .filter((workspace) => !workspace.archived)
+    .map((workspace) => {
+      const cached = activeWorkspaceCache.current.get(workspace);
+      if (cached !== undefined) return cached;
+      const derived = Object.freeze({
+        ...workspace,
+        tasks: Object.freeze(workspace.tasks.filter((task) => !task.archived)),
+      });
+      activeWorkspaceCache.current.set(workspace, derived);
+      return derived;
+    }), [projection?.workspaces]);
+  const pendingTaskIds = useMemo(() => new Set(pendingSends.keys()), [pendingSends]);
   const bannySeatTaskId = useMemo(
     () => resolveBannySeatTaskId(projection?.workspaces ?? [], bannyPlacement),
     [projection?.workspaces, bannyPlacement],
@@ -313,33 +414,38 @@ export function GuildApp({ api }: GuildAppProps) {
       activeTaskIdRef.current = next.activeTask?.task.taskId;
       setDraft(next.activeTask?.draft ?? "");
     }).catch(() => active && setError("bootstrap"));
-    let projectionFlushQueued = false;
     let latestProjection: DesktopBootstrapProjection | undefined;
+    // Projections apply once per frame, but never wait on a frame alone: a hidden window
+    // pauses requestAnimationFrame, so the scheduler also carries a timer fallback.
+    const projectionScheduler = createFrameScheduler(() => {
+      const queued = latestProjection;
+      latestProjection = undefined;
+      if (!active || queued === undefined) return;
+      startTransition(() => {
+        setProjection(queued);
+        const nextTaskId = queued.activeTask?.task.taskId;
+        if (activeTaskIdRef.current !== nextTaskId) {
+          activeTaskIdRef.current = nextTaskId;
+          setDraft(queued.activeTask?.draft ?? "");
+        }
+      });
+    });
     const unsubscribe = api.onProjectionChanged((next) => {
       latestProjection = next;
-      if (projectionFlushQueued) return;
-      projectionFlushQueued = true;
-      queueMicrotask(() => {
-        projectionFlushQueued = false;
-        if (!active) return;
-        const queued = latestProjection;
-        latestProjection = undefined;
-        if (queued === undefined) return;
-        startTransition(() => {
-          setProjection(queued);
-          const nextTaskId = queued.activeTask?.task.taskId;
-          if (activeTaskIdRef.current !== nextTaskId) {
-            activeTaskIdRef.current = nextTaskId;
-            setDraft(queued.activeTask?.draft ?? "");
-          }
-        });
-      });
+      projectionScheduler.schedule();
+    });
+    const overlayScheduler = createFrameScheduler(() => streamOverlay.flush());
+    const unsubscribeDelta = api.onStreamDelta((delta) => {
+      if (active && streamOverlay.apply(delta)) overlayScheduler.schedule();
     });
     return () => {
       active = false;
       unsubscribe();
+      unsubscribeDelta();
+      projectionScheduler.cancel();
+      overlayScheduler.cancel();
     };
-  }, [api]);
+  }, [api, setProjection, streamOverlay]);
 
   useEffect(() => {
     const taskId = projection?.activeTask?.task.taskId;
@@ -382,6 +488,7 @@ export function GuildApp({ api }: GuildAppProps) {
     pendingHistoryAnchor.current = undefined;
   }, [projection?.activeTask?.task.taskId, activeTimeline]);
 
+  // Stick to the bottom: one scroll write per frame, and only while the reader is pinned.
   useEffect(() => {
     const frame = window.requestAnimationFrame(() => {
       const element = conversation.current;
@@ -401,22 +508,53 @@ export function GuildApp({ api }: GuildAppProps) {
     error,
   ]);
 
+  const conversationMounted = projection !== undefined;
+  const timelineKey = `${projection?.activeTask?.task.taskId ?? ""}:${activeTimeline.length === 0 ? "empty" : "full"}:${pendingSends.size}`;
+  // Streamed text grows the timeline without re-rendering this component, so content growth is
+  // observed after layout instead of being measured after every commit.
   useEffect(() => {
-    const element = conversation.current;
-    const task = projection?.activeTask;
-    if (
-      element !== null &&
-      task !== undefined &&
-      shouldLoadEarlierConversation(
-        task.hasEarlierTimeline,
-        element.scrollTop,
-        element.clientHeight,
-        element.scrollHeight,
-      )
-    ) {
-      void loadEarlierTimeline();
-    }
-  }, [projection?.activeTask?.task.taskId, activeTimeline, projection?.activeTask?.hasEarlierTimeline]);
+    const scroller = conversation.current;
+    const content = scroller?.querySelector<HTMLElement>(".guild-timeline");
+    if (scroller === null || scroller === undefined || content === null || content === undefined) return;
+    const observer = new ResizeObserver(() => {
+      if (autoScrollPinned.current) scroller.scrollTop = scroller.scrollHeight;
+    });
+    observer.observe(content);
+    return () => observer.disconnect();
+  }, [conversationMounted, timelineKey]);
+
+  // Pinned state and "load earlier" come from sentinels, so no scroll or layout measurement
+  // happens in JavaScript while the reader scrolls or while text streams.
+  useEffect(() => {
+    const scroller = conversation.current;
+    const sentinel = timelineBottomSentinel.current;
+    if (scroller === null || sentinel === null) return;
+    const observer = new IntersectionObserver((entries) => {
+      const latest = entries.at(-1);
+      if (latest !== undefined) autoScrollPinned.current = latest.isIntersecting;
+    }, { root: scroller, rootMargin: "0px 0px 72px 0px", threshold: 0 });
+    observer.observe(sentinel);
+    return () => observer.disconnect();
+  }, [conversationMounted]);
+
+  const hasEarlierTimeline = projection?.activeTask?.hasEarlierTimeline === true;
+  useEffect(() => {
+    const scroller = conversation.current;
+    const sentinel = timelineTopSentinel.current;
+    if (scroller === null || sentinel === null || !hasEarlierTimeline) return;
+    // Observing again reports the current state, so a page that still leaves the top in
+    // view (or fits without scrolling) keeps loading until the pane is filled.
+    const observer = new IntersectionObserver((entries) => {
+      if (entries.at(-1)?.isIntersecting === true) void latestHandlers.current.loadEarlierTimeline();
+    }, { root: scroller, rootMargin: "72px 0px 0px 0px", threshold: 0 });
+    observer.observe(sentinel);
+    return () => observer.disconnect();
+  }, [
+    projection?.activeTask?.task.taskId,
+    hasEarlierTimeline,
+    activeTimeline.length,
+    loadingEarlierTimeline,
+  ]);
 
   useEffect(() => {
     if (projection !== undefined) document.documentElement.lang = projection.locale;
@@ -551,12 +689,6 @@ export function GuildApp({ api }: GuildAppProps) {
       item.noticeType === "session_restored" &&
       item.sequence > latestInterruptedUserSequence);
   const running = isLiveRunState(activeTask?.task.activeRunState);
-  const activeWorkspaces = projection.workspaces
-    .filter((workspace) => !workspace.archived)
-    .map((workspace) => Object.freeze({
-      ...workspace,
-      tasks: Object.freeze(workspace.tasks.filter((task) => !task.archived)),
-    }));
   const archivedWorkspaces = projection.workspaces.filter((workspace) => workspace.archived);
   const archivedTasks = projection.workspaces
     .filter((workspace) => !workspace.archived)
@@ -600,7 +732,6 @@ export function GuildApp({ api }: GuildAppProps) {
           (task) => isTaskManagementBlocked(task) || pendingSends.has(task.taskId),
         )
   );
-  const pendingTaskIds = new Set(pendingSends.keys());
   const latestAssistant = [...activeTimeline].reverse().find(
     (item) => item.kind === "assistant" && item.status === "completed",
   );
@@ -1481,6 +1612,7 @@ export function GuildApp({ api }: GuildAppProps) {
   const effectiveWorkbenchWidth = viewport.width <= 1000 ? WORKBENCH_MIN_WIDTH : workbenchWidth;
 
   return (
+    <StreamOverlayContext.Provider value={streamOverlay}>
     <div
       className={`guild-shell ${workbenchOpen && activeTask !== undefined ? "workbench-open" : ""} ${bannyDragging ? "banny-dragging" : ""}`}
       style={{
@@ -1594,21 +1726,16 @@ export function GuildApp({ api }: GuildAppProps) {
               bannyDropTargetId={bannyDropTargetId}
               pendingTaskIds={pendingTaskIds}
               locale={projection.locale}
-              onToggle={() => setExpandedWorkspaces((current) => toggleSet(current, workspace.workspaceId))}
-              onOpenTask={(taskId) => void openTask(taskId)}
-              onNewTask={() => void createTask(workspace.workspaceId)}
-              onBannyDragStart={beginBannyDrag}
-              onBannyDragEnd={endBannyDrag}
+              onToggle={stableHandlers.onToggleWorkspace}
+              onOpenTask={stableHandlers.onOpenTask}
+              onNewTask={stableHandlers.onNewTask}
+              onBannyDragStart={stableHandlers.onBannyDragStart}
+              onBannyDragEnd={stableHandlers.onBannyDragEnd}
               onBannyDropTarget={setBannyDropTargetId}
-              onBannyDrop={seatBanny}
-              onPinTask={(task) => void updateTaskFromSidebar(task, task.pinned ? "unpin" : "pin")}
-              onArchiveTask={(task) => void updateTaskFromSidebar(task, "archive")}
-              onContextMenu={(event, menu) => {
-                setConfirmDelete(false);
-                setRenamingTask(false);
-                setRenameError(false);
-                openContextMenu(event, menu, setContextMenu);
-              }}
+              onBannyDrop={stableHandlers.onBannyDrop}
+              onPinTask={stableHandlers.onPinTask}
+              onArchiveTask={stableHandlers.onArchiveTask}
+              onContextMenu={stableHandlers.onContextMenu}
             />
           ))}
           {conversationSearchPending && <div className="guild-search-progress"><SpinnerGap size={13} className="guild-spin" />{messages.searchingConversation}</div>}
@@ -1813,24 +1940,8 @@ export function GuildApp({ api }: GuildAppProps) {
         )}
 
         <span className="guild-sr-only" role="status" aria-live="polite">{latestAssistantAnnouncement}</span>
-        <section className="guild-conversation" ref={conversation} onScroll={(event) => {
-          const element = event.currentTarget;
-          autoScrollPinned.current = isConversationPinnedToBottom(
-            element.scrollTop,
-            element.clientHeight,
-            element.scrollHeight,
-          );
-          const task = projection.activeTask;
-          if (
-            task !== undefined &&
-            shouldLoadEarlierConversation(
-              task.hasEarlierTimeline,
-              element.scrollTop,
-              element.clientHeight,
-              element.scrollHeight,
-            )
-          ) void loadEarlierTimeline();
-        }}>
+        <section className="guild-conversation" ref={conversation}>
+          <div className="guild-scroll-sentinel" ref={timelineTopSentinel} aria-hidden="true" />
           {loadingEarlierTimeline && (
             <div className="guild-history-loading" aria-label={messages.loadingEarlierHistory}>
               <SpinnerGap size={13} className="guild-spin" />
@@ -1870,11 +1981,11 @@ export function GuildApp({ api }: GuildAppProps) {
               continuousTask={activeTask.continuousTask}
               highlightedSequence={searchNavigation?.results[searchNavigation.index]?.taskId === activeTask.task.taskId
                 ? searchNavigation.results[searchNavigation.index]?.sequence : undefined}
-              onOpenExternal={(url) => void openExternal(url)}
-              onPermissionDecision={decidePermission}
-              onBranch={branchFromMessage}
-              onRetryToDraft={retryMessageToDraft}
-              onOpenRuntimeDiagnostics={() => void api.openRuntimeDiagnostics({})}
+              onOpenExternal={stableHandlers.onOpenExternal}
+              onPermissionDecision={stableHandlers.onPermissionDecision}
+              onBranch={stableHandlers.onBranch}
+              onRetryToDraft={stableHandlers.onRetryToDraft}
+              onOpenRuntimeDiagnostics={stableHandlers.onOpenRuntimeDiagnostics}
             />
           )}
           {commandStatus !== undefined && <CommandStatusLine status={commandStatus} locale={projection.locale} />}
@@ -1929,6 +2040,7 @@ export function GuildApp({ api }: GuildAppProps) {
                     : messages.operationFailed}
             </div>
           )}
+          <div className="guild-scroll-sentinel" ref={timelineBottomSentinel} aria-hidden="true" />
         </section>
 
         <form className="guild-composer-wrap" onSubmit={(event) => void submit(event)}>
@@ -2777,6 +2889,7 @@ export function GuildApp({ api }: GuildAppProps) {
         </div>
       )}
     </div>
+    </StreamOverlayContext.Provider>
   );
 }
 
@@ -2899,7 +3012,7 @@ function isTaskManagementBlocked(task: TaskSummaryProjection): boolean {
   return isLiveRunState(task.activeRunState) || (task.queuedTurnCount ?? 0) > 0;
 }
 
-function WorkspaceTree({ workspace, expanded, activeTaskId, bannySeatTaskId, bannyDragging, bannyDropTargetId, pendingTaskIds, locale, onToggle, onOpenTask, onNewTask, onBannyDragStart, onBannyDragEnd, onBannyDropTarget, onBannyDrop, onPinTask, onArchiveTask, onContextMenu }: {
+const WorkspaceTree = memo(function WorkspaceTree({ workspace, expanded, activeTaskId, bannySeatTaskId, bannyDragging, bannyDropTargetId, pendingTaskIds, locale, onToggle, onOpenTask, onNewTask, onBannyDragStart, onBannyDragEnd, onBannyDropTarget, onBannyDrop, onPinTask, onArchiveTask, onContextMenu }: {
   readonly workspace: WorkspaceProjection;
   readonly expanded: boolean;
   readonly activeTaskId?: string;
@@ -2908,9 +3021,9 @@ function WorkspaceTree({ workspace, expanded, activeTaskId, bannySeatTaskId, ban
   readonly bannyDropTargetId?: string;
   readonly pendingTaskIds: ReadonlySet<string>;
   readonly locale: GuildLocale;
-  readonly onToggle: () => void;
+  readonly onToggle: (workspaceId: WorkspaceProjection["workspaceId"]) => void;
   readonly onOpenTask: (taskId: TaskSummaryProjection["taskId"]) => void;
-  readonly onNewTask: () => void;
+  readonly onNewTask: (workspaceId: WorkspaceProjection["workspaceId"]) => void;
   readonly onBannyDragStart: (event: ReactDragEvent<HTMLElement>) => void;
   readonly onBannyDragEnd: () => void;
   readonly onBannyDropTarget: (taskId: string | undefined) => void;
@@ -2924,7 +3037,7 @@ function WorkspaceTree({ workspace, expanded, activeTaskId, bannySeatTaskId, ban
   return (
     <div className="guild-workspace-tree">
       <div className="guild-workspace-row" onContextMenu={(event) => onContextMenu(event, { type: "workspace", workspace })}>
-        <button className="guild-workspace-main" type="button" onClick={onToggle} aria-expanded={expanded}>
+        <button className="guild-workspace-main" type="button" onClick={() => onToggle(workspace.workspaceId)} aria-expanded={expanded}>
           {expanded ? <CaretDown size={14} /> : <CaretRight size={14} />}
           <span>{workspace.name}</span>
           <small>
@@ -2936,7 +3049,7 @@ function WorkspaceTree({ workspace, expanded, activeTaskId, bannySeatTaskId, ban
             {workspace.tasks.length}
           </small>
         </button>
-        <button className="guild-row-add" type="button" aria-label={messagesFor(locale).newTask} onClick={onNewTask}><Plus size={14} /></button>
+        <button className="guild-row-add" type="button" aria-label={messagesFor(locale).newTask} onClick={() => onNewTask(workspace.workspaceId)}><Plus size={14} /></button>
       </div>
       {expanded && (
         <div className="guild-task-list">
@@ -3041,7 +3154,7 @@ function WorkspaceTree({ workspace, expanded, activeTaskId, bannySeatTaskId, ban
       )}
     </div>
   );
-}
+});
 
 function TaskStatusGlyph({ status }: { readonly status: SidebarTaskStatus }) {
   return status === "running" ? <SpinnerGap size={13} />
@@ -3086,7 +3199,18 @@ function Welcome({ messages, hasWorkspace, onChoose, onCreate }: {
   );
 }
 
-function Timeline({ items, pendingUserText, runStatus, locale, recentResult, continuousTask, highlightedSequence, onOpenExternal, onPermissionDecision, onBranch, onRetryToDraft, onOpenRuntimeDiagnostics }: {
+type TimelineHandlers = Readonly<{
+  onOpenExternal: (url: string) => void;
+  onPermissionDecision: (
+    item: Extract<TimelineItemProjection, { readonly kind: "permission" }>,
+    decision: { readonly type: "cancelled" } | { readonly type: "selected"; readonly optionId: string },
+  ) => Promise<void>;
+  onBranch: (item: TimelineItemProjection) => Promise<void>;
+  onRetryToDraft: (item: TimelineItemProjection) => void;
+  onOpenRuntimeDiagnostics: () => void;
+}>;
+
+type TimelineProps = {
   readonly items: readonly TimelineItemProjection[];
   readonly pendingUserText?: string;
   readonly runStatus?: VisibleRunStatus;
@@ -3094,91 +3218,196 @@ function Timeline({ items, pendingUserText, runStatus, locale, recentResult, con
   readonly recentResult?: TaskViewProjection["recentResult"];
   readonly continuousTask?: TaskViewProjection["continuousTask"];
   readonly highlightedSequence?: number;
-  readonly onOpenExternal: (url: string) => void;
-  readonly onPermissionDecision: (
-    item: Extract<TimelineItemProjection, { readonly kind: "permission" }>,
-    decision: { readonly type: "cancelled" } | { readonly type: "selected"; readonly optionId: string },
-  ) => Promise<void>;
-  readonly onBranch: (item: TimelineItemProjection) => Promise<void>;
-  readonly onRetryToDraft: (item: TimelineItemProjection) => void;
-  readonly onOpenRuntimeDiagnostics: () => void;
-}) {
+} & TimelineHandlers;
+
+/** The newest groups always render fully so growth and scrolling at the bottom stay exact. */
+const LIVE_TAIL_GROUPS = 3;
+
+const Timeline = memo(function Timeline({ items, pendingUserText, runStatus, locale, recentResult, continuousTask, highlightedSequence, onOpenExternal, onPermissionDecision, onBranch, onRetryToDraft, onOpenRuntimeDiagnostics }: TimelineProps) {
   const messages = messagesFor(locale);
   const groups = useMemo(() => groupTimeline(items), [items]);
+  const handlers = useMemo(() => Object.freeze({
+    onOpenExternal, onPermissionDecision, onBranch, onRetryToDraft, onOpenRuntimeDiagnostics,
+  }), [onOpenExternal, onPermissionDecision, onBranch, onRetryToDraft, onOpenRuntimeDiagnostics]);
   const completionSequence = continuousTask?.lastRunId !== undefined &&
     ["completed", "stopped"].includes(continuousTask.status)
     ? items.findLast((item) => item.runId === continuousTask.lastRunId)?.sequence : undefined;
-  const renderGroup = (group: (typeof groups)[number], index: number) => {
-    if (group.type === "activity") {
-      const thoughts = group.items.filter((item): item is Extract<TimelineItemProjection, { readonly kind: "thought" }> => item.kind === "thought");
-      const tools = group.items.filter((item): item is Extract<TimelineItemProjection, { readonly kind: "tool" }> => item.kind === "tool");
-      const elapsed = Math.max(0, ...thoughts.map((item) => item.elapsedMs));
-      const state = activityGroupState(group.items);
-      const streaming = state === "streaming";
-      const toolKinds = activityToolKinds(group.items);
-      const summary = streaming
-        ? elapsed > 0
-          ? messages.activeActivityFor(streamingActivity(group.items), Math.max(1, Math.round(elapsed / 1000)))
-          : messages.activeActivity(streamingActivity(group.items))
-        : [
-            state === "cancelled" ? messages.cancelledActivity
-              : state === "interrupted" ? messages.interruptedActivity
-                : state === "failed" ? messages.failedActivity
-                  : "",
-            thoughts.length > 0 ? messages.thoughtFor(Math.max(1, Math.round(elapsed / 1000))) : "",
-            tools.length > 0 ? messages.usedTools(tools.length) : "",
-          ].filter(Boolean).join(" · ");
-      return <details className="guild-disclosure guild-activity" key={`activity-${group.items[0]?.entryId ?? index}`}>
-        <summary>{streaming
-          ? <SpinnerGap size={14} className="guild-spin" />
-          : state === "completed"
-            ? <Check size={14} />
-            : state === "failed"
-              ? <WarningCircle size={14} />
-              : <Stop size={12} weight="fill" />}<span className="guild-activity-summary">{summary}</span>{toolKinds.length > 0 && <span className="guild-activity-tool-icons" aria-label={toolKinds.map((kind) => messages.toolKindLabel(kind)).join(", ")}>{toolKinds.map((kind) => <span title={messages.toolKindLabel(kind)} key={kind}><ToolKindIcon kind={kind} size={12} /></span>)}</span>}<CaretRight size={13} /></summary>
-        <div>
-          {thoughts.length > 0 && <p className="guild-thought-copy">{thoughts.map((item) => item.text).join(" ")}</p>}
-          <div className="guild-tool-list">{tools.map((item) => <ToolRow item={item} locale={locale} key={item.entryId} />)}</div>
-        </div>
-      </details>;
-    }
-    return <TimelineItem
-      item={group.item}
-      locale={locale}
-      onOpenExternal={onOpenExternal}
-      onPermissionDecision={onPermissionDecision}
-      onBranch={onBranch}
-      onRetryToDraft={onRetryToDraft}
-      onOpenRuntimeDiagnostics={onOpenRuntimeDiagnostics}
-      interruptedUser={group.item.kind === "notice" && group.item.noticeType === "session_restored"
-        ? [...items].reverse().find((item) =>
-            item.sequence < group.item.sequence && item.kind === "user" && item.status === "interrupted")
-        : undefined}
-      canRetry={
-        group.item.kind === "user" &&
-        group.item.runId !== undefined &&
-        recentResult !== undefined &&
-        group.item.runId === recentResult?.runId &&
-        recentResult.state !== "completed"
-      }
-      key={group.item.entryId}
-    />;
-  };
+  const settledBefore = groups.length - LIVE_TAIL_GROUPS;
   return <div className="guild-timeline">{groups.map((group, index) => {
     const entries = group.type === "activity" ? group.items : [group.item];
-    const sequence = entries[0]!.sequence;
-    return <div key={entries[0]!.entryId} className={highlightedSequence === sequence ? "guild-timeline-group search-highlight" : "guild-timeline-group"}
-      data-sequence={sequence} tabIndex={-1}>
-      {renderGroup(group, index)}
-      {continuousTask !== undefined && completionSequence !== undefined && entries.some((item) => item.sequence === completionSequence) &&
-        <ContinuousCompletionRecord task={continuousTask} locale={locale} />}
-    </div>;
+    const first = entries[0]!;
+    const sequence = first.sequence;
+    const single = group.type === "single" ? group.item : undefined;
+    return <TimelineGroupRow
+      key={first.entryId}
+      group={group}
+      sequence={sequence}
+      highlighted={highlightedSequence === sequence}
+      settled={index < settledBefore && entries.every(isSettledTimelineItem)}
+      locale={locale}
+      handlers={handlers}
+      interruptedUser={single?.kind === "notice" && single.noticeType === "session_restored"
+        ? [...items].reverse().find((item) =>
+            item.sequence < single.sequence && item.kind === "user" && item.status === "interrupted")
+        : undefined}
+      canRetry={
+        single?.kind === "user" &&
+        single.runId !== undefined &&
+        recentResult !== undefined &&
+        single.runId === recentResult?.runId &&
+        recentResult.state !== "completed"
+      }
+      completionTask={continuousTask !== undefined && completionSequence !== undefined &&
+        entries.some((item) => item.sequence === completionSequence) ? continuousTask : undefined}
+    />;
   })}{pendingUserText !== undefined && (
     <article className="guild-message guild-message-user guild-message-pending" aria-busy="true">
       <div className="guild-message-body"><MarkdownText text={pendingUserText} locale={locale} onOpenExternal={onOpenExternal} /></div>
       <SpinnerGap size={12} className="guild-spin" aria-label={messages.connectingRuntime} />
     </article>
   )}{runStatus !== undefined && <RunStatusLine status={runStatus} locale={locale} />}</div>;
+}, (previous, next) =>
+  previous.items === next.items &&
+  previous.pendingUserText === next.pendingUserText &&
+  previous.locale === next.locale &&
+  previous.recentResult === next.recentResult &&
+  previous.continuousTask === next.continuousTask &&
+  previous.highlightedSequence === next.highlightedSequence &&
+  previous.onOpenExternal === next.onOpenExternal &&
+  previous.onPermissionDecision === next.onPermissionDecision &&
+  previous.onBranch === next.onBranch &&
+  previous.onRetryToDraft === next.onRetryToDraft &&
+  previous.onOpenRuntimeDiagnostics === next.onOpenRuntimeDiagnostics &&
+  previous.runStatus?.stage === next.runStatus?.stage &&
+  previous.runStatus?.startedAtMs === next.runStatus?.startedAtMs);
+
+/** Finished rows can skip layout and paint while off screen (content-visibility: auto). */
+function isSettledTimelineItem(item: TimelineItemProjection): boolean {
+  if (item.status === "streaming" || item.status === "waiting") return false;
+  return !(item.kind === "tool" && (item.toolStatus === "pending" || item.toolStatus === "in_progress"));
+}
+
+type TimelineGroupRowProps = {
+  readonly group: ReturnType<typeof groupTimeline>[number];
+  readonly sequence: number;
+  readonly highlighted: boolean;
+  readonly settled: boolean;
+  readonly locale: GuildLocale;
+  readonly handlers: TimelineHandlers;
+  readonly interruptedUser: TimelineItemProjection | undefined;
+  readonly canRetry: boolean;
+  readonly completionTask: TaskViewProjection["continuousTask"];
+};
+
+const TimelineGroupRow = memo(function TimelineGroupRow({ group, sequence, highlighted, settled, locale, handlers, interruptedUser, canRetry, completionTask }: TimelineGroupRowProps) {
+  const className = [
+    highlighted ? "guild-timeline-group search-highlight" : "guild-timeline-group",
+    settled ? "settled" : "",
+  ].filter(Boolean).join(" ");
+  return <div
+    className={className}
+    data-sequence={sequence}
+    tabIndex={-1}
+    style={settled ? { containIntrinsicBlockSize: `auto ${estimateTimelineGroupHeight(group)}px` } : undefined}
+  >
+    {group.type === "activity"
+      ? <ActivityGroupView items={group.items} locale={locale} />
+      : <TimelineItem
+          item={group.item}
+          locale={locale}
+          onOpenExternal={handlers.onOpenExternal}
+          onPermissionDecision={handlers.onPermissionDecision}
+          onBranch={handlers.onBranch}
+          onRetryToDraft={handlers.onRetryToDraft}
+          onOpenRuntimeDiagnostics={handlers.onOpenRuntimeDiagnostics}
+          interruptedUser={interruptedUser}
+          canRetry={canRetry}
+        />}
+    {completionTask !== undefined && <ContinuousCompletionRecord task={completionTask} locale={locale} />}
+  </div>;
+}, (previous, next) =>
+  previous.sequence === next.sequence &&
+  previous.highlighted === next.highlighted &&
+  previous.settled === next.settled &&
+  previous.locale === next.locale &&
+  previous.handlers === next.handlers &&
+  previous.interruptedUser === next.interruptedUser &&
+  previous.canRetry === next.canRetry &&
+  previous.completionTask === next.completionTask &&
+  sameTimelineGroup(previous.group, next.group));
+
+function sameTimelineGroup(
+  previous: TimelineGroupRowProps["group"],
+  next: TimelineGroupRowProps["group"],
+): boolean {
+  if (previous === next) return true;
+  if (previous.type === "single" || next.type === "single") {
+    return previous.type === "single" && next.type === "single" && previous.item === next.item;
+  }
+  return previous.items.length === next.items.length &&
+    previous.items.every((item, index) => item === next.items[index]);
+}
+
+type ThoughtItem = Extract<TimelineItemProjection, { readonly kind: "thought" }>;
+type ToolItem = Extract<TimelineItemProjection, { readonly kind: "tool" }>;
+
+const ActivityGroupView = memo(function ActivityGroupView({ items, locale }: {
+  readonly items: readonly TimelineItemProjection[];
+  readonly locale: GuildLocale;
+}) {
+  const messages = messagesFor(locale);
+  // Collapsed groups hold no thought text or tool output in the DOM; the body mounts on open.
+  const [open, setOpen] = useState(false);
+  const thoughts = items.filter((item): item is ThoughtItem => item.kind === "thought");
+  const tools = items.filter((item): item is ToolItem => item.kind === "tool");
+  const elapsed = Math.max(0, ...thoughts.map((item) => item.elapsedMs));
+  const state = activityGroupState(items);
+  const streaming = state === "streaming";
+  const toolKinds = activityToolKinds(items);
+  const summary = streaming
+    ? elapsed > 0
+      ? messages.activeActivityFor(streamingActivity(items), Math.max(1, Math.round(elapsed / 1000)))
+      : messages.activeActivity(streamingActivity(items))
+    : [
+        state === "cancelled" ? messages.cancelledActivity
+          : state === "interrupted" ? messages.interruptedActivity
+            : state === "failed" ? messages.failedActivity
+              : "",
+        thoughts.length > 0 ? messages.thoughtFor(Math.max(1, Math.round(elapsed / 1000))) : "",
+        tools.length > 0 ? messages.usedTools(tools.length) : "",
+      ].filter(Boolean).join(" · ");
+  return <details
+    className="guild-disclosure guild-activity"
+    onToggle={(event) => setOpen(event.currentTarget.open)}
+  >
+    <summary onClick={(event) => setOpen(!(event.currentTarget.parentElement as HTMLDetailsElement).open)}>{streaming
+      ? <SpinnerGap size={14} className="guild-spin" />
+      : state === "completed"
+        ? <Check size={14} />
+        : state === "failed"
+          ? <WarningCircle size={14} />
+          : <Stop size={12} weight="fill" />}<span className="guild-activity-summary">{summary}</span>{toolKinds.length > 0 && <span className="guild-activity-tool-icons" aria-label={toolKinds.map((kind) => messages.toolKindLabel(kind)).join(", ")}>{toolKinds.map((kind) => <span title={messages.toolKindLabel(kind)} key={kind}><ToolKindIcon kind={kind} size={12} /></span>)}</span>}<CaretRight size={13} /></summary>
+    {open && <div>
+      {thoughts.length > 0 && <ThoughtCopy thoughts={thoughts} />}
+      <div className="guild-tool-list">{tools.map((item) => <ToolRow item={item} locale={locale} key={item.entryId} />)}</div>
+    </div>}
+  </details>;
+}, (previous, next) =>
+  previous.locale === next.locale &&
+  previous.items.length === next.items.length &&
+  previous.items.every((item, index) => item === next.items[index]));
+
+function ThoughtCopy({ thoughts }: { readonly thoughts: readonly ThoughtItem[] }) {
+  const store = useContext(StreamOverlayContext);
+  const subscribe = useCallback(
+    (listener: () => void) => store === null ? () => undefined : store.subscribe(listener),
+    [store],
+  );
+  useSyncExternalStore(subscribe, () => store?.getVersion() ?? 0, () => 0);
+  const text = thoughts.map((item) => item.status === "streaming"
+    ? mergeStreamText(item.text, store?.get(item.entryId))
+    : item.text).join(" ");
+  return <p className="guild-thought-copy">{text}</p>;
 }
 
 function RunStatusLine({ status, locale }: {
@@ -3271,11 +3500,13 @@ function ToolKindIcon({ kind, size }: { readonly kind: AcpToolKind; readonly siz
   }
 }
 
-export function ToolRow({ item, locale }: {
+export const ToolRow = memo(function ToolRow({ item, locale }: {
   readonly item: Extract<TimelineItemProjection, { readonly kind: "tool" }>;
   readonly locale: GuildLocale;
 }) {
   const messages = messagesFor(locale);
+  // Tool output can be large; its text is mounted only while the details are open.
+  const [detailsOpen, setDetailsOpen] = useState(false);
   const images = item.content.filter(
     (content): content is Extract<(typeof item.content)[number], { readonly type: "media" }> =>
       content.type === "media" && content.mediaType === "image" && isAllowedTimelineMediaUrl(content.grantUrl),
@@ -3314,9 +3545,12 @@ export function ToolRow({ item, locale }: {
       <ViewableImage src={previewedImage.grantUrl} alt={previewedImage.alt} locale={locale} variant="preview" />
       {previewedImage.alt.trim().length > 0 && <figcaption>{previewedImage.alt}</figcaption>}
     </figure>}
-    {details.length > 0 && <details className="guild-tool-content">
-      <summary>{messages.toolDetails}<CaretRight size={12} /></summary>
-      <div>{details.map((content, index) => {
+    {details.length > 0 && <details
+      className="guild-tool-content"
+      onToggle={(event) => setDetailsOpen(event.currentTarget.open)}
+    >
+      <summary onClick={(event) => setDetailsOpen(!(event.currentTarget.parentElement as HTMLDetailsElement).open)}>{messages.toolDetails}<CaretRight size={12} /></summary>
+      {detailsOpen && <div>{details.map((content, index) => {
         if (content.type === "text") return <pre key={index}>{content.text}</pre>;
         if (content.type === "diff") return <section className="guild-tool-diff" key={index}>
           <strong>{messages.fileChange}: {content.path}</strong>
@@ -3325,12 +3559,12 @@ export function ToolRow({ item, locale }: {
         </section>;
         if (content.type === "terminal") return <p key={index}>{messages.terminalOutputUnavailable}</p>;
         return <p key={index}>{messages.unsupportedToolContent(content.contentType)}</p>;
-      })}</div>
+      })}</div>}
     </details>}
   </div>;
-}
+});
 
-function TimelineItem({ item, locale, onOpenExternal, onPermissionDecision, onBranch, onRetryToDraft, onOpenRuntimeDiagnostics, interruptedUser, canRetry }: {
+const TimelineItem = memo(function TimelineItem({ item, locale, onOpenExternal, onPermissionDecision, onBranch, onRetryToDraft, onOpenRuntimeDiagnostics, interruptedUser, canRetry }: {
   readonly item: TimelineItemProjection;
   readonly locale: GuildLocale;
   readonly canRetry: boolean;
@@ -3377,7 +3611,7 @@ function TimelineItem({ item, locale, onOpenExternal, onPermissionDecision, onBr
     : undefined;
   const body = footer?.body ?? item.text;
   return <article className={`guild-message guild-message-${item.kind}`}>
-    {body.length > 0 && <div className="guild-message-body"><MarkdownText text={body} locale={locale} onOpenExternal={onOpenExternal} /></div>}
+    {body.length > 0 && <div className="guild-message-body"><MessageBody entryId={item.entryId} text={body} streaming={item.kind === "assistant" && item.status === "streaming"} locale={locale} onOpenExternal={onOpenExternal} /></div>}
     {footer !== undefined && <ContinuousRoundRecord footer={footer} locale={locale} />}
     {(item.kind === "user" || item.kind === "assistant") && (
       <MessageActions
@@ -3389,7 +3623,7 @@ function TimelineItem({ item, locale, onOpenExternal, onPermissionDecision, onBr
       />
     )}
   </article>;
-}
+});
 
 function MessageActions({ item, messages, canRetry, onBranch, onRetryToDraft }: {
   readonly item: TimelineItemProjection;
@@ -3421,6 +3655,64 @@ const MarkdownText = memo(function MarkdownText({ text, locale, onOpenExternal }
 }) {
   return renderText(text, onOpenExternal, locale);
 }, (previous, next) => previous.text === next.text && previous.locale === next.locale);
+
+/** Live text overlays for entries that stream; absent in tests that render rows on their own. Exported for tests. */
+export const StreamOverlayContext = createContext<StreamOverlayStore | null>(null);
+
+function useStreamOverlayRecord(entryId: string, streaming: boolean): StreamOverlayRecord | undefined {
+  const store = useContext(StreamOverlayContext);
+  const subscribe = useCallback(
+    (listener: () => void) => store === null ? () => undefined : store.subscribe(listener),
+    [store],
+  );
+  const getSnapshot = useCallback(
+    () => store === null || !streaming ? undefined : store.get(entryId),
+    [store, entryId, streaming],
+  );
+  return useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
+}
+
+/**
+ * One Markdown block of a message. A streaming message re-parses only its last block per frame
+ * because earlier blocks are memoized by exact text; a finished message is one block, so its
+ * final markup is identical to a single parse of the whole text.
+ */
+const MarkdownBlock = memo(function MarkdownBlock({ text, whole, locale, onOpenExternal }: {
+  readonly text: string;
+  readonly whole: boolean;
+  readonly locale: GuildLocale;
+  readonly onOpenExternal: (url: string) => void;
+}) {
+  return whole ? renderText(text, onOpenExternal, locale) : renderMarkdown(text, onOpenExternal, locale);
+}, (previous, next) =>
+  previous.text === next.text && previous.whole === next.whole && previous.locale === next.locale);
+
+export function MessageBody({ entryId, text, streaming, locale, onOpenExternal }: {
+  readonly entryId: string;
+  readonly text: string;
+  readonly streaming: boolean;
+  readonly locale: GuildLocale;
+  readonly onOpenExternal: (url: string) => void;
+}) {
+  const overlay = useStreamOverlayRecord(entryId, streaming);
+  const splitter = useRef<StreamingMarkdownSplitter>(undefined);
+  const liveText = streaming ? mergeStreamText(text, overlay) : text;
+  if (!streaming) {
+    splitter.current = undefined;
+    return <MarkdownBlock key={0} text={liveText} whole locale={locale} onOpenExternal={onOpenExternal} />;
+  }
+  splitter.current ??= new StreamingMarkdownSplitter();
+  const blocks = splitter.current.update(liveText);
+  return <>{blocks.map((block, index) => (
+    <MarkdownBlock
+      key={index}
+      text={block}
+      whole={blocks.length === 1}
+      locale={locale}
+      onOpenExternal={onOpenExternal}
+    />
+  ))}</>;
+}
 
 function PermissionCard({ item, messages, onDecision }: {
   readonly item: Extract<TimelineItemProjection, { readonly kind: "permission" }>;
@@ -3461,6 +3753,15 @@ export function renderText(
   locale: GuildLocale = "en-US",
 ) {
   if (isBareSymbolReply(text)) return <p>{text}</p>;
+  return renderMarkdown(text, onOpenExternal, locale);
+}
+
+/** Markdown for one block or one whole message, without the bare-symbol shortcut. */
+export function renderMarkdown(
+  text: string,
+  onOpenExternal: (url: string) => void,
+  locale: GuildLocale = "en-US",
+) {
   return <ReactMarkdown
     remarkPlugins={[remarkGfm]}
     urlTransform={(url, key, node) => {

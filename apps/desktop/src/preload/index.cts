@@ -5,6 +5,7 @@ import type {
   DesktopRequestByChannel,
   DesktopResponseByChannel,
   GuildRendererApi,
+  StreamDeltaEvent,
 } from "@guild/contracts" with { "resolution-mode": "import" };
 
 const DESKTOP_IPC_CHANNELS = Object.freeze({
@@ -45,6 +46,7 @@ const DESKTOP_IPC_CHANNELS = Object.freeze({
   openRuntimeDiagnostics: "guild:v1:diagnostics:open-runtime-log",
   runGrokManagement: "guild:v1:grok:management:run",
   projectionChanged: "guild:v1:event:projection-changed",
+  streamDelta: "guild:v1:event:stream-delta",
 } as const);
 
 const invoke = <Channel extends DesktopInvokeChannel>(
@@ -103,6 +105,11 @@ const api = {
     const wrapped = (_event: Electron.IpcRendererEvent, projection: DesktopBootstrapProjection) => listener(projection);
     ipcRenderer.on(DESKTOP_IPC_CHANNELS.projectionChanged, wrapped);
     return () => ipcRenderer.removeListener(DESKTOP_IPC_CHANNELS.projectionChanged, wrapped);
+  },
+  onStreamDelta: (listener) => {
+    const wrapped = (_event: Electron.IpcRendererEvent, delta: StreamDeltaEvent) => listener(delta);
+    ipcRenderer.on(DESKTOP_IPC_CHANNELS.streamDelta, wrapped);
+    return () => ipcRenderer.removeListener(DESKTOP_IPC_CHANNELS.streamDelta, wrapped);
   },
 } satisfies GuildRendererApi;
 

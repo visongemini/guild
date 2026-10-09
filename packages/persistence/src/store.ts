@@ -230,6 +230,17 @@ export type ConversationEntryRecord = {
   readonly updatedAtMs: number;
 };
 
+/**
+ * Identity of one stored conversation row without decoding or verifying its payload.
+ * `revision` increases on every write to the row, so an unchanged stamp means an
+ * unchanged row and callers may reuse a record they already decoded and verified.
+ */
+export type ConversationEntryStamp = {
+  readonly entryId: string;
+  readonly sequence: number;
+  readonly revision: number;
+};
+
 export type ConversationEntryCreationResult = {
   readonly record: ConversationEntryRecord;
   readonly duplicate: boolean;
@@ -629,6 +640,11 @@ export interface GuildPersistence {
     readonly taskId: TaskId;
     readonly limit?: number;
   }): readonly ConversationEntryRecord[];
+  /** Read-only and cheap: the newest rows' stamps in sequence order, no metadata decode. */
+  listRecentConversationEntryStamps(input: {
+    readonly taskId: TaskId;
+    readonly limit?: number;
+  }): readonly ConversationEntryStamp[];
   listConversationEntriesBefore(input: {
     readonly taskId: TaskId;
     readonly beforeSequence: number;
@@ -1403,6 +1419,37 @@ class SqliteGuildPersistence implements GuildPersistence {
         `)
         .all(taskId, limit)
         .map((row) => this.#decodeConversationEntryRow(row).record),
+    );
+  }
+
+  listRecentConversationEntryStamps(input: {
+    readonly taskId: TaskId;
+    readonly limit?: number;
+  }): readonly ConversationEntryStamp[] {
+    this.#assertOpen();
+    const taskId = parsedTaskId(input.taskId);
+    this.#requiredTaskMetadata(taskId);
+    const limit = input.limit ?? DEFAULT_CONVERSATION_PAGE_SIZE;
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_CONVERSATION_PAGE_SIZE) {
+      throw persistenceError("domain_operation_rejected");
+    }
+    return Object.freeze(
+      this.#database
+        .prepare(`
+          SELECT entry_id, sequence, revision FROM (
+            SELECT entry_id, sequence, revision FROM conversation_entries
+            WHERE task_id = ?
+            ORDER BY sequence DESC
+            LIMIT ?
+          )
+          ORDER BY sequence
+        `)
+        .all(taskId, limit)
+        .map((row) => freeze({
+          entryId: exactText(row, "entry_id"),
+          sequence: exactInteger(row, "sequence"),
+          revision: exactInteger(row, "revision"),
+        })),
     );
   }
 

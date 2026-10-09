@@ -729,6 +729,11 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .guild-timeline-group { min-width: 0; border-radius: 10px; scroll-margin: 35px; }
 .guild-timeline-group:focus { outline: none; }
 .guild-timeline-group.search-highlight { background: var(--guild-orange-soft); box-shadow: 0 0 0 8px var(--guild-orange-soft); }
+/* Finished rows away from the live tail skip layout and paint while off screen. Paint containment would clip a focus ring or the search glow, so those states opt out. */
+.guild-timeline-group.settled { content-visibility: auto; contain-intrinsic-block-size: auto 96px; }
+.guild-timeline-group.settled:focus-within, .guild-timeline-group.settled.search-highlight { content-visibility: visible; }
+/* Zero-size scroll sentinels observed by IntersectionObserver; they take no space. */
+.guild-scroll-sentinel { display: block; height: 0; margin: 0; padding: 0; border: 0; pointer-events: none; }
 .guild-message { font-size: var(--guild-message-size); line-height: 1.75; }
 .guild-message-body { font-size: var(--guild-message-size); line-height: 1.75; }
 .guild-message-user { margin-left: auto; max-width: min(88%, 710px); padding: 14px 19px; border-radius: 16px 16px 4px 16px; background: var(--guild-panel); border: 1px solid var(--guild-line); }

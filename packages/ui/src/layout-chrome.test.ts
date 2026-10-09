@@ -160,13 +160,18 @@ test("task rows expose keyboard-accessible pin and archive controls without nest
   assert.ok(row.indexOf("</button>") < row.indexOf('className="guild-task-hover-actions"'));
 });
 
-test("background projection delivery does not wait for an animation frame", async () => {
+test("background projection delivery never waits on an animation frame alone", async () => {
   const source = await readFile(new URL("../src/App.tsx", import.meta.url), "utf8");
   const start = source.indexOf("const unsubscribe = api.onProjectionChanged");
-  const end = source.indexOf("}, [api]);", start);
+  const end = source.indexOf("}, [api, setProjection, streamOverlay]);", start);
   assert.ok(start >= 0 && end > start);
-  const subscription = source.slice(start, end);
+  const subscription = source.slice(Math.max(0, start - 900), end);
 
-  assert.match(subscription, /queueMicrotask/);
-  assert.doesNotMatch(subscription, /requestAnimationFrame/);
+  // Frame batching is allowed only through the scheduler, whose timer fallback keeps a
+  // hidden window (which pauses requestAnimationFrame) delivering.
+  assert.match(subscription, /createFrameScheduler\(/);
+  assert.doesNotMatch(subscription, /requestAnimationFrame\(/);
+  const scheduler = await readFile(new URL("../src/frame-scheduler.ts", import.meta.url), "utf8");
+  assert.match(scheduler, /setTimer\(fire, fallbackMs\)/);
 });
+
