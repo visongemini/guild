@@ -1122,10 +1122,12 @@ function parseCommands(
   update: Record<string, unknown>,
   received: RuntimeReceiveTimestamp,
 ): RuntimePayload {
+  const advertised = update["availableCommands"];
+  // The command list is advisory: keep the first entries instead of failing the session.
   const commands = array(
-    update["availableCommands"],
+    Array.isArray(advertised) ? advertised.slice(0, RUNTIME_PAYLOAD_LIMITS.maxCommands) : advertised,
     "$.update.availableCommands",
-    ACP_V1_CODEC_LIMITS.maxContentCollectionItems,
+    RUNTIME_PAYLOAD_LIMITS.maxCommands,
   ).map((entry, index) => {
     const path = `$.update.availableCommands[${index}]`;
     const command = record(entry, path, ["description", "name"]);

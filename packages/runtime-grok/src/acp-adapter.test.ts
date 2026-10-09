@@ -636,6 +636,27 @@ describe("ACP v1 adapter initialization and durable session establishment", () =
     await adapter.close();
   });
 
+  it("drops an undecodable command list without ending the session", async () => {
+    const process = new FakeProcess();
+    const sink = new RecordingSink();
+    const adapter = await startAdapter(process, sink);
+    await newSession(adapter, process, "session-commands");
+    process.emitMessages({
+      jsonrpc: "2.0",
+      method: ACP_V1_METHODS.sessionUpdate,
+      params: {
+        sessionId: "session-commands",
+        update: {
+          sessionUpdate: "available_commands_update",
+          availableCommands: [{ name: 42, description: "Not a valid command" }],
+        },
+      },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(adapter.state, "ready");
+    await adapter.close();
+  });
+
   it("does not write initialize after an immediate process-exit event during start", async () => {
     const process = new FakeProcess();
     process.startEvent = { type: "process_exit", code: 9, signal: null };

@@ -1232,6 +1232,13 @@ export class AcpV1Adapter {
             : "unknown_update",
         );
       }
+      if (
+        cause instanceof AcpV1CodecError &&
+        update?.["sessionUpdate"] === "available_commands_update"
+      ) {
+        // The slash-command list is advisory; a list Guild cannot decode must not end the session.
+        return;
+      }
       if (this.currentState === "ready" || this.currentState === "starting") {
         this.fail(
           isSinkLikeFailure(cause) ? "sink_fault" : "protocol_fault",

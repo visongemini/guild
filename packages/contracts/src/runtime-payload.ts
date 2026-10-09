@@ -4,6 +4,8 @@ import { isAbsolute, normalize } from "node:path";
 /** Persistence-safe ACP-derived product data. Raw protocol extensions never enter this family. */
 export const RUNTIME_PAYLOAD_LIMITS = Object.freeze({
   maxContentItems: 128,
+  // Slash commands include every skill the user installed; 136 were advertised on 2026-10-09.
+  maxCommands: 512,
   maxDecodedMediaBytes: 8 * 1024 * 1024,
   maxOptions: 32,
   maxStringLength: 65_536,
@@ -463,7 +465,7 @@ function sessionContext(value: unknown, path: string): RuntimeSessionContextPayl
       exactKeys(rec, ["commands", "kind"], path, true);
       return {
         kind,
-        commands: collection(rec["commands"], `${path}.commands`, RUNTIME_PAYLOAD_LIMITS.maxContentItems).map(
+        commands: collection(rec["commands"], `${path}.commands`, RUNTIME_PAYLOAD_LIMITS.maxCommands).map(
           (entry, index) => {
             const itemPath = `${path}.commands[${index}]`;
             const command = object(entry, itemPath, ["description", "name"]);

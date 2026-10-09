@@ -1134,6 +1134,23 @@ describe("ACP v1 session updates", () => {
     }
   });
 
+  it("keeps a long advertised command list and truncates it at the command limit", () => {
+    const commandsOf = (count: number) => Array.from({ length: count }, (_, index) => ({
+      name: `skill-${index}`,
+      description: `Skill ${index}`,
+    }));
+    for (const [advertised, kept] of [[136, 136], [600, 512]] as const) {
+      const decoded = decodeUpdate({
+        sessionUpdate: "available_commands_update",
+        availableCommands: commandsOf(advertised),
+      });
+      assert.equal(decoded.type, "session_context");
+      if (decoded.type !== "session_context" || decoded.payload.context.kind !== "commands") return;
+      assert.equal(decoded.payload.context.commands.length, kept);
+      assert.equal(decoded.payload.context.commands[0]?.name, "skill-0");
+    }
+  });
+
   it("classifies all five session-context update families outside the turn timeline", () => {
     const updates = [
       {
