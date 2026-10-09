@@ -152,7 +152,15 @@ export type AcpV1NewSessionResult = AcpV1SessionState & {
 export type AcpV1DecodedUpdate =
   | { readonly type: "ignored_extension"; readonly sessionId: string; readonly discriminator: string }
   | { readonly type: "session_context"; readonly payload: RuntimePayload & { readonly type: "session_context" } }
-  | { readonly type: "turn"; readonly payload: Exclude<RuntimePayload, { readonly type: "session_context" }> }
+  | {
+      readonly type: "turn";
+      readonly payload: Exclude<RuntimePayload, { readonly type: "session_context" }>;
+      /**
+       * Set on a replayed `user_message_chunk` the runtime persisted for a mid-turn Steer
+       * (`update._meta.interjection`). It belongs to the running turn: it never opens a new one.
+       */
+      readonly interjection?: true;
+    }
   | {
       readonly type: "media_content";
       readonly sessionId: string;
@@ -934,7 +942,18 @@ function parseContentChunk(
     text: boundedText(content["text"], "$.update.content.text"),
   };
   copyMessageId(update, payload, "$.update");
-  return turnResult(freezeRuntimePayload(payload));
+  const frozen = freezeRuntimePayload(payload);
+  if (discriminator === "user_message_chunk" && hasInterjectionMeta(update)) {
+    if (frozen.type === "session_context") throw new AcpV1CodecError("invalid_value", "$internal.turn");
+    return deepFreeze({ type: "turn", payload: frozen, interjection: true }) as AcpV1DecodedUpdate;
+  }
+  return turnResult(frozen);
+}
+
+function hasInterjectionMeta(update: Record<string, unknown>): boolean {
+  const meta = update["_meta"];
+  return meta !== null && typeof meta === "object" && !Array.isArray(meta) &&
+    (meta as Record<string, unknown>)["interjection"] === true;
 }
 
 function mediaMimeType(

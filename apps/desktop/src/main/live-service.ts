@@ -5496,6 +5496,11 @@ export function createLiveDesktopService(
         cancellation.session,
       );
     },
+    steerMessage: async () => { throw new Error("steer_not_implemented"); },
+    convertQueuedTurnToSteer: async () => { throw new Error("steer_not_implemented"); },
+    previewRewind: async () => { throw new Error("rewind_not_implemented"); },
+    executeRewind: async () => { throw new Error("rewind_not_implemented"); },
+    loadRunFileDiff: async () => { throw new Error("rewind_not_implemented"); },
     decidePermission: async (input) => enqueueCommand(async () => {
       assertOpen();
       const controller = controllerFor(input.taskId);

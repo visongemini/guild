@@ -879,19 +879,20 @@ describe("ACP v1 adapter initialization and durable session establishment", () =
     sessionNotification({ sessionUpdate: "model_changed", model_id: "grok-4.7", reasoning_effort: "high" });
     notify("_x.ai/session/prompt_complete", { sessionId: "session-1", promptId: "p-1", stopReason: "end_turn", agentResult: { secret: "AGENT-RESULT" } });
     notify("_x.ai/models/update", officialModelState());
+    // The echo of a Steer keeps only its client-made id; the text is Guild's own and is not read.
+    notify("_x.ai/session/interjection", { sessionId: "session-1", text: "PRIVATE STEER", interjectionId: "interject-1" });
 
     // Everything below must be ignored without ever reaching the sink.
     notify("_x.ai/mcp/servers_updated", { servers: [{ name: "github", env: { GITHUB_TOKEN: "ghp_PLAINTEXT_SECRET" } }] });
     notify("_x.ai/settings/update", { tips: ["private tip"] });
     notify("_x.ai/announcements/update", { announcements: [{ message: "hello" }] });
     notify("_x.ai/mcp/server_status", { sessionId: "session-1", name: "github", detail: "PRIVATE DETAIL" });
-    notify("_x.ai/session/interjection", { sessionId: "session-1", text: "PRIVATE STEER", interjectionId: "i-1" });
     notify("_x.ai/unknown/future", { sessionId: "session-1", anything: "PRIVATE" });
     sessionNotification({ sessionUpdate: "session_summary_generated", session_summary: "PRIVATE SUMMARY" });
     sessionNotification({ sessionUpdate: "future_subtype", payload: "PRIVATE" });
     notify("not-an-extension/queue/changed", { entries: [] });
     sessionNotification({ sessionUpdate: "hook_run_started", event_name: "", count: -1 });
-    await waitFor(() => signals.length >= 14);
+    await waitFor(() => signals.length >= 16);
     await immediate();
 
     const kinds = signals.map((envelope) => envelope.signal.kind);
@@ -899,7 +900,7 @@ describe("ACP v1 adapter initialization and durable session establishment", () =
       "session_setup", "mcp_init_progress", "sessions_changed", "queue_changed", "hook_run_started",
       "hook_execution", "tool_call_delta_chunk", "pending_interaction", "interaction_resolved",
       "retry_state", "response_completed", "turn_completed", "model_changed", "prompt_complete",
-      "models_update",
+      "models_update", "session_interjection",
     ]);
     const byKind = Object.fromEntries(signals.map((envelope) => [envelope.signal.kind, envelope]));
     assert.deepEqual(byKind["session_setup"], { sessionId: null, signal: { kind: "session_setup", phase: "mcp_merge" }, receivedMonotonicMs: 123.5 });
@@ -912,9 +913,11 @@ describe("ACP v1 adapter initialization and durable session establishment", () =
     assert.deepEqual(byKind["tool_call_delta_chunk"]?.signal, { kind: "tool_call_delta_chunk", toolName: "run_terminal_command" });
     assert.deepEqual(byKind["pending_interaction"]?.signal, { kind: "pending_interaction", interaction: "permission" });
     assert.deepEqual(byKind["retry_state"]?.signal, { kind: "retry_state", active: true, attempt: 1, maxRetries: 15, errorType: "http" });
-    assert.deepEqual(byKind["turn_completed"]?.signal, { kind: "turn_completed", stopReason: "end_turn" });
+    assert.deepEqual(byKind["turn_completed"]?.signal, { kind: "turn_completed", stopReason: "end_turn", promptId: "p-1" });
+    assert.deepEqual(byKind["session_interjection"]?.signal, { kind: "session_interjection", interjectionId: "interject-1" });
+    assert.equal(byKind["session_interjection"]?.sessionId, "session-1");
     assert.deepEqual(byKind["model_changed"]?.signal, { kind: "model_changed", modelId: "grok-4.7", reasoningEffort: "high" });
-    assert.deepEqual(byKind["prompt_complete"]?.signal, { kind: "prompt_complete", stopReason: "end_turn" });
+    assert.deepEqual(byKind["prompt_complete"]?.signal, { kind: "prompt_complete", stopReason: "end_turn", promptId: "p-1" });
     assert.equal(byKind["models_update"]?.sessionId, null);
     assert.equal(byKind["models_update"]?.signal.kind === "models_update" && byKind["models_update"].signal.catalog.models.length, 3);
     assert.equal(byKind["queue_changed"]?.sessionId, "session-1");
@@ -2152,5 +2155,265 @@ describe("ACP v1 adapter epoch identity and restore paths", () => {
     process.emit({ type: "process_exit", code: 9, signal: null });
     await waitFor(() => adapter.state === "faulted");
     await assert.rejects(adapter.interrupted, /fake interruption persistence fault/u);
+  });
+});
+
+describe("ACP v1 adapter turns the runtime starts itself", () => {
+  class AgentTurnSink extends RecordingSink {
+    readonly agentTurns: Parameters<NonNullable<AcpV1AdapterSink["commitAgentTurnStarted"]>>[0][] = [];
+    declineAgentTurns = false;
+    agentTurnGate: Promise<void> | undefined;
+
+    async commitAgentTurnStarted(
+      event: Parameters<NonNullable<AcpV1AdapterSink["commitAgentTurnStarted"]>>[0],
+    ): Promise<void> {
+      this.agentTurns.push(event);
+      this.order.push("agent-turn:started");
+      await this.agentTurnGate;
+      if (this.declineAgentTurns) throw new Error("fake agent turn declined");
+    }
+  }
+
+  const notify = (process: FakeProcess, method: string, params: unknown) =>
+    process.emitMessages({ jsonrpc: "2.0", method, params } as WireMessage);
+
+  function agentUpdate(sessionId: string, promptId: string, text: string): WireMessage {
+    return {
+      jsonrpc: "2.0",
+      method: ACP_V1_METHODS.sessionUpdate,
+      params: {
+        sessionId,
+        update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text } },
+        _meta: { promptId },
+      },
+    };
+  }
+
+  it("attaches an interject-fallback turn on its first frame, streams it, and ends it from turn_completed", async () => {
+    const process = new FakeProcess();
+    const sink = new AgentTurnSink();
+    const adapter = await startAdapter(process, sink);
+    const session = await newSession(adapter, process);
+    notify(process, "_x.ai/queue/changed", {
+      sessionId: "session-1",
+      entries: [],
+      runningPromptId: "interject-fallback-0001",
+      runningText: "steer me after the fact",
+    });
+    process.emitMessages(
+      agentUpdate("session-1", "interject-fallback-0001", "first words"),
+      agentUpdate("session-1", "interject-fallback-0001", " and more"),
+    );
+    await waitFor(() => sink.updates.length === 2);
+    assert.equal(sink.agentTurns.length, 1);
+    assert.deepEqual(
+      {
+        sequence: sink.agentTurns[0]?.identity.promptSequence,
+        sessionId: sink.agentTurns[0]?.identity.sessionId,
+        agentPromptId: sink.agentTurns[0]?.agentPromptId,
+        promptText: sink.agentTurns[0]?.promptText,
+      },
+      { sequence: 1, sessionId: "session-1", agentPromptId: "interject-fallback-0001", promptText: "steer me after the fact" },
+    );
+    assert.deepEqual(sink.updates.map((update) => update.promptSequence), [1, 1]);
+    assert.equal(sink.order.indexOf("agent-turn:started") < sink.order.indexOf("update:live"), true,
+      "the turn is attached before its first frame is committed");
+    assert.equal(sink.terminals.length, 0);
+
+    notify(process, "_x.ai/session_notification", {
+      sessionId: "session-1",
+      update: { sessionUpdate: "turn_completed", prompt_id: "interject-fallback-0001", stop_reason: "end_turn" },
+    });
+    await waitFor(() => sink.terminals.length === 1);
+    assert.equal(sink.terminals[0]?.identity.promptSequence, 1);
+    assert.equal(sink.terminals[0]?.terminal.classification, "completed");
+    assert.equal(sink.terminals[0]?.terminal.stopReason, "end_turn");
+    // The matching prompt_complete that follows ends nothing twice.
+    notify(process, "_x.ai/session/prompt_complete", {
+      sessionId: "session-1", promptId: "interject-fallback-0001", stopReason: "end_turn",
+    });
+    await immediate();
+    assert.equal(sink.terminals.length, 1);
+    assert.equal(adapter.state, "ready");
+
+    // The session is free for Guild's own prompt, numbered after the agent turn.
+    const prompting = adapter.prompt(session, "my own prompt");
+    const request = await waitForOutbound(process, ACP_V1_METHODS.sessionPrompt);
+    await waitFor(() => sink.accepted.length === 1);
+    assert.equal(sink.accepted[0]?.identity.promptSequence, 2);
+    process.emitMessages({ jsonrpc: "2.0", id: request.id, result: { stopReason: "end_turn" } });
+    await prompting;
+    await adapter.close();
+  });
+
+  it("maps an unexpected stop reason to a refusal and ignores an end signal for another turn", async () => {
+    const process = new FakeProcess();
+    const sink = new AgentTurnSink();
+    const adapter = await startAdapter(process, sink);
+    await newSession(adapter, process);
+    process.emitMessages(agentUpdate("session-1", "interject-fallback-0002", "text"));
+    await waitFor(() => sink.updates.length === 1);
+    notify(process, "_x.ai/session_notification", {
+      sessionId: "session-1",
+      update: { sessionUpdate: "turn_completed", prompt_id: "some-other-prompt", stop_reason: "end_turn" },
+    });
+    await immediate();
+    assert.equal(sink.terminals.length, 0, "a signal that names another prompt ends nothing");
+    notify(process, "_x.ai/session_notification", {
+      sessionId: "session-1",
+      update: { sessionUpdate: "turn_completed", prompt_id: "interject-fallback-0002", stop_reason: "error" },
+    });
+    await waitFor(() => sink.terminals.length === 1);
+    assert.equal(sink.terminals[0]?.terminal.stopReason, "refusal");
+    assert.equal(sink.terminals[0]?.terminal.classification, "refused");
+    await adapter.close();
+  });
+
+  it("waits for the previous Guild prompt's terminal commit before attaching the next turn", async () => {
+    const process = new FakeProcess();
+    const sink = new AgentTurnSink();
+    const gate = deferred<void>();
+    sink.terminalGate = gate.promise;
+    const adapter = await startAdapter(process, sink);
+    const session = await newSession(adapter, process);
+    const prompting = adapter.prompt(session, "first");
+    const request = await waitForOutbound(process, ACP_V1_METHODS.sessionPrompt);
+    await waitFor(() => sink.accepted.length === 1);
+    // The response and the runtime's own next turn arrive back to back.
+    process.emitMessages(
+      { jsonrpc: "2.0", id: request.id, result: { stopReason: "end_turn" } },
+      agentUpdate("session-1", "interject-fallback-0003", "follow-up turn"),
+    );
+    await waitFor(() => sink.terminalStarted === 1);
+    await immediate();
+    assert.equal(sink.agentTurns.length, 0, "the agent turn is not attached while the first terminal is committing");
+    assert.equal(sink.updates.length, 0);
+    gate.resolve();
+    await prompting;
+    await waitFor(() => sink.updates.length === 1);
+    assert.equal(sink.agentTurns[0]?.identity.promptSequence, 2);
+    assert.equal(
+      sink.order.indexOf("prompt:terminal") < sink.order.indexOf("agent-turn:started"),
+      true,
+    );
+    assert.equal(adapter.state, "ready");
+    await adapter.close();
+  });
+
+  it("drops a turn the sink declines, cancels its permission requests, and keeps the transport healthy", async () => {
+    const process = new FakeProcess();
+    const sink = new AgentTurnSink();
+    sink.declineAgentTurns = true;
+    const adapter = await startAdapter(process, sink);
+    const session = await newSession(adapter, process);
+    process.emitMessages(
+      agentUpdate("session-1", "interject-fallback-0004", "declined text"),
+      permissionRequest("session-1", "perm-1"),
+    );
+    await waitFor(() => process.frames.some((frame) => frame.includes('"perm-1"')));
+    const answer = process.frames.map(wireMessage).find((message) => message.id === "perm-1");
+    assert.deepEqual(answer?.["result"], { outcome: { outcome: "cancelled" } });
+    assert.equal(sink.updates.length, 0, "declined frames are never committed");
+    assert.equal(sink.permissionRequests.length, 0);
+    notify(process, "_x.ai/session_notification", {
+      sessionId: "session-1",
+      update: { sessionUpdate: "turn_completed", prompt_id: "interject-fallback-0004", stop_reason: "end_turn" },
+    });
+    await waitFor(() => sink.agentTurns.length === 1);
+    await immediate();
+    assert.equal(sink.terminals.length, 0, "a declined turn has no terminal to commit");
+    assert.equal(adapter.state, "ready");
+    const prompting = adapter.prompt(session, "after the declined turn");
+    const request = await waitForOutbound(process, ACP_V1_METHODS.sessionPrompt);
+    process.emitMessages({ jsonrpc: "2.0", id: request.id, result: { stopReason: "end_turn" } });
+    assert.equal((await prompting).classification, "completed");
+    await adapter.close();
+  });
+
+  it("asks the user for a permission that arrives in the same chunk as the first frame of an agent turn", async () => {
+    const process = new FakeProcess();
+    const sink = new AgentTurnSink();
+    const adapter = await startAdapter(process, sink);
+    await newSession(adapter, process);
+    process.emitMessages(
+      agentUpdate("session-1", "interject-fallback-0008", "tool incoming"),
+      permissionRequest("session-1", "perm-same-chunk"),
+    );
+    await waitFor(() => sink.permissionRequests.length === 1);
+    assert.equal(sink.agentTurns.length, 1);
+    assert.equal(sink.permissionRequests[0]?.identity.promptSequence, 1);
+    await waitFor(() => sink.permissionFlushes.length === 1);
+    const answer = process.frames.map(wireMessage).find((message) => message.id === "perm-same-chunk");
+    assert.deepEqual(answer?.["result"], { outcome: { outcome: "selected", optionId: "allow" } });
+    assert.equal(adapter.state, "ready");
+    await adapter.close();
+  });
+
+  it("routes a permission request of an attached agent turn through the sink and lets cancel reach it", async () => {
+    const process = new FakeProcess();
+    const sink = new AgentTurnSink();
+    const adapter = await startAdapter(process, sink);
+    const session = await newSession(adapter, process);
+    process.emitMessages(agentUpdate("session-1", "interject-fallback-0005", "needs a tool"));
+    await waitFor(() => sink.updates.length === 1);
+    process.emitMessages(permissionRequest("session-1", "perm-agent"));
+    await waitFor(() => sink.permissionRequests.length === 1);
+    assert.equal(sink.permissionRequests[0]?.identity.promptSequence, 1);
+    await waitFor(() => sink.permissionFlushes.length === 1);
+    const cancel = await adapter.cancel(session);
+    assert.equal(cancel.messageType, "notification");
+    await waitFor(() => sink.cancellations.length === 1);
+    assert.equal(sink.cancellations[0]?.identity.promptSequence, 1);
+    await adapter.close();
+  });
+
+  it("does not let a turn end signal finish a prompt Guild sent", async () => {
+    const process = new FakeProcess();
+    const sink = new AgentTurnSink();
+    const adapter = await startAdapter(process, sink);
+    const session = await newSession(adapter, process);
+    const prompting = adapter.prompt(session, "mine");
+    const request = await waitForOutbound(process, ACP_V1_METHODS.sessionPrompt);
+    await waitFor(() => sink.accepted.length === 1);
+    process.emitMessages(textUpdate("session-1", "reply"));
+    notify(process, "_x.ai/session_notification", {
+      sessionId: "session-1",
+      update: { sessionUpdate: "turn_completed", prompt_id: "guild-owned", stop_reason: "end_turn" },
+    });
+    notify(process, "_x.ai/session/prompt_complete", {
+      sessionId: "session-1", promptId: "guild-owned", stopReason: "end_turn",
+    });
+    await waitFor(() => sink.updates.length === 1);
+    await immediate();
+    assert.equal(sink.terminals.length, 0);
+    assert.equal(sink.agentTurns.length, 0);
+    process.emitMessages({ jsonrpc: "2.0", id: request.id, result: { stopReason: "end_turn" } });
+    await prompting;
+    assert.equal(sink.terminals.length, 1);
+    await adapter.close();
+  });
+
+  it("keeps rejecting a turn frame with no prompt in flight when the sink cannot attach agent turns", async () => {
+    const process = new FakeProcess();
+    const sink = new RecordingSink();
+    const adapter = await startAdapter(process, sink);
+    await newSession(adapter, process);
+    process.emitMessages(agentUpdate("session-1", "interject-fallback-0006", "unexpected"));
+    await waitFor(() => adapter.state === "faulted");
+    await adapter.interrupted;
+    assert.equal(sink.updates.length, 0);
+  });
+
+  it("interrupts an attached agent turn with its prompt sequence when the process exits", async () => {
+    const process = new FakeProcess();
+    const sink = new AgentTurnSink();
+    const adapter = await startAdapter(process, sink);
+    await newSession(adapter, process);
+    process.emitMessages(agentUpdate("session-1", "interject-fallback-0007", "running"));
+    await waitFor(() => sink.updates.length === 1);
+    process.emit({ type: "process_exit", code: 9, signal: null });
+    await waitFor(() => adapter.state === "faulted");
+    await adapter.interrupted;
+    assert.equal(sink.interruptions[0]?.activePromptSequence, 1);
   });
 });

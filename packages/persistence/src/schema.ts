@@ -1,7 +1,7 @@
 import type { DatabaseSync } from "node:sqlite";
 import { persistenceError } from "./errors.js";
 
-export const SCHEMA_VERSION = 16;
+export const SCHEMA_VERSION = 17;
 
 const MIGRATION_V1 = String.raw`
 CREATE TABLE schema_migrations (
@@ -1111,6 +1111,76 @@ INSERT INTO schema_migrations(version, name, applied_at_ms)
 VALUES(16, 'runtime_model_catalog_and_task_settings', CAST(unixepoch('subsec') * 1000 AS INTEGER));
 `;
 
+// V17 (F4 Steer, F2 run checkpoints). Purely additive: two new tables, no historical row is read
+// or rewritten.
+// 1. task_interjections records every Steer (`_x.ai/interject`) Guild sent, keyed by the
+//    client-made interjection id the runtime echoes back. The conversation entry text is
+//    append-only and its metadata immutable, so the mutable delivery state lives here:
+//    sending (intent recorded, request in flight) -> pending (runtime accepted it) ->
+//    delivered (the runtime echoed the id) | fallen_back (went to the durable queue; the reason is
+//    kept) | failed. `started_run_id` links a Steer the runtime ran as its own turn
+//    (`interject-fallback-*`) to the Run Guild created for that turn.
+// 2. run_checkpoints holds, per Run, the hidden git refs captured at Run start and Run end
+//    (refs/guild/checkpoints/<task>/<n>), the stored changed-file summary, and the rewind marker
+//    (`rolled_back_at_ms`; the row is kept for audit). A Run without a git work tree still gets a
+//    row (status unavailable) so its ordinal and rollback state exist.
+const MIGRATION_V17 = String.raw`
+CREATE TABLE guild_meta_next (
+  singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+  schema_version INTEGER NOT NULL CHECK(schema_version = 17),
+  clean_shutdown INTEGER NOT NULL CHECK(clean_shutdown IN (0, 1)),
+  last_integrity_at_ms INTEGER CHECK(last_integrity_at_ms IS NULL OR last_integrity_at_ms >= 0)
+) STRICT;
+
+INSERT INTO guild_meta_next(singleton, schema_version, clean_shutdown, last_integrity_at_ms)
+SELECT singleton, 17, clean_shutdown, last_integrity_at_ms FROM guild_meta;
+
+DROP TABLE guild_meta;
+ALTER TABLE guild_meta_next RENAME TO guild_meta;
+
+CREATE TABLE task_interjections (
+  task_id TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE RESTRICT,
+  interjection_id TEXT NOT NULL CHECK(length(interjection_id) BETWEEN 1 AND 64),
+  run_id TEXT NOT NULL CHECK(length(run_id) BETWEEN 1 AND 512),
+  text_content TEXT NOT NULL CHECK(length(text_content) BETWEEN 1 AND 200000),
+  state TEXT NOT NULL CHECK(state IN ('sending', 'pending', 'delivered', 'fallen_back', 'failed')),
+  reason TEXT CHECK(reason IS NULL OR length(reason) BETWEEN 1 AND 64),
+  entry_id TEXT CHECK(entry_id IS NULL OR length(entry_id) BETWEEN 1 AND 128),
+  queue_id TEXT CHECK(queue_id IS NULL OR length(queue_id) BETWEEN 1 AND 128),
+  started_run_id TEXT CHECK(started_run_id IS NULL OR length(started_run_id) BETWEEN 1 AND 512),
+  created_at_ms INTEGER NOT NULL CHECK(created_at_ms >= 0),
+  updated_at_ms INTEGER NOT NULL CHECK(updated_at_ms >= created_at_ms),
+  PRIMARY KEY(task_id, interjection_id),
+  FOREIGN KEY(task_id, run_id) REFERENCES runs(task_id, run_id) ON DELETE RESTRICT
+) STRICT;
+
+CREATE INDEX task_interjections_by_run ON task_interjections(task_id, run_id);
+
+CREATE TABLE run_checkpoints (
+  task_id TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE RESTRICT,
+  run_id TEXT NOT NULL CHECK(length(run_id) BETWEEN 1 AND 512),
+  ordinal INTEGER NOT NULL CHECK(ordinal >= 1),
+  start_ref TEXT CHECK(start_ref IS NULL OR length(start_ref) BETWEEN 1 AND 512),
+  end_ref TEXT CHECK(end_ref IS NULL OR length(end_ref) BETWEEN 1 AND 512),
+  status TEXT NOT NULL CHECK(status IN ('capturing', 'captured', 'unavailable', 'rolled_back')),
+  detail TEXT CHECK(detail IS NULL OR length(detail) BETWEEN 1 AND 64),
+  files_json TEXT NOT NULL CHECK(length(files_json) BETWEEN 2 AND 262144),
+  files_total INTEGER NOT NULL CHECK(files_total >= 0),
+  adds INTEGER NOT NULL CHECK(adds >= 0),
+  dels INTEGER NOT NULL CHECK(dels >= 0),
+  rolled_back_at_ms INTEGER CHECK(rolled_back_at_ms IS NULL OR rolled_back_at_ms >= 0),
+  created_at_ms INTEGER NOT NULL CHECK(created_at_ms >= 0),
+  updated_at_ms INTEGER NOT NULL CHECK(updated_at_ms >= created_at_ms),
+  PRIMARY KEY(task_id, run_id),
+  UNIQUE(task_id, ordinal),
+  FOREIGN KEY(task_id, run_id) REFERENCES runs(task_id, run_id) ON DELETE RESTRICT,
+  CHECK((status = 'rolled_back') = (rolled_back_at_ms IS NOT NULL))
+) STRICT;
+
+INSERT INTO schema_migrations(version, name, applied_at_ms)
+VALUES(17, 'steer_interjections_and_run_checkpoints', CAST(unixepoch('subsec') * 1000 AS INTEGER));
+`;
+
 // Only a database created from scratch (user_version 0) runs this, inside the same transaction
 // as MIGRATION_V16, so a new install follows the runtime default instead of the rewritten pair.
 const MIGRATION_V16_FRESH_INSTALL = String.raw`
@@ -1329,6 +1399,18 @@ export function migrateSchema(database: DatabaseSync): void {
       throw persistenceError("schema_integrity_failed", cause);
     }
   }
+  if (version === 16) {
+    database.exec("BEGIN IMMEDIATE");
+    try {
+      database.exec(MIGRATION_V17);
+      database.exec("PRAGMA user_version = 17");
+      database.exec("COMMIT");
+      version = 17;
+    } catch (cause: unknown) {
+      if (database.isTransaction) database.exec("ROLLBACK");
+      throw persistenceError("schema_integrity_failed", cause);
+    }
+  }
   if (version !== SCHEMA_VERSION) {
     throw persistenceError("schema_integrity_failed");
   }
@@ -1339,7 +1421,7 @@ export function migrateSchema(database: DatabaseSync): void {
     .prepare("SELECT schema_version FROM guild_meta WHERE singleton = 1")
     .get();
   if (
-    migrations.length !== 16 ||
+    migrations.length !== 17 ||
     exactInteger(migrations[0], "version") !== 1 ||
     migrations[0]?.["name"] !== "initial_authoritative_aggregates" ||
     exactInteger(migrations[1], "version") !== 2 ||
@@ -1372,6 +1454,8 @@ export function migrateSchema(database: DatabaseSync): void {
     migrations[14]?.["name"] !== "streaming_write_path_and_context_usage" ||
     exactInteger(migrations[15], "version") !== 16 ||
     migrations[15]?.["name"] !== "runtime_model_catalog_and_task_settings" ||
+    exactInteger(migrations[16], "version") !== 17 ||
+    migrations[16]?.["name"] !== "steer_interjections_and_run_checkpoints" ||
     exactInteger(meta, "schema_version") !== SCHEMA_VERSION
   ) {
     throw persistenceError("schema_integrity_failed");

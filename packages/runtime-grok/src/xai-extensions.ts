@@ -131,7 +131,12 @@ const SESSION_NOTIFICATION_PARSERS: Readonly<Record<
   response_completed: () => Object.freeze({ kind: "response_completed" as const }),
   turn_completed: (update) => {
     const stopReason = identifier(update["stop_reason"]);
-    return Object.freeze({ kind: "turn_completed" as const, ...(stopReason === undefined ? {} : { stopReason }) });
+    const promptId = identifier(update["prompt_id"]);
+    return Object.freeze({
+      kind: "turn_completed" as const,
+      ...(stopReason === undefined ? {} : { stopReason }),
+      ...(promptId === undefined ? {} : { promptId }),
+    });
   },
   model_changed: (update) => {
     const modelId = identifier(update["model_id"]);
@@ -182,7 +187,19 @@ export const XAI_NOTIFICATION_PARSERS: Readonly<Record<string, NotificationParse
   },
   "_x.ai/session/prompt_complete": (params) => {
     const stopReason = identifier(params["stopReason"]);
-    return Object.freeze({ kind: "prompt_complete" as const, ...(stopReason === undefined ? {} : { stopReason }) });
+    const promptId = identifier(params["promptId"]);
+    return Object.freeze({
+      kind: "prompt_complete" as const,
+      ...(stopReason === undefined ? {} : { stopReason }),
+      ...(promptId === undefined ? {} : { promptId }),
+    });
+  },
+  "_x.ai/session/interjection": (params) => {
+    // Only the client-made id is kept; the echoed text is never read.
+    const interjectionId = identifier(params["interjectionId"]);
+    return interjectionId === undefined
+      ? undefined
+      : Object.freeze({ kind: "session_interjection" as const, interjectionId });
   },
   "_x.ai/session/setup": (params) => {
     const phase = identifier(params["phase"]);
@@ -200,6 +217,52 @@ export const XAI_NOTIFICATION_PARSERS: Readonly<Record<string, NotificationParse
     return catalog === undefined ? undefined : Object.freeze({ kind: "models_update" as const, catalog });
   },
 });
+
+
+/**
+ * The one place prompt text is read out of an `_x.ai/*` notification: `_x.ai/queue/changed` names
+ * the running prompt and its text. The adapter keeps it only in memory, to give an agent-started
+ * turn (for example `interject-fallback-*`) the text of the user message it runs; it never becomes
+ * a signal, a log line or a stored envelope.
+ */
+export type XaiQueueSnapshot = Readonly<{
+  runningPromptId?: string;
+  runningText?: string;
+  entries: readonly Readonly<{ id: string; text: string }>[];
+}>;
+
+const MAX_QUEUE_TEXT_LENGTH = 65_536;
+
+export function parseXaiQueueSnapshot(params: unknown): XaiQueueSnapshot | undefined {
+  if (!isRecord(params)) return undefined;
+  try {
+    const entries: { id: string; text: string }[] = [];
+    for (const entry of (Array.isArray(params["entries"]) ? params["entries"] : []).slice(0, MAX_SESSIONS)) {
+      const id = isRecord(entry) ? identifier(entry["id"]) : undefined;
+      const text = isRecord(entry) && typeof entry["text"] === "string"
+        ? entry["text"].slice(0, MAX_QUEUE_TEXT_LENGTH)
+        : undefined;
+      if (id !== undefined && text !== undefined) entries.push(Object.freeze({ id, text }));
+    }
+    const runningPromptId = identifier(params["runningPromptId"]);
+    const runningText = typeof params["runningText"] === "string"
+      ? params["runningText"].slice(0, MAX_QUEUE_TEXT_LENGTH)
+      : undefined;
+    return Object.freeze({
+      ...(runningPromptId === undefined ? {} : { runningPromptId }),
+      ...(runningText === undefined ? {} : { runningText }),
+      entries: Object.freeze(entries),
+    });
+  } catch {
+    return undefined;
+  }
+}
+
+/** The runtime's id of the prompt a `session/update` frame belongs to (`params._meta.promptId`). */
+export function promptIdOfSessionUpdate(params: unknown): string | undefined {
+  if (!isRecord(params) || !isRecord(params["_meta"])) return undefined;
+  return identifier(params["_meta"]["promptId"]);
+}
 
 /** Top-level notifications whose session id is not in `params.sessionId`. */
 const SESSION_LESS_NOTIFICATIONS: ReadonlySet<string> = new Set([

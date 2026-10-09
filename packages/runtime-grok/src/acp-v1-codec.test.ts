@@ -761,6 +761,33 @@ describe("ACP v1 session updates", () => {
     }
   });
 
+  it("flags a replayed user chunk the runtime persisted for a mid-turn Steer, and only that", () => {
+    const steer = decodeUpdate({
+      sessionUpdate: "user_message_chunk",
+      content: { type: "text", text: "<user_query>\ngo left\n</user_query>", _meta: { displayText: "go left" } },
+      _meta: { interjection: true, modelId: "grok-4.7" },
+    });
+    assert.equal(steer.type, "turn");
+    if (steer.type !== "turn") return;
+    assert.equal(steer.interjection, true);
+    assert.equal(steer.payload.type, "user_text_chunk");
+    for (const meta of [{}, { interjection: false }, { interjection: "true" }, undefined]) {
+      const plain = decodeUpdate({
+        sessionUpdate: "user_message_chunk",
+        content: { type: "text", text: "hello" },
+        ...(meta === undefined ? {} : { _meta: meta }),
+      });
+      assert.equal(plain.type === "turn" && plain.interjection, undefined);
+    }
+    // The flag belongs to user chunks: an agent chunk that carries it is just an agent chunk.
+    const agent = decodeUpdate({
+      sessionUpdate: "agent_message_chunk",
+      content: { type: "text", text: "a" },
+      _meta: { interjection: true },
+    });
+    assert.equal(agent.type === "turn" && agent.interjection, undefined);
+  });
+
   it("returns nonfatal redacted results for every legal non-text chunk kind and role", () => {
     const contentBlocks = [
       {

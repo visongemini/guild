@@ -1,7 +1,10 @@
 import type {
   ChooseAvatarResponse,
   ChoosePromptFilesResponse,
+  ConvertQueuedTurnToSteerResponse,
   DesktopBootstrapProjection,
+  ExecuteRewindRequest,
+  ExecuteRewindResponse,
   ExportTaskResponse,
   GuildGrokModel,
   GuildGrokPermissionMode,
@@ -9,6 +12,9 @@ import type {
   GuildGrokStartupSettings,
   GuildLocale,
   GuildNewTaskWorkspaceMode,
+  LoadRunFileDiffRequest,
+  LoadRunFileDiffResponse,
+  PreviewRewindResponse,
   RunId,
   RunGrokManagementRequest,
   RunGrokManagementResponse,
@@ -16,6 +22,7 @@ import type {
   PromptAttachment,
   SendMessageResponse,
   SearchConversationsResponse,
+  SteerMessageResponse,
   SetTaskRuntimeSettingsRequest,
   SetTaskRuntimeSettingsResponse,
   StreamDeltaEvent,
@@ -69,6 +76,16 @@ export interface DesktopApplicationService {
   preemptQueuedTurn(taskId: TaskId, queueId: string): Promise<void>;
   cancelQueuedTurn(taskId: TaskId, queueId: string): Promise<void>;
   cancelRun(taskId: TaskId, runId: RunId): Promise<void>;
+  /** F4: injects the text into the running turn; falls back to the durable queue with a reason. */
+  steerMessage(taskId: TaskId, text: string): Promise<SteerMessageResponse>;
+  /** F4: sends a queued turn into the running turn instead; it stays queued when Steer is impossible. */
+  convertQueuedTurnToSteer(taskId: TaskId, queueId: string): Promise<ConvertQueuedTurnToSteerResponse>;
+  /** F2: what going back to before this Run started would do, and what it cannot undo. */
+  previewRewind(taskId: TaskId, runId: RunId): Promise<PreviewRewindResponse>;
+  /** F2: rewinds the conversation and restores the files from Guild's checkpoint. */
+  executeRewind(request: ExecuteRewindRequest): Promise<ExecuteRewindResponse>;
+  /** F2: the bounded unified diff of one file the Run changed. */
+  loadRunFileDiff(request: LoadRunFileDiffRequest): Promise<LoadRunFileDiffResponse>;
   decidePermission(input: {
     readonly taskId: TaskId;
     readonly runId: RunId;

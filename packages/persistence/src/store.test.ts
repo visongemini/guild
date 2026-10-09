@@ -377,7 +377,7 @@ describe("main-only SQLite persistence", () => {
     store.close();
     const raw = new DatabaseSync(path);
     assert.equal(raw.prepare("PRAGMA journal_mode").get()?.["journal_mode"], "wal");
-    assert.equal(raw.prepare("PRAGMA user_version").get()?.["user_version"], 16);
+    assert.equal(raw.prepare("PRAGMA user_version").get()?.["user_version"], 17);
     const strictByTable = new Map(
       raw
         .prepare("PRAGMA table_list")
@@ -1091,7 +1091,7 @@ describe("main-only SQLite persistence", () => {
     const reopened = openGuildPersistence({ path });
     assert.equal(reopened.loadRun(taskId, runId).state, "completed");
     assert.equal(reopened.loadConversationEntry(taskId, "live-assistant-1").text, "Hello");
-    assert.equal(reopened.verifyIntegrity().schemaVersion, 16);
+    assert.equal(reopened.verifyIntegrity().schemaVersion, 17);
     reopened.close();
   });
 
@@ -1138,7 +1138,7 @@ describe("main-only SQLite persistence", () => {
     const next = store.commitLiveRuntimeEvent({ event: eventAt(257), mutation });
     assert.equal(next.ok, true);
     assert.equal(next.record?.text, "x".repeat(257));
-    assert.equal(store.verifyIntegrity().schemaVersion, 16);
+    assert.equal(store.verifyIntegrity().schemaVersion, 17);
     store.close();
   });
 
@@ -1150,6 +1150,8 @@ describe("main-only SQLite persistence", () => {
     const raw = new DatabaseSync(path);
     raw.exec(`
       PRAGMA foreign_keys = OFF;
+      DROP TABLE run_checkpoints;
+      DROP TABLE task_interjections;
       DROP TABLE runtime_model_catalog;
       DROP TABLE task_runtime_settings;
       DROP TABLE task_context_usage;
@@ -1177,7 +1179,7 @@ describe("main-only SQLite persistence", () => {
         PRIMARY KEY(task_id, idempotency_key),
         UNIQUE(task_id, adapter_epoch, receive_sequence)
       ) STRICT;
-      DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16);
+      DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17);
       CREATE TABLE guild_meta_v1 (
         singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
         schema_version INTEGER NOT NULL CHECK(schema_version = 1),
@@ -1193,7 +1195,7 @@ describe("main-only SQLite persistence", () => {
     raw.close();
 
     const migrated = openGuildPersistence({ path });
-    assert.equal(migrated.verifyIntegrity().schemaVersion, 16);
+    assert.equal(migrated.verifyIntegrity().schemaVersion, 17);
     assert.equal(migrated.loadRun(taskId, runId).state, "queued");
     assert.throws(
       () => migrated.loadTaskMetadata(taskId),
@@ -1338,7 +1340,7 @@ describe("main-only SQLite persistence", () => {
     });
     assert.equal(secondDispatch.run.runId, secondQueuedRunId);
     assert.equal(store.listQueuedTurns(taskId).length, 0);
-    assert.equal(store.verifyIntegrity().schemaVersion, 16);
+    assert.equal(store.verifyIntegrity().schemaVersion, 17);
     store.close();
   });
 
@@ -2836,7 +2838,7 @@ describe("main-only SQLite persistence", () => {
       assert.equal(merged.payload.text, texts.slice(1).join(""));
 
       const reopened = openGuildPersistence({ path });
-      assert.equal(reopened.verifyIntegrity().schemaVersion, 16);
+      assert.equal(reopened.verifyIntegrity().schemaVersion, 17);
       // Admission continues from the last covered sequence, so the stream resumes gaplessly.
       const next = reopened.commitLiveRuntimeEvent({
         event: textChunk(lastSequence + 1, "!"),
@@ -3160,10 +3162,12 @@ describe("main-only SQLite persistence", () => {
         BEGIN
           SELECT RAISE(ABORT, 'conversation_entry_not_append_only');
         END;
+        DROP TABLE run_checkpoints;
+        DROP TABLE task_interjections;
         DROP TABLE runtime_model_catalog;
         DROP TABLE task_runtime_settings;
         DROP TABLE task_context_usage;
-        DELETE FROM schema_migrations WHERE version IN (15, 16);
+        DELETE FROM schema_migrations WHERE version IN (15, 16, 17);
         CREATE TABLE guild_meta_v14 (
           singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
           schema_version INTEGER NOT NULL CHECK(schema_version = 14),
@@ -3186,12 +3190,12 @@ describe("main-only SQLite persistence", () => {
       downgrade.close();
 
       const migrated = openGuildPersistence({ path });
-      assert.equal(migrated.verifyIntegrity().schemaVersion, 16);
+      assert.equal(migrated.verifyIntegrity().schemaVersion, 17);
       migrated.close();
       assert.equal(snapshot(), before, "migration must not read-modify historical rows");
 
       const raw = new DatabaseSync(path);
-      assert.equal(raw.prepare("PRAGMA user_version").get()?.["user_version"], 16);
+      assert.equal(raw.prepare("PRAGMA user_version").get()?.["user_version"], 17);
       assert.match(
         String(raw.prepare("SELECT sql FROM sqlite_schema WHERE name = 'conversation_entry_is_append_only'").get()?.["sql"]),
         /octet_length/u,
@@ -3341,7 +3345,7 @@ describe("main-only SQLite persistence", () => {
 
       const reopened = openGuildPersistence({ path });
       assert.equal(reopened.loadLatestContextTokensUsed(taskId), 9_000);
-      assert.equal(reopened.verifyIntegrity().schemaVersion, 16);
+      assert.equal(reopened.verifyIntegrity().schemaVersion, 17);
       reopened.close();
     });
 
@@ -3400,9 +3404,11 @@ describe("main-only SQLite persistence", () => {
       withRaw(path, (raw) => {
         raw.exec(`
           PRAGMA foreign_keys = OFF;
+          DROP TABLE run_checkpoints;
+          DROP TABLE task_interjections;
           DROP TABLE runtime_model_catalog;
           DROP TABLE task_runtime_settings;
-          DELETE FROM schema_migrations WHERE version = 16;
+          DELETE FROM schema_migrations WHERE version IN (16, 17);
           CREATE TABLE app_settings_v15 (
             singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
             locale TEXT NOT NULL CHECK(locale IN ('zh-CN', 'en-US')),
@@ -3518,7 +3524,7 @@ describe("main-only SQLite persistence", () => {
       const older = seedV15(t, "grok-4.5", "medium");
 
       const migrated = openGuildPersistence({ path: owner });
-      assert.equal(migrated.verifyIntegrity().schemaVersion, 16);
+      assert.equal(migrated.verifyIntegrity().schemaVersion, 17);
       const settings = migrated.loadAppSettings();
       assert.equal(settings.grokModel, "grok-4.7");
       assert.equal(settings.reasoningEffort, "high");
@@ -3549,13 +3555,14 @@ describe("main-only SQLite persistence", () => {
       }
 
       withRaw(owner, (raw) => {
-        assert.equal(raw.prepare("PRAGMA user_version").get()?.["user_version"], 16);
+        assert.equal(raw.prepare("PRAGMA user_version").get()?.["user_version"], 17);
         assert.deepEqual(
           raw.prepare("SELECT version, name FROM schema_migrations WHERE version >= 15 ORDER BY version")
             .all().map((row) => ({ ...row })),
           [
             { version: 15, name: "streaming_write_path_and_context_usage" },
             { version: 16, name: "runtime_model_catalog_and_task_settings" },
+            { version: 17, name: "steer_interjections_and_run_checkpoints" },
           ],
         );
         assert.deepEqual(
@@ -3727,7 +3734,7 @@ describe("main-only SQLite persistence", () => {
       const reopened = openGuildPersistence({ path });
       assert.equal(reopened.loadAppSettings().grokModel, "grok-4.6");
       assert.equal(reopened.loadAppSettings().reasoningEffort, null);
-      assert.equal(reopened.verifyIntegrity().schemaVersion, 16);
+      assert.equal(reopened.verifyIntegrity().schemaVersion, 17);
       reopened.close();
     });
 
@@ -3829,7 +3836,7 @@ describe("main-only SQLite persistence", () => {
 
       store = openGuildPersistence({ path });
       assert.deepEqual(store.loadTaskRuntimeSettings(taskId), updated);
-      assert.equal(store.verifyIntegrity().schemaVersion, 16);
+      assert.equal(store.verifyIntegrity().schemaVersion, 17);
       assert.throws(
         () => store.clearTaskRuntimeSettings({ taskId, expectedRevision: 1 }),
         failure("persistence_cas_conflict"),
@@ -3889,7 +3896,7 @@ describe("main-only SQLite persistence", () => {
       });
       store = openGuildPersistence({ path });
       assert.deepEqual(store.loadModelCatalogCache()?.catalog, catalog);
-      assert.equal(store.verifyIntegrity().schemaVersion, 16);
+      assert.equal(store.verifyIntegrity().schemaVersion, 17);
 
       // An identical list (even built with another key order) is not rewritten; a changed list
       // or runtime version is.
@@ -3941,11 +3948,299 @@ describe("main-only SQLite persistence", () => {
         });
         const reopened = openGuildPersistence({ path });
         assert.equal(reopened.loadModelCatalogCache(), undefined, damaged);
-        assert.equal(reopened.verifyIntegrity().schemaVersion, 16);
+        assert.equal(reopened.verifyIntegrity().schemaVersion, 17);
         reopened.saveModelCatalogCache({ catalog });
         assert.deepEqual(reopened.loadModelCatalogCache()?.catalog, catalog);
         reopened.close();
       }
     });
+  });
+});
+
+describe("Steer interjections and run checkpoints (schema v17)", () => {
+  function withRaw<T>(path: string, operation: (raw: DatabaseSync) => T): T {
+    const raw = new DatabaseSync(path);
+    try {
+      return operation(raw);
+    } finally {
+      raw.close();
+    }
+  }
+
+  function failure(code: string): (error: unknown) => boolean {
+    return (error: unknown) => error instanceof PersistenceError && error.code === code;
+  }
+
+  it("tracks a Steer through sending, pending and delivered and creates its user entry once", (t) => {
+    const path = temporaryDatabase(t);
+    const store = liveReadyStore(path);
+    const begun = store.beginInterjection({ taskId, interjectionId: "interject-1", runId, text: "go left" });
+    assert.equal(begun.state, "sending");
+    assert.equal(begun.entryId, undefined);
+    assert.equal(store.listConversationEntries({ taskId }).some((entry) => entry.metadata["interjection"] === true), false,
+      "no entry exists until the runtime accepted the interjection");
+    // The intent is idempotent; the same id with other text is a different message.
+    assert.equal(store.beginInterjection({ taskId, interjectionId: "interject-1", runId, text: "go left" }).state, "sending");
+    assert.throws(
+      () => store.beginInterjection({ taskId, interjectionId: "interject-1", runId, text: "go right" }),
+      failure("aggregate_already_exists"),
+    );
+    assert.throws(
+      () => store.beginInterjection({ taskId, interjectionId: "bad id", runId, text: "x" }),
+      failure("domain_operation_rejected"),
+    );
+    assert.throws(
+      () => store.beginInterjection({ taskId, interjectionId: "interject-empty", runId, text: "   " }),
+      failure("domain_operation_rejected"),
+    );
+
+    const sent = store.commitInterjectionSent({
+      taskId, interjectionId: "interject-1", entryId: "user-interject-1", delivered: false,
+    });
+    assert.equal(sent.state, "pending");
+    assert.equal(sent.entryId, "user-interject-1");
+    const entry = store.loadConversationEntry(taskId, "user-interject-1");
+    assert.equal(entry.kind, "user");
+    assert.equal(entry.runId, runId);
+    assert.equal(entry.text, "go left");
+    assert.equal(entry.status, "complete");
+    assert.deepEqual({ ...entry.metadata }, { interjection: true, interjectionId: "interject-1" });
+    // A retried commit is a no-op.
+    assert.equal(store.commitInterjectionSent({
+      taskId, interjectionId: "interject-1", entryId: "user-interject-1", delivered: false,
+    }).state, "pending");
+
+    const delivered = store.markInterjectionDelivered({ taskId, interjectionId: "interject-1" });
+    assert.equal(delivered?.state, "delivered");
+    assert.equal(store.markInterjectionDelivered({ taskId, interjectionId: "interject-1" })?.state, "delivered");
+    assert.equal(store.markInterjectionDelivered({ taskId, interjectionId: "interject-unknown" }), undefined);
+    assert.deepEqual(store.listInterjections(taskId).map((row) => [row.interjectionId, row.state]), [
+      ["interject-1", "delivered"],
+    ]);
+    store.close();
+
+    const reopened = openGuildPersistence({ path });
+    assert.equal(reopened.loadInterjection(taskId, "interject-1")?.state, "delivered");
+    assert.equal(reopened.verifyIntegrity().schemaVersion, 17);
+    reopened.close();
+  });
+
+  it("accepts an echo that arrived before the commit and cancels the converted queued turn atomically", (t) => {
+    const path = temporaryDatabase(t);
+    const store = liveReadyStore(path);
+    store.enqueueQueuedTurn({
+      taskId,
+      queueId: "queue-steer",
+      intendedSessionId: sessionId,
+      reservedRunId: must(parseRunId("run-queued-steer")),
+      entryId: "user-queued-steer",
+      text: "steer me",
+    });
+    store.beginInterjection({ taskId, interjectionId: "interject-q", runId, text: "steer me" });
+    // A queue id that does not exist rolls the whole commit back: no entry, still sending.
+    assert.throws(
+      () => store.commitInterjectionSent({
+        taskId, interjectionId: "interject-q", entryId: "user-interject-q", delivered: true, removeQueueId: "queue-missing",
+      }),
+      failure("persistence_cas_conflict"),
+    );
+    assert.equal(store.loadInterjection(taskId, "interject-q")?.state, "sending");
+    assert.throws(() => store.loadConversationEntry(taskId, "user-interject-q"), failure("aggregate_not_found"));
+    assert.equal(store.listQueuedTurns(taskId).length, 1);
+
+    const sent = store.commitInterjectionSent({
+      taskId, interjectionId: "interject-q", entryId: "user-interject-q", delivered: true, removeQueueId: "queue-steer",
+    });
+    assert.equal(sent.state, "delivered");
+    assert.equal(store.listQueuedTurns(taskId).length, 0);
+    store.close();
+  });
+
+  it("records why a Steer fell back, keeps the explanatory notice, and recovers interrupted intents", (t) => {
+    const path = temporaryDatabase(t);
+    const store = liveReadyStore(path);
+    store.beginInterjection({ taskId, interjectionId: "interject-f", runId, text: "later please" });
+    const fallen = store.fallBackInterjection({
+      taskId, interjectionId: "interject-f", reason: "unsupported",
+      noticeEntryId: "notice-interject-f", noticeText: "Steer is not available.", queueId: "queue-f",
+    });
+    assert.equal(fallen.state, "fallen_back");
+    assert.equal(fallen.reason, "unsupported");
+    assert.equal(fallen.queueId, "queue-f");
+    const notice = store.loadConversationEntry(taskId, "notice-interject-f");
+    assert.equal(notice.kind, "notice");
+    assert.deepEqual({ ...notice.metadata }, {
+      interjection: true, interjectionId: "interject-f", interjectionFallback: true, reason: "unsupported",
+    });
+    // A fallen-back row cannot later be sent or failed.
+    assert.throws(
+      () => store.commitInterjectionSent({ taskId, interjectionId: "interject-f", entryId: "x-entry", delivered: false }),
+      failure("domain_operation_rejected"),
+    );
+    assert.throws(
+      () => store.failInterjection({ taskId, interjectionId: "interject-f", reason: "runtime_error" }),
+      failure("domain_operation_rejected"),
+    );
+
+    store.beginInterjection({ taskId, interjectionId: "interject-g", runId, text: "crash window" });
+    store.beginInterjection({ taskId, interjectionId: "interject-h", runId, text: "will fail" });
+    store.failInterjection({ taskId, interjectionId: "interject-h", reason: "runtime_error" });
+    store.close();
+
+    const reopened = openGuildPersistence({ path });
+    assert.equal(reopened.failInterruptedInterjections(taskId), 1);
+    assert.equal(reopened.loadInterjection(taskId, "interject-g")?.state, "failed");
+    assert.equal(reopened.loadInterjection(taskId, "interject-g")?.reason, "interrupted");
+    assert.equal(reopened.loadInterjection(taskId, "interject-h")?.reason, "runtime_error");
+    assert.equal(reopened.failInterruptedInterjections(taskId), 0);
+    reopened.close();
+  });
+
+  it("links a Steer that the runtime ran as its own turn to the Run created for it", (t) => {
+    const path = temporaryDatabase(t);
+    const store = liveReadyStore(path);
+    store.beginInterjection({ taskId, interjectionId: "interject-s", runId, text: "run me alone" });
+    store.commitInterjectionSent({ taskId, interjectionId: "interject-s", entryId: "user-interject-s", delivered: true });
+    const second = must(parseRunId("run-fallback-turn"));
+    store.applyRun({ taskId, runId, event: { type: "application_quit", idempotencyKey: key("quit-first") } });
+    store.createRun({ taskId, runId: second });
+    const linked = store.linkInterjectionStartedRun({ taskId, interjectionId: "interject-s", startedRunId: second });
+    assert.equal(linked.startedRunId, second);
+    assert.equal(store.linkInterjectionStartedRun({ taskId, interjectionId: "interject-s", startedRunId: second }).startedRunId, second);
+    assert.throws(
+      () => store.linkInterjectionStartedRun({ taskId, interjectionId: "interject-s", startedRunId: runId }),
+      failure("aggregate_already_exists"),
+    );
+    store.close();
+  });
+
+  it("stores per-Run checkpoints with stable ordinals, a capped file summary, and rollback markers", (t) => {
+    const path = temporaryDatabase(t);
+    const store = liveReadyStore(path);
+    const first = store.createRunCheckpoint({
+      taskId, runId, startRef: "refs/guild/checkpoints/task-1/1", status: "capturing",
+    });
+    assert.equal(first.ordinal, 1);
+    assert.equal(first.status, "capturing");
+    assert.equal(first.startRef, "refs/guild/checkpoints/task-1/1");
+    assert.equal(store.createRunCheckpoint({ taskId, runId, status: "unavailable", detail: "not_a_git_repo" }).status, "capturing",
+      "an existing row is returned unchanged");
+    assert.throws(
+      () => store.createRunCheckpoint({ taskId, runId: must(parseRunId("run-nope")), status: "unavailable" }),
+      failure("aggregate_not_found"),
+    );
+    assert.throws(
+      () => store.createRunCheckpoint({ taskId, runId, status: "capturing" }),
+      failure("domain_operation_rejected"),
+      "a capturing row needs its start ref",
+    );
+
+    const done = store.completeRunCheckpoint({
+      taskId, runId, endRef: "refs/guild/checkpoints/task-1/2", status: "captured",
+      files: [
+        { path: "src/a.ts", status: "M", adds: 3, dels: 1 },
+        { path: "new name.txt", oldPath: "old name.txt", status: "R", adds: 0, dels: 0 },
+        { path: "logo.png", status: "A", adds: null, dels: null },
+      ],
+      filesTotal: 3, adds: 3, dels: 1,
+    });
+    assert.equal(done.status, "captured");
+    assert.equal(done.endRef, "refs/guild/checkpoints/task-1/2");
+    assert.deepEqual(done.files.map((file) => [file.path, file.oldPath, file.status, file.adds]), [
+      ["src/a.ts", undefined, "M", 3],
+      ["new name.txt", "old name.txt", "R", 0],
+      ["logo.png", undefined, "A", null],
+    ]);
+    // A second completion does not rewrite a finished row.
+    assert.equal(store.completeRunCheckpoint({
+      taskId, runId, status: "unavailable", detail: "timeout", files: [], filesTotal: 0, adds: 0, dels: 0,
+    }).status, "captured");
+    assert.throws(
+      () => store.completeRunCheckpoint({
+        taskId, runId, status: "captured", files: [], filesTotal: 0, adds: 0, dels: 0,
+      }),
+      failure("domain_operation_rejected"),
+      "a captured row needs its end ref",
+    );
+
+    // A Run without a row gets one when it is rolled back; ordinals follow insertion order.
+    store.applyRun({ taskId, runId, event: { type: "application_quit", idempotencyKey: key("quit-ckpt") } });
+    const later = must(parseRunId("run-later"));
+    store.createRun({ taskId, runId: later });
+    const marked = store.markRunsRolledBack({ taskId, runIds: [runId, later] });
+    assert.deepEqual(marked.map((row) => [row.runId, row.ordinal, row.status]), [
+      [runId, 1, "rolled_back"],
+      [later, 2, "rolled_back"],
+    ]);
+    assert.equal(marked[1]?.detail, "capture_skipped");
+    assert.equal(typeof marked[0]?.rolledBackAtMs, "number");
+    assert.equal(marked[0]?.files.length, 3, "the summary is kept for audit");
+    assert.equal(store.markRunsRolledBack({ taskId, runIds: [runId] })[0]?.status, "rolled_back");
+    assert.deepEqual(store.listRunCheckpoints(taskId, [later]).map((row) => row.runId), [later]);
+    assert.deepEqual(store.listTaskRuns(taskId).map((run) => run.runId), [runId, later]);
+    store.close();
+
+    const reopened = openGuildPersistence({ path });
+    assert.equal(reopened.loadRunCheckpoint(taskId, runId)?.status, "rolled_back");
+    reopened.close();
+  });
+
+  it("rejects an oversized file summary and an inconsistent rolled-back row", (t) => {
+    const path = temporaryDatabase(t);
+    const store = liveReadyStore(path);
+    store.createRunCheckpoint({ taskId, runId, startRef: "refs/guild/checkpoints/task-1/1", status: "capturing" });
+    const huge = Array.from({ length: 80 }, (_, index) => ({
+      path: `${String(index).padStart(3, "0")}/${"x".repeat(4_000)}`, status: "M" as const, adds: 1, dels: 1,
+    }));
+    assert.throws(
+      () => store.completeRunCheckpoint({
+        taskId, runId, endRef: "refs/guild/checkpoints/task-1/2", status: "captured",
+        files: huge, filesTotal: 80, adds: 80, dels: 80,
+      }),
+      failure("domain_operation_rejected"),
+    );
+    assert.equal(store.loadRunCheckpoint(taskId, runId)?.status, "capturing");
+    store.close();
+    withRaw(path, (raw) => {
+      assert.throws(() => raw.exec(
+        `UPDATE run_checkpoints SET status = 'rolled_back' WHERE task_id = 'task-1'`,
+      ), /CHECK constraint failed/u);
+      assert.throws(() => raw.exec(
+        `UPDATE run_checkpoints SET rolled_back_at_ms = 5 WHERE task_id = 'task-1'`,
+      ), /CHECK constraint failed/u);
+    });
+  });
+
+  it("migrates a v16 database forward without touching existing rows", (t) => {
+    const path = temporaryDatabase(t);
+    const legacy = liveReadyStore(path);
+    legacy.createConversationEntry({ taskId, entryId: "history-1", kind: "user", runId, text: "old", status: "complete" });
+    legacy.close();
+    withRaw(path, (raw) => {
+      raw.exec(`
+        PRAGMA foreign_keys = OFF;
+        DROP TABLE run_checkpoints;
+        DROP TABLE task_interjections;
+        DELETE FROM schema_migrations WHERE version = 17;
+        CREATE TABLE guild_meta_v16 (
+          singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+          schema_version INTEGER NOT NULL CHECK(schema_version = 16),
+          clean_shutdown INTEGER NOT NULL CHECK(clean_shutdown IN (0, 1)),
+          last_integrity_at_ms INTEGER CHECK(last_integrity_at_ms IS NULL OR last_integrity_at_ms >= 0)
+        ) STRICT;
+        INSERT INTO guild_meta_v16(singleton, schema_version, clean_shutdown, last_integrity_at_ms)
+        SELECT singleton, 16, clean_shutdown, last_integrity_at_ms FROM guild_meta;
+        DROP TABLE guild_meta;
+        ALTER TABLE guild_meta_v16 RENAME TO guild_meta;
+        PRAGMA user_version = 16;
+      `);
+    });
+    const migrated = openGuildPersistence({ path });
+    assert.equal(migrated.verifyIntegrity().schemaVersion, 17);
+    assert.equal(migrated.loadConversationEntry(taskId, "history-1").text, "old");
+    assert.deepEqual(migrated.listInterjections(taskId), []);
+    assert.deepEqual(migrated.listRunCheckpoints(taskId), []);
+    migrated.beginInterjection({ taskId, interjectionId: "interject-after", runId, text: "works after migration" });
+    migrated.close();
   });
 });

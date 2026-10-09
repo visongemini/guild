@@ -89,6 +89,16 @@ export function registerDesktopIpc(
     await service.cancelRun(request.taskId, request.runId);
     return Object.freeze({});
   });
+  handle(DESKTOP_IPC_CHANNELS.steerMessage, async (request) =>
+    service.steerMessage(request.taskId, request.text));
+  handle(DESKTOP_IPC_CHANNELS.convertQueuedTurnToSteer, async (request) =>
+    service.convertQueuedTurnToSteer(request.taskId, request.queueId));
+  handle(DESKTOP_IPC_CHANNELS.previewRewind, async (request) =>
+    service.previewRewind(request.taskId, request.runId));
+  handle(DESKTOP_IPC_CHANNELS.executeRewind, async (request) =>
+    service.executeRewind(request));
+  handle(DESKTOP_IPC_CHANNELS.loadRunFileDiff, async (request) =>
+    service.loadRunFileDiff(request));
   handle(DESKTOP_IPC_CHANNELS.decidePermission, async (request) => {
     await service.decidePermission(request);
     return Object.freeze({});

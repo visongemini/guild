@@ -22,6 +22,24 @@ import {
   type GuildModelSelectionSource,
 } from "./grok-models.js";
 import type { RunPhaseProjection } from "./run-phase.js";
+import {
+  GUILD_REWIND_SCOPES,
+  GUILD_STEER_MAX_LENGTH,
+  type ConvertQueuedTurnToSteerRequest,
+  type ConvertQueuedTurnToSteerResponse,
+  type ExecuteRewindRequest,
+  type ExecuteRewindResponse,
+  type LoadRunFileDiffRequest,
+  type LoadRunFileDiffResponse,
+  type PreviewRewindRequest,
+  type PreviewRewindResponse,
+  type RewindAvailabilityProjection,
+  type RunCheckpointProjection,
+  type SteerAvailabilityProjection,
+  type SteerMessageRequest,
+  type SteerMessageResponse,
+  type TimelineInterjectionProjection,
+} from "./steer-checkpoints.js";
 import type {
   AcpPermissionOptionKind,
   AcpToolKind,
@@ -93,6 +111,11 @@ export const DESKTOP_IPC_CHANNELS = Object.freeze({
   preemptQueuedTurn: "guild:v1:queue:preempt",
   cancelQueuedTurn: "guild:v1:queue:cancel",
   cancelRun: "guild:v1:run:cancel",
+  steerMessage: "guild:v1:run:steer",
+  convertQueuedTurnToSteer: "guild:v1:queue:steer",
+  previewRewind: "guild:v1:run:rewind:preview",
+  executeRewind: "guild:v1:run:rewind:execute",
+  loadRunFileDiff: "guild:v1:run:file-diff:load",
   decidePermission: "guild:v1:permission:decide",
   setDraft: "guild:v1:draft:set",
   authorizeSessionReplacement: "guild:v1:session:authorize-replacement",
@@ -195,6 +218,10 @@ type TimelineBase = {
   readonly createdAtMs: number;
   readonly updatedAtMs: number;
   readonly status: TimelineItemStatus;
+  /** Steer state; only on a steered `user` entry and on the `notice` entry of a fallback. */
+  readonly interjection?: TimelineInterjectionProjection;
+  /** True when a rewind undid this entry's Run; the entry is kept for audit and should be dimmed. */
+  readonly rolledBack?: true;
 };
 
 export type TimelineItemProjection = TimelineBase &
@@ -270,6 +297,12 @@ export type TaskViewProjection = {
   readonly modelSelection: TaskModelSelectionProjection;
   /** Ephemeral phase of the running turn; absent when no turn is running. */
   readonly runPhase?: RunPhaseProjection;
+  /** Whether the composer may Steer the running turn (F4). */
+  readonly steer?: SteerAvailabilityProjection;
+  /** Checkpoint and changed-file summary of the Runs in the loaded timeline window (F2). */
+  readonly runCheckpoints?: readonly RunCheckpointProjection[];
+  /** Whether a rewind could be offered right now (F2). */
+  readonly rewind?: RewindAvailabilityProjection;
   readonly auxiliaryActivity?: Readonly<{
     activity: GuildTaskActivity;
     startedAtMs: number;
@@ -489,6 +522,13 @@ export type CancelQueuedTurnRequest = { readonly taskId: TaskId; readonly queueI
 export type PrioritizeQueuedTurnRequest = CancelQueuedTurnRequest;
 export type PreemptQueuedTurnRequest = CancelQueuedTurnRequest;
 export type CancelRunRequest = { readonly taskId: TaskId; readonly runId: RunId };
+export type {
+  ConvertQueuedTurnToSteerRequest,
+  ExecuteRewindRequest,
+  LoadRunFileDiffRequest,
+  PreviewRewindRequest,
+  SteerMessageRequest,
+};
 export type DecidePermissionRequest = {
   readonly taskId: TaskId;
   readonly runId: RunId;
@@ -669,6 +709,11 @@ export type DesktopRequestByChannel = {
   readonly [DESKTOP_IPC_CHANNELS.preemptQueuedTurn]: PreemptQueuedTurnRequest;
   readonly [DESKTOP_IPC_CHANNELS.cancelQueuedTurn]: CancelQueuedTurnRequest;
   readonly [DESKTOP_IPC_CHANNELS.cancelRun]: CancelRunRequest;
+  readonly [DESKTOP_IPC_CHANNELS.steerMessage]: SteerMessageRequest;
+  readonly [DESKTOP_IPC_CHANNELS.convertQueuedTurnToSteer]: ConvertQueuedTurnToSteerRequest;
+  readonly [DESKTOP_IPC_CHANNELS.previewRewind]: PreviewRewindRequest;
+  readonly [DESKTOP_IPC_CHANNELS.executeRewind]: ExecuteRewindRequest;
+  readonly [DESKTOP_IPC_CHANNELS.loadRunFileDiff]: LoadRunFileDiffRequest;
   readonly [DESKTOP_IPC_CHANNELS.decidePermission]: DecidePermissionRequest;
   readonly [DESKTOP_IPC_CHANNELS.setDraft]: SetDraftRequest;
   readonly [DESKTOP_IPC_CHANNELS.authorizeSessionReplacement]: AuthorizeSessionReplacementRequest;
@@ -709,6 +754,11 @@ export type DesktopResponseByChannel = {
   readonly [DESKTOP_IPC_CHANNELS.preemptQueuedTurn]: EmptyDesktopResponse;
   readonly [DESKTOP_IPC_CHANNELS.cancelQueuedTurn]: EmptyDesktopResponse;
   readonly [DESKTOP_IPC_CHANNELS.cancelRun]: EmptyDesktopResponse;
+  readonly [DESKTOP_IPC_CHANNELS.steerMessage]: SteerMessageResponse;
+  readonly [DESKTOP_IPC_CHANNELS.convertQueuedTurnToSteer]: ConvertQueuedTurnToSteerResponse;
+  readonly [DESKTOP_IPC_CHANNELS.previewRewind]: PreviewRewindResponse;
+  readonly [DESKTOP_IPC_CHANNELS.executeRewind]: ExecuteRewindResponse;
+  readonly [DESKTOP_IPC_CHANNELS.loadRunFileDiff]: LoadRunFileDiffResponse;
   readonly [DESKTOP_IPC_CHANNELS.decidePermission]: EmptyDesktopResponse;
   readonly [DESKTOP_IPC_CHANNELS.setDraft]: EmptyDesktopResponse;
   readonly [DESKTOP_IPC_CHANNELS.authorizeSessionReplacement]: TaskViewProjection;
@@ -776,6 +826,15 @@ export type GuildRendererApi = Readonly<{
     request: CancelQueuedTurnRequest,
   ) => Promise<EmptyDesktopResponse>;
   readonly cancelRun: (request: CancelRunRequest) => Promise<EmptyDesktopResponse>;
+  readonly steerMessage: (request: SteerMessageRequest) => Promise<SteerMessageResponse>;
+  readonly convertQueuedTurnToSteer: (
+    request: ConvertQueuedTurnToSteerRequest,
+  ) => Promise<ConvertQueuedTurnToSteerResponse>;
+  readonly previewRewind: (request: PreviewRewindRequest) => Promise<PreviewRewindResponse>;
+  readonly executeRewind: (request: ExecuteRewindRequest) => Promise<ExecuteRewindResponse>;
+  readonly loadRunFileDiff: (
+    request: LoadRunFileDiffRequest,
+  ) => Promise<LoadRunFileDiffResponse>;
   readonly decidePermission: (
     request: DecidePermissionRequest,
   ) => Promise<EmptyDesktopResponse>;
@@ -1181,6 +1240,66 @@ export function parseDesktopRequest<Channel extends DesktopInvokeChannel>(
       const runId = parseRunId(record["runId"]);
       if (!taskId.ok || !runId.ok) throw new TypeError("invalid_cancel");
       return Object.freeze({ taskId: boundedId(taskId.value), runId: boundedId(runId.value) }) as DesktopRequestByChannel[Channel];
+    }
+    case DESKTOP_IPC_CHANNELS.steerMessage: {
+      const record = exactRecord(input, ["taskId", "text"]);
+      const parsed = parseTaskId(record["taskId"]);
+      const text = record["text"];
+      if (
+        !parsed.ok ||
+        typeof text !== "string" ||
+        text.trim().length === 0 ||
+        text.length > GUILD_STEER_MAX_LENGTH ||
+        text.includes("\0")
+      ) {
+        throw new TypeError("invalid_steer_message");
+      }
+      return Object.freeze({ taskId: boundedId(parsed.value), text }) as DesktopRequestByChannel[Channel];
+    }
+    case DESKTOP_IPC_CHANNELS.convertQueuedTurnToSteer: {
+      const record = exactRecord(input, ["taskId", "queueId"]);
+      const taskId = parseTaskId(record["taskId"]);
+      const queueId = boundedText(record["queueId"], MAX_ID_LENGTH);
+      if (!taskId.ok) throw new TypeError("invalid_queue_action");
+      return Object.freeze({ taskId: boundedId(taskId.value), queueId }) as DesktopRequestByChannel[Channel];
+    }
+    case DESKTOP_IPC_CHANNELS.previewRewind: {
+      const record = exactRecord(input, ["taskId", "runId"]);
+      const taskId = parseTaskId(record["taskId"]);
+      const runId = parseRunId(record["runId"]);
+      if (!taskId.ok || !runId.ok) throw new TypeError("invalid_rewind");
+      return Object.freeze({ taskId: boundedId(taskId.value), runId: boundedId(runId.value) }) as DesktopRequestByChannel[Channel];
+    }
+    case DESKTOP_IPC_CHANNELS.executeRewind: {
+      const record = exactRecord(input, ["taskId", "runId"], ["scope", "overwriteConflicts"]);
+      const taskId = parseTaskId(record["taskId"]);
+      const runId = parseRunId(record["runId"]);
+      const scope = record["scope"];
+      const overwrite = record["overwriteConflicts"];
+      if (
+        !taskId.ok ||
+        !runId.ok ||
+        (scope !== undefined && (typeof scope !== "string" || !(GUILD_REWIND_SCOPES as readonly string[]).includes(scope))) ||
+        (overwrite !== undefined && typeof overwrite !== "boolean")
+      ) {
+        throw new TypeError("invalid_rewind");
+      }
+      return Object.freeze({
+        taskId: boundedId(taskId.value),
+        runId: boundedId(runId.value),
+        ...(scope === undefined ? {} : { scope: scope as ExecuteRewindRequest["scope"] }),
+        ...(overwrite === undefined ? {} : { overwriteConflicts: overwrite }),
+      }) as DesktopRequestByChannel[Channel];
+    }
+    case DESKTOP_IPC_CHANNELS.loadRunFileDiff: {
+      const record = exactRecord(input, ["taskId", "runId", "path"]);
+      const taskId = parseTaskId(record["taskId"]);
+      const runId = parseRunId(record["runId"]);
+      const path = boundedText(record["path"], 4_096);
+      if (!taskId.ok || !runId.ok || path.startsWith("/") || path.startsWith("\\") || /(^|[\\/])\.\.([\\/]|$)/u.test(path)) {
+        throw new TypeError("invalid_run_file_diff");
+      }
+      return Object.freeze({ taskId: boundedId(taskId.value), runId: boundedId(runId.value), path }) as DesktopRequestByChannel[Channel];
     }
     case DESKTOP_IPC_CHANNELS.decidePermission: {
       const record = exactRecord(input, ["taskId", "runId", "permissionId", "decision"]);
