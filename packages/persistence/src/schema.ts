@@ -1,7 +1,7 @@
 import type { DatabaseSync } from "node:sqlite";
 import { persistenceError } from "./errors.js";
 
-export const SCHEMA_VERSION = 17;
+export const SCHEMA_VERSION = 18;
 
 const MIGRATION_V1 = String.raw`
 CREATE TABLE schema_migrations (
@@ -1181,6 +1181,51 @@ INSERT INTO schema_migrations(version, name, applied_at_ms)
 VALUES(17, 'steer_interjections_and_run_checkpoints', CAST(unixepoch('subsec') * 1000 AS INTEGER));
 `;
 
+// V18 (F3 per-task git worktree). Purely additive: one new table, no historical row is read or
+// rewritten. task_worktrees holds, per task that was created with an isolated worktree, where the
+// worktree lives, which branch Guild created for it and what it was cut from:
+//  - source_repo_path is the repository's top level (a realpath) and worktree_path the worktree
+//    root under Guild's own data directory; the task's session folder is worktree_path plus the
+//    workspace's sub-folder inside the repository (usually none);
+//  - branch is always `guild/...` (the only kind of branch Guild ever deletes), base_commit the
+//    source HEAD at creation and base_branch its branch name when HEAD was not detached;
+//  - status: active -> applied (merged back; worktree and branch kept) -> active again when new
+//    work appears, discarded (worktree and branch removed by the user), missing (the directory or
+//    the repository vanished). A discarded row is kept so the task stays readable.
+const MIGRATION_V18 = String.raw`
+CREATE TABLE guild_meta_next (
+  singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+  schema_version INTEGER NOT NULL CHECK(schema_version = 18),
+  clean_shutdown INTEGER NOT NULL CHECK(clean_shutdown IN (0, 1)),
+  last_integrity_at_ms INTEGER CHECK(last_integrity_at_ms IS NULL OR last_integrity_at_ms >= 0)
+) STRICT;
+
+INSERT INTO guild_meta_next(singleton, schema_version, clean_shutdown, last_integrity_at_ms)
+SELECT singleton, 18, clean_shutdown, last_integrity_at_ms FROM guild_meta;
+
+DROP TABLE guild_meta;
+ALTER TABLE guild_meta_next RENAME TO guild_meta;
+
+CREATE TABLE task_worktrees (
+  task_id TEXT PRIMARY KEY REFERENCES tasks(task_id) ON DELETE RESTRICT,
+  source_workspace_id TEXT NOT NULL REFERENCES workspaces(workspace_id) ON DELETE RESTRICT,
+  source_repo_path TEXT NOT NULL CHECK(length(source_repo_path) BETWEEN 1 AND 4096),
+  worktree_path TEXT NOT NULL CHECK(length(worktree_path) BETWEEN 1 AND 4096),
+  branch TEXT NOT NULL CHECK(length(branch) BETWEEN 7 AND 200 AND substr(branch, 1, 6) = 'guild/'),
+  base_commit TEXT NOT NULL CHECK(length(base_commit) IN (40, 64)),
+  base_branch TEXT CHECK(base_branch IS NULL OR length(base_branch) BETWEEN 1 AND 255),
+  status TEXT NOT NULL CHECK(status IN ('active', 'applied', 'discarded', 'missing')),
+  created_at_ms INTEGER NOT NULL CHECK(created_at_ms >= 0),
+  updated_at_ms INTEGER NOT NULL CHECK(updated_at_ms >= created_at_ms)
+) STRICT;
+
+CREATE UNIQUE INDEX task_worktrees_by_path ON task_worktrees(worktree_path);
+CREATE UNIQUE INDEX task_worktrees_by_branch ON task_worktrees(source_repo_path, branch);
+
+INSERT INTO schema_migrations(version, name, applied_at_ms)
+VALUES(18, 'task_worktrees', CAST(unixepoch('subsec') * 1000 AS INTEGER));
+`;
+
 // Only a database created from scratch (user_version 0) runs this, inside the same transaction
 // as MIGRATION_V16, so a new install follows the runtime default instead of the rewritten pair.
 const MIGRATION_V16_FRESH_INSTALL = String.raw`
@@ -1411,6 +1456,18 @@ export function migrateSchema(database: DatabaseSync): void {
       throw persistenceError("schema_integrity_failed", cause);
     }
   }
+  if (version === 17) {
+    database.exec("BEGIN IMMEDIATE");
+    try {
+      database.exec(MIGRATION_V18);
+      database.exec("PRAGMA user_version = 18");
+      database.exec("COMMIT");
+      version = 18;
+    } catch (cause: unknown) {
+      if (database.isTransaction) database.exec("ROLLBACK");
+      throw persistenceError("schema_integrity_failed", cause);
+    }
+  }
   if (version !== SCHEMA_VERSION) {
     throw persistenceError("schema_integrity_failed");
   }
@@ -1421,7 +1478,7 @@ export function migrateSchema(database: DatabaseSync): void {
     .prepare("SELECT schema_version FROM guild_meta WHERE singleton = 1")
     .get();
   if (
-    migrations.length !== 17 ||
+    migrations.length !== 18 ||
     exactInteger(migrations[0], "version") !== 1 ||
     migrations[0]?.["name"] !== "initial_authoritative_aggregates" ||
     exactInteger(migrations[1], "version") !== 2 ||
@@ -1456,6 +1513,8 @@ export function migrateSchema(database: DatabaseSync): void {
     migrations[15]?.["name"] !== "runtime_model_catalog_and_task_settings" ||
     exactInteger(migrations[16], "version") !== 17 ||
     migrations[16]?.["name"] !== "steer_interjections_and_run_checkpoints" ||
+    exactInteger(migrations[17], "version") !== 18 ||
+    migrations[17]?.["name"] !== "task_worktrees" ||
     exactInteger(meta, "schema_version") !== SCHEMA_VERSION
   ) {
     throw persistenceError("schema_integrity_failed");

@@ -22,7 +22,13 @@ import {
   type TaskViewProjection,
   type WorkspaceId,
 } from "@guild/contracts";
+import type { TaskWorktreeRecord } from "@guild/persistence";
+import { mkdtempSync, statSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { basename, isAbsolute, join } from "node:path";
 import type { DesktopApplicationService } from "./application-service.js";
+import { gitWorktrees } from "./git-worktrees.js";
+import { createTaskWorktreeManager, type TaskWorktreeManager } from "./task-worktrees.js";
 
 const NOW = new Date("2026-08-27T08:30:00+08:00").getTime();
 const SEND_DELAY_MS = boundedFixtureDelay(process.env["GUILD_FIXTURE_SEND_DELAY_MS"]);
@@ -51,6 +57,14 @@ const MODEL_REFUSAL: GuildModelSwitchRefusalReason | undefined = GUILD_MODEL_SWI
 );
 // GUILD_FIXTURE_MODEL_DELAY_MS slows a model change down so the picker's pending state is visible.
 const MODEL_DELAY_MS = boundedFixtureDelay(process.env["GUILD_FIXTURE_MODEL_DELAY_MS"]);
+
+// GUILD_FIXTURE_WORKTREE_REPO=<absolute path of a git repository> adds that repository as a second
+// workspace whose tasks can be created with an isolated worktree (F3). Creating, merging back and
+// discarding then run real git against the repository, with the worktrees under
+// GUILD_FIXTURE_WORKTREE_DATA (a fresh temporary directory by default). A message "edits" a file in
+// the worktree so the chip shows uncommitted changes. Everything else stays canned.
+const WORKTREE_REPO = validatedFixtureRepository(process.env["GUILD_FIXTURE_WORKTREE_REPO"]);
+const WORKTREE_REPO_WORKSPACE = "workspace-repo" as WorkspaceId;
 
 /** The list the official runtime advertised on 2026-10-09 (names, labels and descriptions are its own). */
 const FIXTURE_EFFORTS = (withExtraHigh: boolean) => [
@@ -111,7 +125,21 @@ export function createFixtureDesktopService(): DesktopApplicationService {
     QUEUE_PREEMPT_STATE,
     fixtureRunPhase(RUN_PHASE),
   ));
+  const worktrees: TaskWorktreeManager | undefined = WORKTREE_REPO === undefined ? undefined : createFixtureWorktrees(() => publish());
+  let agentEdits = 0;
   let projection = buildProjection();
+
+  /** The active task as the renderer sees it: with the F3 worktree status of a task that has one. */
+  function currentTask(): TaskViewProjection {
+    const worktree = worktrees?.projectionOf(activeTask.task.taskId);
+    if (worktree === undefined) return activeTask;
+    return Object.freeze({
+      ...activeTask,
+      worktree,
+      task: Object.freeze({ ...activeTask.task, worktreeStatus: worktree.status }),
+      canSend: activeTask.canSend && worktree.status !== "discarded",
+    });
+  }
 
   /** What the task will use for its next turn: its own override, then the global default, then the runtime's. */
   function withModelSelection(task: Omit<TaskViewProjection, "modelSelection">): TaskViewProjection {
@@ -141,7 +169,9 @@ export function createFixtureDesktopService(): DesktopApplicationService {
   }
 
   function buildProjection(): DesktopBootstrapProjection {
-    const task = activeTask.task;
+    const view = currentTask();
+    const task = view.task;
+    const inRepo = WORKTREE_REPO !== undefined && task.workspaceId === WORKTREE_REPO_WORKSPACE;
     return Object.freeze({
       apiVersion: GUILD_API_VERSION,
       appVersion: "2.0.28-dev",
@@ -172,7 +202,7 @@ export function createFixtureDesktopService(): DesktopApplicationService {
           name: "Cowork",
           archived: false,
           tasks: Object.freeze([
-            task,
+            ...(inRepo ? [] : [task]),
             Object.freeze({
               taskId: "task-bananafit" as TaskId,
               workspaceId: "workspace-cowork" as WorkspaceId,
@@ -229,8 +259,15 @@ export function createFixtureDesktopService(): DesktopApplicationService {
             ] : []),
           ]),
         }),
+        ...(WORKTREE_REPO === undefined ? [] : [Object.freeze({
+          workspaceId: WORKTREE_REPO_WORKSPACE,
+          name: basename(WORKTREE_REPO),
+          archived: false,
+          worktreeAvailable: true as const,
+          tasks: Object.freeze(inRepo ? [task] : []),
+        })]),
       ]),
-      activeTask,
+      activeTask: view,
       usage,
     });
   }
@@ -244,10 +281,28 @@ export function createFixtureDesktopService(): DesktopApplicationService {
     bootstrap: async () => projection,
     chooseWorkspace: async () => projection,
     choosePromptFiles: async () => Object.freeze({ status: "cancelled" as const }),
-    createTask: async (workspaceId) => {
+    createTask: async (workspaceId, isolation) => {
+      if (isolation === "worktree" && (worktrees === undefined || workspaceId !== WORKTREE_REPO_WORKSPACE)) {
+        throw new Error("worktree_not_a_git_repo");
+      }
+      // An untouched task takes its fresh worktree with it, like the live service.
+      if (worktrees !== undefined && activeTask.timeline.length === 0) {
+        await worktrees.discardIfUntouched(activeTask.task.taskId);
+      }
+      const taskId = `task-${Date.now()}` as TaskId;
+      if (isolation === "worktree" && worktrees !== undefined && WORKTREE_REPO !== undefined) {
+        await worktrees.create({
+          taskId,
+          workspaceId,
+          workspacePath: WORKTREE_REPO,
+          title: locale === "zh-CN" ? "新任务" : "New task",
+          createTaskRow: () => undefined,
+        });
+        await worktrees.refresh(taskId, { force: true });
+      }
       activeTask = withModelSelection({
         task: Object.freeze({
-          taskId: `task-${Date.now()}` as TaskId,
+          taskId,
           workspaceId,
           title: locale === "zh-CN" ? "新任务" : "New task",
           pinned: false,
@@ -267,10 +322,13 @@ export function createFixtureDesktopService(): DesktopApplicationService {
         workbench: Object.freeze({ files: Object.freeze([]), diffs: Object.freeze([]), terminalObserved: false }),
       });
       publish();
-      return activeTask;
+      return currentTask();
     },
     openTask: async (taskId) => {
-      if (taskId === activeTask.task.taskId) return activeTask;
+      if (taskId === activeTask.task.taskId) {
+        worktrees?.noteViewed(taskId);
+        return currentTask();
+      }
       throw new Error("fixture_task_not_found");
     },
     loadEarlierTimeline: async (taskId) => {
@@ -285,6 +343,24 @@ export function createFixtureDesktopService(): DesktopApplicationService {
     exportTask: async () => Object.freeze({ status: "cancelled" as const }),
     searchConversations: async () => Object.freeze({ results: Object.freeze([]) }),
     openTaskResource: async () => undefined,
+    previewWorktreeApply: async (taskId) => worktrees === undefined
+      ? Object.freeze({ status: "refused" as const, reason: "no_worktree" as const })
+      : worktrees.preview(taskId as TaskId),
+    applyWorktree: async (taskId) => {
+      if (worktrees === undefined) return Object.freeze({ status: "refused" as const, reason: "no_worktree" as const });
+      const outcome = await worktrees.apply(taskId as TaskId, activeTask.task.title);
+      if (outcome.status !== "applied") return outcome;
+      publish();
+      return Object.freeze({ ...outcome, task: currentTask() });
+    },
+    discardWorktree: async (taskId) => {
+      if (worktrees === undefined) return Object.freeze({ status: "refused" as const, reason: "no_worktree" as const });
+      const outcome = await worktrees.discard(taskId as TaskId);
+      if (outcome.status !== "discarded") return outcome;
+      publish();
+      return Object.freeze({ status: "discarded" as const, task: currentTask() });
+    },
+    openWorktreeResource: async () => undefined,
     setSessionConfigOption: async () => activeTask,
     setTaskRuntimeSettings: async (request: SetTaskRuntimeSettingsRequest): Promise<SetTaskRuntimeSettingsResponse> => {
       if (request.taskId !== activeTask.task.taskId) throw new Error("fixture_task_not_found");
@@ -345,6 +421,15 @@ export function createFixtureDesktopService(): DesktopApplicationService {
           } as const),
         ]),
       });
+      // A task in a worktree "edits" a file there, so the chip shows uncommitted changes.
+      if (worktrees !== undefined && WORKTREE_REPO !== undefined && worktrees.rowOf(taskId) !== undefined) {
+        agentEdits += 1;
+        writeFileSync(
+          join(worktrees.rootPathOf(taskId, WORKTREE_REPO), `fixture-agent-note-${agentEdits}.md`),
+          `Edit ${agentEdits}: ${text}\n`,
+        );
+        await worktrees.refresh(taskId, { force: true });
+      }
       publish();
       return Object.freeze({ status: "started", runId });
     },
@@ -737,4 +822,52 @@ function fixtureTask(
       ] : []),
     ]),
   });
+}
+
+/** An in-memory `task_worktrees` and the real git layer, for the F3 UI fixture. */
+function createFixtureWorktrees(onChange: () => void): TaskWorktreeManager {
+  const rows = new Map<string, TaskWorktreeRecord>();
+  const dataRoot = process.env["GUILD_FIXTURE_WORKTREE_DATA"] ?? mkdtempSync(join(tmpdir(), "guild-fixture-worktrees-"));
+  return createTaskWorktreeManager({
+    store: {
+      createTaskWorktree: (input) => {
+        const at = Date.now();
+        const row: TaskWorktreeRecord = Object.freeze({
+          taskId: input.taskId,
+          sourceWorkspaceId: input.sourceWorkspaceId,
+          sourceRepoPath: input.sourceRepoPath,
+          worktreePath: input.worktreePath,
+          branch: input.branch,
+          baseCommit: input.baseCommit,
+          ...(input.baseBranch === undefined ? {} : { baseBranch: input.baseBranch }),
+          status: "active" as const,
+          createdAtMs: at,
+          updatedAtMs: at,
+        });
+        rows.set(input.taskId, row);
+        return row;
+      },
+      listTaskWorktrees: () => [...rows.values()],
+      setTaskWorktreeStatus: ({ taskId, status }) => {
+        const existing = rows.get(taskId);
+        if (existing === undefined) throw new Error("fixture_worktree_not_found");
+        const updated: TaskWorktreeRecord = Object.freeze({ ...existing, status, updatedAtMs: Date.now() });
+        rows.set(taskId, updated);
+        return updated;
+      },
+    },
+    git: gitWorktrees,
+    dataRoot,
+    runBlock: () => undefined,
+    onChange,
+  });
+}
+
+function validatedFixtureRepository(value: string | undefined): string | undefined {
+  if (value === undefined || !isAbsolute(value)) return undefined;
+  try {
+    return statSync(join(value, ".git")) !== undefined ? value : undefined;
+  } catch {
+    return undefined;
+  }
 }

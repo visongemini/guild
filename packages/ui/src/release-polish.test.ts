@@ -23,7 +23,11 @@ test("new task creation preserves workspace selection behavior", async () => {
 
   assert.match(createTask, /const selected = await chooseWorkspace\(\)/);
   assert.match(createTask, /selected\?\.generalSettings\.lastWorkspaceId/);
-  assert.match(createTask, /api\.createTask/);
+  // Since F3 the call goes through the worktree hook, which still ends in `api.createTask`.
+  assert.match(createTask, /worktreeUi\.createTask\(target, isolated\)/);
+  const worktree = await readFile(new URL("../src/Worktree.tsx", import.meta.url), "utf8");
+  assert.match(worktree, /api\.createTask\(\{ \.\.\.request, isolation: "worktree" \}\)/);
+  assert.match(worktree, /return api\.createTask\(request\)/);
 });
 
 test("modal dialogs support escape, initial focus, and tab containment", async () => {

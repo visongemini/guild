@@ -23,8 +23,12 @@ export async function assertWorkspaceFolderExists(canonicalPath: string): Promis
   }
 }
 
+/** F3: `worktree_<reason>` from a refused isolated-worktree creation; the reason is a fixed code, never a path. */
+const WORKTREE_REFUSAL_MESSAGE = /^worktree_[a-z_]{1,48}$/u;
+
 export function toDesktopIpcFailure(cause: unknown): Error {
   const message = cause instanceof Error ? cause.message : "";
+  if (WORKTREE_REFUSAL_MESSAGE.test(message)) return new Error(message);
   if (
     message === WORKSPACE_FOLDER_MISSING ||
     message === SESSION_RECOVERY_CONTEXT_REQUIRED ||

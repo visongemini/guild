@@ -3,6 +3,7 @@ export * from "./grok-models.js";
 export * from "./run-phase.js";
 export * from "./xai-signals.js";
 export * from "./steer-checkpoints.js";
+export * from "./worktrees.js";
 export * from "./desktop-ipc.js";
 export * from "./run-events.js";
 export * from "./runtime-envelope.js";

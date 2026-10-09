@@ -169,7 +169,8 @@ export interface GitCheckpointPort {
 // git process runner
 // ---------------------------------------------------------------------------------------------
 
-type GitOutcome = Readonly<{
+/** Shared with git-worktrees.ts: one bounded, hook-free way to run git. */
+export type GitOutcome = Readonly<{
   code: number | null;
   stdout: Buffer;
   stderr: string;
@@ -179,7 +180,7 @@ type GitOutcome = Readonly<{
   missing: boolean;
 }>;
 
-type GitRun = Readonly<{
+export type GitRun = Readonly<{
   cwd: string;
   env?: Readonly<Record<string, string>>;
   timeoutMs: number;
@@ -226,7 +227,7 @@ export function setGitExecutableForTests(path: string | undefined): void {
   gitExecutable = path ?? "git";
 }
 
-function runGit(args: readonly string[], run: GitRun, stdin?: Buffer | string): Promise<GitOutcome> {
+export function runGit(args: readonly string[], run: GitRun, stdin?: Buffer | string): Promise<GitOutcome> {
   return new Promise<GitOutcome>((resolveOutcome) => {
     let settled = false;
     const chunks: Buffer[] = [];
@@ -250,6 +251,14 @@ function runGit(args: readonly string[], run: GitRun, stdin?: Buffer | string): 
     const timer = setTimeout(() => {
       timedOut = true;
       child?.kill("SIGKILL");
+      // A grandchild that inherited the pipes can keep them open after git itself is gone, which
+      // would hold "close" back for as long as it lives. The deadline is a promise to the caller.
+      const grace = setTimeout(() => {
+        child?.stdout?.destroy();
+        child?.stderr?.destroy();
+        finish({ code: null, missing: false });
+      }, 400);
+      grace.unref?.();
     }, Math.max(1, run.timeoutMs));
     timer.unref?.();
     try {
@@ -297,7 +306,7 @@ function failureOf(outcome: GitOutcome): CheckpointFailureReason {
 }
 
 /** A deadline shared by the git processes of one operation. */
-function deadlineIn(timeoutMs: number): () => number {
+export function deadlineIn(timeoutMs: number): () => number {
   const end = Date.now() + timeoutMs;
   return () => end - Date.now();
 }
@@ -305,6 +314,9 @@ function deadlineIn(timeoutMs: number): () => number {
 function text(outcome: GitOutcome): string {
   return outcome.stdout.toString("utf8");
 }
+
+/** The captured stdout of a git run as text. */
+export const gitOutputText: (outcome: GitOutcome) => string = text;
 
 // ---------------------------------------------------------------------------------------------
 // Repository detection and refs

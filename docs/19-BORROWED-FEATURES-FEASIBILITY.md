@@ -133,3 +133,15 @@ throwaway git repository, Guild's own service path with a temporary data directo
 - Interjection with no running turn: the runtime ran `interject-fallback-<uuid>` as its own turn;
   frames, queue broadcast, completion and the `session/load` replay of that turn were recorded and are
   the fixture of an adapter test.
+
+## F3 implementation status (2026-10-10, branch feature-f3-worktrees)
+
+Implemented end to end as D-056: schema v18 `task_worktrees`, `apps/desktop/src/main/git-worktrees.ts`
+(git layer), `task-worktrees.ts` (orchestration), live-service integration, IPC (`createTask isolation`,
+`previewWorktreeApply`, `applyWorktree`, `discardWorktree`, `openWorktreeResource`), UI (new-task option,
+topbar chip and menu, sidebar glyph, merge and discard dialogs). The design above held, with these
+differences: the branch is cut from the source HEAD commit and its branch name is recorded (`base_branch`);
+Apply is refused (not forced) when the checkout has staged changes, because git refuses any
+non-fast-forward merge then; a merged worktree stays (`applied`) until the owner discards it.
+Live check on grok 1.0.50: one tiny turn in a worktree task reported the worktree as its working directory.
+

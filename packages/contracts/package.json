@@ -24,6 +24,10 @@
     "./run-phase": {
       "types": "./dist/run-phase.d.ts",
       "import": "./dist/run-phase.js"
+    },
+    "./worktrees": {
+      "types": "./dist/worktrees.d.ts",
+      "import": "./dist/worktrees.js"
     }
   }
 }

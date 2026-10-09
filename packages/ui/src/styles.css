@@ -1067,6 +1067,76 @@ span.guild-pill { cursor: default; }
 [data-density="compact"] .guild-timeline { gap: var(--guild-s2); }
 [data-density="compact"] .guild-timeline-group:has(> .guild-message-user) { margin-top: var(--guild-s2); }
 
+/* ------------------------------------------------------------------ worktree (F3) */
+.guild-worktree-glyph { display: block; color: var(--guild-faint); }
+.guild-worktree-glyph.discarded { opacity: .55; }
+.guild-worktree-glyph.missing { color: var(--guild-wait-text); }
+.guild-worktree-chip { min-width: 0; max-width: min(340px, 44vw); flex: 0 1 auto; height: 22px; padding: 0 var(--guild-s2); display: inline-flex; align-items: center; gap: 5px; border: 1px solid var(--guild-line-strong); border-radius: 6px; background: transparent; color: var(--guild-muted); font-size: var(--guild-fs-meta); font-weight: 500; cursor: pointer; -webkit-app-region: no-drag; transition: background-color var(--guild-dur-1) var(--guild-ease), color var(--guild-dur-1) var(--guild-ease); }
+.guild-worktree-chip svg { flex: none; }
+.guild-worktree-chip:hover:not(:disabled), .guild-worktree-chip.open { background: var(--guild-hover); color: var(--guild-text); }
+.guild-worktree-chip:disabled { cursor: default; opacity: .7; }
+.guild-worktree-chip.missing { border-color: var(--guild-wait); color: var(--guild-wait-text); }
+.guild-worktree-branch { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.guild-worktree-stat-group { flex: none; display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
+.guild-worktree-sep { color: var(--guild-faint); }
+.guild-worktree-stat.ahead { color: var(--guild-accent-text); }
+.guild-worktree-stat.dirty, .guild-worktree-stat.missing { color: var(--guild-wait-text); }
+.guild-worktree-stat.applied { color: var(--guild-ok-text); }
+.guild-worktree-menu { width: 288px; }
+.guild-worktree-menu button:disabled { opacity: .45; cursor: default; }
+.guild-worktree-menu button:disabled:hover { background: transparent; }
+.guild-worktree-menu-branch { margin: 0; padding: var(--guild-s1) var(--guild-s2) var(--guild-s2); display: flex; align-items: center; gap: 6px; color: var(--guild-faint); font-size: var(--guild-fs-meta); }
+.guild-worktree-menu-branch svg { flex: none; }
+.guild-worktree-menu-branch span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.guild-worktree-note { margin: var(--guild-s1) var(--guild-s2); color: var(--guild-muted); font-size: var(--guild-fs-meta); line-height: 1.5; }
+.guild-worktree-option { width: min(660px, 100%); margin-top: var(--guild-s3); padding: var(--guild-s3) var(--guild-s4); display: grid; gap: var(--guild-s1); border: 1px solid var(--guild-line); border-radius: var(--guild-r-md); background: var(--guild-surface); text-align: left; }
+.guild-worktree-option label { display: flex; align-items: center; gap: var(--guild-s2); color: var(--guild-text); font-size: var(--guild-fs-ui); font-weight: 560; cursor: pointer; }
+.guild-worktree-option label svg { flex: none; color: var(--guild-accent); }
+.guild-worktree-option input { width: 15px; height: 15px; margin: 0; accent-color: var(--guild-accent); }
+.guild-worktree-option small { margin-left: 23px; color: var(--guild-muted); font-size: var(--guild-fs-sm); line-height: 1.5; }
+.guild-worktree-option .guild-worktree-notice { color: var(--guild-wait-text); }
+.guild-worktree-banner { margin: 0 0 var(--guild-s2); padding: var(--guild-s2) var(--guild-s3); display: flex; align-items: center; gap: var(--guild-s2); border: 1px solid var(--guild-line); border-radius: var(--guild-r-md); background: var(--guild-soft); color: var(--guild-muted); font-size: var(--guild-fs-sm); line-height: 1.4; }
+.guild-worktree-banner svg { flex: none; }
+.guild-worktree-banner.missing { border-color: color-mix(in srgb, var(--guild-wait) 40%, var(--guild-line)); background: color-mix(in srgb, var(--guild-wait) 7%, var(--guild-surface)); }
+.guild-worktree-dialog { width: min(520px, calc(100vw - 16px)); }
+.guild-worktree-dialog .guild-dialog-header { justify-content: flex-start; }
+.guild-wt-branch-label { min-width: 0; margin-left: auto; display: inline-flex; align-items: center; gap: 4px; overflow: hidden; color: var(--guild-faint); font-family: var(--guild-font-mono); font-size: var(--guild-fs-meta); text-overflow: ellipsis; white-space: nowrap; }
+.guild-wt-branch-label svg { flex: none; }
+.guild-worktree-dialog .guild-dialog-body { display: grid; gap: var(--guild-s2); align-content: start; }
+.guild-worktree-dialog p, .guild-worktree-discard p { margin: 0; }
+.guild-wt-working, .guild-wt-done, .guild-wt-problem { display: flex; align-items: center; gap: var(--guild-s2); font-size: var(--guild-fs-ui); font-weight: 560; }
+.guild-wt-working { color: var(--guild-muted); }
+.guild-wt-done { color: var(--guild-ok-text); }
+.guild-wt-problem { color: var(--guild-error-text); }
+.guild-wt-summary { color: var(--guild-text); font-size: var(--guild-fs-ui); }
+.guild-wt-more { color: var(--guild-muted); font-size: var(--guild-fs-sm); line-height: 1.5; }
+.guild-wt-facts { margin: 0; padding: 0; display: grid; gap: var(--guild-s1); list-style: none; color: var(--guild-muted); font-size: var(--guild-fs-sm); line-height: 1.5; }
+.guild-wt-facts li { position: relative; padding-left: var(--guild-s3); }
+.guild-wt-facts li::before { content: ""; position: absolute; left: 2px; top: .62em; width: 4px; height: 4px; border-radius: 50%; background: var(--guild-faint); }
+.guild-wt-facts.destructive li::before { background: var(--guild-error); }
+.guild-wt-facts em { margin-left: var(--guild-s1); color: var(--guild-error-text); font-style: normal; }
+.guild-wt-files { max-height: 220px; margin: 0; padding: 0; overflow: auto; display: grid; list-style: none; border: 1px solid var(--guild-line); border-radius: var(--guild-r-sm); background: var(--guild-soft); }
+.guild-wt-files li { min-width: 0; padding: 5px var(--guild-s2); display: grid; grid-template-columns: 16px minmax(0, 1fr) auto; align-items: center; gap: var(--guild-s2); font-size: var(--guild-fs-sm); }
+.guild-wt-files li + li { border-top: 1px solid var(--guild-line); }
+.guild-wt-status { color: var(--guild-accent-text); font-family: var(--guild-font-mono); font-size: var(--guild-fs-meta); font-weight: 650; text-align: center; }
+.guild-wt-status.A { color: var(--guild-ok-text); }
+.guild-wt-status.D { color: var(--guild-error-text); }
+.guild-wt-path { min-width: 0; overflow: hidden; color: var(--guild-text); font-family: var(--guild-font-mono); font-size: var(--guild-fs-meta); text-overflow: ellipsis; white-space: nowrap; }
+.guild-wt-counts { display: inline-flex; gap: var(--guild-s2); font-family: var(--guild-font-mono); font-size: var(--guild-fs-meta); }
+.guild-wt-counts .add { color: var(--guild-ok-text); }
+.guild-wt-counts .del { color: var(--guild-error-text); }
+.guild-wt-paths { max-height: 160px; margin: 0; padding: var(--guild-s2) var(--guild-s3); overflow: auto; display: grid; gap: 2px; list-style: none; border: 1px solid var(--guild-line); border-radius: var(--guild-r-sm); background: var(--guild-soft); color: var(--guild-text); font-family: var(--guild-font-mono); font-size: var(--guild-fs-meta); }
+.guild-wt-paths li { min-width: 0; overflow-wrap: anywhere; }
+.guild-wt-paths li.more { color: var(--guild-muted); font-family: var(--guild-font-ui); }
+.guild-wt-blocks { display: grid; gap: var(--guild-s3); }
+.guild-wt-block { display: grid; gap: var(--guild-s2); }
+.guild-wt-block > p { color: var(--guild-text); font-size: var(--guild-fs-ui); line-height: 1.5; }
+.guild-worktree-discard { width: min(420px, calc(100vw - 48px)); }
+.guild-worktree-discard > strong { font-size: var(--guild-fs-title); font-weight: 620; }
+.guild-confirm-actions button.danger { display: inline-flex; align-items: center; gap: 6px; border-color: var(--guild-error); background: var(--guild-error); color: var(--guild-on-accent); font-weight: 560; }
+.guild-confirm-actions button.danger:hover:not(:disabled) { background: var(--guild-error-text); }
+.guild-confirm-actions button:disabled { opacity: .55; cursor: default; }
+
 /* ------------------------------------------------------------------ responsive */
 @media (max-width: 1000px) {
   .guild-shell.workbench-open { grid-template-columns: minmax(0, var(--effective-sidebar-width)) minmax(0,1fr); }
@@ -1088,6 +1158,7 @@ span.guild-pill { cursor: default; }
   .guild-queued-turns { max-height: 72px; }
 }
 @media (max-width: 760px) {
+  .guild-worktree-chip { max-width: 38vw; }
   .guild-topbar { padding-left: var(--guild-s4); padding-right: var(--guild-s3); }
   .guild-conversation { padding: var(--guild-s5) var(--guild-s4); }
   .guild-activity-stats { display: none; }

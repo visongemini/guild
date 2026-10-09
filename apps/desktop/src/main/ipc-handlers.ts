@@ -44,7 +44,7 @@ export function registerDesktopIpc(
   handle(DESKTOP_IPC_CHANNELS.choosePromptFiles, async (request) =>
     service.choosePromptFiles(request.taskId));
   handle(DESKTOP_IPC_CHANNELS.createTask, async (request) =>
-    service.createTask(request.workspaceId));
+    service.createTask(request.workspaceId, request.isolation));
   handle(DESKTOP_IPC_CHANNELS.openTask, async (request) =>
     service.openTask(request.taskId, request.sequence));
   handle(DESKTOP_IPC_CHANNELS.loadEarlierTimeline, async (request) =>
@@ -99,6 +99,16 @@ export function registerDesktopIpc(
     service.executeRewind(request));
   handle(DESKTOP_IPC_CHANNELS.loadRunFileDiff, async (request) =>
     service.loadRunFileDiff(request));
+  handle(DESKTOP_IPC_CHANNELS.previewWorktreeApply, async (request) =>
+    service.previewWorktreeApply(request.taskId));
+  handle(DESKTOP_IPC_CHANNELS.applyWorktree, async (request) =>
+    service.applyWorktree(request.taskId));
+  handle(DESKTOP_IPC_CHANNELS.discardWorktree, async (request) =>
+    service.discardWorktree(request.taskId));
+  handle(DESKTOP_IPC_CHANNELS.openWorktreeResource, async (request) => {
+    await service.openWorktreeResource(request.taskId, request.action);
+    return Object.freeze({});
+  });
   handle(DESKTOP_IPC_CHANNELS.decidePermission, async (request) => {
     await service.decidePermission(request);
     return Object.freeze({});
