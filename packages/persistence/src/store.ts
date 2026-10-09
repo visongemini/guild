@@ -929,6 +929,8 @@ export interface GuildPersistence {
   }): readonly RunCheckpointRecord[];
   /** Every Run of the task in creation order. */
   listTaskRuns(taskId: TaskId): readonly RunRecord[];
+  /** Startup recovery: rows left `capturing` by a crash become `unavailable` (`capture_skipped`). */
+  failCapturingRunCheckpoints(taskId: TaskId): number;
   /** Cheap: the Runs a rewind undid, without decoding any file summary. */
   listRolledBackRunIds(taskId: TaskId): readonly RunId[];
   /** Cheap: the next checkpoint ordinal and the number of rows, without decoding any file summary. */
@@ -4482,6 +4484,20 @@ class SqliteGuildPersistence implements GuildPersistence {
         marked.push(this.#requiredRunCheckpoint(taskId, runId));
       }
       return Object.freeze(marked);
+    });
+  }
+
+  failCapturingRunCheckpoints(taskIdInput: TaskId): number {
+    const taskId = parsedTaskId(taskIdInput);
+    return this.#immediate(() => {
+      const updated = this.#database
+        .prepare(`
+          UPDATE run_checkpoints
+          SET status = 'unavailable', detail = 'capture_skipped', updated_at_ms = MAX(updated_at_ms, ?)
+          WHERE task_id = ? AND status = 'capturing'
+        `)
+        .run(exactNow(), taskId);
+      return changes(updated.changes);
     });
   }
 

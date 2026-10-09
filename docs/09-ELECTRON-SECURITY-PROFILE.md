@@ -186,6 +186,18 @@ task/run/session tuple required by the architecture, and both main and renderer 
 late or mismatched event. Rate, count, and byte limits apply before allocation of large
 payloads; large media is never copied through IPC.
 
+
+### Steer, rewind and checkpoint operations (Guild 2.2)
+
+`guild:v1:run:steer`, `guild:v1:queue:steer`, `guild:v1:run:rewind:preview`,
+`guild:v1:run:rewind:execute` and `guild:v1:run:file-diff:load` are registered like every other
+operation: closed request shapes (`parseDesktopRequest`), ids and text bounded, a diff path must be
+relative with no `..`, and no request names a git revision, a ref or a filesystem path outside the task
+folder. The renderer never sees a ref name it could pass back. Main runs `git` only with fixed argument
+vectors and checkpoint refs it created itself (`refs/guild/checkpoints/<task>/<n>`), with hooks,
+fsmonitor and credential prompts disabled and a deadline on every process; it deletes only files that a
+Run's checkpoints say a Run added, after checking they resolve inside the task folder.
+
 ## Minimal preload surface
 
 Preload exposes one frozen, versioned `window.guild` object through `contextBridge`. Each

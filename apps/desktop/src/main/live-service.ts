@@ -1467,6 +1467,15 @@ export function createLiveDesktopService(
       assertOpen();
       const evaluation = await evaluateRewind(taskId, runId, live);
       if (!evaluation.ok) return Object.freeze({ status: "refused" as const, reason: evaluation.reason });
+      if (!evaluation.conversation.available && evaluation.files.kind !== "git") {
+        // Neither half can be undone, so there is nothing to offer.
+        return Object.freeze({
+          status: "refused" as const,
+          reason: evaluation.conversation.reason === "unsupported"
+            ? "conversation_rewind_unsupported" as const
+            : "runtime_unavailable" as const,
+        });
+      }
       return rewindPlanProjection(runId, evaluation, store.loadAppSettings().locale);
     });
   }
@@ -1522,15 +1531,24 @@ export function createLiveDesktopService(
       let removed: readonly string[] = [];
       let failed: readonly Readonly<{ path: string; reason: string }>[] = [];
       if (gitFiles !== undefined) {
-        const result = await checkpoints.restore({
-          cwd: evaluation.cwd,
-          sourceRef: gitFiles.startRef,
-          restore: gitFiles.restore,
-          remove: gitFiles.remove,
-        });
-        restored = result.restored;
-        removed = result.removed;
-        failed = result.failed;
+        try {
+          const result = await checkpoints.restore({
+            cwd: evaluation.cwd,
+            sourceRef: gitFiles.startRef,
+            restore: gitFiles.restore,
+            remove: gitFiles.remove,
+          });
+          restored = result.restored;
+          removed = result.removed;
+          failed = result.failed;
+        } catch {
+          // The conversation is already rewound; report every file as not restored and carry on.
+          restored = [];
+          removed = [];
+          failed = [...gitFiles.restore, ...gitFiles.remove]
+            .slice(0, REWIND_FILE_LIST_LIMIT)
+            .map((path) => ({ path, reason: "restore_failed" }));
+        }
       }
       // 3. Guild's own record: the Runs stay for audit and are marked, the prompt returns to the draft.
       let draftRestored = false;
@@ -3899,6 +3917,8 @@ export function createLiveDesktopService(
         includeArchived: true,
       })) {
         reconcilePreviousRuntime(task.taskId);
+        // No capture survives a restart, so a checkpoint still being taken will never finish.
+        store.failCapturingRunCheckpoints(task.taskId);
       }
     }
   }

@@ -4185,6 +4185,28 @@ describe("Steer interjections and run checkpoints (schema v17)", () => {
     reopened.close();
   });
 
+  it("repairs checkpoints a crash left capturing without touching finished or rolled-back rows", (t) => {
+    const path = temporaryDatabase(t);
+    const store = liveReadyStore(path);
+    store.createRunCheckpoint({ taskId, runId, startRef: "refs/guild/checkpoints/task-1/1", status: "capturing" });
+    store.applyRun({ taskId, runId, event: { type: "application_quit", idempotencyKey: key("quit-repair") } });
+    const second = must(parseRunId("run-second"));
+    store.createRun({ taskId, runId: second });
+    store.createRunCheckpoint({ taskId, runId: second, status: "unavailable", detail: "not_a_git_repo" });
+    assert.equal(store.nextRunCheckpointOrdinal(taskId), 3);
+    assert.equal(store.countRunCheckpoints(taskId), 2);
+    assert.equal(store.failCapturingRunCheckpoints(taskId), 1);
+    assert.equal(store.failCapturingRunCheckpoints(taskId), 0);
+    assert.equal(store.loadRunCheckpoint(taskId, runId)?.status, "unavailable");
+    assert.equal(store.loadRunCheckpoint(taskId, runId)?.detail, "capture_skipped");
+    assert.equal(store.loadRunCheckpoint(taskId, second)?.detail, "not_a_git_repo");
+    assert.deepEqual(store.listRolledBackRunIds(taskId), []);
+    store.markRunsRolledBack({ taskId, runIds: [second] });
+    assert.deepEqual(store.listRolledBackRunIds(taskId), [second]);
+    assert.equal(store.failCapturingRunCheckpoints(taskId), 0);
+    store.close();
+  });
+
   it("rejects an oversized file summary and an inconsistent rolled-back row", (t) => {
     const path = temporaryDatabase(t);
     const store = liveReadyStore(path);

@@ -2246,6 +2246,72 @@ describe("ACP v1 adapter turns the runtime starts itself", () => {
     await adapter.close();
   });
 
+  it("follows the frames grok 1.0.50 really sends for an interject-fallback turn (recorded 2026-10-09)", async () => {
+    const process = new FakeProcess();
+    const sink = new AgentTurnSink();
+    const adapter = await startAdapter(process, sink);
+    const sessionId = "01a1216a-35c3-78c3-a737-e437b08a295a";
+    const promptId = "interject-fallback-01a1216a-45fe-7810-8cb5-563be6c27b47";
+    await newSession(adapter, process, sessionId);
+    const meta = (chunkId: number) => ({
+      totalTokens: 2049, eventId: `${sessionId}-${chunkId}`, agentTimestampMs: 1791547976988 + chunkId, promptId,
+      streamStartMs: 1791547974598, turnStartMs: 1791547972940, updateType: "AgentMessageChunk", chunkId,
+    });
+    const chunk = (kind: string, text: string, chunkId: number): WireMessage => ({
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: { sessionId, update: { sessionUpdate: kind, content: { type: "text", text } }, _meta: meta(chunkId) },
+    });
+    notify(process, "_x.ai/session/interjection", {
+      sessionId, text: "Reply with exactly the single word: FALLBACK", interjectionId: "probe-idle-1",
+    });
+    notify(process, "_x.ai/queue/changed", {
+      sessionId, entries: [], runningPromptId: promptId,
+      runningText: "Reply with exactly the single word: FALLBACK", runningKind: "prompt",
+    });
+    notify(process, "_x.ai/session_notification", {
+      sessionId, update: { sessionUpdate: "hook_run_started", event_name: "user_prompt_submit", prompt_id: promptId, count: 1 },
+    });
+    process.emitMessages({
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: {
+        sessionId,
+        update: { sessionUpdate: "available_commands_update", availableCommands: [{ name: "compact", description: "Compress", input: null }] },
+        _meta: { promptId },
+      },
+    });
+    process.emitMessages(
+      chunk("agent_thought_chunk", "The user wants a reply", 1),
+      chunk("agent_thought_chunk", " containing exactly the single word FALLBACK.", 2),
+      chunk("agent_message_chunk", "FALL", 3),
+      chunk("agent_message_chunk", "BACK", 4),
+    );
+    await waitFor(() => sink.updates.length === 5);
+    notify(process, "_x.ai/session_notification", {
+      sessionId, update: { sessionUpdate: "response_completed", usage: { input_tokens: 5 } },
+    });
+    notify(process, "_x.ai/session_notification", {
+      sessionId,
+      update: { sessionUpdate: "turn_completed", prompt_id: promptId, stop_reason: "end_turn", elapsed_ms: 3966 },
+    });
+    await waitFor(() => sink.terminals.length === 1);
+    notify(process, "_x.ai/session_notification", {
+      sessionId, update: { sessionUpdate: "last_turn_summary", summary: "PRIVATE" },
+    });
+    await immediate();
+    assert.equal(sink.agentTurns.length, 1);
+    assert.equal(sink.agentTurns[0]?.agentPromptId, promptId);
+    assert.equal(sink.agentTurns[0]?.promptText, "Reply with exactly the single word: FALLBACK");
+    assert.deepEqual(
+      sink.updates.map((update) => update.update.type === "turn" ? update.update.payload.type : update.update.type),
+      ["session_context", "agent_thought_chunk", "agent_thought_chunk", "agent_text_chunk", "agent_text_chunk"],
+    );
+    assert.equal(sink.terminals[0]?.terminal.classification, "completed");
+    assert.equal(adapter.state, "ready");
+    await adapter.close();
+  });
+
   it("maps an unexpected stop reason to a refusal and ignores an end signal for another turn", async () => {
     const process = new FakeProcess();
     const sink = new AgentTurnSink();

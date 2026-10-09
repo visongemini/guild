@@ -638,3 +638,78 @@ selectable. The installed runtime also advertises models the owner added to the 
 - Extension requests use `AcpV1Adapter.sendExtensionRequest`: names must match
   `^_x.ai/[a-z]...`, -32601 means "unsupported" and is remembered per process, any other error is
   `AcpV1ExtensionRequestError`. Steer (`_x.ai/interject`) and rewind (`_x.ai/rewind/*`) build on it.
+
+## D-055 — Steer injects into the running turn through the official process; checkpoints and rewind are Guild's own git state plus the official conversation rewind
+
+Date: 2026-10-10. Implements F4 and F2 of `docs/19-BORROWED-FEATURES-FEASIBILITY.md` (backend and IPC
+only; schema v17). Verified against the real `grok` 1.0.50 through Guild's own service path in a
+throwaway git repository (four tiny model turns in total, see the end of this entry).
+
+Steer (`steerMessage`, `convertQueuedTurnToSteer`)
+- The text is trimmed (the runtime trims queued text), the intent is stored first (`task_interjections`,
+  state `sending`), then `_x.ai/interject {sessionId, text, interjectionId}` goes to the official
+  process. Only when the runtime answers `queued` does Guild create the `user` entry (metadata
+  `interjection`, `interjectionId`) and move the row to `pending`. The runtime's
+  `_x.ai/session/interjection` echo moves it to `delivered`; only the client-made id is read from the
+  echo (the allowlist keeps no text). An echo that beats the response is remembered, an acknowledged
+  request whose echo never comes counts as delivered when the Run ends. A normal send during a Run
+  still queues in Guild's durable queue.
+- Fallback: `-32601` (remembered per process, so the extension is not asked again), a turn that is not
+  running or steerable, or a rejected request all become an ordinary send (queue while a Run is
+  active, new Run otherwise) with the reason returned to the caller and, when a turn was involved,
+  recorded as a `fallen_back` row plus a localized `notice` entry. No user entry is created for a
+  Steer the runtime did not take, so the message is never shown twice.
+- The runtime runs a Steer that missed its turn as its own prompt (`interject-fallback-*`) with no
+  JSON-RPC response. The adapter treats a turn frame with no Guild prompt in flight as an
+  agent-started turn: it waits for the previous prompt's terminal commit, attaches the turn through
+  the new optional sink hook `commitAgentTurnStarted` (the Run, the user message taken from
+  `_x.ai/queue/changed` `runningText`, and the outbound-prompt replay proof), streams its frames with
+  the allocated prompt sequence and ends it from `turn_completed` (a fallback turn emits no
+  `prompt_complete`). When Guild cannot give it a Run (one of Guild's own is in flight) the sink
+  declines, the frames are dropped, its permission requests are cancelled and the transport stays
+  healthy. A sink without the hook keeps the old protocol fault. If the turn's text equals a Steer
+  Guild sent, the turn's own user entry is a hidden replay anchor and the Steer is shown once.
+- Replay: the runtime persists a mid-turn Steer as a `user_message_chunk` with `_meta.interjection:
+  true`. The codec flags it and the reconciler skips it (it never opens a turn); local Steer entries
+  are not turns either. Rolled-back Runs are left out of the local history because the runtime drops
+  a rewound branch from its replay.
+
+Checkpoints and changed files
+- `apps/desktop/src/main/git-checkpoints.ts`: a capture builds a tree in a private `GIT_INDEX_FILE`
+  (a copy of the real index dated to the epoch so a same-size edit inside one second is still
+  re-read), `commit-tree` with a fixed author, `update-ref refs/guild/checkpoints/<task>/<n>`
+  (`2k-1` at Run `k` start, `2k` at its end). The user's index, HEAD, branches, stash and reflogs are
+  never written; hooks, fsmonitor, gc and signing are off; every process has a deadline; untracked file
+  count and size are guarded; a non-git folder, missing git, timeout or guard is `unavailable` with a
+  reason and never an error.
+- The start capture runs after the Run exists and before `session/prompt`; the prompt waits for it
+  up to 3.5 s, after which the late capture is discarded and the Run's checkpoint is `unavailable`
+  (`timeout`). Captures of one task run strictly in order (end of Run k, start of Run k+1). The end
+  capture starts after the Run is terminal and stores `git diff --numstat -z -M` plus name-status
+  (200 files kept, totals kept for all) in `run_checkpoints`. A turn the runtime started itself is
+  captured when Guild first sees it, so edits made before its first frame can be absorbed into its
+  start state.
+
+Rewind (`previewRewind`, `executeRewind`)
+- Only while the task is idle. The official prompt index of a Run is the number of earlier
+  non-rolled-back accepted Runs of the same session; Guild requires `_x.ai/rewind/points` to list
+  exactly that many prompts, to be numbered `0..n-1`, and the target's preview to match the Run's
+  first line, then runs the official dry run (`conversation_only`, or `all` outside git). Any mismatch
+  refuses with `prompt_index_mismatch`.
+- File plan: the paths each undone Run changed (its own start to end checkpoints), restored from the
+  first Run's start checkpoint (exists there) or deleted (the Runs added them); anything else, including
+  edits the user made between Runs, is left alone. A path that differs from the first Run's end
+  checkpoint is a conflict: `later_run` (expected) or `modified_after_run` (needs
+  `overwriteConflicts`). `git restore --source=<ref> --worktree` never touches the index, so a staged
+  change survives.
+- Execute order: official `conversation_only` with `force:true` first (a refusal changes nothing),
+  then the file restore, then the Runs are marked `rolled_back` (rows kept, entries dimmed through
+  `rolledBack`), the prompt text goes into the draft and a notice entry is added. If the runtime has no
+  `_x.ai/rewind/*`, the conversation is not rewound and `scope: "files_only"` is offered, explicitly
+  labeled, without marking any Run rolled back.
+- The preview states what cannot be undone: network and MCP effects, git commits and pushes made by
+  commands, memory writes, and (without a git checkpoint) shell file changes.
+
+Residual risks: `git push --mirror` would publish `refs/guild/*`; checkpoint refs are not pruned; a Steer
+that races a queued turn's dispatch can reach the runtime twice; a Guild send racing a runtime-started
+turn fails the new Run with the usual "send again" notice.

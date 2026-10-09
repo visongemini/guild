@@ -117,3 +117,19 @@ Admit only these signals; store no text from them.
   active|applied|discarded, timestamps)`; branch badge with dirty/ahead counts; Apply = commit +
   `git merge --no-ff` with conflict preview; Discard = `git worktree remove --force` +
   `branch -D` after confirmation. A fresh worktree lacks ignored files such as node_modules.
+
+## Implementation status (2026-10-10, branch feature-f2-f4-backend)
+
+F4 Steer and F2 checkpoints, changed files and rewind are implemented in the main process, contracts,
+IPC and the task projection (no UI): see D-055. Live checks on grok 1.0.50 (four tiny model turns, a
+throwaway git repository, Guild's own service path with a temporary data directory):
+
+- Create one file and edit another in one turn: run summary `hello.txt A +1`, `notes.txt M +1`, both
+  diffs served, checkpoint refs created, the repository's index and status unchanged.
+- Rewind that Run: official dry run and `conversation_only` execute accepted, `notes.txt` restored,
+  `hello.txt` removed, prompt back in the draft; a follow-up turn answered "NO UNKNOWN" to "did you
+  create a file / what is my codeword", so the hidden context was truncated.
+- Steer during `sleep 10`: accepted in 26 ms, echoed at once, final answer `DONE STEERED`.
+- Interjection with no running turn: the runtime ran `interject-fallback-<uuid>` as its own turn;
+  frames, queue broadcast, completion and the `session/load` replay of that turn were recorded and are
+  the fixture of an adapter test.

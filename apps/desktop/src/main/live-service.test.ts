@@ -48,7 +48,7 @@ import {
   type RuntimeAdapterPort,
   type RuntimeFactory,
 } from "./live-service.js";
-import { checkpointRef, type GitCheckpointPort } from "./git-checkpoints.js";
+import { checkpointRef, gitCheckpoints, type GitCheckpointPort } from "./git-checkpoints.js";
 
 const services: { close(): Promise<void> }[] = [];
 
@@ -6268,6 +6268,31 @@ describe("live desktop service Steer, run checkpoints and rewind [F4, F2]", () =
     assert.deepEqual((await task(setup)).runCheckpoints?.[0]?.files, []);
   });
 
+  it("marks a checkpoint the app quit in the middle of taking as unavailable on the next start [F2]", async () => {
+    const log: string[] = [];
+    const checkpoints = new FakeCheckpoints(log);
+    checkpoints.hangCaptures = true;
+    const setup = await f24Task({
+      checkpoints,
+      extra: { checkpointStartBoundMs: 60 },
+      specs: [{ sessionId: "quit-session" }],
+    });
+    await setup.service.sendMessage(setup.taskId, "hello");
+    await waitForCompleted(setup.service);
+    assert.equal((await task(setup)).runCheckpoints?.[0]?.status, "capturing");
+    await setup.service.close();
+    services.splice(services.indexOf(setup.service), 1);
+    const reopened = createLiveDesktopService({
+      ...setup.options,
+      runtimeFactory: fakeRuntimeFactory([{ sessionId: "quit-session" }]),
+      checkpoints: new FakeCheckpoints([]),
+    });
+    services.push(reopened);
+    const checkpoint = (await reopened.bootstrap()).activeTask?.runCheckpoints?.[0];
+    assert.equal(checkpoint?.status, "unavailable");
+    assert.equal(checkpoint?.detail, "capture_skipped");
+  });
+
   it("records a checkpoint as unavailable outside a git work tree and for a git failure, and carries on [F2]", async () => {
     const plain = await f24Task();
     await plain.service.sendMessage(plain.taskId, "hello");
@@ -6517,6 +6542,47 @@ describe("live desktop service Steer, run checkpoints and rewind [F4, F2]", () =
     const forced = await setup.service.executeRewind({ taskId: setup.taskId, runId, overwriteConflicts: true });
     assert.equal(forced.status, "rolled_back");
     assert.equal(await readFile(join(setup.workspace, "a.txt"), "utf8"), "alpha\nbeta\n");
+  });
+
+  it("still finishes the rewind and reports every file as failed when the file restore itself throws [F2]", async () => {
+    const throwing: GitCheckpointPort = {
+      ...gitCheckpoints,
+      restore: async () => { throw new Error("disk went away"); },
+    };
+    const setup = await f24Task({
+      git: true,
+      checkpoints: throwing,
+      specs: [{
+        promptEffect: async (text) => {
+          if (text === "edit-files") await writeFile(join(setup_workspace(), "a.txt"), "alpha\nCHANGED\n");
+        },
+      }],
+    });
+    function setup_workspace(): string { return setup.workspace; }
+    await setup.service.sendMessage(setup.taskId, "edit-files");
+    await waitForCompleted(setup.service);
+    await waitForIdle(setup.service);
+    await eventuallyAsync(async () => (await task(setup)).runCheckpoints?.[0]?.status === "captured", "captured");
+    setup.adapters[0]!.extensionHandler = rewindRuntime(["edit-files"]);
+    const runId = (await task(setup)).runCheckpoints![0]!.runId;
+    const executed = await setup.service.executeRewind({ taskId: setup.taskId, runId });
+    assert.equal(executed.status, "rolled_back");
+    if (executed.status !== "rolled_back") return;
+    assert.deepEqual(executed.restoredFiles, []);
+    assert.deepEqual(executed.failedFiles, [{ path: "a.txt", reason: "restore_failed" }]);
+    assert.equal(executed.draftRestored, true, "the conversation half already happened and is not lost");
+    assert.equal((await task(setup)).runCheckpoints?.[0]?.rolledBack, true);
+  });
+
+  it("offers no rewind at all when neither the conversation nor any file can be undone [F2]", async () => {
+    const setup = await f24Task();
+    await setup.service.sendMessage(setup.taskId, "hello");
+    await waitForCompleted(setup.service);
+    await waitForIdle(setup.service);
+    await eventuallyAsync(async () => (await task(setup)).runCheckpoints?.[0]?.status === "unavailable", "unavailable");
+    const runId = (await task(setup)).runCheckpoints![0]!.runId;
+    // Not a git folder and the runtime answers -32601 to every _x.ai/rewind/* request.
+    assert.deepEqual(await setup.service.previewRewind(setup.taskId, runId), { status: "refused", reason: "conversation_rewind_unsupported" });
   });
 
   it("leaves rolled-back Runs out of the local history when the session is reopened [F2]", async () => {

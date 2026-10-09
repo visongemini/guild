@@ -105,6 +105,30 @@ change the context window. Extension notifications (`_x.ai/...`) are accepted on
 allowlist in `packages/runtime-grok/src/xai-extensions.ts`; extension requests need the `_x.ai/`
 prefix and treat -32601 as "unsupported".
 
+## Steer, runtime-started turns and rewind
+
+`_x.ai/interject {sessionId, text, interjectionId}` answers `{"status":"queued"}`. Every attached
+client then receives `_x.ai/session/interjection {sessionId, text, interjectionId}`; Guild reads only
+`interjectionId` from it. A turn the runtime starts itself (the `interject-fallback-<uuid>` prompt it
+makes from a Steer that arrives with no running turn, and wake turns such as `task-completed-*`) sends
+`_x.ai/queue/changed {runningPromptId, runningText}`, then `session/update` frames whose
+`_meta.promptId` is that id, then `_x.ai/session_notification` `turn_completed {prompt_id, stop_reason}`;
+there is no JSON-RPC response and no `_x.ai/session/prompt_complete`. The adapter attaches such a turn on
+its first turn frame when no Guild prompt is in flight (sink hook `commitAgentTurnStarted`), commits the
+frames with the allocated prompt sequence, and commits a synthesized terminal when the matching
+`turn_completed` arrives (unknown stop reasons count as `refusal`). Frames of a turn that arrive while a
+Guild prompt is active belong to that prompt.
+
+On `session/load` a Steer drained into a turn is replayed as `user_message_chunk` with
+`update._meta.interjection: true` (and `content._meta.displayText` holding the typed text); it belongs to
+the turn it steered. The fallback prompt's own user chunk carries only the typed text.
+
+`_x.ai/rewind/points {sessionId}` lists `0..n-1`, one point per prompt including runtime-started
+turns. `_x.ai/rewind/execute {sessionId, targetPromptIndex, mode, force}` with `force:false` is a dry
+run; with `force:true` and `conversation_only` it truncates the conversation (the prompt text comes back
+in `prompt_text`) and persists a `RewindMarker`, so a later `session/load` replays only the surviving
+timeline.
+
 ## Prompt cancellation
 
 `session/cancel` is a notification and has no request ID:
