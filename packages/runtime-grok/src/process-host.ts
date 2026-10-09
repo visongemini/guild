@@ -13,6 +13,7 @@ import type {
 import {
   ExecutablePinError,
   pinExecutable,
+  pinExecutableShared,
   type ExecutablePinFailureCode,
   type PinnedExecutable,
   type PinnedExecutableCleanup,
@@ -153,6 +154,8 @@ export type GrokProcessHostOptions = {
 /** @internal Only the non-root package testing entry may construct this seam. */
 export type InternalProcessHostTestConfiguration = {
   readonly fixtureArgs?: readonly string[];
+  /** Defaults to the private per-process pin so teardown tests observe a deterministic stage. */
+  readonly pin?: typeof pinExecutable;
   readonly afterPin?: (pinned: PinnedExecutable) => void | Promise<void>;
   readonly cleanupPinned?: (pinned: PinnedExecutable) => Promise<PinnedExecutableCleanup>;
   readonly signalGroup?: (processGroupId: number, signal: "SIGTERM" | "SIGKILL") => ProcessGroupSignalEvidence;
@@ -162,9 +165,7 @@ export type InternalProcessHostTestConfiguration = {
   readonly cleanupDeadlineMs?: number;
 };
 
-type ProcessHostLifecycle = Required<Omit<InternalProcessHostTestConfiguration, "fixtureArgs">> & {
-  readonly pin: typeof pinExecutable;
-};
+type ProcessHostLifecycle = Required<Omit<InternalProcessHostTestConfiguration, "fixtureArgs">>;
 
 type HostState = "closed" | "created" | "failed" | "running" | "starting" | "stopping";
 type Deferred<T> = { readonly promise: Promise<T>; readonly reject: (reason: unknown) => void; readonly resolve: (value: T) => void };
@@ -734,7 +735,8 @@ class ProcessHostCore {
 }
 
 const PRODUCTION_LIFECYCLE = Object.freeze<ProcessHostLifecycle>({
-  pin: pinExecutable,
+  // One verified staged copy per SHA-256 is reused by every spawn (see executable-pin.ts).
+  pin: pinExecutableShared,
   afterPin: () => undefined,
   cleanupPinned: (pinned) => pinned.cleanup(),
   signalGroup,
@@ -755,6 +757,7 @@ export function createInternalProcessHostForTesting(
   );
   return new ProcessHostCore(options, Object.freeze({
     ...PRODUCTION_LIFECYCLE,
+    pin: configuration.pin ?? pinExecutable,
     afterPin: configuration.afterPin ?? PRODUCTION_LIFECYCLE.afterPin,
     cleanupPinned: configuration.cleanupPinned ?? PRODUCTION_LIFECYCLE.cleanupPinned,
     signalGroup: configuration.signalGroup ?? PRODUCTION_LIFECYCLE.signalGroup,

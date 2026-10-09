@@ -1,6 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
 import { constants, type BigIntStats } from "node:fs";
-import { chmod, lstat, mkdir, open, realpath, rm, type FileHandle } from "node:fs/promises";
+import { chmod, lstat, mkdir, open, readdir, realpath, rename, rm, type FileHandle } from "node:fs/promises";
 import { basename, isAbsolute, join } from "node:path";
 
 export type ExecutablePinFailureCode =
@@ -66,6 +66,334 @@ export async function pinExecutable(
   return pinExecutableInternal(executablePath, stagingRoot, expectedSha256);
 }
 
+const SHARED_STAGE_PREFIX = ".grok-pin-";
+const SHA256_HEX = /^[a-f0-9]{64}$/u;
+const STALE_PRIVATE_STAGE_AGE_MS = 60 * 60 * 1000;
+
+type SharedStage = {
+  readonly key: string;
+  readonly directory: string;
+  readonly directoryIdentity: BigIntStats;
+  readonly stagedExecutablePath: string;
+  readonly sha256: string;
+  readonly handle: FileHandle;
+  readonly snapshot: BigIntStats;
+  readonly verifyForSpawn: () => Promise<void>;
+};
+
+/** Process-wide stages keyed by staging root and SHA-256. A settled entry has been proven intact. */
+const sharedStages = new Map<string, Promise<SharedStage>>();
+
+/**
+ * Evidence for a lease on a shared stage. The lease owns no descriptor and no directory: the
+ * stage belongs to the process-wide cache and is deliberately kept for the next spawn.
+ */
+const SHARED_LEASE_CLEANUP: PinnedExecutableCleanup = Object.freeze({
+  stageHandleClosed: true,
+  stagingDirectoryRemoved: true,
+  failure: "none",
+});
+
+/**
+ * Leases the one verified staged copy for this SHA-256, creating it on first use. The copy lives
+ * in a deterministic `.grok-pin-<sha256>` directory and is reused while its identity (device,
+ * inode, size, mtime, ctime, mode 0500, owner, link count) is unchanged; a missing or altered
+ * copy is replaced. A copy left by an earlier process is adopted only after it hashes to the pin.
+ * The staged bytes always equal the pin, so a hit never needs to touch the (large) source again.
+ */
+export async function pinExecutableShared(
+  executablePath: string,
+  stagingRoot: string,
+  expectedSha256: string,
+): Promise<PinnedExecutable> {
+  return pinExecutableSharedInternal(executablePath, stagingRoot, expectedSha256);
+}
+
+/** @internal Used only by the non-root package test entry. */
+export async function pinExecutableSharedInternal(
+  executablePath: string,
+  stagingRoot: string,
+  expectedSha256: string,
+  testHooks?: ExecutablePinTestHooks,
+): Promise<PinnedExecutable> {
+  if (!isAbsolute(executablePath)) {
+    throw failure("path_not_absolute", "executable path must be absolute");
+  }
+  if (!isAbsolute(stagingRoot)) {
+    throw failure("staging_root_not_absolute", "staging root must be absolute");
+  }
+  const sha256 = expectedSha256.toLowerCase();
+  if (!SHA256_HEX.test(sha256)) {
+    throw failure("hash_mismatch", "executable SHA-256 pin is malformed");
+  }
+  const resolvedStagingRoot = await resolveDirectory(stagingRoot);
+  const resolvedExecutablePath = await resolvePath(executablePath, "executable metadata could not be read");
+  const key = `${resolvedStagingRoot}\0${sha256}`;
+  const create = (): Promise<SharedStage> =>
+    createSharedStage(key, resolvedStagingRoot, resolvedExecutablePath, sha256, testHooks);
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    let pending = sharedStages.get(key);
+    if (pending === undefined) {
+      pending = registerSharedStage(key, create());
+    } else {
+      await preflightSource(resolvedExecutablePath);
+    }
+    const entry = await pending;
+    if (await sharedStageIntact(entry)) {
+      return Object.freeze({
+        resolvedExecutablePath,
+        stagedExecutablePath: entry.stagedExecutablePath,
+        sha256: entry.sha256,
+        dev: entry.snapshot.dev,
+        ino: entry.snapshot.ino,
+        verifyForSpawn: entry.verifyForSpawn,
+        cleanup: Object.freeze(once(async () => SHARED_LEASE_CLEANUP)),
+      });
+    }
+    // Replace the broken copy exactly once; concurrent callers join the replacement.
+    if (sharedStages.get(key) === pending) {
+      registerSharedStage(key, discardSharedStage(entry).then(create));
+    }
+  }
+  throw failure("executable_changed", "shared staged executable could not be re-established");
+}
+
+/**
+ * Removes staging leftovers: shared copies of other SHA-256 values, and private stages orphaned
+ * by a crashed process (older than one hour, so a live stage is never touched). Entries that are
+ * not directories named like pins are ignored. Returns the number of removed directories.
+ */
+export async function pruneStalePinnedExecutables(
+  stagingRoot: string,
+  keepSha256: string,
+  nowMs: number = Date.now(),
+): Promise<number> {
+  if (!isAbsolute(stagingRoot)) return 0;
+  const keep = keepSha256.toLowerCase();
+  let names: string[];
+  try {
+    names = await readdir(stagingRoot);
+  } catch {
+    return 0;
+  }
+  let removed = 0;
+  for (const name of names) {
+    if (!name.startsWith(SHARED_STAGE_PREFIX)) continue;
+    const suffix = name.slice(SHARED_STAGE_PREFIX.length);
+    const directory = join(stagingRoot, name);
+    try {
+      const info = await lstat(directory);
+      if (!info.isDirectory()) continue;
+      const stale = SHA256_HEX.test(suffix)
+        ? suffix !== keep
+        : nowMs - info.mtimeMs >= STALE_PRIVATE_STAGE_AGE_MS;
+      if (!stale) continue;
+      await rm(directory, { recursive: true, force: true, maxRetries: 0 });
+      removed += 1;
+    } catch {
+      // Best effort: a leftover that cannot be removed now is retried at the next start.
+    }
+  }
+  return removed;
+}
+
+/**
+ * @internal Test hook: drops this process's view of shared stages without touching the disk,
+ * as if the process had exited, so adoption of a leftover copy can be exercised.
+ */
+export async function forgetSharedStagesInternal(): Promise<void> {
+  const pending = [...sharedStages.values()];
+  sharedStages.clear();
+  await Promise.allSettled(pending.map(async (entry) => closeQuietly((await entry).handle)));
+}
+
+function registerSharedStage(key: string, creation: Promise<SharedStage>): Promise<SharedStage> {
+  sharedStages.set(key, creation);
+  // A failed creation must not poison later attempts.
+  creation.catch(() => {
+    if (sharedStages.get(key) === creation) sharedStages.delete(key);
+  });
+  return creation;
+}
+
+async function createSharedStage(
+  key: string,
+  resolvedStagingRoot: string,
+  resolvedExecutablePath: string,
+  sha256: string,
+  testHooks: ExecutablePinTestHooks | undefined,
+): Promise<SharedStage> {
+  await preflightSource(resolvedExecutablePath);
+  const directory = join(resolvedStagingRoot, `${SHARED_STAGE_PREFIX}${sha256}`);
+  const name = basename(resolvedExecutablePath);
+  const adopted = await adoptSharedStage(key, directory, name, sha256);
+  if (adopted !== undefined) return adopted;
+
+  const staged = await stageVerifiedCopy(resolvedExecutablePath, resolvedStagingRoot, sha256, testHooks);
+  let published = false;
+  try {
+    try {
+      await rename(staged.stagingDirectory, directory);
+      published = true;
+    } catch (cause) {
+      const code = nodeErrorCode(cause);
+      if (code === "ENOTEMPTY" || code === "EEXIST") {
+        // Another process published first. Use its copy only if it proves itself.
+        const winner = await adoptSharedStage(key, directory, name, sha256);
+        if (winner !== undefined) {
+          await discardStagedCopy(staged);
+          return winner;
+        }
+      }
+      throw failure("preflight_io_failure", "shared staged executable could not be published");
+    }
+    return await describeSharedStage(
+      key,
+      directory,
+      join(directory, basename(staged.stagedExecutablePath)),
+      sha256,
+      staged.retainedStage,
+      staged.verifiedStageSnapshot,
+    );
+  } catch (cause) {
+    if (published) {
+      await closeQuietly(staged.retainedStage);
+      await rm(directory, { recursive: true, force: true, maxRetries: 0 }).catch(() => undefined);
+    } else {
+      await discardStagedCopy(staged);
+    }
+    throw cause;
+  }
+}
+
+/** Takes over a copy left by an earlier process, but only if it hashes to the pin. */
+async function adoptSharedStage(
+  key: string,
+  directory: string,
+  name: string,
+  sha256: string,
+): Promise<SharedStage | undefined> {
+  try {
+    await lstat(directory);
+  } catch {
+    return undefined;
+  }
+  const stagedExecutablePath = join(directory, name);
+  let handle: FileHandle | undefined;
+  try {
+    handle = await open(stagedExecutablePath, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const before = await handle.stat({ bigint: true });
+    assertSharedStageFile(before);
+    await assertMachO(handle);
+    if ((await hashHandle(handle)) !== sha256) throw new Error("hash differs");
+    const [after, pathAfter] = await Promise.all([
+      handle.stat({ bigint: true }),
+      lstat(stagedExecutablePath, { bigint: true }),
+    ]);
+    if (!sameSnapshot(before, after) || !sameSnapshot(before, pathAfter)) throw new Error("changed");
+    return await describeSharedStage(key, directory, stagedExecutablePath, sha256, handle, Object.freeze(after));
+  } catch {
+    await closeQuietly(handle);
+    await rm(directory, { recursive: true, force: true, maxRetries: 0 }).catch(() => undefined);
+    return undefined;
+  }
+}
+
+/** Proves the published pathname still names the verified inode, then freezes the stage record. */
+async function describeSharedStage(
+  key: string,
+  directory: string,
+  stagedExecutablePath: string,
+  sha256: string,
+  handle: FileHandle,
+  snapshot: BigIntStats,
+): Promise<SharedStage> {
+  const directoryIdentity = await lstat(directory, { bigint: true });
+  if (!isOwnedPrivateDirectory(directoryIdentity)) {
+    throw failure("executable_changed", "shared staging directory is not private");
+  }
+  const reopened = await openReadNoFollow(stagedExecutablePath);
+  try {
+    const reopenedStats = await reopened.stat({ bigint: true });
+    if (!sameSnapshot(snapshot, reopenedStats)) {
+      throw failure("executable_changed", "shared staged executable changed while it was published");
+    }
+  } finally {
+    await closeQuietly(reopened);
+  }
+  return Object.freeze({
+    key,
+    directory,
+    directoryIdentity,
+    stagedExecutablePath,
+    sha256,
+    handle,
+    snapshot,
+    verifyForSpawn: createSpawnVerifier(stagedExecutablePath, handle, snapshot),
+  });
+}
+
+async function sharedStageIntact(entry: SharedStage): Promise<boolean> {
+  try {
+    const [pathStats, handleStats, directoryStats] = await Promise.all([
+      lstat(entry.stagedExecutablePath, { bigint: true }),
+      entry.handle.stat({ bigint: true }),
+      lstat(entry.directory, { bigint: true }),
+    ]);
+    return (
+      sameSnapshot(entry.snapshot, pathStats) &&
+      sameSnapshot(entry.snapshot, handleStats) &&
+      pathStats.nlink === 1n &&
+      pathStats.uid === entry.snapshot.uid &&
+      directoryStats.dev === entry.directoryIdentity.dev &&
+      directoryStats.ino === entry.directoryIdentity.ino &&
+      isOwnedPrivateDirectory(directoryStats)
+    );
+  } catch {
+    return false;
+  }
+}
+
+async function discardSharedStage(entry: SharedStage): Promise<void> {
+  await closeQuietly(entry.handle);
+  await rm(entry.directory, { recursive: true, force: true, maxRetries: 0 }).catch(() => undefined);
+}
+
+async function discardStagedCopy(staged: StagedCopy): Promise<void> {
+  await closeQuietly(staged.retainedStage);
+  await rm(staged.stagingDirectory, { recursive: true, force: true, maxRetries: 0 }).catch(() => undefined);
+}
+
+/** The cheap source checks every pin performs, without copying or hashing anything. */
+async function preflightSource(resolvedExecutablePath: string): Promise<void> {
+  const source = await openReadNoFollow(resolvedExecutablePath);
+  try {
+    assertRegularExecutable(await source.stat({ bigint: true }));
+    await assertMachO(source);
+  } finally {
+    await closeQuietly(source);
+  }
+}
+
+function assertSharedStageFile(stats: BigIntStats): void {
+  if (
+    !stats.isFile() ||
+    (stats.mode & 0o7777n) !== 0o500n ||
+    stats.nlink !== 1n ||
+    !ownedByCurrentUser(stats)
+  ) {
+    throw failure("executable_changed", "shared staged executable is not a private read-only file");
+  }
+}
+
+function isOwnedPrivateDirectory(stats: BigIntStats): boolean {
+  return stats.isDirectory() && (stats.mode & 0o777n) === 0o700n && ownedByCurrentUser(stats);
+}
+
+function ownedByCurrentUser(stats: BigIntStats): boolean {
+  return typeof process.getuid !== "function" || stats.uid === BigInt(process.getuid());
+}
+
 /** @internal Used only by the non-root package test entry. */
 export async function pinExecutableInternal(
   executablePath: string,
@@ -73,6 +401,60 @@ export async function pinExecutableInternal(
   expectedSha256: string,
   testHooks?: ExecutablePinTestHooks,
 ): Promise<PinnedExecutable> {
+  const staged = await stageVerifiedCopy(executablePath, stagingRoot, expectedSha256, testHooks);
+  const { retainedStage, stagingDirectory, stagedExecutablePath, verifiedStageSnapshot } = staged;
+  const verifyForSpawn = createSpawnVerifier(stagedExecutablePath, retainedStage, verifiedStageSnapshot);
+  const cleanup = Object.freeze(once(async () => {
+    let stageHandleClosed = true;
+    try {
+      await retainedStage.close();
+    } catch {
+      stageHandleClosed = false;
+    }
+    let stagingDirectoryRemoved = true;
+    try {
+      await removePrivateDirectoryStrict(stagingDirectory);
+    } catch {
+      stagingDirectoryRemoved = false;
+    }
+    return Object.freeze({
+      stageHandleClosed,
+      stagingDirectoryRemoved,
+      failure: cleanupFailure(stageHandleClosed, stagingDirectoryRemoved),
+    });
+  }));
+  return Object.freeze({
+    resolvedExecutablePath: staged.resolvedExecutablePath,
+    stagedExecutablePath,
+    sha256: staged.sha256,
+    dev: verifiedStageSnapshot.dev,
+    ino: verifiedStageSnapshot.ino,
+    verifyForSpawn,
+    cleanup,
+  });
+}
+
+type StagedCopy = {
+  readonly resolvedExecutablePath: string;
+  readonly stagingDirectory: string;
+  readonly stagedExecutablePath: string;
+  readonly sha256: string;
+  /** Open descriptor of the verified copy; the caller owns closing it. */
+  readonly retainedStage: FileHandle;
+  readonly verifiedStageSnapshot: BigIntStats;
+};
+
+/**
+ * Copies the executable into a fresh private directory and proves the copy: regular file, Mach-O,
+ * independent inode, not writable, SHA-256 equal to the pin, source unchanged during the copy.
+ * Any failure removes everything this call created.
+ */
+async function stageVerifiedCopy(
+  executablePath: string,
+  stagingRoot: string,
+  expectedSha256: string,
+  testHooks?: ExecutablePinTestHooks,
+): Promise<StagedCopy> {
   if (!isAbsolute(executablePath)) {
     throw failure("path_not_absolute", "executable path must be absolute");
   }
@@ -144,67 +526,58 @@ export async function pinExecutableInternal(
 
     const retainedStage = stage;
     const verifiedStageSnapshot = Object.freeze(stageAfterHash);
-    const verifyForSpawn = Object.freeze(async (): Promise<void> => {
-      let reopened: FileHandle | undefined;
-      try {
-        reopened = await open(stagedExecutablePath, constants.O_RDONLY | constants.O_NOFOLLOW);
-        const [retainedStats, reopenedStats] = await Promise.all([
-          retainedStage.stat({ bigint: true }),
-          reopened.stat({ bigint: true }),
-        ]);
-        assertSpawnSafe(retainedStats);
-        assertSpawnSafe(reopenedStats);
-        if (
-          !sameSnapshot(verifiedStageSnapshot, retainedStats) ||
-          !sameSnapshot(verifiedStageSnapshot, reopenedStats) ||
-          !sameSnapshot(retainedStats, reopenedStats)
-        ) {
-          throw failure("executable_changed", "staged executable changed before spawn");
-        }
-      } catch (cause) {
-        if (cause instanceof ExecutablePinError && cause.code === "executable_changed") {
-          throw cause;
-        }
-        throw failure("executable_changed", "staged executable could not be revalidated before spawn");
-      } finally {
-        await closeQuietly(reopened);
-      }
-    });
-    const cleanup = Object.freeze(once(async () => {
-      let stageHandleClosed = true;
-      try {
-        await retainedStage.close();
-      } catch {
-        stageHandleClosed = false;
-      }
-      let stagingDirectoryRemoved = true;
-      try {
-        await removePrivateDirectoryStrict(stagingDirectory);
-      } catch {
-        stagingDirectoryRemoved = false;
-      }
-      return Object.freeze({
-        stageHandleClosed,
-        stagingDirectoryRemoved,
-        failure: cleanupFailure(stageHandleClosed, stagingDirectoryRemoved),
-      });
-    }));
     await closeRequired(source, "source executable descriptor could not be closed");
     source = undefined;
     stage = undefined;
     return Object.freeze({
       resolvedExecutablePath,
+      stagingDirectory,
       stagedExecutablePath,
       sha256,
-      dev: stageAfterHash.dev,
-      ino: stageAfterHash.ino,
-      verifyForSpawn,
-      cleanup,
+      retainedStage,
+      verifiedStageSnapshot,
     });
   } catch (cause) {
     const cleanup = await cleanupFailedPin(writer, stage, source, stagingDirectory);
     throw preservePinFailure(cause, cleanup);
   }
+}
+
+/**
+ * Re-proves, immediately before spawn, that the staged pathname still names the verified inode
+ * and that none of its identity fields changed.
+ */
+function createSpawnVerifier(
+  stagedExecutablePath: string,
+  retainedStage: FileHandle,
+  verifiedStageSnapshot: BigIntStats,
+): () => Promise<void> {
+  return Object.freeze(async (): Promise<void> => {
+    let reopened: FileHandle | undefined;
+    try {
+      reopened = await open(stagedExecutablePath, constants.O_RDONLY | constants.O_NOFOLLOW);
+      const [retainedStats, reopenedStats] = await Promise.all([
+        retainedStage.stat({ bigint: true }),
+        reopened.stat({ bigint: true }),
+      ]);
+      assertSpawnSafe(retainedStats);
+      assertSpawnSafe(reopenedStats);
+      if (
+        !sameSnapshot(verifiedStageSnapshot, retainedStats) ||
+        !sameSnapshot(verifiedStageSnapshot, reopenedStats) ||
+        !sameSnapshot(retainedStats, reopenedStats)
+      ) {
+        throw failure("executable_changed", "staged executable changed before spawn");
+      }
+    } catch (cause) {
+      if (cause instanceof ExecutablePinError && cause.code === "executable_changed") {
+        throw cause;
+      }
+      throw failure("executable_changed", "staged executable could not be revalidated before spawn");
+    } finally {
+      await closeQuietly(reopened);
+    }
+  });
 }
 
 async function resolvePath(path: string, message: string): Promise<string> {
@@ -293,6 +666,9 @@ async function assertMachO(handle: FileHandle): Promise<void> {
   }
 }
 
+/** Large reads keep a 160+ MB copy or hash to a few hundred awaited syscalls. */
+const COPY_CHUNK_BYTES = 1024 * 1024;
+
 const MACH_O_MAGICS = new Set([
   0xfeedface,
   0xcefaedfe,
@@ -305,7 +681,7 @@ const MACH_O_MAGICS = new Set([
 ]);
 
 async function copyHandle(source: FileHandle, destination: FileHandle): Promise<void> {
-  const buffer = Buffer.allocUnsafe(64 * 1024);
+  const buffer = Buffer.allocUnsafe(COPY_CHUNK_BYTES);
   let position = 0;
   while (true) {
     const { bytesRead } = await source.read(buffer, 0, buffer.length, position);
@@ -326,7 +702,7 @@ async function copyHandle(source: FileHandle, destination: FileHandle): Promise<
 
 async function hashHandle(handle: FileHandle): Promise<string> {
   const hash = createHash("sha256");
-  const buffer = Buffer.allocUnsafe(64 * 1024);
+  const buffer = Buffer.allocUnsafe(COPY_CHUNK_BYTES);
   let position = 0;
   while (true) {
     const { bytesRead } = await handle.read(buffer, 0, buffer.length, position);

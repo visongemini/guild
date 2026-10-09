@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
-import { createReadStream } from "node:fs";
+import { createReadStream, type BigIntStats } from "node:fs";
 import { lstat, realpath } from "node:fs/promises";
 import { homedir } from "node:os";
 import { delimiter, isAbsolute, join } from "node:path";
@@ -23,11 +23,65 @@ const PROXY_KEYS = Object.freeze([
   "all_proxy",
 ] as const);
 
-/** Resolve only the official executable. Authentication remains entirely inside that process. */
+type RuntimeStatKey = Readonly<{
+  dev: bigint;
+  ino: bigint;
+  size: bigint;
+  mtimeNs: bigint;
+  ctimeNs: bigint;
+}>;
+
+type LocatedRuntimeCacheEntry = Readonly<{
+  searchPath: string;
+  /** The PATH hit before symlink resolution. Re-resolved on every call to notice a repointed symlink. */
+  candidate: string;
+  key: RuntimeStatKey;
+  located: LocatedGrokRuntime;
+}>;
+
+let locatedCache: LocatedRuntimeCacheEntry | undefined;
+let locateInFlight: { readonly searchPath: string; readonly promise: Promise<LocatedGrokRuntime> } | undefined;
+
+/**
+ * Resolve only the official executable. Authentication remains entirely inside that process.
+ *
+ * The expensive parts (`which`, a SHA-256 over the whole binary, `--version`) run once per
+ * binary identity. A cached result is reused only while the PATH hit still resolves to the same
+ * file and that file keeps its device, inode, size, mtime and ctime.
+ */
 export async function locateOfficialGrokRuntime(
   environment: NodeJS.ProcessEnv = process.env,
 ): Promise<LocatedGrokRuntime> {
   const path = buildRuntimeSearchPath(environment.PATH);
+  const cached = await readCachedRuntime(path);
+  if (cached !== undefined) return cached;
+  if (locateInFlight?.searchPath === path) return locateInFlight.promise;
+  const promise = locateUncached(path).finally(() => {
+    if (locateInFlight?.promise === promise) locateInFlight = undefined;
+  });
+  locateInFlight = { searchPath: path, promise };
+  return promise;
+}
+
+/** Forget the cached binary identity, e.g. after a failed preflight or spawn. */
+export function invalidateOfficialGrokRuntimeCache(): void {
+  locatedCache = undefined;
+}
+
+async function readCachedRuntime(searchPath: string): Promise<LocatedGrokRuntime | undefined> {
+  const entry = locatedCache;
+  if (entry === undefined || entry.searchPath !== searchPath) return undefined;
+  try {
+    const executablePath = await realpath(entry.candidate);
+    if (executablePath !== entry.located.executablePath) return undefined;
+    const key = runtimeStatKey(await lstat(executablePath, { bigint: true }));
+    return sameRuntimeStatKey(key, entry.key) ? entry.located : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function locateUncached(path: string): Promise<LocatedGrokRuntime> {
   const located = await execute("/usr/bin/which", ["grok"], {
     PATH: path,
   });
@@ -36,14 +90,42 @@ export async function locateOfficialGrokRuntime(
     throw new Error("grok_runtime_not_found");
   }
   const executablePath = await realpath(candidate);
-  const info = await lstat(executablePath);
-  if (!info.isFile()) throw new Error("grok_runtime_not_a_file");
-  const sha256 = await digestFile(executablePath);
+  if (!(await lstat(executablePath)).isFile()) throw new Error("grok_runtime_not_a_file");
+  // Run the binary first: executing it may touch its metadata, and the identity below must be
+  // the one that is stable while it is hashed.
   const versionResult = await execute(executablePath, ["--version"], {
     PATH: path,
   }).catch(() => undefined);
   const version = versionResult?.stdout.trim().split(/\r?\n/u)[0]?.slice(0, 160) || undefined;
-  return Object.freeze({ executablePath, sha256, version });
+  const key = runtimeStatKey(await lstat(executablePath, { bigint: true }));
+  const sha256 = await digestFile(executablePath);
+  const result: LocatedGrokRuntime = Object.freeze({ executablePath, sha256, version });
+  // Cache only an identity that was stable across hashing; a torn hash must not be remembered.
+  const after = await lstat(executablePath, { bigint: true }).catch(() => undefined);
+  if (after !== undefined && sameRuntimeStatKey(key, runtimeStatKey(after))) {
+    locatedCache = Object.freeze({ searchPath: path, candidate, key, located: result });
+  }
+  return result;
+}
+
+function runtimeStatKey(stats: BigIntStats): RuntimeStatKey {
+  return Object.freeze({
+    dev: stats.dev,
+    ino: stats.ino,
+    size: stats.size,
+    mtimeNs: stats.mtimeNs,
+    ctimeNs: stats.ctimeNs,
+  });
+}
+
+function sameRuntimeStatKey(left: RuntimeStatKey, right: RuntimeStatKey): boolean {
+  return (
+    left.dev === right.dev &&
+    left.ino === right.ino &&
+    left.size === right.size &&
+    left.mtimeNs === right.mtimeNs &&
+    left.ctimeNs === right.ctimeNs
+  );
 }
 
 /**

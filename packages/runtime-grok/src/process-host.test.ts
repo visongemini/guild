@@ -807,6 +807,39 @@ describe("GrokProcessHost independent executable pinning (PC-SEC-001, ADR D-008)
     }
   });
 
+  it("reuses one shared staged copy across production hosts and keeps it after each stop", async () => {
+    const fixture = await prepareFixture();
+    const executablePath = await realpath("/usr/bin/true");
+    const expectedSha256 = sha256Of(await readFile(executablePath));
+    const stagedPaths: string[] = [];
+    const stagedInodes: bigint[] = [];
+    try {
+      for (let run = 0; run < 2; run += 1) {
+        const host = new GrokProcessHost({ ...options(fixture), executablePath, expectedSha256 });
+        const started = await startOwned(host, fixture);
+        stagedPaths.push(started.executablePath);
+        stagedInodes.push((await stat(started.executablePath, { bigint: true })).ino);
+        const termination = await bounded(host.waitForTermination());
+        assert.equal(termination.type, "stop_reaped");
+        if (termination.type === "stop_reaped") {
+          // The lease owns neither the descriptor nor the directory of a shared copy.
+          assert.deepEqual(termination.cleanup, {
+            stageHandleClosed: true,
+            stagingDirectoryRemoved: true,
+            failure: "none",
+          });
+        }
+        await cleanup(host, started.processGroupId);
+        await access(started.executablePath);
+      }
+      assert.equal(stagedPaths[0], stagedPaths[1]);
+      assert.equal(stagedInodes[0], stagedInodes[1], "the second spawn must not stage a new copy");
+      assert.deepEqual(await stagedDirectories(fixture.stagingRoot), [`.grok-pin-${expectedSha256}`]);
+    } finally {
+      await fixture.remove();
+    }
+  });
+
   it("rejects all required preflight cases before spawning", async () => {
     const fixture = await prepareFixture();
     const script = join(fixture.directory, "agent");

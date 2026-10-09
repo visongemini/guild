@@ -5,6 +5,7 @@ export * from "./grok-acp-profile.js";
 export * from "./json-rpc-peer.js";
 export * from "./json-value.js";
 export * from "./ndjson.js";
+export { pinExecutableShared, pruneStalePinnedExecutables } from "./executable-pin.js";
 export {
   GrokProcessHost,
   GrokProcessHostError,
