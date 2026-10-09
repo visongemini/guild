@@ -9,6 +9,7 @@ export {
   type ConversationEntryKind,
   type ConversationEntryMetadata,
   type ConversationEntryRecord,
+  type ConversationEntryStamp,
   type ConversationEntryStatus,
   type ConversationMetadataValue,
   type ContinuousTaskPhase,

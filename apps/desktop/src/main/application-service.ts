@@ -16,6 +16,7 @@ import type {
   PromptAttachment,
   SendMessageResponse,
   SearchConversationsResponse,
+  StreamDeltaEvent,
   TaskId,
   TaskViewProjection,
   UpdateTaskRequest,
@@ -98,5 +99,7 @@ export interface DesktopApplicationService {
   runGrokManagement(request: RunGrokManagementRequest): Promise<RunGrokManagementResponse>;
   handleLifecycleEvent(event: "renderer_reload" | "suspend" | "resume"): Promise<void>;
   subscribe(listener: (projection: DesktopBootstrapProjection) => void): () => void;
+  /** Small append-only text events for the active task; never an authority over the projection. */
+  subscribeStreamDeltas(listener: (delta: StreamDeltaEvent) => void): () => void;
   close(): Promise<void>;
 }

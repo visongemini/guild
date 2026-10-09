@@ -233,6 +233,164 @@ describe("NdjsonDecoder (PC-TRN-003)", () => {
   });
 });
 
+describe("NdjsonDecoder LF splitting and single-pass decoding", () => {
+  const samples: readonly string[] = [
+    "plain ascii",
+    "你好，世界",
+    "emoji \u{1F600}\u{1F9D1}\u200D\u{1F4BB} and combining e\u0301",
+    "escapes \\n \\t \" quote and \u2028 separator",
+    "",
+    "x".repeat(2_000),
+    "混合 mixed \u{10FFFF} end",
+  ];
+
+  function buildStream(count: number, random: () => number): {
+    readonly bytes: Uint8Array;
+    readonly expected: readonly JsonObject[];
+  } {
+    const expected: JsonObject[] = [];
+    const parts: Uint8Array[] = [];
+    for (let index = 0; index < count; index += 1) {
+      const text = samples[Math.floor(random() * samples.length)]!;
+      const frame: JsonObject = { index, text, nested: { list: [text.length, true, null] } };
+      expected.push(frame);
+      const ending = random() < 0.4 ? "\r\n" : "\n";
+      parts.push(bytes(`${JSON.stringify(frame)}${ending}`));
+    }
+    const total = parts.reduce((sum, part) => sum + part.byteLength, 0);
+    const joined = new Uint8Array(total);
+    let offset = 0;
+    for (const part of parts) {
+      joined.set(part, offset);
+      offset += part.byteLength;
+    }
+    return { bytes: joined, expected };
+  }
+
+  function seeded(seed: number): () => number {
+    let state = seed >>> 0;
+    return () => {
+      state = (Math.imul(state, 1_664_525) + 1_013_904_223) >>> 0;
+      return state / 0x1_0000_0000;
+    };
+  }
+
+  it("decodes identically for any chunking, including one-byte and multibyte-splitting chunks", () => {
+    for (let seed = 1; seed <= 40; seed += 1) {
+      const random = seeded(seed);
+      const { bytes: stream, expected } = buildStream(12, random);
+      const whole = decodeChunks([stream]);
+      assert.deepEqual(whole, { frames: expected, terminalCode: undefined, terminalState: "ended" });
+
+      const chunks: Uint8Array[] = [];
+      for (let offset = 0; offset < stream.byteLength;) {
+        const size = seed % 5 === 0 ? 1 : 1 + Math.floor(random() * 97);
+        chunks.push(stream.subarray(offset, Math.min(stream.byteLength, offset + size)));
+        offset += size;
+      }
+      assert.deepEqual(decodeChunks(chunks), whole, `seed ${seed} with ${chunks.length} chunks`);
+    }
+  });
+
+  it("splits a frame at every byte, including inside each multibyte scalar and between CR and LF", () => {
+    const encoded = bytes(`${JSON.stringify({ text: "aé你\u{1F600}z" })}\r\n{"n":2}\n`);
+    for (let first = 0; first <= encoded.byteLength; first += 1) {
+      for (let second = first; second <= encoded.byteLength; second += 7) {
+        const outcome = decodeChunks([
+          encoded.subarray(0, first),
+          encoded.subarray(first, second),
+          encoded.subarray(second),
+        ]);
+        assert.deepEqual(outcome, {
+          frames: [{ text: "aé你\u{1F600}z" }, { n: 2 }],
+          terminalCode: undefined,
+          terminalState: "ended",
+        }, `splits ${first}/${second}`);
+      }
+    }
+  });
+
+  it("enforces the byte limit exactly at the boundary wherever the line feed lands", () => {
+    const payload = '{"k":1}';
+    const exact = bytes(`${payload}\n`);
+    const options = { maxFrameBytes: payload.length };
+    for (let split = 0; split <= exact.byteLength; split += 1) {
+      assert.deepEqual(
+        decodeChunks([exact.subarray(0, split), exact.subarray(split)], options),
+        { frames: [{ k: 1 }], terminalCode: undefined, terminalState: "ended" },
+        `exactly maxFrameBytes plus LF, split ${split}`,
+      );
+    }
+    // A CR belongs to the frame bytes, so the same line with CRLF is one byte too long.
+    const crlf = bytes(`${payload}\r\n`);
+    for (let split = 0; split <= crlf.byteLength; split += 1) {
+      assert.deepEqual(
+        decodeChunks([crlf.subarray(0, split), crlf.subarray(split)], options),
+        { frames: [], terminalCode: "frame_too_large", terminalState: "faulted" },
+        `CRLF over the limit, split ${split}`,
+      );
+    }
+    // Over the limit is detected without waiting for the line feed.
+    const decoder = new NdjsonDecoder(options);
+    assertFault(() => decoder.push(bytes(`${payload}x`)), "frame_too_large");
+  });
+
+  it("keeps frames completed before an oversized frame in the same chunk", () => {
+    const decoder = new NdjsonDecoder({ maxFrameBytes: 12 });
+    const error = assertFault(
+      () => decoder.push(bytes('{"a":1}\n{"b":2}\n{"long":"xxxxxxxxxxxxxxxx"}\n')),
+      "frame_too_large",
+    );
+    assert.deepEqual(error.framesBeforeFault, [{ a: 1 }, { b: 2 }]);
+  });
+
+  it("is unaffected by the caller reusing its buffer after a partial line", () => {
+    const decoder = new NdjsonDecoder();
+    const reused = new Uint8Array(16);
+    reused.set(bytes('{"text":"你'));
+    const firstLength = bytes('{"text":"你').byteLength;
+    assert.deepEqual(decoder.push(reused.subarray(0, firstLength)), []);
+    reused.fill(0x58);
+    reused.set(bytes('好"}\n'));
+    assert.deepEqual(decoder.push(reused.subarray(0, bytes('好"}\n').byteLength)), [{ text: "你好" }]);
+  });
+
+  it("strips a leading byte order mark exactly like the previous decoder", () => {
+    const decoder = new NdjsonDecoder();
+    assert.deepEqual(decoder.push(bytes('\uFEFF{"bom":true}\n')), [{ bom: true }]);
+    assert.deepEqual(decoder.push(bytes('{"after":1}\n')), [{ after: 1 }]);
+  });
+
+  it("reports invalid UTF-8 inside a complete line after earlier frames, whatever the chunking", () => {
+    const stream = Uint8Array.of(
+      ...bytes('{"ok":1}\n{"bad":"'),
+      0xff,
+      0xfe,
+      ...bytes('"}\n'),
+    );
+    for (let split = 0; split <= stream.byteLength; split += 1) {
+      assert.deepEqual(
+        decodeChunks([stream.subarray(0, split), stream.subarray(split)]),
+        { frames: [{ ok: 1 }], terminalCode: "invalid_utf8", terminalState: "faulted" },
+        `split ${split}`,
+      );
+    }
+  });
+
+  it("decodes a large multi-megabyte frame delivered in pipe-sized chunks", () => {
+    const text = "line of tool output 你好\n".repeat(120_000);
+    const stream = bytes(`${JSON.stringify({ text })}\n`);
+    const chunks: Uint8Array[] = [];
+    for (let offset = 0; offset < stream.byteLength; offset += 65_536) {
+      chunks.push(stream.subarray(offset, offset + 65_536));
+    }
+    assert.ok(stream.byteLength > 3 * 1024 * 1024);
+    const outcome = decodeChunks(chunks);
+    assert.equal(outcome.terminalCode, undefined);
+    assert.equal((outcome.frames[0] as { text: string }).text.length, text.length);
+  });
+});
+
 describe("NDJSON encoding", () => {
   it("emits exactly JSON.stringify(object) followed by LF", () => {
     const value = { jsonrpc: "2.0", id: 1, method: "initialize" };

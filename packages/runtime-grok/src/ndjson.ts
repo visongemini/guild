@@ -1,3 +1,4 @@
+import { Buffer } from "node:buffer";
 import { TextDecoder } from "node:util";
 import {
   assertJsonValue,
@@ -46,7 +47,11 @@ const DEFAULT_MAX_FRAME_BYTES = 12 * 1024 * 1024;
  */
 export class NdjsonDecoder {
   readonly maxFrameBytes: number;
-  private pending: number[] = [];
+  /** Bytes of an incomplete line carried across pushes, copied so callers may reuse their buffers. */
+  private pendingPieces: Uint8Array[] = [];
+  private pendingBytes = 0;
+  // Stateless between decode() calls (no `stream` option), so one instance serves every line.
+  private readonly utf8 = new TextDecoder("utf-8", { fatal: true });
   private currentState: NdjsonDecoderState = "open";
   private terminalError: NdjsonProtocolError | undefined;
 
@@ -74,49 +79,68 @@ export class NdjsonDecoder {
   push(chunk: Uint8Array): readonly JsonObject[] {
     this.assertOpen();
     const frames: JsonObject[] = [];
-    for (const byte of chunk) {
-      if (byte === 0x0a) {
-        frames.push(this.finishLine(frames));
-        continue;
+    const length = chunk.length;
+    let start = 0;
+    while (start < length) {
+      const newline = chunk.indexOf(0x0a, start);
+      if (newline === -1) {
+        if (this.pendingBytes + (length - start) > this.maxFrameBytes) {
+          this.fail(
+            "frame_too_large",
+            `NDJSON frame exceeds ${this.maxFrameBytes} bytes`,
+            frames,
+          );
+        }
+        this.pendingPieces.push(new Uint8Array(chunk.subarray(start, length)));
+        this.pendingBytes += length - start;
+        break;
       }
-      if (this.pending.length >= this.maxFrameBytes) {
+      if (this.pendingBytes + (newline - start) > this.maxFrameBytes) {
         this.fail(
           "frame_too_large",
           `NDJSON frame exceeds ${this.maxFrameBytes} bytes`,
           frames,
         );
       }
-      this.pending.push(byte);
+      frames.push(this.finishLine(chunk.subarray(start, newline), frames));
+      start = newline + 1;
     }
     return frames;
   }
 
   end(): readonly JsonObject[] {
     this.assertOpen();
-    if (this.pending.length === 0) {
+    if (this.pendingBytes === 0) {
       this.currentState = "ended";
       return [];
     }
 
     const text = this.decodePending();
     if (text.trim().length === 0) {
-      this.pending = [];
+      this.clearPending();
       this.currentState = "ended";
       return [];
     }
     this.fail("truncated_frame", "stdout ended with an unterminated NDJSON frame");
   }
 
-  private finishLine(framesBeforeFault: readonly JsonObject[]): JsonObject {
-    let bytes = this.pending;
-    this.pending = [];
-    if (bytes.at(-1) === 0x0d) {
-      bytes = bytes.slice(0, -1);
+  /** `tail` is the part of the line inside the current chunk; earlier parts are pending. */
+  private finishLine(tail: Uint8Array, framesBeforeFault: readonly JsonObject[]): JsonObject {
+    let bytes: Uint8Array;
+    if (this.pendingBytes === 0) {
+      bytes = tail;
+    } else {
+      this.pendingPieces.push(tail);
+      bytes = Buffer.concat(this.pendingPieces, this.pendingBytes + tail.length);
+      this.clearPending();
+    }
+    if (bytes.length > 0 && bytes[bytes.length - 1] === 0x0d) {
+      bytes = bytes.subarray(0, bytes.length - 1);
     }
 
     let text: string;
     try {
-      text = new TextDecoder("utf-8", { fatal: true }).decode(Uint8Array.from(bytes));
+      text = this.utf8.decode(bytes);
     } catch {
       this.fail(
         "invalid_utf8",
@@ -163,12 +187,15 @@ export class NdjsonDecoder {
 
   private decodePending(): string {
     try {
-      return new TextDecoder("utf-8", { fatal: true }).decode(
-        Uint8Array.from(this.pending),
-      );
+      return this.utf8.decode(Buffer.concat(this.pendingPieces, this.pendingBytes));
     } catch {
       this.fail("invalid_utf8", "unterminated NDJSON bytes are not valid UTF-8");
     }
+  }
+
+  private clearPending(): void {
+    this.pendingPieces = [];
+    this.pendingBytes = 0;
   }
 
   private assertOpen(): void {
@@ -188,7 +215,7 @@ export class NdjsonDecoder {
     const error = new NdjsonProtocolError(code, message, framesBeforeFault);
     this.currentState = "faulted";
     this.terminalError = error;
-    this.pending = [];
+    this.clearPending();
     throw error;
   }
 }

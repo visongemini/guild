@@ -123,7 +123,15 @@ export const DESKTOP_IPC_CHANNELS = Object.freeze({
   openRuntimeDiagnostics: "guild:v1:diagnostics:open-runtime-log",
   runGrokManagement: "guild:v1:grok:management:run",
   projectionChanged: "guild:v1:event:projection-changed",
+  streamDelta: "guild:v1:event:stream-delta",
 } as const);
+
+/** Main-to-renderer push channels. Every other registered channel is renderer-initiated invoke. */
+export const DESKTOP_EVENT_CHANNELS = Object.freeze([
+  DESKTOP_IPC_CHANNELS.projectionChanged,
+  DESKTOP_IPC_CHANNELS.streamDelta,
+] as const);
+export type DesktopEventChannel = (typeof DESKTOP_EVENT_CHANNELS)[number];
 
 export const GUILD_DEFAULT_NICKNAME = "BDV";
 
@@ -310,6 +318,34 @@ export type TaskWorkbenchProjection = {
   }[];
   readonly terminalObserved: boolean;
 };
+
+/**
+ * Streaming text delta for one authored entry (assistant text or thought).
+ * It is an optimization over the full projection, never an authority:
+ * `offset` is the UTF-16 length of the entry text before `appendText`, so the renderer
+ * can detect gaps and duplicates and always converges on the next full projection.
+ */
+export const GUILD_STREAM_DELTA_KINDS = Object.freeze(["assistant", "thought"] as const);
+export type GuildStreamDeltaKind = (typeof GUILD_STREAM_DELTA_KINDS)[number];
+export const GUILD_STREAM_DELTA_LIMITS = Object.freeze({
+  /** Bounds one coalesced delta; a single runtime chunk is at most 65,536 characters. */
+  maxAppendTextLength: 131_072,
+  /** Persistence caps one entry at 1 MiB of UTF-8, which is fewer UTF-16 units than this. */
+  maxOffset: 1_048_576,
+  maxRevision: 4_294_967_295,
+});
+export type StreamDeltaEvent = Readonly<{
+  taskId: TaskId;
+  runId?: RunId;
+  entryId: string;
+  kind: GuildStreamDeltaKind;
+  /** UTF-16 length of the entry text before this delta was appended. */
+  offset: number;
+  appendText: string;
+  /** Strictly increasing per entry; counts runtime chunks applied by main. */
+  revision: number;
+  updatedAtMs: number;
+}>;
 
 export type ConversationSearchResult = {
   readonly taskId: TaskId;
@@ -751,6 +787,9 @@ export type GuildRendererApi = Readonly<{
   readonly onProjectionChanged: (
     listener: (projection: DesktopBootstrapProjection) => void,
   ) => () => void;
+  readonly onStreamDelta: (
+    listener: (event: StreamDeltaEvent) => void,
+  ) => () => void;
 }>;
 
 export const GUILD_MAX_MESSAGE_LENGTH = 200_000;
@@ -886,6 +925,55 @@ export function parseAvatarPreviewToken(value: unknown): string {
     throw new TypeError("invalid_avatar_preview_token");
   }
   return value;
+}
+
+/** Validates a main-to-renderer stream delta before it is sent and before it is applied. */
+export function parseStreamDeltaEvent(input: unknown): StreamDeltaEvent {
+  const record = exactRecord(
+    input,
+    ["taskId", "entryId", "kind", "offset", "appendText", "revision", "updatedAtMs"],
+    ["runId"],
+  );
+  const task = parseTaskId(record["taskId"]);
+  if (!task.ok) throw new TypeError("invalid_stream_delta_task");
+  const kind = record["kind"];
+  if (kind !== "assistant" && kind !== "thought") {
+    throw new TypeError("invalid_stream_delta_kind");
+  }
+  const offset = record["offset"];
+  const revision = record["revision"];
+  const updatedAtMs = record["updatedAtMs"];
+  if (
+    typeof offset !== "number" ||
+    !Number.isSafeInteger(offset) ||
+    offset < 0 ||
+    offset > GUILD_STREAM_DELTA_LIMITS.maxOffset ||
+    typeof revision !== "number" ||
+    !Number.isSafeInteger(revision) ||
+    revision < 1 ||
+    revision > GUILD_STREAM_DELTA_LIMITS.maxRevision ||
+    typeof updatedAtMs !== "number" ||
+    !Number.isSafeInteger(updatedAtMs) ||
+    updatedAtMs < 0
+  ) {
+    throw new TypeError("invalid_stream_delta_position");
+  }
+  let runId: RunId | undefined;
+  if (Object.hasOwn(record, "runId")) {
+    const run = parseRunId(record["runId"]);
+    if (!run.ok) throw new TypeError("invalid_stream_delta_run");
+    runId = boundedId(run.value);
+  }
+  return Object.freeze({
+    taskId: boundedId(task.value),
+    ...(runId === undefined ? {} : { runId }),
+    entryId: boundedText(record["entryId"], MAX_ID_LENGTH),
+    kind,
+    offset,
+    appendText: boundedText(record["appendText"], GUILD_STREAM_DELTA_LIMITS.maxAppendTextLength),
+    revision,
+    updatedAtMs,
+  });
 }
 
 export function parseDesktopRequest<Channel extends DesktopInvokeChannel>(
@@ -1196,6 +1284,9 @@ export function parseDesktopRequest<Channel extends DesktopInvokeChannel>(
         taskNotificationsEnabled: record["taskNotificationsEnabled"],
       }) as DesktopRequestByChannel[Channel];
     }
+    default:
+      // Push-only event channels and any dynamically built name are never requests.
+      throw new TypeError("unregistered_channel");
   }
 }
 

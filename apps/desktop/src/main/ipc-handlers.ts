@@ -8,6 +8,7 @@ import {
 } from "@guild/contracts";
 import { BrowserWindow, ipcMain, type IpcMainInvokeEvent } from "electron";
 import type { DesktopApplicationService } from "./application-service.js";
+import { createStreamDeltaForwarder } from "./stream-delta-channel.js";
 import { isTrustedGuildSender } from "./window-security.js";
 import { toDesktopIpcFailure } from "./workspace-folder.js";
 
@@ -138,8 +139,14 @@ export function registerDesktopIpc(
     }
   });
 
+  const forwardStreamDelta = createStreamDeltaForwarder(window);
+  const unsubscribeDeltas = service.subscribeStreamDeltas((delta) => {
+    forwardStreamDelta(delta);
+  });
+
   return () => {
     unsubscribe();
+    unsubscribeDeltas();
     for (const channel of channels) ipcMain.removeHandler(channel);
   };
 }

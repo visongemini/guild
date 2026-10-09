@@ -2842,6 +2842,18 @@ describe("main-only SQLite persistence", () => {
       reopened.close();
     });
 
+    it("reports the pending revision in entry stamps while a stream window is open [WP4]", (t) => {
+      const store = liveReadyStore(temporaryDatabase(t));
+      const { record } = streamChunks(store, "stamp-entry", ["a", "b", "c", "d", "e"], 1);
+      const stamp = store.listRecentConversationEntryStamps({ taskId }).at(-1);
+      assert.equal(stamp?.entryId, "stamp-entry");
+      // Projection caches key rows by these stamps; a stored revision behind the window would
+      // keep serving text without the pending tail.
+      assert.equal(stamp?.revision, record.revision);
+      assert.equal(stamp?.revision, store.listRecentConversationEntries({ taskId }).at(-1)?.revision);
+      store.close();
+    });
+
     it("writes the open window before any other store call, in call order [WP2]", (t) => {
       const path = temporaryDatabase(t);
       const store = liveReadyStore(path);

@@ -325,6 +325,8 @@ export function createFixtureDesktopService(): DesktopApplicationService {
       listeners.add(listener);
       return () => listeners.delete(listener);
     },
+    // Fixtures are static, so they never stream text.
+    subscribeStreamDeltas: () => () => undefined,
     close: async () => listeners.clear(),
   };
 

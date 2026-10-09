@@ -577,3 +577,30 @@ once per process:
   falls back to a dedicated process only if the borrowed call fails.
 - The child environment carries the fixed Guild-owned value `OPENVIKING_RECALL_COMPRESS=off` (see
   `docs/18-SPEED-PLAN-2.2.md`).
+
+## D-053 — Stream text as deltas and publish full projections only on structural change
+
+Date: 2026-10-09. Implements WP4 of `docs/18-SPEED-PLAN-2.2.md` and amends D-049. During a long
+answer main rebuilt and re-sent the whole bootstrap (about 1 MB, several MB on large tasks) up to
+60 times per second, and the renderer re-rendered every row for each one.
+
+Authored text and thought chunks now also produce a small `StreamDeltaEvent` on the registered
+`guild:v1:event:stream-delta` channel (active task only, coalesced to one per 16 ms per entry,
+validated against a closed schema right before send). The delta is never an authority: it carries
+the UTF-16 offset it appends at, the renderer shows `projection text + delta suffix`, ignores
+duplicates, rejects other tasks, and every full projection supersedes the suffix. Full projections
+are rebuilt on structural change (new entry, tool/plan/permission/run-state change, sidebar or
+settings change) and at most every 250 ms (longer if the last build was slow) while text streams.
+This replaces D-049's per-chunk publication; its yielding, partial-display, ordering and
+terminal-text guarantees are unchanged, and terminal and permission barriers still await
+publication. Tool, plan and sub-agent updates now schedule publication instead of holding the
+one-at-a-time update queue, and `sendMessage` hands the prompt to the official process before it
+publishes the new Run.
+
+Main reuses rows it already decoded and integrity-verified while a read-only stamp query
+(`entry_id`, `sequence`, `revision`) shows them unchanged. The renderer applies projections once
+per frame with a timer fallback for hidden windows, shares unchanged objects between projections,
+memoizes rows, re-parses only the last Markdown block of a streaming message, mounts collapsed
+activity and tool-output bodies on demand, and uses observers instead of post-commit layout reads.
+Finished rows away from the live tail use `content-visibility: auto` with estimated placeholder
+heights. A finished message is still rendered as one document, so final markup is unchanged.

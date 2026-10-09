@@ -169,6 +169,17 @@ For every request and event:
    bounded public error code and localized-safe details, never a raw exception, stack,
    SQL text, environment dump, protocol frame, or secret.
 
+Main-to-renderer events are registered in the same contract (`DESKTOP_EVENT_CHANNELS`). Besides
+the full projection, `guild:v1:event:stream-delta` carries one small `StreamDeltaEvent` per
+streaming entry (`taskId`, optional `runId`, `entryId`, `kind`, `offset`, `appendText`, `revision`,
+`updatedAtMs`) so streamed text does not require a full projection per chunk. Main validates every
+delta against the closed schema (`parseStreamDeltaEvent`, `appendText` at most 131,072 UTF-16 units)
+immediately before sending and sends only through the web contents captured when the window was
+registered. It is an optimization, never an authority: the renderer shows `projection text + delta
+suffix`, rejects deltas for any task it is not viewing, ignores duplicates and gaps, and the next full
+projection always supersedes the suffix. The preload only subscribes to the two registered event
+channels and strips the Electron event object.
+
 Subscriptions expose a named callback wrapper and return a working unsubscribe function.
 Preload removes Electron's event object before invoking renderer code. Events carry the
 task/run/session tuple required by the architecture, and both main and renderer reject a
