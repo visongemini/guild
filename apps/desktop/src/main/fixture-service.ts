@@ -1,15 +1,23 @@
 import {
   GUILD_API_VERSION,
-  GUILD_GROK_MODELS,
   GUILD_GROK_PERMISSION_MODES,
   GUILD_DEFAULT_GROK_STARTUP_SETTINGS,
+  GUILD_MODEL_SWITCH_REFUSAL_REASONS,
+  GUILD_RUN_PHASES,
+  freezeGrokModelCatalog,
+  resolveEffectiveSelection,
   type DesktopBootstrapProjection,
   type GuildLocale,
   type GuildGrokModel,
   type GuildGrokPermissionMode,
   type GuildGrokReasoningEffort,
   type GuildGrokStartupSettings,
+  type GuildModelSwitchRefusalReason,
+  type GuildRunPhase,
   type RunId,
+  type RunPhaseProjection,
+  type SetTaskRuntimeSettingsRequest,
+  type SetTaskRuntimeSettingsResponse,
   type TaskId,
   type TaskViewProjection,
   type WorkspaceId,
@@ -32,12 +40,56 @@ const RECOVERY_STATE =
   process.env["GUILD_FIXTURE_UI_STATE"] === "recovery-narrow" ||
   process.env["GUILD_FIXTURE_UI_STATE"] === "recovery-wide";
 const QUEUE_PREEMPT_STATE = process.env["GUILD_FIXTURE_UI_STATE"] === "queue-preempt";
+// GUILD_FIXTURE_RUN_PHASE=<phase> turns the task into a running turn that exposes that phase, so the
+// phase line (thinking, prompt_sent, retrying, ...) can be inspected; it implies a running task.
+const RUN_PHASE: GuildRunPhase | undefined = GUILD_RUN_PHASES.find(
+  (phase) => phase === process.env["GUILD_FIXTURE_RUN_PHASE"],
+);
+// GUILD_FIXTURE_MODEL_REFUSAL=<reason> makes the model picker refuse every model change with that reason.
+const MODEL_REFUSAL: GuildModelSwitchRefusalReason | undefined = GUILD_MODEL_SWITCH_REFUSAL_REASONS.find(
+  (reason) => reason === process.env["GUILD_FIXTURE_MODEL_REFUSAL"],
+);
+// GUILD_FIXTURE_MODEL_DELAY_MS slows a model change down so the picker's pending state is visible.
+const MODEL_DELAY_MS = boundedFixtureDelay(process.env["GUILD_FIXTURE_MODEL_DELAY_MS"]);
+
+/** The list the official runtime advertised on 2026-10-09 (names, labels and descriptions are its own). */
+const FIXTURE_EFFORTS = (withExtraHigh: boolean) => [
+  ...(withExtraHigh
+    ? [{ id: "xhigh", label: "Extra High", description: "Maximum reasoning for the hardest tasks.", isDefault: false }]
+    : []),
+  { id: "high", label: "High", description: "Thorough reasoning and quality. Recommended.", isDefault: true },
+  { id: "medium", label: "Medium", isDefault: false },
+  { id: "low", label: "Low", isDefault: false },
+];
+const FIXTURE_MODEL_CATALOG = freezeGrokModelCatalog({
+  models: [
+    {
+      id: "grok-4.7",
+      name: "Grok 4.7",
+      description: "SpaceXAI's latest frontier model",
+      reasoningEfforts: FIXTURE_EFFORTS(true),
+      contextWindows: [256000, 500000],
+    },
+    {
+      id: "grok-4.7-build-fast",
+      name: "Grok 4.7 Fast",
+      description: "Fast variant. 2x the price.",
+      reasoningEfforts: FIXTURE_EFFORTS(true),
+      contextWindows: [256000, 500000],
+    },
+    { id: "grok-4.6", name: "Grok 4.6", reasoningEfforts: FIXTURE_EFFORTS(true), contextWindows: [256000] },
+    { id: "grok-4.5", name: "Grok 4.5", reasoningEfforts: FIXTURE_EFFORTS(false), contextWindows: [256000] },
+  ],
+  runtimeDefaultModelId: "grok-4.7",
+});
 
 export function createFixtureDesktopService(): DesktopApplicationService {
   const listeners = new Set<(projection: DesktopBootstrapProjection) => void>();
   let locale: GuildLocale = "zh-CN";
-  let grokModel: GuildGrokModel = "grok-4.6";
-  let reasoningEffort: GuildGrokReasoningEffort = "xhigh";
+  // null follows the runtime default, like a fresh install.
+  let grokModel: GuildGrokModel | null = null;
+  let reasoningEffort: GuildGrokReasoningEffort | null = null;
+  const taskOverrides = new Map<string, { model: GuildGrokModel; reasoningEffort: GuildGrokReasoningEffort | null }>();
   let permissionMode: GuildGrokPermissionMode = "default";
   let startup: GuildGrokStartupSettings = GUILD_DEFAULT_GROK_STARTUP_SETTINGS;
   let sidebarWidth = 280;
@@ -50,15 +102,43 @@ export function createFixtureDesktopService(): DesktopApplicationService {
     status: "unavailable",
     reason: "not_reported_by_runtime",
   });
-  let activeTask = fixtureTask(
+  let activeTask = withModelSelection(fixtureTask(
     SESSION_REPLACEMENT_REQUIRED,
     COMMAND_STATUS_RUNNING || STATUS_VARIANTS,
     WAITING_STATUS,
     RUN_BOUNDARIES,
     RECOVERY_STATE,
     QUEUE_PREEMPT_STATE,
-  );
+    fixtureRunPhase(RUN_PHASE),
+  ));
   let projection = buildProjection();
+
+  /** What the task will use for its next turn: its own override, then the global default, then the runtime's. */
+  function withModelSelection(task: Omit<TaskViewProjection, "modelSelection">): TaskViewProjection {
+    const override = taskOverrides.get(task.task.taskId);
+    const resolved = resolveEffectiveSelection({
+      ...(override === undefined
+        ? {}
+        : { task: { modelId: override.model, reasoningEffort: override.reasoningEffort } }),
+      global: { modelId: grokModel, reasoningEffort },
+      catalog: FIXTURE_MODEL_CATALOG,
+    });
+    const state = task.task.activeRunState;
+    const turnLive = state !== undefined &&
+      !["completed", "failed", "cancelled", "interrupted"].includes(state);
+    // A finished turn has no phase and the picker is free again.
+    const { runPhase, ...rest } = task;
+    return Object.freeze({
+      ...rest,
+      ...(turnLive && runPhase !== undefined ? { runPhase } : {}),
+      modelSelection: Object.freeze({
+        modelId: resolved.modelId,
+        reasoningEffort: resolved.reasoningEffort,
+        source: resolved.source,
+        canChange: !turnLive,
+      }),
+    });
+  }
 
   function buildProjection(): DesktopBootstrapProjection {
     const task = activeTask.task;
@@ -70,9 +150,9 @@ export function createFixtureDesktopService(): DesktopApplicationService {
       runtimeSettings: Object.freeze({
         model: grokModel,
         reasoningEffort,
+        modelCatalog: FIXTURE_MODEL_CATALOG,
         permissionMode,
         startup,
-        availableModels: GUILD_GROK_MODELS,
         availablePermissionModes: GUILD_GROK_PERMISSION_MODES,
         canChange: true,
       }),
@@ -165,7 +245,7 @@ export function createFixtureDesktopService(): DesktopApplicationService {
     chooseWorkspace: async () => projection,
     choosePromptFiles: async () => Object.freeze({ status: "cancelled" as const }),
     createTask: async (workspaceId) => {
-      activeTask = Object.freeze({
+      activeTask = withModelSelection({
         task: Object.freeze({
           taskId: `task-${Date.now()}` as TaskId,
           workspaceId,
@@ -206,6 +286,28 @@ export function createFixtureDesktopService(): DesktopApplicationService {
     searchConversations: async () => Object.freeze({ results: Object.freeze([]) }),
     openTaskResource: async () => undefined,
     setSessionConfigOption: async () => activeTask,
+    setTaskRuntimeSettings: async (request: SetTaskRuntimeSettingsRequest): Promise<SetTaskRuntimeSettingsResponse> => {
+      if (request.taskId !== activeTask.task.taskId) throw new Error("fixture_task_not_found");
+      if (MODEL_DELAY_MS > 0) await new Promise<void>((resolve) => setTimeout(resolve, MODEL_DELAY_MS));
+      // The previous selection stays when the runtime refuses.
+      const refusal: GuildModelSwitchRefusalReason | undefined = request.model === null
+        ? undefined
+        : MODEL_REFUSAL ?? (request.model === "grok-4.5" && request.reasoningEffort === "xhigh"
+          ? "unsupported_value"
+          : undefined);
+      if (refusal !== undefined) {
+        return Object.freeze({ status: "refused" as const, reason: refusal, task: activeTask });
+      }
+      if (request.model === null) taskOverrides.delete(request.taskId);
+      else taskOverrides.set(request.taskId, { model: request.model, reasoningEffort: request.reasoningEffort });
+      activeTask = withModelSelection(activeTask);
+      publish();
+      // A task that has not opened a session yet only stores the choice for when it does.
+      return Object.freeze({
+        status: activeTask.timeline.length > 0 ? "applied" as const : "saved" as const,
+        task: activeTask,
+      });
+    },
     updateWorkspace: async () => projection,
     updateTask: async () => projection,
     sendMessage: async (taskId, text) => {
@@ -214,7 +316,7 @@ export function createFixtureDesktopService(): DesktopApplicationService {
         await new Promise<void>((resolve) => setTimeout(resolve, SEND_DELAY_MS));
       }
       const runId = `run-${Date.now()}` as RunId;
-      activeTask = Object.freeze({
+      activeTask = withModelSelection({
         ...activeTask,
         task: Object.freeze({ ...activeTask.task, activeRunState: "completed", updatedAtMs: Date.now() }),
         timeline: Object.freeze([
@@ -287,6 +389,7 @@ export function createFixtureDesktopService(): DesktopApplicationService {
       reasoningEffort = nextReasoningEffort;
       permissionMode = nextPermissionMode;
       startup = nextStartup;
+      activeTask = withModelSelection(activeTask);
       publish();
       return projection;
     },
@@ -333,6 +436,24 @@ export function createFixtureDesktopService(): DesktopApplicationService {
   return Object.freeze(service);
 }
 
+/** A turn that began 35 s ago and has spent 23 s in `phase` (the whole turn for the first two phases). */
+function fixtureRunPhase(phase: GuildRunPhase | undefined): RunPhaseProjection | undefined {
+  if (phase === undefined) return undefined;
+  const nowMs = Date.now();
+  const turnStartedAtMs = nowMs - 35_000;
+  const beganWithTurn = phase === "starting_runtime" || phase === "prompt_sent";
+  return Object.freeze({
+    phase,
+    turnStartedAtMs,
+    phaseStartedAtMs: beganWithTurn ? turnStartedAtMs : nowMs - 23_000,
+    ...(phase === "queued" ? { queuePosition: 2 } : {}),
+    ...(phase === "running_hooks" ? { hookCount: 2 } : {}),
+    ...(phase === "preparing_tool" || phase === "running_tool" ? { toolName: "Bash" } : {}),
+    ...(phase === "retrying" ? { attempt: 2, maxRetries: 5 } : {}),
+    ...(phase === "opening_session" ? { mcpConnected: 3, mcpTotal: 7 } : {}),
+  });
+}
+
 function boundedFixtureDelay(value: string | undefined): number {
   if (value === undefined) return 0;
   const parsed = Number(value);
@@ -346,7 +467,8 @@ function fixtureTask(
   runBoundaries = false,
   recoveryState = false,
   queuePreemptState = false,
-): TaskViewProjection {
+  runPhase: RunPhaseProjection | undefined = undefined,
+): Omit<TaskViewProjection, "modelSelection"> {
   const taskId = "task-market-review" as TaskId;
   const runId = "run-market-review" as RunId;
   return Object.freeze({
@@ -359,7 +481,7 @@ function fixtureTask(
       updatedAtMs: NOW,
       activeRunState: recoveryState
         ? "interrupted"
-        : commandStatusRunning || waitingForGrok || runBoundaries || queuePreemptState
+        : commandStatusRunning || waitingForGrok || runBoundaries || queuePreemptState || runPhase !== undefined
           ? "running"
           : "completed",
       ...(commandStatusRunning || runBoundaries || queuePreemptState ? { activeActivity: "reading" as const } : {}),
@@ -397,7 +519,7 @@ function fixtureTask(
           terminalObserved: true,
         }),
       }),
-    } : !commandStatusRunning && !waitingForGrok && !runBoundaries ? {
+    } : !commandStatusRunning && !waitingForGrok && !runBoundaries && runPhase === undefined ? {
       recentResult: Object.freeze({
         runId,
         state: "completed" as const,
@@ -410,6 +532,7 @@ function fixtureTask(
         }),
       }),
     } : {}),
+    ...(runPhase === undefined ? {} : { runPhase }),
     queuedTurns: queuePreemptState ? Object.freeze([
       Object.freeze({
         queueId: "queue-preempt-1",
@@ -463,14 +586,14 @@ function fixtureTask(
         Object.freeze({ entryId: "tool-goal-search", taskId, runId, sequence: 10, createdAtMs: NOW + 1_100, updatedAtMs: NOW + 1_300, status: "completed", kind: "tool", title: "搜索关卡入口", toolKind: "search", toolStatus: "completed", content: Object.freeze([]), locations: Object.freeze([]) } as const),
         Object.freeze({ entryId: "tool-goal-read", taskId, runId, sequence: 11, createdAtMs: NOW + 1_400, updatedAtMs: NOW + 1_500, status: "streaming", kind: "tool", title: "读取关卡脚本", toolKind: "read", toolStatus: "in_progress", content: Object.freeze([]), locations: Object.freeze([]) } as const),
       ] : []),
-      ...(waitingForGrok ? [
+      ...(waitingForGrok || runPhase !== undefined ? [
         Object.freeze({
           entryId: "user-waiting",
           taskId,
           runId: "run-waiting" as RunId,
           sequence: 8,
-          createdAtMs: Date.now() - 76_000,
-          updatedAtMs: Date.now() - 76_000,
+          createdAtMs: runPhase?.turnStartedAtMs ?? Date.now() - 76_000,
+          updatedAtMs: runPhase?.turnStartedAtMs ?? Date.now() - 76_000,
           status: "completed",
           kind: "user",
           text: "可以的，没数还需要你继续优化。",

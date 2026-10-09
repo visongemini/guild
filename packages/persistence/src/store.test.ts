@@ -15,6 +15,7 @@ import { describe, it, type TestContext } from "node:test";
 import { Worker } from "node:worker_threads";
 import {
   createRuntimeTurnEvent,
+  freezeGrokModelCatalog,
   freezeRuntimePayload,
   parseAdapterEpoch,
   parseIdempotencyKey,
@@ -26,6 +27,7 @@ import {
   parseTaskId,
   parseToolCallId,
   parseWindowId,
+  type GrokModelCatalog,
   type PermissionIdentity,
   type Result,
   type RuntimePermissionRequestPayload,
@@ -369,13 +371,13 @@ describe("main-only SQLite persistence", () => {
     );
   });
 
-  it("creates a WAL database whose application tables are STRICT at schema v15", (t) => {
+  it("creates a WAL database whose application tables are STRICT at schema v16", (t) => {
     const path = temporaryDatabase(t);
     const store = baseStore(path);
     store.close();
     const raw = new DatabaseSync(path);
     assert.equal(raw.prepare("PRAGMA journal_mode").get()?.["journal_mode"], "wal");
-    assert.equal(raw.prepare("PRAGMA user_version").get()?.["user_version"], 15);
+    assert.equal(raw.prepare("PRAGMA user_version").get()?.["user_version"], 16);
     const strictByTable = new Map(
       raw
         .prepare("PRAGMA table_list")
@@ -403,6 +405,8 @@ describe("main-only SQLite persistence", () => {
       "session_context_windows",
       "continuous_tasks",
       "task_context_usage",
+      "task_runtime_settings",
+      "runtime_model_catalog",
     ]) {
       assert.equal(strictByTable.get(table), 1, `${table} must be STRICT`);
     }
@@ -742,8 +746,8 @@ describe("main-only SQLite persistence", () => {
         locale: "zh-CN",
         sidebarWidth: 280,
         browserSyncEnabled: false,
-        grokModel: "grok-4.6",
-        reasoningEffort: "xhigh",
+        grokModel: null,
+        reasoningEffort: null,
         permissionMode: "default",
         startup: {
           webSearchEnabled: true,
@@ -805,12 +809,11 @@ describe("main-only SQLite persistence", () => {
     assert.throws(
       () => store.updateAppSettings({
         expectedRevision: settings2.revision,
-        grokModel: "grok-4.5",
-        reasoningEffort: "xhigh",
+        grokModel: "MiniMax-M3",
       }),
       (error: unknown) =>
-        error instanceof PersistenceError &&
-        error.code === "domain_operation_rejected",
+        error instanceof TypeError ||
+        (error instanceof PersistenceError && error.code === "domain_operation_rejected"),
     );
     assert.throws(
       () => store.updateAppSettings({
@@ -1088,7 +1091,7 @@ describe("main-only SQLite persistence", () => {
     const reopened = openGuildPersistence({ path });
     assert.equal(reopened.loadRun(taskId, runId).state, "completed");
     assert.equal(reopened.loadConversationEntry(taskId, "live-assistant-1").text, "Hello");
-    assert.equal(reopened.verifyIntegrity().schemaVersion, 15);
+    assert.equal(reopened.verifyIntegrity().schemaVersion, 16);
     reopened.close();
   });
 
@@ -1135,7 +1138,7 @@ describe("main-only SQLite persistence", () => {
     const next = store.commitLiveRuntimeEvent({ event: eventAt(257), mutation });
     assert.equal(next.ok, true);
     assert.equal(next.record?.text, "x".repeat(257));
-    assert.equal(store.verifyIntegrity().schemaVersion, 15);
+    assert.equal(store.verifyIntegrity().schemaVersion, 16);
     store.close();
   });
 
@@ -1147,6 +1150,8 @@ describe("main-only SQLite persistence", () => {
     const raw = new DatabaseSync(path);
     raw.exec(`
       PRAGMA foreign_keys = OFF;
+      DROP TABLE runtime_model_catalog;
+      DROP TABLE task_runtime_settings;
       DROP TABLE task_context_usage;
       DROP TABLE continuous_tasks;
       DROP TABLE queued_turns;
@@ -1172,7 +1177,7 @@ describe("main-only SQLite persistence", () => {
         PRIMARY KEY(task_id, idempotency_key),
         UNIQUE(task_id, adapter_epoch, receive_sequence)
       ) STRICT;
-      DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+      DELETE FROM schema_migrations WHERE version IN (2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16);
       CREATE TABLE guild_meta_v1 (
         singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
         schema_version INTEGER NOT NULL CHECK(schema_version = 1),
@@ -1188,7 +1193,7 @@ describe("main-only SQLite persistence", () => {
     raw.close();
 
     const migrated = openGuildPersistence({ path });
-    assert.equal(migrated.verifyIntegrity().schemaVersion, 15);
+    assert.equal(migrated.verifyIntegrity().schemaVersion, 16);
     assert.equal(migrated.loadRun(taskId, runId).state, "queued");
     assert.throws(
       () => migrated.loadTaskMetadata(taskId),
@@ -1333,7 +1338,7 @@ describe("main-only SQLite persistence", () => {
     });
     assert.equal(secondDispatch.run.runId, secondQueuedRunId);
     assert.equal(store.listQueuedTurns(taskId).length, 0);
-    assert.equal(store.verifyIntegrity().schemaVersion, 15);
+    assert.equal(store.verifyIntegrity().schemaVersion, 16);
     store.close();
   });
 
@@ -2831,7 +2836,7 @@ describe("main-only SQLite persistence", () => {
       assert.equal(merged.payload.text, texts.slice(1).join(""));
 
       const reopened = openGuildPersistence({ path });
-      assert.equal(reopened.verifyIntegrity().schemaVersion, 15);
+      assert.equal(reopened.verifyIntegrity().schemaVersion, 16);
       // Admission continues from the last covered sequence, so the stream resumes gaplessly.
       const next = reopened.commitLiveRuntimeEvent({
         event: textChunk(lastSequence + 1, "!"),
@@ -3155,8 +3160,10 @@ describe("main-only SQLite persistence", () => {
         BEGIN
           SELECT RAISE(ABORT, 'conversation_entry_not_append_only');
         END;
+        DROP TABLE runtime_model_catalog;
+        DROP TABLE task_runtime_settings;
         DROP TABLE task_context_usage;
-        DELETE FROM schema_migrations WHERE version = 15;
+        DELETE FROM schema_migrations WHERE version IN (15, 16);
         CREATE TABLE guild_meta_v14 (
           singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
           schema_version INTEGER NOT NULL CHECK(schema_version = 14),
@@ -3179,12 +3186,12 @@ describe("main-only SQLite persistence", () => {
       downgrade.close();
 
       const migrated = openGuildPersistence({ path });
-      assert.equal(migrated.verifyIntegrity().schemaVersion, 15);
+      assert.equal(migrated.verifyIntegrity().schemaVersion, 16);
       migrated.close();
       assert.equal(snapshot(), before, "migration must not read-modify historical rows");
 
       const raw = new DatabaseSync(path);
-      assert.equal(raw.prepare("PRAGMA user_version").get()?.["user_version"], 15);
+      assert.equal(raw.prepare("PRAGMA user_version").get()?.["user_version"], 16);
       assert.match(
         String(raw.prepare("SELECT sql FROM sqlite_schema WHERE name = 'conversation_entry_is_append_only'").get()?.["sql"]),
         /octet_length/u,
@@ -3334,7 +3341,7 @@ describe("main-only SQLite persistence", () => {
 
       const reopened = openGuildPersistence({ path });
       assert.equal(reopened.loadLatestContextTokensUsed(taskId), 9_000);
-      assert.equal(reopened.verifyIntegrity().schemaVersion, 15);
+      assert.equal(reopened.verifyIntegrity().schemaVersion, 16);
       reopened.close();
     });
 
@@ -3367,6 +3374,578 @@ describe("main-only SQLite persistence", () => {
         (error: unknown) =>
           error instanceof PersistenceError && error.code === "aggregate_integrity_failed",
       );
+    });
+  });
+
+  describe("runtime model catalog and per-task settings [F1]", () => {
+    const failure = (code: string) => (error: unknown) =>
+      error instanceof PersistenceError && error.code === code;
+    // updateAppSettings lets the contracts parser's TypeError through, like every other setting.
+    const invalidValue = (error: unknown) =>
+      error instanceof TypeError ||
+      (error instanceof PersistenceError && error.code === "domain_operation_rejected");
+
+    function withRaw<T>(path: string, operation: (raw: DatabaseSync) => T): T {
+      const raw = new DatabaseSync(path);
+      try {
+        return operation(raw);
+      } finally {
+        raw.close();
+      }
+    }
+
+    // Rebuilds a freshly created database the way a Guild 2.2 (schema v15) install looks: the
+    // old closed model and effort CHECKs, none of the V16 tables, and the given settings pair.
+    function downgradeToV15(path: string, model: string, effort: string): void {
+      withRaw(path, (raw) => {
+        raw.exec(`
+          PRAGMA foreign_keys = OFF;
+          DROP TABLE runtime_model_catalog;
+          DROP TABLE task_runtime_settings;
+          DELETE FROM schema_migrations WHERE version = 16;
+          CREATE TABLE app_settings_v15 (
+            singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+            locale TEXT NOT NULL CHECK(locale IN ('zh-CN', 'en-US')),
+            sidebar_width INTEGER NOT NULL CHECK(sidebar_width BETWEEN 220 AND 600),
+            browser_sync_enabled INTEGER NOT NULL CHECK(browser_sync_enabled IN (0, 1)),
+            revision INTEGER NOT NULL CHECK(revision >= 1),
+            updated_at_ms INTEGER NOT NULL CHECK(updated_at_ms >= 0),
+            grok_model TEXT NOT NULL CHECK(grok_model IN ('grok-4.6', 'grok-4.5')),
+            reasoning_effort TEXT NOT NULL CHECK(reasoning_effort IN ('xhigh', 'high', 'medium', 'low')),
+            nickname TEXT NOT NULL CHECK(length(nickname) BETWEEN 1 AND 512),
+            avatar_filename TEXT CHECK(avatar_filename IS NULL OR length(avatar_filename) BETWEEN 1 AND 80),
+            restore_last_task INTEGER NOT NULL CHECK(restore_last_task IN (0, 1)),
+            new_task_workspace_mode TEXT NOT NULL CHECK(new_task_workspace_mode IN ('ask', 'last')),
+            last_active_task_id TEXT CHECK(last_active_task_id IS NULL OR length(last_active_task_id) BETWEEN 1 AND 512),
+            last_workspace_id TEXT CHECK(last_workspace_id IS NULL OR length(last_workspace_id) BETWEEN 1 AND 512),
+            permission_mode TEXT NOT NULL CHECK(permission_mode IN (
+              'default', 'acceptEdits', 'auto', 'dontAsk', 'bypassPermissions', 'plan'
+            )),
+            web_search_enabled INTEGER NOT NULL CHECK(web_search_enabled IN (0, 1)),
+            plan_enabled INTEGER NOT NULL CHECK(plan_enabled IN (0, 1)),
+            subagents_enabled INTEGER NOT NULL CHECK(subagents_enabled IN (0, 1)),
+            max_turns INTEGER CHECK(max_turns IS NULL OR max_turns BETWEEN 1 AND 10000),
+            task_notifications_enabled INTEGER NOT NULL CHECK(task_notifications_enabled IN (0, 1))
+          ) STRICT;
+          CREATE TABLE guild_meta_v15 (
+            singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+            schema_version INTEGER NOT NULL CHECK(schema_version = 15),
+            clean_shutdown INTEGER NOT NULL CHECK(clean_shutdown IN (0, 1)),
+            last_integrity_at_ms INTEGER CHECK(last_integrity_at_ms IS NULL OR last_integrity_at_ms >= 0)
+          ) STRICT;
+          INSERT INTO guild_meta_v15(singleton, schema_version, clean_shutdown, last_integrity_at_ms)
+          SELECT singleton, 15, clean_shutdown, last_integrity_at_ms FROM guild_meta;
+          DROP TABLE guild_meta;
+          ALTER TABLE guild_meta_v15 RENAME TO guild_meta;
+        `);
+        // revision and updated_at_ms get recognisable values so the test can prove they are kept.
+        raw.prepare(`
+          INSERT INTO app_settings_v15(
+            singleton, locale, sidebar_width, browser_sync_enabled, revision, updated_at_ms,
+            grok_model, reasoning_effort, nickname, avatar_filename, restore_last_task,
+            new_task_workspace_mode, last_active_task_id, last_workspace_id, permission_mode,
+            web_search_enabled, plan_enabled, subagents_enabled, max_turns,
+            task_notifications_enabled
+          )
+          SELECT singleton, locale, sidebar_width, browser_sync_enabled, 7, 1234567890123,
+            ?, ?, nickname, avatar_filename, restore_last_task,
+            new_task_workspace_mode, last_active_task_id, last_workspace_id, permission_mode,
+            web_search_enabled, plan_enabled, subagents_enabled, max_turns,
+            task_notifications_enabled
+          FROM app_settings
+        `).run(model, effort);
+        raw.exec(`
+          DROP TABLE app_settings;
+          ALTER TABLE app_settings_v15 RENAME TO app_settings;
+          PRAGMA user_version = 15;
+        `);
+      });
+    }
+
+    function seedV15(t: TestContext, model: string, effort: string): string {
+      const path = temporaryDatabase(t);
+      const seeded = conversationStore(path);
+      seeded.updateAppSettings({
+        expectedRevision: 1,
+        nickname: "Owner",
+        sidebarWidth: 333,
+        permissionMode: "plan",
+        startup: { webSearchEnabled: false, planEnabled: true, subagentsEnabled: false, maxTurns: 42 },
+      });
+      seeded.close();
+      withRaw(path, (raw) => {
+        raw.prepare(
+          "INSERT INTO task_context_usage(task_id, session_id, tokens_used, updated_at_ms) VALUES(?, ?, 1234, 99)",
+        ).run(taskId, sessionId);
+      });
+      downgradeToV15(path, model, effort);
+      return path;
+    }
+
+    function realisticCatalog(): GrokModelCatalog {
+      const efforts = (withXhigh: boolean) => [
+        ...(withXhigh ? [{ id: "xhigh", label: "Extra High", isDefault: false }] : []),
+        { id: "high", label: "High", isDefault: true },
+        { id: "medium", label: "Medium", isDefault: false },
+        { id: "low", label: "Low", isDefault: false },
+      ];
+      return freezeGrokModelCatalog({
+        models: [
+          {
+            id: "grok-4.7",
+            name: "Grok 4.7",
+            reasoningEfforts: efforts(true),
+            contextWindows: [256_000, 500_000],
+            defaultContextWindow: 256_000,
+          },
+          {
+            id: "grok-4.7-build-fast",
+            name: "Grok 4.7 Build Fast",
+            description: "Fast variant. 2x the price.",
+            reasoningEfforts: [],
+            contextWindows: [256_000],
+          },
+          { id: "grok-4.6", name: "Grok 4.6", reasoningEfforts: efforts(false), contextWindows: [256_000] },
+          { id: "grok-4.5", name: "Grok 4.5", reasoningEfforts: efforts(false), contextWindows: [256_000] },
+        ],
+        runtimeDefaultModelId: "grok-4.7",
+      });
+    }
+
+    it("migrates a v15 database: rewrites exactly the owner-approved pair and relaxes the constraints", (t) => {
+      const owner = seedV15(t, "grok-4.6", "xhigh");
+      const tuned = seedV15(t, "grok-4.6", "high");
+      const older = seedV15(t, "grok-4.5", "medium");
+
+      const migrated = openGuildPersistence({ path: owner });
+      assert.equal(migrated.verifyIntegrity().schemaVersion, 16);
+      const settings = migrated.loadAppSettings();
+      assert.equal(settings.grokModel, "grok-4.7");
+      assert.equal(settings.reasoningEffort, "high");
+      // The rewrite is a migration: it keeps the revision and timestamp, and every other column.
+      assert.equal(settings.revision, 7);
+      assert.equal(settings.updatedAtMs, 1234567890123);
+      assert.equal(settings.nickname, "Owner");
+      assert.equal(settings.sidebarWidth, 333);
+      assert.equal(settings.permissionMode, "plan");
+      assert.deepEqual(settings.startup, {
+        webSearchEnabled: false, planEnabled: true, subagentsEnabled: false, maxTurns: 42,
+      });
+      assert.equal(migrated.loadTaskRuntimeSettings(taskId), undefined);
+      assert.equal(migrated.loadModelCatalogCache(), undefined);
+      migrated.close();
+
+      for (const [path, model, effort] of [
+        [tuned, "grok-4.6", "high"],
+        [older, "grok-4.5", "medium"],
+      ] as const) {
+        const other = openGuildPersistence({ path });
+        const kept = other.loadAppSettings();
+        assert.equal(kept.grokModel, model);
+        assert.equal(kept.reasoningEffort, effort);
+        assert.equal(kept.revision, 7);
+        assert.equal(kept.updatedAtMs, 1234567890123);
+        other.close();
+      }
+
+      withRaw(owner, (raw) => {
+        assert.equal(raw.prepare("PRAGMA user_version").get()?.["user_version"], 16);
+        assert.deepEqual(
+          raw.prepare("SELECT version, name FROM schema_migrations WHERE version >= 15 ORDER BY version")
+            .all().map((row) => ({ ...row })),
+          [
+            { version: 15, name: "streaming_write_path_and_context_usage" },
+            { version: 16, name: "runtime_model_catalog_and_task_settings" },
+          ],
+        );
+        assert.deepEqual(
+          raw.prepare("SELECT tokens_used, updated_at_ms FROM task_context_usage").all().map((row) => ({ ...row })),
+          [{ tokens_used: 1234, updated_at_ms: 99 }],
+        );
+        const strictByTable = new Map(
+          raw.prepare("PRAGMA table_list").all().map((row) => [row["name"], row["strict"]]),
+        );
+        assert.equal(strictByTable.get("task_runtime_settings"), 1);
+        assert.equal(strictByTable.get("runtime_model_catalog"), 1);
+
+        const setting = (column: string, value: string) =>
+          raw.prepare(`UPDATE app_settings SET ${column} = ?`).run(value);
+        // Accepted: a model and effort the old closed lists did not know, and the sentinel.
+        setting("grok_model", "grok-4.9-preview");
+        setting("reasoning_effort", "max");
+        setting("grok_model", `grok-${"a".repeat(59)}`);
+        setting("reasoning_effort", "a".repeat(32));
+        setting("grok_model", "");
+        setting("reasoning_effort", "");
+        // Rejected: foreign models, injection text, control characters, over-long and malformed ids.
+        for (const model of [
+          "MiniMax-M3", "grok-4.7'; DROP TABLE app_settings; --", "grok-4.7\n", "GROK-4.7",
+          "grok-4.7 fast", `grok-${"a".repeat(60)}`, "grok4.7",
+        ]) {
+          assert.throws(() => setting("grok_model", model), /CHECK constraint failed/u, model);
+        }
+        for (const effort of ["High", "1high", "high effort", "high\n", "a".repeat(33), "hi'gh"]) {
+          assert.throws(() => setting("reasoning_effort", effort), /CHECK constraint failed/u, effort);
+        }
+
+        raw.prepare("INSERT INTO task_runtime_settings(task_id, model_id, revision, updated_at_ms) VALUES(?, ?, 1, 1)")
+          .run(taskId, "grok-4.9-preview");
+        for (const model of ["", "MiniMax-M3", `grok-${"a".repeat(60)}`]) {
+          assert.throws(
+            () => raw.prepare("UPDATE task_runtime_settings SET model_id = ?").run(model),
+            /CHECK constraint failed/u,
+            model,
+          );
+        }
+        for (const window of [0, -1, 100_000_001]) {
+          assert.throws(
+            () => raw.prepare("UPDATE task_runtime_settings SET context_window = ?").run(window),
+            /CHECK constraint failed/u,
+            String(window),
+          );
+        }
+        raw.prepare("UPDATE task_runtime_settings SET context_window = 100000000").run();
+        assert.throws(
+          () => raw.prepare("UPDATE task_runtime_settings SET reasoning_effort = 'Max'").run(),
+          /CHECK constraint failed/u,
+        );
+        assert.throws(
+          () => raw.prepare("INSERT INTO task_runtime_settings(task_id, revision, updated_at_ms) VALUES('missing', 1, 1)").run(),
+          /FOREIGN KEY constraint failed/u,
+        );
+        assert.throws(
+          () => raw.prepare("INSERT INTO runtime_model_catalog(singleton, catalog_json, updated_at_ms) VALUES(2, '{}', 1)").run(),
+          /CHECK constraint failed/u,
+        );
+        assert.throws(
+          () => raw.prepare("INSERT INTO runtime_model_catalog(singleton, catalog_json, updated_at_ms) VALUES(1, '', 1)").run(),
+          /CHECK constraint failed/u,
+        );
+      });
+    });
+
+    it("starts a brand-new database on the runtime default instead of the rewritten pair", (t) => {
+      const path = temporaryDatabase(t);
+      const fresh = openGuildPersistence({ path });
+      const settings = fresh.loadAppSettings();
+      assert.equal(settings.grokModel, null);
+      assert.equal(settings.reasoningEffort, null);
+      assert.equal(settings.revision, 1);
+      fresh.close();
+
+      withRaw(path, (raw) => {
+        assert.deepEqual(
+          raw.prepare("SELECT grok_model, reasoning_effort FROM app_settings").all().map((row) => ({ ...row })),
+          [{ grok_model: "", reasoning_effort: "" }],
+        );
+      });
+      const reopened = openGuildPersistence({ path });
+      assert.equal(reopened.loadAppSettings().grokModel, null);
+      assert.equal(reopened.loadAppSettings().reasoningEffort, null);
+      reopened.close();
+    });
+
+    it("updates the global model and effort: explicit values, back to the runtime default, undefined unchanged", (t) => {
+      const path = temporaryDatabase(t);
+      const store = openGuildPersistence({ path });
+      const initial = store.loadAppSettings();
+
+      const pinned = store.updateAppSettings({
+        expectedRevision: initial.revision,
+        grokModel: "grok-4.7",
+        reasoningEffort: "xhigh",
+      });
+      assert.equal(pinned.grokModel, "grok-4.7");
+      assert.equal(pinned.reasoningEffort, "xhigh");
+      assert.equal(pinned.revision, initial.revision + 1);
+
+      // The catalog is runtime data: a model or effort the old closed lists did not know is stored.
+      const future = store.updateAppSettings({
+        expectedRevision: pinned.revision,
+        grokModel: "grok-4.9-preview",
+        reasoningEffort: "max",
+      });
+      assert.equal(future.grokModel, "grok-4.9-preview");
+      assert.equal(future.reasoningEffort, "max");
+
+      const renamed = store.updateAppSettings({ expectedRevision: future.revision, nickname: "Owner" });
+      assert.equal(renamed.grokModel, "grok-4.9-preview");
+      assert.equal(renamed.reasoningEffort, "max");
+
+      const effortOnly = store.updateAppSettings({
+        expectedRevision: renamed.revision,
+        reasoningEffort: "low",
+      });
+      assert.equal(effortOnly.grokModel, "grok-4.9-preview");
+      assert.equal(effortOnly.reasoningEffort, "low");
+
+      const reset = store.updateAppSettings({
+        expectedRevision: effortOnly.revision,
+        grokModel: null,
+        reasoningEffort: null,
+      });
+      assert.equal(reset.grokModel, null);
+      assert.equal(reset.reasoningEffort, null);
+      assert.equal(reset.revision, effortOnly.revision + 1);
+      // Setting the sentinel again is a no-op and does not advance the revision.
+      const unchanged = store.updateAppSettings({
+        expectedRevision: reset.revision,
+        grokModel: null,
+        reasoningEffort: null,
+      });
+      assert.equal(unchanged.revision, reset.revision);
+
+      const modelOnly = store.updateAppSettings({
+        expectedRevision: reset.revision,
+        grokModel: "grok-4.6",
+      });
+      assert.equal(modelOnly.grokModel, "grok-4.6");
+      assert.equal(modelOnly.reasoningEffort, null);
+
+      for (const bad of [
+        { grokModel: "MiniMax-M3" },
+        { grokModel: "" },
+        { grokModel: "grok-4.7; DROP TABLE app_settings" },
+        { grokModel: `grok-${"a".repeat(60)}` },
+        { reasoningEffort: "High" },
+        { reasoningEffort: "" },
+        { reasoningEffort: "x".repeat(33) },
+      ]) {
+        assert.throws(
+          () => store.updateAppSettings({ expectedRevision: modelOnly.revision, ...bad }),
+          invalidValue,
+          JSON.stringify(bad),
+        );
+      }
+      assert.equal(store.loadAppSettings().revision, modelOnly.revision);
+      assert.throws(
+        () => store.updateAppSettings({ expectedRevision: initial.revision, grokModel: "grok-4.5" }),
+        failure("persistence_cas_conflict"),
+      );
+      store.close();
+
+      const reopened = openGuildPersistence({ path });
+      assert.equal(reopened.loadAppSettings().grokModel, "grok-4.6");
+      assert.equal(reopened.loadAppSettings().reasoningEffort, null);
+      assert.equal(reopened.verifyIntegrity().schemaVersion, 16);
+      reopened.close();
+    });
+
+    it("keeps per-task model overrides under compare-and-set and across reopen", (t) => {
+      const path = temporaryDatabase(t);
+      let store = conversationStore(path);
+      const unknownTask = must(parseTaskId("task-unknown"));
+      assert.equal(store.loadTaskRuntimeSettings(taskId), undefined);
+      assert.throws(() => store.loadTaskRuntimeSettings(unknownTask), failure("aggregate_not_found"));
+
+      const created = store.saveTaskRuntimeSettings({
+        taskId,
+        expectedRevision: 0,
+        modelId: "grok-4.7-build-fast",
+        reasoningEffort: "high",
+        contextWindow: 500_000,
+      });
+      assert.deepEqual(
+        { ...created, updatedAtMs: undefined },
+        {
+          taskId,
+          modelId: "grok-4.7-build-fast",
+          reasoningEffort: "high",
+          contextWindow: 500_000,
+          revision: 1,
+          updatedAtMs: undefined,
+        },
+      );
+      assert.equal(Object.isFrozen(created), true);
+      assert.deepEqual(store.loadTaskRuntimeSettings(taskId), created);
+
+      assert.throws(
+        () => store.saveTaskRuntimeSettings({
+          taskId, expectedRevision: 0, modelId: "grok-4.6", reasoningEffort: null, contextWindow: null,
+        }),
+        failure("persistence_cas_conflict"),
+      );
+
+      // NULL columns inherit the global default; clearing one field keeps the others.
+      const updated = store.saveTaskRuntimeSettings({
+        taskId, expectedRevision: 1, modelId: null, reasoningEffort: "low", contextWindow: null,
+      });
+      assert.equal(updated.revision, 2);
+      assert.equal(updated.modelId, null);
+      assert.equal(updated.reasoningEffort, "low");
+      assert.equal(updated.contextWindow, null);
+      const same = store.saveTaskRuntimeSettings({
+        taskId, expectedRevision: 2, modelId: null, reasoningEffort: "low", contextWindow: null,
+      });
+      assert.equal(same.revision, 2);
+
+      for (const stale of [1, 3]) {
+        assert.throws(
+          () => store.saveTaskRuntimeSettings({
+            taskId, expectedRevision: stale, modelId: "grok-4.6", reasoningEffort: null, contextWindow: null,
+          }),
+          failure("persistence_cas_conflict"),
+        );
+      }
+      assert.throws(
+        () => store.saveTaskRuntimeSettings({
+          taskId, expectedRevision: 2, modelId: null, reasoningEffort: null, contextWindow: null,
+        }),
+        failure("domain_operation_rejected"),
+      );
+      for (const bad of [
+        { modelId: "MiniMax-M3" },
+        { modelId: "" },
+        { reasoningEffort: "High" },
+        { contextWindow: 0 },
+        { contextWindow: 1.5 },
+        { contextWindow: 100_000_001 },
+      ]) {
+        assert.throws(
+          () => store.saveTaskRuntimeSettings({
+            taskId,
+            expectedRevision: 2,
+            modelId: "grok-4.6",
+            reasoningEffort: null,
+            contextWindow: null,
+            ...bad,
+          }),
+          failure("domain_operation_rejected"),
+          JSON.stringify(bad),
+        );
+      }
+      assert.throws(
+        () => store.saveTaskRuntimeSettings({
+          taskId: unknownTask, expectedRevision: 0, modelId: "grok-4.6", reasoningEffort: null, contextWindow: null,
+        }),
+        failure("aggregate_not_found"),
+      );
+      assert.throws(
+        () => store.clearTaskRuntimeSettings({ taskId: unknownTask, expectedRevision: 1 }),
+        failure("aggregate_not_found"),
+      );
+      assert.deepEqual(store.loadTaskRuntimeSettings(taskId), updated);
+      store.close();
+
+      store = openGuildPersistence({ path });
+      assert.deepEqual(store.loadTaskRuntimeSettings(taskId), updated);
+      assert.equal(store.verifyIntegrity().schemaVersion, 16);
+      assert.throws(
+        () => store.clearTaskRuntimeSettings({ taskId, expectedRevision: 1 }),
+        failure("persistence_cas_conflict"),
+      );
+      store.clearTaskRuntimeSettings({ taskId, expectedRevision: 2 });
+      assert.equal(store.loadTaskRuntimeSettings(taskId), undefined);
+      assert.throws(
+        () => store.clearTaskRuntimeSettings({ taskId, expectedRevision: 2 }),
+        failure("persistence_cas_conflict"),
+      );
+      const recreated = store.saveTaskRuntimeSettings({
+        taskId, expectedRevision: 0, modelId: null, reasoningEffort: null, contextWindow: 256_000,
+      });
+      assert.equal(recreated.revision, 1);
+      store.close();
+    });
+
+    it("catches a corrupted per-task settings row at verification and on read", (t) => {
+      const path = temporaryDatabase(t);
+      const seeded = conversationStore(path);
+      seeded.saveTaskRuntimeSettings({
+        taskId, expectedRevision: 0, modelId: "grok-4.7", reasoningEffort: null, contextWindow: null,
+      });
+      seeded.close();
+      withRaw(path, (raw) => {
+        raw.exec("PRAGMA ignore_check_constraints = ON");
+        raw.prepare("UPDATE task_runtime_settings SET model_id = 'MiniMax-M3'").run();
+      });
+
+      const store = openGuildPersistence({ path });
+      assert.throws(() => store.loadTaskRuntimeSettings(taskId), failure("aggregate_integrity_failed"));
+      assert.throws(() => store.verifyIntegrity(), (error: unknown) =>
+        error instanceof PersistenceError &&
+        (error.code === "aggregate_integrity_failed" || error.code === "schema_integrity_failed"));
+      store.close();
+    });
+
+    it("caches the runtime model list, ignores a bad cache, and skips unchanged writes", (t) => {
+      const path = temporaryDatabase(t);
+      let store = openGuildPersistence({ path });
+      assert.equal(store.loadModelCatalogCache(), undefined);
+
+      const catalog = realisticCatalog();
+      store.saveModelCatalogCache({ catalog, runtimeVersion: "0.1.231" });
+      const cached = store.loadModelCatalogCache();
+      assert.deepEqual(cached?.catalog, catalog);
+      assert.equal(cached?.runtimeVersion, "0.1.231");
+      assert.equal(typeof cached?.updatedAtMs, "number");
+      assert.equal(Object.isFrozen(cached?.catalog), true);
+      assert.equal(Object.isFrozen(cached?.catalog.models[0]), true);
+      assert.equal(cached?.catalog.models[1]?.description, "Fast variant. 2x the price.");
+      store.close();
+
+      // Rewind the stored timestamp so a rewrite is detectable whatever the clock resolution.
+      withRaw(path, (raw) => {
+        raw.prepare("UPDATE runtime_model_catalog SET updated_at_ms = 1000").run();
+      });
+      store = openGuildPersistence({ path });
+      assert.deepEqual(store.loadModelCatalogCache()?.catalog, catalog);
+      assert.equal(store.verifyIntegrity().schemaVersion, 16);
+
+      // An identical list (even built with another key order) is not rewritten; a changed list
+      // or runtime version is.
+      const reordered: unknown = {
+        runtimeDefaultModelId: "grok-4.7",
+        models: catalog.models.map((model) => ({
+          contextWindows: model.contextWindows,
+          reasoningEfforts: model.reasoningEfforts.map((effort) => ({
+            isDefault: effort.isDefault, label: effort.label, id: effort.id,
+          })),
+          name: model.name,
+          id: model.id,
+          ...(model.description === undefined ? {} : { description: model.description }),
+          ...(model.defaultContextWindow === undefined
+            ? {}
+            : { defaultContextWindow: model.defaultContextWindow }),
+        })),
+      };
+      store.saveModelCatalogCache({ catalog: reordered as GrokModelCatalog, runtimeVersion: "0.1.231" });
+      assert.equal(store.loadModelCatalogCache()?.updatedAtMs, 1000);
+      store.saveModelCatalogCache({ catalog, runtimeVersion: "0.1.232" });
+      assert.equal(store.loadModelCatalogCache()?.runtimeVersion, "0.1.232");
+      assert.notEqual(store.loadModelCatalogCache()?.updatedAtMs, 1000);
+      store.saveModelCatalogCache({
+        catalog: freezeGrokModelCatalog({ models: catalog.models.slice(1) }),
+      });
+      const shrunk = store.loadModelCatalogCache();
+      assert.equal(shrunk?.catalog.models.length, 3);
+      assert.equal(shrunk?.runtimeVersion, undefined);
+
+      assert.throws(
+        () => store.saveModelCatalogCache({
+          catalog: { models: [{ id: "MiniMax-M3", name: "MiniMax", reasoningEfforts: [], contextWindows: [] }] } as never,
+        }),
+        failure("domain_operation_rejected"),
+      );
+      assert.throws(
+        () => store.saveModelCatalogCache({ catalog, runtimeVersion: "v".repeat(129) }),
+        failure("domain_operation_rejected"),
+      );
+      assert.equal(store.loadModelCatalogCache()?.catalog.models.length, 3);
+      store.close();
+
+      // A damaged cache is treated as absent: the database still opens and verifies, and the next
+      // advertised list replaces the row.
+      for (const damaged of ["{not json", '{"models":[{"id":"MiniMax-M3"}]}', "[]"]) {
+        withRaw(path, (raw) => {
+          raw.prepare("UPDATE runtime_model_catalog SET catalog_json = ?").run(damaged);
+        });
+        const reopened = openGuildPersistence({ path });
+        assert.equal(reopened.loadModelCatalogCache(), undefined, damaged);
+        assert.equal(reopened.verifyIntegrity().schemaVersion, 16);
+        reopened.saveModelCatalogCache({ catalog });
+        assert.deepEqual(reopened.loadModelCatalogCache()?.catalog, catalog);
+        reopened.close();
+      }
     });
   });
 });

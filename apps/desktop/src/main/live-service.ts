@@ -8,7 +8,7 @@ import {
   GUILD_API_VERSION,
   GUILD_PROMPT_ATTACHMENT_LIMIT,
   GUILD_PROMPT_ATTACHMENT_MAX_BYTES,
-  GUILD_GROK_MODELS,
+  EMPTY_GROK_MODEL_CATALOG,
   GUILD_GROK_PERMISSION_MODES,
   canonicalGuildExternalUrl,
   createRuntimeTurnEvent,
@@ -29,17 +29,23 @@ import {
   parseGuildNickname,
   parseGuildNewTaskWorkspaceMode,
   parseContinuousFooter,
-  supportsGuildGrokReasoningEffort,
+  defaultReasoningEffortOf,
+  grokModelById,
+  modelSupportsReasoningEffort,
+  resolveEffectiveSelection,
+  sessionSelectionOf,
   type AdapterEpoch,
   type AcpToolKind,
   type AcpToolStatus,
   type DesktopBootstrapProjection,
+  type GrokModelCatalog,
   type GuildLocale,
   type GuildGrokModel,
   type GuildGrokPermissionMode,
   type GuildGrokReasoningEffort,
   type GuildGrokStartupSettings,
   type GuildTaskActivity,
+  type GuildModelSwitchRefusalReason,
   type IdempotencyKey,
   type OfficialUsageProjection,
   type PermissionIdentity,
@@ -48,18 +54,23 @@ import {
   type RuntimePermissionRequestPayload,
   type RuntimeCommand,
   type RuntimeConfigOption,
+  type RunPhaseProjection,
   type RuntimeToolContent,
   type RuntimeToolLocation,
   type RuntimeTurnPayload,
+  type SetTaskRuntimeSettingsRequest,
+  type SetTaskRuntimeSettingsResponse,
   type SessionAttemptId,
   type SessionId,
   type TaskId,
+  type TaskModelSelectionProjection,
   type TaskViewProjection,
   type TimelineToolContent,
   type TimelineItemProjection,
   type WorkspaceProjection,
   type WindowId,
   type WorkspaceId,
+  type XaiSignalEnvelope,
   type ChooseAvatarResponse,
   type ChoosePromptFilesResponse,
   type GuildNewTaskWorkspaceMode,
@@ -71,7 +82,11 @@ import {
 } from "@guild/contracts";
 import {
   CONFLICT_FREE_VERDICT,
+  createRunPhaseTracker,
   type PermissionRecord,
+  type RunPhaseInput,
+  type RunPhaseStage,
+  type RunPhaseTracker,
   type RunRecord,
 } from "@guild/domain";
 import {
@@ -92,6 +107,7 @@ import {
   type AcpV1DecodedUpdate,
   type AcpV1InitializeResult,
   type AcpV1OfficialBillingSnapshot,
+  type AcpV1SessionStartOptions,
   type AcpV1SessionState,
   type JsonRpcInboundResponseWriteReceipt,
   type JsonRpcWriteReceipt,
@@ -108,6 +124,11 @@ import {
   resolveOfficialGrokEnvironment,
 } from "./runtime-locator.js";
 import { warmOfficialGrokRuntime } from "./runtime-warmup.js";
+import {
+  applyRuntimeSelection,
+  refusalReasonOf,
+  type RuntimeSelectionOutcome,
+} from "./model-selection.js";
 import {
   SESSION_RECOVERY_CONTEXT_REQUIRED,
   assertWorkspaceFolderExists,
@@ -159,22 +180,23 @@ export type RuntimeAdapterPort = {
   start(): Promise<AcpV1InitializeResult>;
   authenticate(methodId: string): Promise<void>;
   officialBilling(): Promise<AcpV1OfficialBillingSnapshot>;
+  /** Used only for the context window; model and effort go through `setConfigOption`. */
   setModel(
     session: AcpV1AdapterSession,
     model: GuildGrokModel,
-  ): Promise<void>;
-  setMode(
-    session: AcpV1AdapterSession,
-    model: GuildGrokModel,
-    reasoningEffort: GuildGrokReasoningEffort,
+    options?: { readonly reasoningEffort?: GuildGrokReasoningEffort; readonly contextWindow?: number },
   ): Promise<void>;
   setConfigOption(
     session: AcpV1AdapterSession,
     configId: string,
     value: string | boolean,
   ): Promise<readonly RuntimeConfigOption[]>;
-  newSession(cwd: string): Promise<AcpV1AdapterSession>;
-  resumeSession(sessionId: string, cwd: string): Promise<AcpV1AdapterSession>;
+  newSession(cwd: string, startOptions?: AcpV1SessionStartOptions): Promise<AcpV1AdapterSession>;
+  resumeSession(
+    sessionId: string,
+    cwd: string,
+    startOptions?: AcpV1SessionStartOptions,
+  ): Promise<AcpV1AdapterSession>;
   loadSession(sessionId: string, cwd: string): Promise<AcpV1AdapterSession>;
   prompt(
     session: AcpV1AdapterSession,
@@ -197,9 +219,8 @@ export type RuntimeFactory = (input: {
   readonly sink: AcpV1AdapterSink;
   readonly stagingRoot: string;
   readonly workingDirectory: string;
+  /** Process-level settings only: the model and effort are applied per session after it opens. */
   readonly runtimeSettings: {
-    readonly model: GuildGrokModel;
-    readonly reasoningEffort: GuildGrokReasoningEffort;
     readonly permissionMode: GuildGrokPermissionMode;
     readonly startup: GuildGrokStartupSettings;
   };
@@ -310,6 +331,12 @@ type RuntimeController = {
     reason: AcpV1AdapterInterruptionReason;
     diagnostic: AcpV1AdapterInterruptionDiagnostic;
   }> | undefined;
+  /** Ephemeral first-token phase of the running turn (F1b); never persisted. */
+  readonly phase: RunPhaseTracker;
+  /** Sends admitted for this task that have not yet created their Run. */
+  sendsInFlight: number;
+  /** True while the session runs a selection other than the stored one because the runtime refused it. */
+  selectionRefused: boolean;
 };
 
 type ReplayStaging = {
@@ -429,6 +456,9 @@ export function createLiveDesktopService(
   const managementRunner = options.managementRunner ?? runOfficialGrokManagement;
   let activeTaskId: TaskId | undefined;
   let runtimeVersion: string | undefined;
+  // Last model list the official runtime advertised. Seeded from the local cache so the picker has
+  // choices before any process starts; replaced whenever a runtime advertises a different list.
+  let modelCatalog: GrokModelCatalog = store.loadModelCatalogCache()?.catalog ?? EMPTY_GROK_MODEL_CATALOG;
   let usageSnapshot: AcpV1OfficialBillingSnapshot | undefined;
   let usageFetchedAtMs = 0;
   let usageLoading = false;
@@ -556,6 +586,203 @@ export function createLiveDesktopService(
     }
   }
 
+  function noteModelCatalog(catalog: GrokModelCatalog | undefined): void {
+    if (catalog === undefined || catalog.models.length === 0) return;
+    if (JSON.stringify(catalog) === JSON.stringify(modelCatalog)) return;
+    modelCatalog = catalog;
+    try {
+      store.saveModelCatalogCache({
+        catalog,
+        ...(runtimeVersion === undefined ? {} : { runtimeVersion: runtimeVersion.slice(0, 128) }),
+      });
+    } catch {
+      // The cache only lets the picker show choices before a runtime starts.
+    }
+    schedulePhasePublish();
+  }
+
+  /** Task override, then the global default, then the runtime default (a catalog fact, not a setting). */
+  function desiredSelection(taskId: TaskId, settings = store.loadAppSettings()): Readonly<{
+    selection: ReturnType<typeof resolveEffectiveSelection>;
+    contextWindow: number | null;
+  }> {
+    const override = readOncePerBuild(`rts:${taskId}`, () => store.loadTaskRuntimeSettings(taskId));
+    return Object.freeze({
+      selection: resolveEffectiveSelection({
+        ...(override === undefined
+          ? {}
+          : { task: { modelId: override.modelId, reasoningEffort: override.reasoningEffort } }),
+        global: { modelId: settings.grokModel, reasoningEffort: settings.reasoningEffort },
+        catalog: modelCatalog,
+      }),
+      contextWindow: override?.contextWindow ?? null,
+    });
+  }
+
+  /** A task takes a model change only between turns: no run, queue, permission or start in flight. */
+  function taskSelectionCanChange(taskId: TaskId): boolean {
+    if (managementOperationActive) return false;
+    const controller = controllers.get(taskId);
+    if (
+      controller !== undefined &&
+      ((controller.startOperation !== undefined && !controller.startIsPrewarm) ||
+        controller.promptRunId !== undefined ||
+        controller.activeRunId !== undefined ||
+        controller.sendsInFlight > 0 ||
+        controller.pendingPermissions.size > 0)
+    ) {
+      return false;
+    }
+    try {
+      const run = readOncePerBuild(`restore:${taskId}`, () => store.restoreTask(taskId)).currentRun;
+      return (run === undefined || TERMINAL_RUN_STATES.has(run.state)) &&
+        readOncePerBuild(`queue:${taskId}`, () => store.listQueuedTurns(taskId)).length === 0;
+    } catch {
+      return false;
+    }
+  }
+
+  function modelSelectionProjection(
+    taskId: TaskId,
+    controller: RuntimeController | undefined,
+  ): TaskModelSelectionProjection {
+    const { selection } = desiredSelection(taskId);
+    const live = controller?.session === undefined
+      ? undefined
+      : sessionSelectionOf(controller.sessionConfigOptions);
+    const showLive = live !== undefined && (selection.source === "runtime" || controller?.selectionRefused === true);
+    return Object.freeze({
+      modelId: (showLive ? live.modelId : undefined) ?? selection.modelId,
+      reasoningEffort: (showLive ? live.reasoningEffort : undefined) ?? selection.reasoningEffort,
+      source: selection.source,
+      canChange: taskSelectionCanChange(taskId),
+    });
+  }
+
+  /**
+   * Brings a live idle session to the stored selection. Refusals and unknown options never abort a
+   * start or a prompt: the session keeps its previous selection and the projection reports it.
+   */
+  async function reconcileRuntimeSelection(
+    taskId: TaskId,
+    controller: RuntimeController,
+    adapter: RuntimeAdapterPort,
+    session: AcpV1AdapterSession,
+  ): Promise<RuntimeSelectionOutcome["status"] | "skipped"> {
+    const { selection, contextWindow } = desiredSelection(taskId);
+    // Nothing pinned anywhere: the runtime default (or the session's own earlier choice) stays.
+    if (selection.source === "runtime" || adapter.state !== "ready") {
+      controller.selectionRefused = false;
+      return "skipped";
+    }
+    const outcome = await applyRuntimeSelection({
+      port: adapter,
+      session,
+      options: controller.sessionConfigOptions,
+      catalog: modelCatalog,
+      desired: { modelId: selection.modelId, reasoningEffort: selection.reasoningEffort, contextWindow },
+      currentContextWindow: controller.contextWindowUsage?.size ?? controller.contextWindowSize,
+    });
+    controller.sessionConfigOptions = outcome.options;
+    if (outcome.status !== "refused" && outcome.contextWindow !== undefined) {
+      controller.contextWindowSize = outcome.contextWindow;
+    }
+    controller.selectionRefused = outcome.status === "refused";
+    if (outcome.status !== "unchanged") {
+      logRuntime({
+        category: "runtime",
+        event: outcome.status === "refused" ? "model_switch_refused" : "model_switch_applied",
+        taskId,
+        sessionId: session.sessionId,
+        ...(outcome.status === "refused" ? { reason: outcome.reason } : {}),
+      });
+    }
+    return outcome.status;
+  }
+
+  /** The effort is passed at creation only when the model a new session starts on offers it. */
+  function sessionStartOptionsFor(taskId: TaskId): AcpV1SessionStartOptions | undefined {
+    const { selection } = desiredSelection(taskId);
+    if (selection.source === "runtime" || selection.reasoningEffort === null) return undefined;
+    const startModel = grokModelById(modelCatalog, modelCatalog.runtimeDefaultModelId);
+    if (startModel !== undefined && !modelSupportsReasoningEffort(startModel, selection.reasoningEffort)) {
+      return undefined;
+    }
+    return Object.freeze({ reasoningEffort: selection.reasoningEffort });
+  }
+
+  function runPhaseProjection(
+    controller: RuntimeController | undefined,
+    activeRunState: string | undefined,
+  ): RunPhaseProjection | undefined {
+    if (controller === undefined || !controller.phase.active) return undefined;
+    const running = activeRunState === "starting" ||
+      activeRunState === "running" ||
+      activeRunState === "awaiting_permission";
+    const preRun = controller.sendsInFlight > 0 ||
+      (controller.startOperation !== undefined && !controller.startIsPrewarm);
+    if (!running && !preRun) {
+      // A turn that ended (or was cancelled) must not leave a phase behind.
+      controller.phase.end();
+      return undefined;
+    }
+    return controller.phase.snapshot();
+  }
+
+  /** Feeds one input to the task's phase tracker and publishes when the visible phase changed. */
+  function notePhase(controller: RuntimeController, input: RunPhaseInput, atMs = performance.now()): void {
+    if (controller.phase.apply(input, atMs)) schedulePhasePublish();
+  }
+
+  function beginPhase(controller: RuntimeController, stage?: RunPhaseStage): void {
+    const idle = controller.activeRunId === undefined &&
+      controller.promptRunId === undefined &&
+      controller.sendsInFlight <= 1 &&
+      (controller.startOperation === undefined || controller.startIsPrewarm);
+    // A tracker left over from a turn that never reported its end is stale.
+    if (controller.phase.active && idle) controller.phase.end();
+    if (!controller.phase.active) {
+      controller.phase.begin(performance.now(), Date.now(), stage);
+      schedulePhasePublish();
+    }
+  }
+
+  function endPhase(controller: RuntimeController): void {
+    if (!controller.phase.active) return;
+    controller.phase.end();
+    schedulePhasePublish();
+  }
+
+  /** Phase changes are display-only: a non-structural projection that never reloads the sidebar. */
+  function schedulePhasePublish(): void {
+    if (closed || closing || maintenance) return;
+    void requestPublish().catch(() => {
+      logRuntime({ category: "runtime", event: "stream_projection_failed" });
+    });
+  }
+
+  function observeRuntimeSignal(
+    controller: RuntimeController,
+    envelope: XaiSignalEnvelope,
+  ): void {
+    const { signal } = envelope;
+    if (signal.kind === "models_update") {
+      noteModelCatalog(signal.catalog);
+      return;
+    }
+    const session = controller.session;
+    // Child (worker/reviewer) sessions are multiplexed on the same connection; their signals are not this turn's.
+    if (envelope.sessionId !== null && session !== undefined && envelope.sessionId !== session.sessionId) return;
+    if (signal.kind === "sessions_changed") {
+      if (session === undefined) return;
+      const own = signal.sessions.filter((entry) => entry.sessionId === session.sessionId);
+      if (own.length === 0) return;
+      notePhase(controller, { type: "signal", signal: { kind: "sessions_changed", sessions: own } }, envelope.receivedMonotonicMs);
+      return;
+    }
+    notePhase(controller, { type: "signal", signal }, envelope.receivedMonotonicMs);
+  }
+
   function controllerFor(taskId: TaskId): RuntimeController {
     let controller = controllers.get(taskId);
     if (controller === undefined) {
@@ -589,6 +816,9 @@ export function createLiveDesktopService(
         toolStates: new Map(),
         auxiliarySessions: new Map(),
         closeInterruptionOverride: undefined,
+        phase: createRunPhaseTracker(),
+        sendsInFlight: 0,
+        selectionRefused: false,
       };
       controllers.set(taskId, controller);
     }
@@ -929,9 +1159,9 @@ export function createLiveDesktopService(
       runtimeSettings: Object.freeze({
         model: settings.grokModel,
         reasoningEffort: settings.reasoningEffort,
+        modelCatalog,
         permissionMode: settings.permissionMode,
         startup: settings.startup,
-        availableModels: GUILD_GROK_MODELS,
         availablePermissionModes: GUILD_GROK_PERMISSION_MODES,
         canChange: runtimeSettingsCanChange(),
       }),
@@ -1316,6 +1546,7 @@ export function createLiveDesktopService(
         .filter((tool) => tool.status === "pending" || tool.status === "in_progress")
         .map((tool) => tool.kind)),
     )];
+    const runPhase = runPhaseProjection(controller, summary.activeRunState);
     const latestRunId = [...entries].reverse().find((entry) => entry.runId !== undefined)?.runId;
     const latestRun = latestRunId === undefined
       ? undefined
@@ -1354,6 +1585,8 @@ export function createLiveDesktopService(
       availableCommands: controller?.availableCommands ?? Object.freeze([]),
       sessionModes: controller?.sessionModes ?? null,
       sessionConfigOptions: controller?.sessionConfigOptions ?? Object.freeze([]),
+      modelSelection: modelSelectionProjection(taskId, controller),
+      ...(runPhase === undefined ? {} : { runPhase }),
       ...(latestAuxiliary === undefined
         ? {}
         : {
@@ -2214,8 +2447,6 @@ export function createLiveDesktopService(
         stagingRoot: options.stagingRoot,
         workingDirectory: workspace.canonicalPath,
         runtimeSettings: Object.freeze({
-          model: selectedRuntimeSettings.grokModel,
-          reasoningEffort: selectedRuntimeSettings.reasoningEffort,
           permissionMode: selectedRuntimeSettings.permissionMode,
           startup: selectedRuntimeSettings.startup,
         }),
@@ -2238,6 +2469,7 @@ export function createLiveDesktopService(
           .filter(Boolean)
           .join(" ");
       }
+      noteModelCatalog(initialized.modelCatalog);
       const selectedAuthMethod = initialized.authMethods.length === 1
         ? initialized.authMethods[0]!.id
         : initialized.defaultAuthMethodId;
@@ -2277,9 +2509,11 @@ export function createLiveDesktopService(
         currentBinding = store.loadSessionBinding(taskId);
       }
       let session: AcpV1AdapterSession | undefined;
+      const sessionStartOptions = sessionStartOptionsFor(taskId);
+      notePhase(controller, { type: "opening_session" });
       if (currentBinding.state === "creating") {
         startStage = "session_new";
-        session = await created.adapter.newSession(workspace.canonicalPath);
+        session = await created.adapter.newSession(workspace.canonicalPath, sessionStartOptions);
       } else if (
         currentBinding.state === "restore_pending" &&
         currentBinding.retainedSessionId !== undefined &&
@@ -2293,6 +2527,7 @@ export function createLiveDesktopService(
             session = await created.adapter.resumeSession(
               currentBinding.retainedSessionId,
               workspace.canonicalPath,
+              sessionStartOptions,
             );
           } catch (cause: unknown) {
             if (created.adapter.state !== "ready") throw cause;
@@ -2353,23 +2588,9 @@ export function createLiveDesktopService(
           size: session.contextWindowSize,
         });
       }
-      const runtimeSettings = store.loadAppSettings();
-      if (
-        !supportsGuildGrokReasoningEffort(
-          runtimeSettings.grokModel,
-          runtimeSettings.reasoningEffort,
-        )
-      ) {
-        throw new Error("runtime_settings_invalid");
-      }
-      startStage = "session_set_model";
-      await created.adapter.setModel(session, runtimeSettings.grokModel);
-      startStage = "session_set_mode";
-      await created.adapter.setMode(
-        session,
-        runtimeSettings.grokModel,
-        runtimeSettings.reasoningEffort,
-      );
+      noteModelCatalog(session.modelCatalog);
+      startStage = "session_selection";
+      await reconcileRuntimeSelection(taskId, controller, created.adapter, session);
       if (runtimeGeneration !== startGeneration) {
         throw new Error("runtime_start_invalidated_by_resume");
       }
@@ -2775,6 +2996,7 @@ export function createLiveDesktopService(
 
   function createSink(taskId: TaskId, controller: RuntimeController): AcpV1AdapterSink {
     return Object.freeze({
+      observeSignal: (envelope: XaiSignalEnvelope) => observeRuntimeSignal(controller, envelope),
       commitSessionEstablished: async (event) => {
         if (controller.adapterEpoch !== event.identity.adapterEpoch) return;
         const attemptId = controller.currentAttemptId;
@@ -3095,6 +3317,7 @@ export function createLiveDesktopService(
           prepared: deferred(),
         };
         controller.pendingPermissions.set(permissionId, pending);
+        notePhase(controller, { type: "permission", open: true });
         clearPromptSilenceTimer(controller);
         const abort = () => pending.decision.reject(event.signal.reason);
         event.signal.addEventListener("abort", abort, { once: true });
@@ -3118,6 +3341,7 @@ export function createLiveDesktopService(
             throw new Error(`permission_claim_${claimed.ok ? "missing" : claimed.reason}`);
           }
           controller.pendingPermissions.delete(permissionId);
+          notePhase(controller, { type: "permission", open: controller.pendingPermissions.size > 0 });
           pending.prepared.resolve();
           await publish();
           return Object.freeze({
@@ -3130,6 +3354,7 @@ export function createLiveDesktopService(
           });
         } catch (cause: unknown) {
           controller.pendingPermissions.delete(permissionId);
+          notePhase(controller, { type: "permission", open: controller.pendingPermissions.size > 0 });
           let rejection = cause;
           if (event.signal.aborted) {
             const current = safeLoadRun(taskId, runId);
@@ -3251,6 +3476,7 @@ export function createLiveDesktopService(
         clearCancelTimer(controller);
         clearPromptSilenceTimer(controller);
         controller.activeRunId = undefined;
+        endPhase(controller);
         logRuntime({
           category: "prompt",
           event: "terminal",
@@ -3477,6 +3703,23 @@ export function createLiveDesktopService(
     });
   }
 
+  /** Streamed content and tool state are Guild-authoritative inputs of the phase indicator. */
+  function notePhaseForTurn(controller: RuntimeController, payload: RuntimeTurnPayload): void {
+    if (payload.type === "agent_text_chunk") {
+      notePhase(controller, { type: "content", kind: "message" });
+    } else if (payload.type === "agent_thought_chunk") {
+      notePhase(controller, { type: "content", kind: "thought" });
+    } else if (payload.type === "tool_call_create" || payload.type === "tool_call_update") {
+      const previous = controller.toolStates.get(payload.toolCallId);
+      notePhase(controller, {
+        type: "tool",
+        toolCallId: payload.toolCallId,
+        status: payload.status ?? previous?.status ?? "pending",
+        fallbackName: payload.kind ?? previous?.kind ?? "other",
+      });
+    }
+  }
+
   async function commitTurnUpdate(
     taskId: TaskId,
     controller: RuntimeController,
@@ -3485,6 +3728,7 @@ export function createLiveDesktopService(
   ): Promise<void> {
     const runId = requireActiveRun(controller);
     const payload = update.payload;
+    notePhaseForTurn(controller, payload);
     if (payload.type === "plan") {
       logRuntime({
         category: "prompt",
@@ -3851,6 +4095,7 @@ export function createLiveDesktopService(
       }
       controller.activeRunId = undefined;
     }
+    endPhase(controller);
     const continuousTask = store.loadContinuousTask(taskId);
     if (
       continuousTask?.status === "active" &&
@@ -3953,6 +4198,7 @@ export function createLiveDesktopService(
     if (adapter === undefined || controller.promptRunId !== undefined) {
       throw new Error("runtime_prompt_overlap");
     }
+    beginPhase(controller, "prompt_sent");
     controller.recoveryHandoff = prompt.recoveryHandoff === undefined
       ? undefined
       : Object.freeze({
@@ -3992,6 +4238,12 @@ export function createLiveDesktopService(
     }[],
   ): Promise<void> {
     try {
+      // The stored model and effort are brought up to date between turns, never mid-turn. A refusal
+      // keeps the session on its previous selection and never blocks the turn.
+      await reconcileRuntimeSelection(taskId, controller, adapter, session).catch(() => {
+        logRuntime({ category: "runtime", event: "model_switch_failed", taskId });
+      });
+      notePhase(controller, { type: "prompt_sent" });
       await adapter.prompt(session, text, resources);
     } catch (cause: unknown) {
       if (process.env["GUILD_DESKTOP_DEBUG"] === "1") {
@@ -4034,6 +4286,7 @@ export function createLiveDesktopService(
             status: "failed",
           });
           controller.activeRunId = undefined;
+          endPhase(controller);
           runTerminalized = true;
         } else if (
           run !== undefined &&
@@ -4058,6 +4311,7 @@ export function createLiveDesktopService(
             status: "failed",
           });
           controller.activeRunId = undefined;
+          endPhase(controller);
           runTerminalized = true;
         }
       }
@@ -4401,6 +4655,7 @@ export function createLiveDesktopService(
     const adapterClose = controller.adapter?.close();
     if (strictAdapterClose) await adapterClose;
     else await adapterClose?.catch(() => undefined);
+    controller.phase.end();
     controller.promptRunId = undefined;
     controller.promptOperation = undefined;
     controller.promptReplayProof = undefined;
@@ -4813,6 +5068,9 @@ export function createLiveDesktopService(
         const option = controller.sessionConfigOptions.find((candidate) => candidate.id === configId);
         if (
           option === undefined ||
+          // Model and effort have their own validated channel (D-011: only official models, between turns).
+          option.category === "model" ||
+          option.category === "thought_level" ||
           (option.type === "boolean" && typeof value !== "boolean") ||
           (option.type === "select" && typeof value !== "string")
         ) {
@@ -4914,6 +5172,14 @@ export function createLiveDesktopService(
         throw new Error("continuous_task_attachments_not_supported");
       }
       messageAdmissionsActive += 1;
+      const phaseController = controllerFor(taskId);
+      phaseController.sendsInFlight += 1;
+      beginPhase(
+        phaseController,
+        phaseController.session !== undefined && phaseController.adapter?.state === "ready"
+          ? "prompt_sent"
+          : "starting_runtime",
+      );
       try {
         await enqueueCommand(async () => {
           if (!isUntitledNewTask(taskId)) return;
@@ -5081,6 +5347,11 @@ export function createLiveDesktopService(
         throw new Error("runtime_session_changed_during_send");
       } finally {
         messageAdmissionsActive -= 1;
+        phaseController.sendsInFlight -= 1;
+        // A send that never created a Run (start failure, rejection) leaves no phase behind.
+        if (phaseController.activeRunId === undefined && phaseController.promptRunId === undefined) {
+          endPhase(phaseController);
+        }
       }
     },
     setContinuousTask: async (taskId, action) => {
@@ -5348,29 +5619,53 @@ export function createLiveDesktopService(
       return buildBootstrap();
     }),
     setRuntimeSettings: async (
-      model: GuildGrokModel,
-      reasoningEffort: GuildGrokReasoningEffort,
+      model: GuildGrokModel | null,
+      reasoningEffort: GuildGrokReasoningEffort | null,
       permissionMode: GuildGrokPermissionMode,
       startup: GuildGrokStartupSettings,
     ) => enqueueCommand(async () => {
       assertOpen();
-      if (!supportsGuildGrokReasoningEffort(model, reasoningEffort)) {
+      if (model === null && reasoningEffort !== null) {
         throw new Error("runtime_settings_change_unavailable");
       }
+      if (model !== null && modelCatalog.models.length > 0) {
+        const offered = grokModelById(modelCatalog, model);
+        // The stored default must be something the runtime has advertised; the effort must be one of its.
+        if (
+          offered === undefined ||
+          (reasoningEffort !== null && !modelSupportsReasoningEffort(offered, reasoningEffort))
+        ) {
+          throw new Error("runtime_settings_change_unavailable");
+        }
+      }
       const currentSettings = store.loadAppSettings();
-      if (
-        currentSettings.grokModel === model &&
-        currentSettings.reasoningEffort === reasoningEffort &&
+      const processSettingsSame =
         currentSettings.permissionMode === permissionMode &&
         currentSettings.startup.webSearchEnabled === startup.webSearchEnabled &&
         currentSettings.startup.planEnabled === startup.planEnabled &&
         currentSettings.startup.subagentsEnabled === startup.subagentsEnabled &&
-        currentSettings.startup.maxTurns === startup.maxTurns
+        currentSettings.startup.maxTurns === startup.maxTurns;
+      if (
+        currentSettings.grokModel === model &&
+        currentSettings.reasoningEffort === reasoningEffort &&
+        processSettingsSame
       ) {
+        return buildBootstrap();
+      }
+      if (processSettingsSame) {
+        // Model and effort are applied to each session between turns (reconcileRuntimeSelection),
+        // so changing the default never closes a process or loses a conversation's context.
+        store.updateAppSettings({
+          expectedRevision: currentSettings.revision,
+          grokModel: model,
+          reasoningEffort,
+        });
+        await publish();
         return buildBootstrap();
       }
       await settlePrewarmStarts();
       if (!runtimeSettingsCanChange()) throw new Error("runtime_settings_change_unavailable");
+      // Permission mode and startup behavior are process arguments: the idle processes restart.
       runtimeGeneration += 1;
       const closes = [...controllers.values()]
         .map((controller) => controller.adapter)
@@ -5391,6 +5686,99 @@ export function createLiveDesktopService(
       await publish();
       return buildBootstrap();
     }),
+    setTaskRuntimeSettings: async (request: SetTaskRuntimeSettingsRequest) => enqueueCommand(
+      async (): Promise<SetTaskRuntimeSettingsResponse> => {
+        assertOpen();
+        const { taskId } = request;
+        const metadata = store.loadTaskMetadata(taskId);
+        if (metadata.disposition !== "active") throw new Error("task_not_writable");
+        const view = (): TaskViewProjection => taskView(taskId, conversationPageDepths.get(taskId) ?? 1);
+        if (!taskSelectionCanChange(taskId)) throw new Error("task_runtime_settings_unavailable");
+        const existing = store.loadTaskRuntimeSettings(taskId);
+        const persist = (): void => {
+          if (request.model === null) {
+            if (existing !== undefined) {
+              store.clearTaskRuntimeSettings({ taskId, expectedRevision: existing.revision });
+            }
+            return;
+          }
+          store.saveTaskRuntimeSettings({
+            taskId,
+            expectedRevision: existing?.revision ?? 0,
+            modelId: request.model,
+            reasoningEffort: request.reasoningEffort,
+            contextWindow: request.contextWindow ?? null,
+          });
+        };
+        const refuse = async (reason: GuildModelSwitchRefusalReason): Promise<SetTaskRuntimeSettingsResponse> => {
+          await publish();
+          return Object.freeze({ status: "refused" as const, reason, task: view() });
+        };
+        if (request.model !== null && modelCatalog.models.length > 0) {
+          const offered = grokModelById(modelCatalog, request.model);
+          if (
+            offered === undefined ||
+            (request.reasoningEffort !== null &&
+              !modelSupportsReasoningEffort(offered, request.reasoningEffort)) ||
+            (request.contextWindow !== undefined &&
+              request.contextWindow !== null &&
+              !offered.contextWindows.includes(request.contextWindow))
+          ) {
+            return refuse("unsupported_value");
+          }
+        }
+        const controller = controllers.get(taskId);
+        const adapter = controller?.adapter;
+        const session = controller?.session;
+        if (
+          controller !== undefined &&
+          adapter !== undefined &&
+          session !== undefined &&
+          adapter.state === "ready"
+        ) {
+          // Apply to the live session first: a refused switch must leave the stored choice untouched.
+          const outcome = request.model === null
+            ? undefined
+            : await applyRuntimeSelection({
+                port: adapter,
+                session,
+                options: controller.sessionConfigOptions,
+                catalog: modelCatalog,
+                desired: {
+                  modelId: request.model,
+                  reasoningEffort: request.reasoningEffort,
+                  contextWindow: request.contextWindow ?? null,
+                },
+                currentContextWindow: controller.contextWindowUsage?.size ?? controller.contextWindowSize,
+              });
+          if (outcome !== undefined) {
+            controller.sessionConfigOptions = outcome.options;
+            if (outcome.status === "refused") {
+              logRuntime({
+                category: "runtime",
+                event: "model_switch_refused",
+                taskId,
+                sessionId: session.sessionId,
+                reason: outcome.reason,
+              });
+              return refuse(outcome.reason);
+            }
+            if (outcome.contextWindow !== undefined) controller.contextWindowSize = outcome.contextWindow;
+          }
+          controller.selectionRefused = false;
+          persist();
+          // Clearing the override sends the session back to the default at the next turn start.
+          if (request.model === null) {
+            await reconcileRuntimeSelection(taskId, controller, adapter, session).catch(() => undefined);
+          }
+          await publish();
+          return Object.freeze({ status: "applied" as const, task: view() });
+        }
+        persist();
+        await publish();
+        return Object.freeze({ status: "saved" as const, task: view() });
+      },
+    ),
     setSidebarWidth: async (width) => enqueueCommand(async () => {
       assertOpen();
       const settings = store.loadAppSettings();
@@ -6020,8 +6408,6 @@ async function createProductionRuntime(input: {
   readonly stagingRoot: string;
   readonly workingDirectory: string;
   readonly runtimeSettings: {
-    readonly model: GuildGrokModel;
-    readonly reasoningEffort: GuildGrokReasoningEffort;
     readonly permissionMode: GuildGrokPermissionMode;
     readonly startup: GuildGrokStartupSettings;
   };

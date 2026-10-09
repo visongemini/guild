@@ -6,16 +6,18 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, describe, it } from "node:test";
 import type {
+  GrokModelCatalog,
   RuntimePromptTerminalPayload,
   RuntimeCommand,
   RuntimeConfigOption,
   RuntimePlanPayload,
   RuntimeTextChunkPayload,
   SendMessageResponse,
+  XaiSignal,
 } from "@guild/contracts";
 import {
-  GUILD_GROK_MODELS,
   GUILD_GROK_PERMISSION_MODES,
+  freezeGrokModelCatalog,
   parseAdapterEpoch,
   parseIdempotencyKey,
   parseRunId,
@@ -26,6 +28,7 @@ import {
 import { openGuildPersistence } from "@guild/persistence";
 import {
   AcpV1AdapterError,
+  AcpV1ConfigOptionRefusedError,
   ACP_V1_CODEC_LIMITS,
   type AcpV1AdapterSession,
   type AcpV1AdapterSink,
@@ -890,7 +893,7 @@ describe("live desktop service", () => {
     assert.equal((await running).status, "failed");
   });
 
-  it("persists official Grok runtime settings and applies them to the real session selectors", async () => {
+  it("persists runtime settings; model and effort follow the advertised list and never restart a process", async () => {
     const root = await mkdtemp(join(tmpdir(), "guild-live-service-runtime-settings-"));
     const workspace = join(root, "Workspace");
     await mkdir(workspace);
@@ -898,7 +901,7 @@ describe("live desktop service", () => {
     const adapters: FakeAdapter[] = [];
     const factoryInputs: Parameters<RuntimeFactory>[0][] = [];
     const runtimeFactory = fakeRuntimeFactory(
-      [],
+      [{ modelCatalog: testCatalog(), configOptions: selectionOptions("grok-4.7", "high") }],
       (adapter) => adapters.push(adapter),
       (input) => factoryInputs.push(input),
     );
@@ -911,94 +914,97 @@ describe("live desktop service", () => {
     });
     services.push(service);
 
+    const startup = { webSearchEnabled: true, planEnabled: true, subagentsEnabled: true, maxTurns: null };
     assert.deepEqual((await service.bootstrap()).runtimeSettings, {
-      model: "grok-4.6",
-      reasoningEffort: "xhigh",
+      model: null,
+      reasoningEffort: null,
+      modelCatalog: { models: [] },
       permissionMode: "default",
-      availableModels: GUILD_GROK_MODELS,
       availablePermissionModes: GUILD_GROK_PERMISSION_MODES,
-      startup: {
-        webSearchEnabled: true,
-        planEnabled: true,
-        subagentsEnabled: true,
-        maxTurns: null,
-      },
+      startup,
       canChange: true,
-    });
-    const configured = await service.setRuntimeSettings(
-      "grok-4.5",
-      "medium",
-      "bypassPermissions",
-      {
-        webSearchEnabled: false,
-        planEnabled: true,
-        subagentsEnabled: false,
-        maxTurns: 256,
-      },
-    );
-    assert.deepEqual(configured.runtimeSettings, {
-      model: "grok-4.5",
-      reasoningEffort: "medium",
-      permissionMode: "bypassPermissions",
-      availableModels: GUILD_GROK_MODELS,
-      availablePermissionModes: GUILD_GROK_PERMISSION_MODES,
-      startup: {
-        webSearchEnabled: false,
-        planEnabled: true,
-        subagentsEnabled: false,
-        maxTurns: 256,
-      },
-      canChange: true,
-    });
+    }, "a new install follows the runtime default and has no model list yet");
+
+    // No list yet: any official-looking pair is accepted; the runtime validates it per session.
     const withWorkspace = await service.chooseWorkspace();
     const task = await service.createTask(withWorkspace.workspaces[0]!.workspaceId);
-    await service.sendMessage(task.task.taskId, "settings-check");
+    await service.sendMessage(task.task.taskId, "first-turn");
     await waitForCompleted(service);
+    assert.deepEqual(adapters[0]?.callLog, ["prompt:first-turn"], "nothing is pinned, so the runtime default is left alone");
+    const advertised = (await service.bootstrap()).runtimeSettings;
+    assert.deepEqual(advertised.modelCatalog.models.map((model) => model.id), [
+      "grok-4.7", "grok-4.7-build-fast", "grok-4.5",
+    ]);
+    assert.equal(advertised.modelCatalog.runtimeDefaultModelId, "grok-4.7");
 
-    assert.deepEqual(factoryInputs.map((input) => input.runtimeSettings), [{
-      model: "grok-4.5",
-      reasoningEffort: "medium",
-      permissionMode: "bypassPermissions",
-      startup: {
-        webSearchEnabled: false,
-        planEnabled: true,
-        subagentsEnabled: false,
-        maxTurns: 256,
-      },
-    }]);
-    assert.deepEqual(adapters[0]?.selectedModels, ["grok-4.5"]);
-    assert.deepEqual(adapters[0]?.selectedModes, [{
-      model: "grok-4.5",
-      reasoningEffort: "medium",
-    }]);
-
-    const adapterStateBeforeNoOp = adapters[0]?.state;
-    const unchanged = await service.setRuntimeSettings(
-      "grok-4.5",
-      "medium",
-      "bypassPermissions",
-      {
-        webSearchEnabled: false,
-        planEnabled: true,
-        subagentsEnabled: false,
-        maxTurns: 256,
-      },
+    // Model and effort are validated against the advertised list and applied without closing a process.
+    await assert.rejects(
+      service.setRuntimeSettings("grok-4.9-nonexistent", "high", "default", startup),
+      /runtime_settings_change_unavailable/u,
     );
-    assert.equal(unchanged.runtimeSettings.permissionMode, "bypassPermissions");
-    assert.equal(adapters[0]?.state, adapterStateBeforeNoOp);
+    await assert.rejects(
+      service.setRuntimeSettings("grok-4.5", "xhigh", "default", startup),
+      /runtime_settings_change_unavailable/u,
+      "grok-4.5 has no xhigh",
+    );
+    await assert.rejects(
+      service.setRuntimeSettings(null, "high", "default", startup),
+      /runtime_settings_change_unavailable/u,
+    );
+    const stateBefore = adapters[0]?.state;
+    const modelOnly = await service.setRuntimeSettings("grok-4.5", "medium", "default", startup);
+    assert.equal(modelOnly.runtimeSettings.model, "grok-4.5");
+    assert.equal(modelOnly.runtimeSettings.reasoningEffort, "medium");
+    assert.equal(adapters.length, 1);
+    assert.equal(adapters[0]?.state, stateBefore, "changing the default model does not close the adapter");
+    assert.equal(adapters[0]?.state, "ready");
+    assert.deepEqual(adapters[0]?.callLog, ["prompt:first-turn"], "and nothing is sent until the next turn");
+
+    // The next turn on the SAME session first applies the change (model before effort), then prompts.
+    await service.sendMessage(task.task.taskId, "second-turn");
+    await waitForCompleted(service, 2);
+    assert.deepEqual(adapters[0]?.callLog, [
+      "prompt:first-turn",
+      "config:model=grok-4.5",
+      "config:reasoning_effort=medium",
+      "prompt:second-turn",
+    ]);
+    assert.equal(adapters.length, 1, "same process, same session, context kept");
+
+    // Permission mode and startup behavior are process arguments: those still restart idle processes.
+    await waitForIdle(service);
+    const configured = await service.setRuntimeSettings("grok-4.5", "medium", "bypassPermissions", {
+      webSearchEnabled: false,
+      planEnabled: true,
+      subagentsEnabled: false,
+      maxTurns: 256,
+    });
+    assert.equal(configured.runtimeSettings.permissionMode, "bypassPermissions");
+    assert.equal(adapters[0]?.state, "closed");
+    await service.sendMessage(task.task.taskId, "third-turn");
+    await waitForCompleted(service, 3);
+    assert.deepEqual(factoryInputs.map((input) => input.runtimeSettings), [
+      { permissionMode: "default", startup },
+      {
+        permissionMode: "bypassPermissions",
+        startup: { webSearchEnabled: false, planEnabled: true, subagentsEnabled: false, maxTurns: 256 },
+      },
+    ], "the factory receives process settings only, never a model or effort");
+    assert.equal(adapters.length, 2);
 
     const running = await service.sendMessage(task.task.taskId, "wait-for-cancel");
     await waitForRunState(service, "running");
     assert.equal((await service.bootstrap()).runtimeSettings.canChange, false);
     await assert.rejects(
-      service.setRuntimeSettings("grok-4.6", "high", "default", {
-        webSearchEnabled: true,
-        planEnabled: true,
-        subagentsEnabled: true,
-        maxTurns: null,
-      }),
-      /runtime_settings_change_unavailable/,
+      service.setRuntimeSettings("grok-4.5", "medium", "default", startup),
+      /runtime_settings_change_unavailable/u,
+      "process settings wait for idle",
     );
+    const duringRun = await service.setRuntimeSettings("grok-4.7", "low", "bypassPermissions", {
+      webSearchEnabled: false, planEnabled: true, subagentsEnabled: false, maxTurns: 256,
+    });
+    assert.equal(duringRun.runtimeSettings.model, "grok-4.7", "a default model change is allowed mid-turn; it applies at the next turn");
+    assert.equal(adapters[1]?.state, "ready");
     await service.cancelRun(task.task.taskId, startedRunId(running));
     await waitForRunState(service, "cancelled");
 
@@ -1012,20 +1018,14 @@ describe("live desktop service", () => {
       runtimeFactory: fakeRuntimeFactory(),
     });
     services.push(reopened);
-    assert.deepEqual((await reopened.bootstrap()).runtimeSettings, {
-      model: "grok-4.5",
-      reasoningEffort: "medium",
-      permissionMode: "bypassPermissions",
-      availableModels: GUILD_GROK_MODELS,
-      availablePermissionModes: GUILD_GROK_PERMISSION_MODES,
-      startup: {
-        webSearchEnabled: false,
-        planEnabled: true,
-        subagentsEnabled: false,
-        maxTurns: 256,
-      },
-      canChange: true,
-    });
+    const restored = (await reopened.bootstrap()).runtimeSettings;
+    assert.equal(restored.model, "grok-4.7");
+    assert.equal(restored.reasoningEffort, "low");
+    assert.deepEqual(
+      restored.modelCatalog.models.map((model) => model.id),
+      ["grok-4.7", "grok-4.7-build-fast", "grok-4.5"],
+      "the last advertised list is cached for the next launch, before any process starts",
+    );
   });
 
   it("branches, exports, searches, and opens only task-owned local resources", async () => {
@@ -4686,7 +4686,7 @@ describe("live desktop service", () => {
       { sessionId: "session-setup-original", resumeFails: true },
       {
         sessionId: "session-setup-replacement",
-        setModelFailure: "fake replacement model failure",
+        failAfterSessionCommit: "fake replacement setup failure",
       },
       { sessionId: "session-setup-replacement" },
     ], (adapter) => adapters.push(adapter));
@@ -4721,7 +4721,7 @@ describe("live desktop service", () => {
     );
     await assert.rejects(
       replacementAttempt.authorizeSessionReplacement(task.task.taskId),
-      /runtime_start_session_set_model:fake replacement model failure/u,
+      /runtime_start_session_new:fake replacement setup failure/u,
     );
     await replacementAttempt.close();
     services.splice(services.indexOf(replacementAttempt), 1);
@@ -5218,7 +5218,7 @@ describe("live desktop service runtime reuse and prewarm", () => {
   }
 
   const startedAndConfigured = (adapter: FakeAdapter | undefined): boolean =>
-    adapter !== undefined && adapter.state === "ready" && adapter.selectedModes.length > 0;
+    adapter !== undefined && adapter.state === "ready" && adapter.sessionEstablishments > 0;
 
   it("keeps a healthy idle runtime across system resume and only probes it", async () => {
     const { service, adapters, taskId } = await idleTask();
@@ -5405,13 +5405,14 @@ describe("live desktop service runtime reuse and prewarm", () => {
     const { service, adapters, taskIds } = await restartedWithTasks([{ startDelayMs: 120 }]);
     await service.bootstrap();
     await eventually(() => adapters.length === 1, "prewarm began");
-    const updated = await service.setRuntimeSettings("grok-4.5", "medium", "default", {
+    // A process-level setting (permission mode) is the one that still has to wait for, and restart, a prewarm.
+    const updated = await service.setRuntimeSettings(null, null, "acceptEdits", {
       webSearchEnabled: true,
       planEnabled: true,
       subagentsEnabled: true,
       maxTurns: null,
     });
-    assert.equal(updated.runtimeSettings.model, "grok-4.5");
+    assert.equal(updated.runtimeSettings.permissionMode, "acceptEdits");
 
     await service.openTask(taskIds[0]!);
     await eventually(() => adapters.length === 2, "second prewarm began");
@@ -5462,6 +5463,326 @@ describe("live desktop service runtime reuse and prewarm", () => {
     });
   }
 });
+
+describe("live desktop service model selection and phase indicator [F1]", () => {
+  async function f1Task(
+    specs: readonly FakeRuntimeSpec[] = [{ modelCatalog: testCatalog(), configOptions: selectionOptions("grok-4.7", "high") }],
+  ) {
+    const root = await mkdtemp(join(tmpdir(), "guild-live-service-f1-"));
+    const workspace = join(root, "Workspace");
+    await mkdir(workspace);
+    const databasePath = join(root, "guild.sqlite3");
+    const adapters: FakeAdapter[] = [];
+    const options = {
+      appVersion: "2.2.0-test",
+      databasePath,
+      stagingRoot: join(root, "staging"),
+      chooseWorkspace: async () => workspace,
+      runtimeFactory: fakeRuntimeFactory(specs, (adapter) => adapters.push(adapter)),
+    };
+    const service = createLiveDesktopService(options);
+    services.push(service);
+    const selected = await service.chooseWorkspace();
+    const task = await service.createTask(selected.workspaces[0]!.workspaceId);
+    return { root, workspace, databasePath, adapters, options, service, taskId: task.task.taskId };
+  }
+
+  const startup = { webSearchEnabled: true, planEnabled: true, subagentsEnabled: true, maxTurns: null };
+
+  async function completedFirstTurn(setup: Awaited<ReturnType<typeof f1Task>>) {
+    await setup.service.sendMessage(setup.taskId, "hello");
+    await waitForCompleted(setup.service);
+    await waitForIdle(setup.service);
+  }
+
+  it("does not let the generic session-option channel change the model or effort", async () => {
+    const setup = await f1Task();
+    await completedFirstTurn(setup);
+    for (const [configId, value] of [["model", "grok-4.5"], ["reasoning_effort", "low"]] as const) {
+      await assert.rejects(
+        setup.service.setSessionConfigOption(setup.taskId, configId, value),
+        /session_config_option_unavailable/u,
+        configId,
+      );
+    }
+    assert.deepEqual(setup.adapters[0]?.callLog, ["prompt:hello"]);
+  });
+
+  it("applies a per-task model and effort to the live session between turns, model first, without a restart", async () => {
+    const setup = await f1Task();
+    const { service, adapters, taskId } = setup;
+    await completedFirstTurn(setup);
+    const adapter = adapters[0]!;
+    assert.deepEqual(adapter.callLog, ["prompt:hello"]);
+    const before = (await service.openTask(taskId)).modelSelection;
+    assert.deepEqual(before, { modelId: "grok-4.7", reasoningEffort: "high", source: "runtime", canChange: true });
+
+    const applied = await service.setTaskRuntimeSettings({ taskId, model: "grok-4.5", reasoningEffort: "low" });
+    assert.equal(applied.status, "applied");
+    assert.deepEqual(applied.task.modelSelection, {
+      modelId: "grok-4.5", reasoningEffort: "low", source: "task", canChange: true,
+    });
+    assert.deepEqual(adapter.callLog, ["prompt:hello", "config:model=grok-4.5", "config:reasoning_effort=low"]);
+    assert.equal(adapters.length, 1);
+    assert.equal(adapter.state, "ready", "switching the model never closes the adapter");
+    assert.equal((await service.bootstrap()).runtimeSettings.model, null, "the global default is untouched");
+
+    // Pinning the same pair again sends nothing; the next turn reuses the same session.
+    const repeated = await service.setTaskRuntimeSettings({ taskId, model: "grok-4.5", reasoningEffort: "low" });
+    assert.equal(repeated.status, "applied");
+    await service.sendMessage(taskId, "second");
+    await waitForCompleted(service, 2);
+    assert.deepEqual(adapter.callLog.slice(3), ["prompt:second"]);
+    assert.equal(adapters.length, 1);
+
+    // Between turns only: while a turn runs the change is refused before anything is sent.
+    await waitForIdle(service);
+    const running = await service.sendMessage(taskId, "wait-for-cancel");
+    await waitForRunState(service, "running");
+    const during = await service.bootstrap();
+    assert.equal(during.activeTask?.modelSelection.canChange, false);
+    const logLength = adapter.callLog.length;
+    await assert.rejects(
+      service.setTaskRuntimeSettings({ taskId, model: "grok-4.7", reasoningEffort: "high" }),
+      /task_runtime_settings_unavailable/u,
+    );
+    assert.equal(adapter.callLog.length, logLength);
+    await service.cancelRun(taskId, startedRunId(running));
+    await waitForRunState(service, "cancelled");
+    await waitForIdle(service);
+
+    // Clearing the override sends the task back to the default (nothing pinned -> runtime default).
+    const cleared = await service.setTaskRuntimeSettings({ taskId, model: null, reasoningEffort: null });
+    assert.equal(cleared.status, "applied");
+    assert.equal(cleared.task.modelSelection.source, "runtime");
+  });
+
+  it("keeps the previous selection and reports why when the runtime or the advertised list refuses", async () => {
+    const setup = await f1Task([{
+      modelCatalog: testCatalog(),
+      configOptions: selectionOptions("grok-4.7", "high"),
+      configRefusal: { configId: "model", reason: "incompatible_agent" },
+    }]);
+    const { service, adapters, taskId } = setup;
+    await completedFirstTurn(setup);
+    const adapter = adapters[0]!;
+
+    const refused = await service.setTaskRuntimeSettings({ taskId, model: "grok-4.5", reasoningEffort: "medium" });
+    assert.equal(refused.status, "refused");
+    assert.equal(refused.status === "refused" && refused.reason, "incompatible_agent");
+    assert.deepEqual(refused.task.modelSelection, {
+      modelId: "grok-4.7", reasoningEffort: "high", source: "runtime", canChange: true,
+    }, "the previous selection is kept and shown");
+    assert.deepEqual(adapter.callLog, ["prompt:hello"]);
+
+    // Values the advertised list does not contain are refused locally, before any request.
+    for (const [model, effort] of [["grok-9", "high"], ["grok-4.5", "xhigh"]] as const) {
+      const unsupported = await service.setTaskRuntimeSettings({ taskId, model, reasoningEffort: effort });
+      assert.equal(unsupported.status === "refused" && unsupported.reason, "unsupported_value", `${model} ${effort}`);
+    }
+    assert.deepEqual(adapter.callLog, ["prompt:hello"]);
+    assert.equal(adapter.state, "ready");
+
+    // Nothing was stored: after a restart the task still has no override.
+    await service.close();
+    services.splice(services.indexOf(service), 1);
+    const store = openGuildPersistence({ path: setup.databasePath });
+    try {
+      assert.equal(store.loadTaskRuntimeSettings(taskId), undefined);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("maps a plain invalid-value refusal to unsupported_value and any other failure to unavailable", async () => {
+    for (const [reason, expected] of [["invalid_value", "unsupported_value"], ["other", "unavailable"]] as const) {
+      const setup = await f1Task([{
+        modelCatalog: testCatalog(),
+        configOptions: selectionOptions("grok-4.7", "high"),
+        configRefusal: { configId: "model", reason },
+      }]);
+      await completedFirstTurn(setup);
+      const result = await setup.service.setTaskRuntimeSettings({
+        taskId: setup.taskId, model: "grok-4.7-build-fast", reasoningEffort: "high",
+      });
+      assert.equal(result.status === "refused" && result.reason, expected, reason);
+    }
+  });
+
+  it("saves a choice made before any session exists and applies it, with the effort, when the session opens", async () => {
+    const setup = await f1Task();
+    const { service, adapters, taskId } = setup;
+    const saved = await service.setTaskRuntimeSettings({ taskId, model: "grok-4.7-build-fast", reasoningEffort: "medium" });
+    assert.equal(saved.status, "saved");
+    assert.deepEqual(saved.task.modelSelection, {
+      modelId: "grok-4.7-build-fast", reasoningEffort: "medium", source: "task", canChange: true,
+    });
+    assert.equal(adapters.length, 0, "choosing a model does not start a process");
+
+    await service.sendMessage(taskId, "first");
+    await waitForCompleted(service);
+    const adapter = adapters[0]!;
+    assert.deepEqual(adapter.sessionStartOptions, [{ reasoningEffort: "medium" }], "the effort is also passed when the session is created");
+    assert.deepEqual(adapter.callLog, [
+      "config:model=grok-4.7-build-fast",
+      "config:reasoning_effort=medium",
+      "prompt:first",
+    ]);
+  });
+
+  it("lets a task override beat the global default, and both survive a restart", async () => {
+    const setup = await f1Task();
+    const { service, taskId } = setup;
+    await completedFirstTurn(setup);
+    await service.setRuntimeSettings("grok-4.5", "medium", "default", startup);
+    const other = await service.createTask((await service.bootstrap()).workspaces[0]!.workspaceId);
+    await service.updateTask({ taskId: other.task.taskId, action: "rename", title: "Other task" });
+    await service.setTaskRuntimeSettings({ taskId, model: "grok-4.7", reasoningEffort: "xhigh" });
+    assert.deepEqual((await service.openTask(taskId)).modelSelection, {
+      modelId: "grok-4.7", reasoningEffort: "xhigh", source: "task", canChange: true,
+    });
+    assert.deepEqual((await service.openTask(other.task.taskId)).modelSelection, {
+      modelId: "grok-4.5", reasoningEffort: "medium", source: "global", canChange: true,
+    });
+
+    await service.close();
+    services.splice(services.indexOf(service), 1);
+    const reopened = createLiveDesktopService({ ...setup.options, runtimeFactory: fakeRuntimeFactory() });
+    services.push(reopened);
+    assert.deepEqual((await reopened.openTask(taskId)).modelSelection, {
+      modelId: "grok-4.7", reasoningEffort: "xhigh", source: "task", canChange: true,
+    });
+    assert.deepEqual((await reopened.openTask(other.task.taskId)).modelSelection, {
+      modelId: "grok-4.5", reasoningEffort: "medium", source: "global", canChange: true,
+    });
+  });
+
+  it("never blocks a turn on a refused default and shows the model the session really runs", async () => {
+    const setup = await f1Task([{
+      modelCatalog: testCatalog(),
+      configOptions: selectionOptions("grok-4.7", "high"),
+      configRefusal: { configId: "model", reason: "other" },
+    }]);
+    const { service, adapters, taskId } = setup;
+    await service.setRuntimeSettings("grok-4.5", "medium", "default", startup);
+    await service.sendMessage(taskId, "go");
+    await waitForCompleted(service);
+    assert.deepEqual(adapters[0]?.callLog, ["prompt:go"], "the refusal did not stop the prompt");
+    const view = (await service.openTask(taskId)).modelSelection;
+    assert.equal(view.modelId, "grok-4.7", "the projection reports the live selection");
+    assert.equal(view.source, "global");
+  });
+
+  it("applies a pinned context window with set_model only when the model offers it", async () => {
+    const setup = await f1Task();
+    const { service, adapters, taskId } = setup;
+    await completedFirstTurn(setup);
+    const unsupported = await service.setTaskRuntimeSettings({
+      taskId, model: "grok-4.5", reasoningEffort: "high", contextWindow: 500_000,
+    });
+    assert.equal(unsupported.status === "refused" && unsupported.reason, "unsupported_value");
+    assert.deepEqual(adapters[0]?.callLog, ["prompt:hello"]);
+    const applied = await service.setTaskRuntimeSettings({
+      taskId, model: "grok-4.7", reasoningEffort: "high", contextWindow: 500_000,
+    });
+    assert.equal(applied.status, "applied");
+    assert.deepEqual(adapters[0]?.callLog, ["prompt:hello", "context:grok-4.7:500000"]);
+    assert.equal(adapters[0]?.contextWindowCalls[0]?.contextWindow, 500_000);
+  });
+
+  it("shows the turn phase from authoritative state plus allowlisted signals, only while a turn runs", async () => {
+    const setup = await f1Task([{ modelCatalog: testCatalog(), configOptions: selectionOptions("grok-4.7", "high"), startDelayMs: 120 }]);
+    const { service, adapters, taskId } = setup;
+    assert.equal((await service.bootstrap()).activeTask?.runPhase, undefined, "no phase for an idle task");
+
+    // "silent" holds the turn open without any streamed content, so only the signals move the phase.
+    const sending = service.sendMessage(taskId, "silent");
+    await eventuallyAsync(async () => (await service.bootstrap()).activeTask?.runPhase?.phase === "starting_runtime");
+    const early = (await service.bootstrap()).activeTask?.runPhase;
+    assert.ok(early !== undefined && early.turnStartedAtMs <= Date.now());
+    const running = await sending;
+    await waitForRunState(service, "running");
+    const adapter = adapters[0]!;
+    const phase = async () => (await service.bootstrap()).activeTask?.runPhase;
+
+    const sent = await phase();
+    assert.equal(sent?.phase, "prompt_sent");
+    assert.equal(sent?.turnStartedAtMs, early.turnStartedAtMs, "the turn clock is stable across phases");
+    assert.ok((sent?.phaseStartedAtMs ?? 0) >= early.phaseStartedAtMs);
+
+    // Signals about another (child) session are not this turn's.
+    adapter.emitSignal({ kind: "hook_run_started", event: "pre_tool_use", count: 3 }, "worker-session-1");
+    assert.equal((await phase())?.phase, "prompt_sent");
+
+    adapter.emitSignal({ kind: "queue_changed", queued: 1, firstPosition: 0, running: false });
+    await eventuallyAsync(async () => (await phase())?.phase === "waiting_for_model");
+    adapter.emitSignal({ kind: "hook_run_started", event: "user_prompt_submit", count: 2 });
+    await eventuallyAsync(async () => (await phase())?.phase === "running_hooks");
+    assert.equal((await phase())?.hookCount, 2);
+    adapter.emitSignal({ kind: "hook_execution", event: "user_prompt_submit", runs: 2, failed: 0, maxElapsedMs: 8_000 });
+    await eventuallyAsync(async () => (await phase())?.phase === "waiting_for_model");
+    adapter.emitSignal({ kind: "tool_call_delta_chunk", toolName: "run_terminal_command" });
+    await eventuallyAsync(async () => (await phase())?.phase === "preparing_tool");
+    assert.equal((await phase())?.toolName, "run_terminal_command");
+    adapter.emitSignal({ kind: "retry_state", active: true, attempt: 1, maxRetries: 15, errorType: "http" });
+    await eventuallyAsync(async () => (await phase())?.phase === "retrying");
+    assert.deepEqual([(await phase())?.attempt, (await phase())?.maxRetries], [1, 15]);
+    const untouched = (await service.bootstrap()).activeTask?.timeline.length;
+    adapter.emitSignal({ kind: "turn_completed", stopReason: "end_turn" });
+    assert.equal((await service.bootstrap()).activeTask?.timeline.length, untouched, "signals never create conversation entries");
+
+    await service.cancelRun(taskId, startedRunId(running));
+    await waitForRunState(service, "cancelled");
+    assert.equal((await phase()), undefined, "no phase once the turn is over");
+    await waitForIdle(service);
+    adapter.emitSignal({ kind: "hook_run_started", event: "stop", count: 1 });
+    assert.equal((await phase()), undefined, "late signals after the turn do not resurrect it");
+  });
+
+  it("follows a model list the runtime pushes after start and caches it for the next launch", async () => {
+    const setup = await f1Task([{ modelCatalog: testCatalog(), configOptions: selectionOptions("grok-4.7", "high") }]);
+    const { service, adapters, taskId } = setup;
+    await completedFirstTurn(setup);
+    const pushed = freezeGrokModelCatalog({
+      runtimeDefaultModelId: "grok-4.8",
+      models: [{
+        id: "grok-4.8", name: "Grok 4.8", description: "Pushed later",
+        reasoningEfforts: [{ id: "high", label: "High", isDefault: true }],
+        contextWindows: [256_000],
+      }],
+    });
+    adapters[0]!.emitSignal({ kind: "models_update", catalog: pushed }, null);
+    await eventuallyAsync(async () =>
+      (await service.bootstrap()).runtimeSettings.modelCatalog.models[0]?.id === "grok-4.8");
+    await service.close();
+    services.splice(services.indexOf(service), 1);
+    const reopened = createLiveDesktopService({ ...setup.options, runtimeFactory: fakeRuntimeFactory() });
+    services.push(reopened);
+    const settings = (await reopened.bootstrap()).runtimeSettings;
+    assert.deepEqual(settings.modelCatalog.models.map((model) => model.id), ["grok-4.8"]);
+    assert.equal(taskId.length > 0, true);
+  });
+});
+
+async function eventuallyAsync(
+  predicate: () => boolean | Promise<boolean>,
+  label = "condition",
+): Promise<void> {
+  const deadline = Date.now() + 3_000;
+  while (Date.now() < deadline) {
+    if (await predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.fail(`condition not reached: ${label}`);
+}
+
+/** Process-level settings and backups wait for the last prompt to settle after its Run completed. */
+async function waitForIdle(service: ReturnType<typeof createLiveDesktopService>): Promise<void> {
+  const deadline = Date.now() + 3_000;
+  while (!(await service.bootstrap()).runtimeSettings.canChange && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
 
 async function waitForCompleted(
   service: ReturnType<typeof createLiveDesktopService>,
@@ -5616,6 +5937,47 @@ function startedRunId(response: SendMessageResponse) {
   return response.runId;
 }
 
+/** The models and efforts the installed runtime advertised on 2026-10-09, trimmed to official xAI ids. */
+function testCatalog(): GrokModelCatalog {
+  const effort = (id: string, label: string, isDefault = false) => ({
+    id, label, description: `${label} reasoning`, isDefault,
+  });
+  const full = [effort("xhigh", "Extra High"), effort("high", "High", true), effort("medium", "Medium"), effort("low", "Low")];
+  return freezeGrokModelCatalog({
+    runtimeDefaultModelId: "grok-4.7",
+    models: [
+      { id: "grok-4.7", name: "Grok 4.7", description: "SpaceXAI's latest frontier model", reasoningEfforts: full, contextWindows: [256_000, 500_000], defaultContextWindow: 256_000 },
+      { id: "grok-4.7-build-fast", name: "Grok 4.7 Fast", description: "Fast variant. 2x the price.", reasoningEfforts: full, contextWindows: [256_000, 500_000] },
+      { id: "grok-4.5", name: "Grok 4.5", reasoningEfforts: [effort("high", "High", true), effort("medium", "Medium"), effort("low", "Low")], contextWindows: [256_000] },
+    ],
+  });
+}
+
+/** What `session/new` reports for the catalog above: the official model and thought_level options. */
+function selectionOptions(model: string, effortValue: string): readonly RuntimeConfigOption[] {
+  return Object.freeze([
+    {
+      id: "model", name: "Model", category: "model", type: "select", currentValue: model,
+      choices: {
+        form: "flat",
+        options: [
+          { value: "grok-4.7", name: "Grok 4.7" },
+          { value: "grok-4.7-build-fast", name: "Grok 4.7 Fast" },
+          { value: "grok-4.5", name: "Grok 4.5" },
+        ],
+      },
+    },
+    {
+      id: "reasoning_effort", name: "Reasoning Effort", category: "thought_level", type: "select",
+      currentValue: effortValue,
+      choices: {
+        form: "flat",
+        options: ["xhigh", "high", "medium", "low"].map((value) => ({ value, name: value })),
+      },
+    },
+  ]) as readonly RuntimeConfigOption[];
+}
+
 type FakeRuntimeSpec = {
   readonly contextWindowSize?: number;
   readonly sessionId?: string;
@@ -5644,7 +6006,11 @@ type FakeRuntimeSpec = {
   }>[];
   readonly startDelayMs?: number;
   readonly startFailure?: string;
-  readonly setModelFailure?: string;
+  /** The session is committed and the open call then fails, like a setup step that breaks late. */
+  readonly failAfterSessionCommit?: string;
+  readonly modelCatalog?: GrokModelCatalog;
+  /** The runtime refuses `session/set_config_option` for this option id with this reason. */
+  readonly configRefusal?: Readonly<{ configId: string; reason: "incompatible_agent" | "invalid_value" | "other" }>;
   readonly availableCommands?: readonly RuntimeCommand[];
   readonly configOptions?: readonly RuntimeConfigOption[];
   readonly promptResponses?: readonly string[];
@@ -5675,12 +6041,14 @@ function fakeRuntimeFactory(
       spec.startDelayMs ?? 0,
       spec.startFailure,
       spec.newSessionFailure,
-      spec.setModelFailure,
+      spec.failAfterSessionCommit,
       spec.contextWindowSize,
       spec.availableCommands,
       spec.configOptions,
       spec.promptResponses,
       spec.promptDelayMs ?? 0,
+      spec.modelCatalog,
+      spec.configRefusal,
     );
     onCreate?.(adapter);
     return {
@@ -5697,11 +6065,11 @@ class FakeAdapter implements RuntimeAdapterPort {
   billingFailure: string | undefined;
   probeCalls = 0;
   livenessAnswer = true;
-  readonly selectedModels: string[] = [];
-  readonly selectedModes: Array<{
-    readonly model: string;
-    readonly reasoningEffort: string;
-  }> = [];
+  sessionEstablishments = 0;
+  readonly sessionStartOptions: Array<{ readonly reasoningEffort?: string } | undefined> = [];
+  /** Ordered record of config changes, context-window changes and prompts sent to the runtime. */
+  readonly callLog: string[] = [];
+  readonly contextWindowCalls: Array<{ readonly model: string; readonly contextWindow: number | undefined }> = [];
   readonly selectedConfigOptions: Array<{ readonly configId: string; readonly value: string | boolean }> = [];
   readonly prompts: Array<{
     readonly text: string;
@@ -5769,13 +6137,24 @@ class FakeAdapter implements RuntimeAdapterPort {
     private readonly startDelayMs: number,
     private readonly startFailure: string | undefined,
     private readonly newSessionFailure: string | undefined,
-    private readonly setModelFailure: string | undefined,
+    private readonly failAfterSessionCommit: string | undefined,
     private readonly contextWindowSize: number | undefined,
     private readonly availableCommands: readonly RuntimeCommand[] | undefined,
     private configOptions: readonly RuntimeConfigOption[] | undefined,
     private readonly promptResponses: readonly string[] | undefined,
     private readonly promptDelayMs: number,
+    private readonly modelCatalog: GrokModelCatalog | undefined,
+    private readonly configRefusal: FakeRuntimeSpec["configRefusal"],
   ) {}
+
+  /** Delivers one allowlisted runtime signal exactly as the ACP adapter would. */
+  emitSignal(signal: XaiSignal, sessionId: string | null = this.sessionId): void {
+    this.sink.observeSignal?.(Object.freeze({
+      sessionId,
+      signal,
+      receivedMonotonicMs: performance.now(),
+    }));
+  }
 
   async start(): Promise<AcpV1InitializeResult> {
     if (this.startDelayMs > 0) {
@@ -5800,6 +6179,7 @@ class FakeAdapter implements RuntimeAdapterPort {
       }),
       authMethods: Object.freeze([]),
       agentInfo: Object.freeze({ name: "Fake Grok", version: "1.0" }),
+      ...(this.modelCatalog === undefined ? {} : { modelCatalog: this.modelCatalog }),
     });
   }
 
@@ -5816,17 +6196,13 @@ class FakeAdapter implements RuntimeAdapterPort {
     return this.state === "ready" && this.livenessAnswer;
   }
 
-  async setModel(_session: AcpV1AdapterSession, model: "grok-4.6" | "grok-4.5"): Promise<void> {
-    this.selectedModels.push(model);
-    if (this.setModelFailure !== undefined) throw new Error(this.setModelFailure);
-  }
-
-  async setMode(
+  async setModel(
     _session: AcpV1AdapterSession,
-    model: "grok-4.6" | "grok-4.5",
-    reasoningEffort: "xhigh" | "high" | "medium" | "low",
+    model: string,
+    options?: { readonly reasoningEffort?: string; readonly contextWindow?: number },
   ): Promise<void> {
-    this.selectedModes.push({ model, reasoningEffort });
+    this.callLog.push(`context:${model}:${options?.contextWindow ?? "-"}`);
+    this.contextWindowCalls.push({ model, contextWindow: options?.contextWindow });
   }
 
   async setConfigOption(
@@ -5834,14 +6210,28 @@ class FakeAdapter implements RuntimeAdapterPort {
     configId: string,
     value: string | boolean,
   ): Promise<readonly RuntimeConfigOption[]> {
+    if (this.state !== "ready") throw new AcpV1AdapterError("transport_lost");
+    if (this.configRefusal?.configId === configId) {
+      throw new AcpV1ConfigOptionRefusedError(this.configRefusal.reason, -32602);
+    }
+    const target = (this.configOptions ?? []).find((option) => option.id === configId);
+    if (
+      target?.type === "select" &&
+      !(target.choices.form === "flat" ? target.choices.options : target.choices.groups.flatMap((group) => group.options))
+        .some((choice) => choice.value === value)
+    ) {
+      throw new AcpV1ConfigOptionRefusedError("invalid_value", -32602);
+    }
     this.selectedConfigOptions.push({ configId, value });
+    this.callLog.push(`config:${configId}=${String(value)}`);
     this.configOptions = Object.freeze((this.configOptions ?? []).map((option) =>
       option.id !== configId ? option : Object.freeze({ ...option, currentValue: value }) as RuntimeConfigOption));
     return this.configOptions;
   }
 
-  async newSession(): Promise<AcpV1AdapterSession> {
+  async newSession(_cwd?: string, startOptions?: { readonly reasoningEffort?: string }): Promise<AcpV1AdapterSession> {
     this.newSessionCalls += 1;
+    this.sessionStartOptions.push(startOptions);
     if (this.newSessionFailure !== undefined) throw new Error(this.newSessionFailure);
     await this.sink.commitSessionEstablished({
       identity: { adapterEpoch: this.adapterEpoch, sessionId: this.sessionId },
@@ -5849,17 +6239,25 @@ class FakeAdapter implements RuntimeAdapterPort {
       state: {},
     });
     await this.announceCommands();
+    this.sessionEstablishments += 1;
+    if (this.failAfterSessionCommit !== undefined) throw new Error(this.failAfterSessionCommit);
     return this.makeSession("new");
   }
 
-  async resumeSession(): Promise<AcpV1AdapterSession> {
+  async resumeSession(
+    _sessionId?: string,
+    _cwd?: string,
+    startOptions?: { readonly reasoningEffort?: string },
+  ): Promise<AcpV1AdapterSession> {
     if (this.resumeFails) throw new Error("fake resume failed");
+    this.sessionStartOptions.push(startOptions);
     await this.sink.commitSessionEstablished({
       identity: { adapterEpoch: this.adapterEpoch, sessionId: this.sessionId },
       establishedBy: "resume",
       state: {},
     });
     await this.announceCommands();
+    this.sessionEstablishments += 1;
     return this.makeSession("resume");
   }
 
@@ -6026,6 +6424,7 @@ class FakeAdapter implements RuntimeAdapterPort {
     }[] = [],
   ): Promise<RuntimePromptTerminalPayload> {
     this.prompts.push(Object.freeze({ text, resources: Object.freeze([...resources]) }));
+    this.callLog.push(`prompt:${text}`);
     this.promptSequence += 1;
     const promptSequence = this.promptSequence;
     const identity = {
@@ -6899,6 +7298,7 @@ class FakeAdapter implements RuntimeAdapterPort {
       establishedBy,
       ...(this.contextWindowSize === undefined ? {} : { contextWindowSize: this.contextWindowSize }),
       ...(this.configOptions === undefined ? {} : { configOptions: this.configOptions }),
+      ...(this.modelCatalog === undefined ? {} : { modelCatalog: this.modelCatalog }),
     });
     this.session = session;
     return session;

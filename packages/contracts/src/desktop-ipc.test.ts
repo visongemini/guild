@@ -3,18 +3,16 @@ import test from "node:test";
 import {
   DESKTOP_EVENT_CHANNELS,
   DESKTOP_IPC_CHANNELS,
-  GUILD_GROK_MODELS,
   GUILD_STREAM_DELTA_LIMITS,
   GUILD_GROK_PERMISSION_MODES,
   GUILD_MAX_MESSAGE_LENGTH,
   parseDesktopRequest,
-  parseGuildGrokModel,
   parseGuildGrokPermissionMode,
-  parseGuildGrokReasoningEffort,
   parseGuildLocale,
   parseGuildNickname,
   parseStreamDeltaEvent,
 } from "./desktop-ipc.js";
+import { parseGuildGrokModel, parseGuildGrokReasoningEffort } from "./grok-models.js";
 
 test("desktop IPC accepts only closed request shapes", () => {
   assert.deepEqual(
@@ -280,13 +278,12 @@ test("locale and sidebar width validation are bounded", () => {
   );
 });
 
-test("runtime settings expose only official Grok models and valid effort pairs", () => {
-  assert.deepEqual(GUILD_GROK_MODELS.map((model) => model.id), [
-    "grok-4.6",
-    "grok-4.5",
-  ]);
+test("runtime settings accept advertised model ids as bounded identifiers, not an enum", () => {
   assert.equal(parseGuildGrokModel("grok-4.6"), "grok-4.6");
+  assert.equal(parseGuildGrokModel("grok-4.7-build-fast"), "grok-4.7-build-fast");
+  assert.equal(parseGuildGrokModel("grok-5.0-preview"), "grok-5.0-preview");
   assert.equal(parseGuildGrokReasoningEffort("medium"), "medium");
+  assert.equal(parseGuildGrokReasoningEffort("ultra"), "ultra");
   assert.deepEqual(GUILD_GROK_PERMISSION_MODES, [
     "default",
     "acceptEdits",
@@ -301,8 +298,14 @@ test("runtime settings expose only official Grok models and valid effort pairs",
   assert.equal(parseGuildGrokPermissionMode("dontAsk"), "dontAsk");
   assert.equal(parseGuildGrokPermissionMode("plan"), "plan");
   assert.throws(() => parseGuildGrokPermissionMode("always-approve"));
-  for (const rejected of ["MiniMax-M3", "ornith-1.5-35b-a3b-unc", "grok-custom"]){
-    assert.throws(() => parseGuildGrokModel(rejected));
+  for (const rejected of [
+    "MiniMax-M3", "ornith-1.5-35b-a3b-unc", "", " grok-4.7", "grok-4.7 ", "grok-4.7;rm -rf",
+    "../grok-4.7", "grok-4.7\n", `grok-${"x".repeat(64)}`, 4.7, null, undefined, {},
+  ]) {
+    assert.throws(() => parseGuildGrokModel(rejected), /invalid_grok_model/u);
+  }
+  for (const rejected of ["", "High", "x high", "a".repeat(33), 3, null, "-low"]) {
+    assert.throws(() => parseGuildGrokReasoningEffort(rejected), /invalid_grok_reasoning_effort/u);
   }
   assert.deepEqual(
     parseDesktopRequest(DESKTOP_IPC_CHANNELS.setRuntimeSettings, {
@@ -328,17 +331,24 @@ test("runtime settings expose only official Grok models and valid effort pairs",
       },
     },
   );
-  assert.throws(() =>
+  const startup = { webSearchEnabled: true, planEnabled: true, subagentsEnabled: true, maxTurns: null };
+  assert.deepEqual(
     parseDesktopRequest(DESKTOP_IPC_CHANNELS.setRuntimeSettings, {
-      model: "grok-4.5",
-      reasoningEffort: "xhigh",
-      permissionMode: "default",
-      startup: {
-        webSearchEnabled: true,
-        planEnabled: true,
-        subagentsEnabled: true,
-        maxTurns: null,
-      },
+      model: null, reasoningEffort: null, permissionMode: "default", startup,
+    }),
+    { model: null, reasoningEffort: null, permissionMode: "default", startup },
+    "null follows the runtime default",
+  );
+  assert.throws(
+    () => parseDesktopRequest(DESKTOP_IPC_CHANNELS.setRuntimeSettings, {
+      model: null, reasoningEffort: "high", permissionMode: "default", startup,
+    }),
+    /invalid_grok_model/u,
+    "an effort without a model is ambiguous",
+  );
+  assert.throws(
+    () => parseDesktopRequest(DESKTOP_IPC_CHANNELS.setRuntimeSettings, {
+      model: "grok-4.7", reasoningEffort: "high", permissionMode: "default", startup, extra: 1,
     }),
   );
   assert.throws(() =>
@@ -545,4 +555,39 @@ test("stream delta validation rejects unknown, malformed, and oversized events",
   assert.throws(() => parseStreamDeltaEvent(Object.create({ ...validDelta })), TypeError);
   const symbolKeyed = { ...validDelta, [Symbol("x")]: 1 };
   assert.throws(() => parseStreamDeltaEvent(symbolKeyed), TypeError);
+});
+
+test("per-task runtime settings parse a pinned pair, a full clear, and nothing in between", () => {
+  const taskId = "task-1";
+  assert.deepEqual(
+    parseDesktopRequest(DESKTOP_IPC_CHANNELS.setTaskRuntimeSettings, {
+      taskId, model: "grok-4.7-build-fast", reasoningEffort: "low",
+    }),
+    { taskId, model: "grok-4.7-build-fast", reasoningEffort: "low" },
+  );
+  assert.deepEqual(
+    parseDesktopRequest(DESKTOP_IPC_CHANNELS.setTaskRuntimeSettings, {
+      taskId, model: "grok-4.7", reasoningEffort: "high", contextWindow: 500_000,
+    }),
+    { taskId, model: "grok-4.7", reasoningEffort: "high", contextWindow: 500_000 },
+  );
+  assert.deepEqual(
+    parseDesktopRequest(DESKTOP_IPC_CHANNELS.setTaskRuntimeSettings, {
+      taskId, model: null, reasoningEffort: null, contextWindow: null,
+    }),
+    { taskId, model: null, reasoningEffort: null, contextWindow: null },
+  );
+  for (const rejected of [
+    { taskId, model: null, reasoningEffort: "low" },
+    { taskId, model: null, reasoningEffort: null, contextWindow: 256_000 },
+    { taskId, model: "MiniMax-M3", reasoningEffort: null },
+    { taskId, model: "grok-4.7", reasoningEffort: "Low Effort" },
+    { taskId, model: "grok-4.7", reasoningEffort: null, contextWindow: 0 },
+    { taskId, model: "grok-4.7", reasoningEffort: null, contextWindow: 1.5 },
+    { taskId, model: "grok-4.7", reasoningEffort: null, extra: true },
+    { model: "grok-4.7", reasoningEffort: null },
+    { taskId: "", model: "grok-4.7", reasoningEffort: null },
+  ]) {
+    assert.throws(() => parseDesktopRequest(DESKTOP_IPC_CHANNELS.setTaskRuntimeSettings, rejected));
+  }
 });

@@ -604,3 +604,37 @@ memoizes rows, re-parses only the last Markdown block of a streaming message, mo
 activity and tool-output bodies on demand, and uses observers instead of post-commit layout reads.
 Finished rows away from the live tail use `content-visibility: auto` with estimated placeholder
 heights. A finished message is still rendered as one document, so final markup is unchanged.
+
+## D-054 — The model list belongs to the runtime; the phase indicator reads only allowlisted `_x.ai` signals
+
+Date: 2026-10-09. Implements WP5 of `docs/18-SPEED-PLAN-2.2.md` and F1a/F1b of
+`docs/19-BORROWED-FEATURES-FEASIBILITY.md`. D-011 is unchanged: only xAI `grok-*` models are
+selectable. The installed runtime also advertises models the owner added to the CLI's own config
+(for example MiniMax and a local endpoint); Guild drops them when it decodes the list.
+
+- No model or effort is hard-coded. The catalog comes from `initialize` `_meta.modelState`,
+  `session/new` and `session/resume` `models`, and `_x.ai/models/update`, is cached in
+  `runtime_model_catalog` (schema v16) so the picker has choices before a process starts, and ids
+  are validated as bounded identifiers (`grok-` + `[A-Za-z0-9._:-]`, 64 characters), not an enum.
+- The process is started without `--model` / `--reasoning-effort`. Model, effort and context window
+  are applied per session: `_meta.reasoningEffort` on `session/new` and resume, then
+  `session/set_config_option` (model first, effort second; the effort choices belong to the model)
+  after the session opens and before each prompt, never mid-turn. `session/set_model` remains only
+  for the context window. A runtime refusal (-32602, `MODEL_SWITCH_INCOMPATIBLE_AGENT`) keeps the
+  previous selection and is reported as `incompatible_agent`, `unsupported_value` or `unavailable`.
+  Changing model or effort never closes an adapter; permission mode and startup flags still do.
+- Selection resolves task override (`task_runtime_settings`), then global default, then the
+  runtime's own default. `''` in `app_settings` means "follow the runtime default" and is what a new
+  install gets. Schema v16 rewrote exactly the old pair (`grok-4.6` + `xhigh`) to `grok-4.7` +
+  `high` once, with the owner's approval of 2026-10-09; no other value was touched. When nothing is
+  pinned Guild does not touch the model of a resumed session.
+- `_x.ai/*` notifications are parsed through one allowlist (`packages/runtime-grok/src/xai-extensions.ts`)
+  into bounded signals: enum-like identifiers and counts only. Prompt text, hook names and output,
+  tool arguments, usage, signatures, retry reason text and `_x.ai/mcp/servers_updated` (MCP settings
+  with secrets in plain text) are never decoded, stored or logged. The phase of the running turn is
+  derived by a pure tracker (`packages/domain/src/run-phase.ts`) from Guild-authoritative state
+  (Run state, streamed content, tool and permission state) plus those signals, carried in the
+  existing projection as ephemeral display state, and shown with one 1 Hz renderer tick.
+- Extension requests use `AcpV1Adapter.sendExtensionRequest`: names must match
+  `^_x.ai/[a-z]...`, -32601 means "unsupported" and is remembered per process, any other error is
+  `AcpV1ExtensionRequestError`. Steer (`_x.ai/interject`) and rewind (`_x.ai/rewind/*`) build on it.

@@ -63,6 +63,8 @@ export function registerDesktopIpc(
   });
   handle(DESKTOP_IPC_CHANNELS.setSessionConfigOption, async (request) =>
     service.setSessionConfigOption(request.taskId, request.configId, request.value));
+  handle(DESKTOP_IPC_CHANNELS.setTaskRuntimeSettings, async (request) =>
+    service.setTaskRuntimeSettings(request));
   handle(DESKTOP_IPC_CHANNELS.updateWorkspace, async (request) =>
     service.updateWorkspace(request.workspaceId, request.action));
   handle(DESKTOP_IPC_CHANNELS.updateTask, async (request) =>

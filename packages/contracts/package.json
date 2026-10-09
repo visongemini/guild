@@ -16,6 +16,14 @@
     "./continuous-footer": {
       "types": "./dist/continuous-footer.d.ts",
       "import": "./dist/continuous-footer.js"
+    },
+    "./grok-models": {
+      "types": "./dist/grok-models.d.ts",
+      "import": "./dist/grok-models.js"
+    },
+    "./run-phase": {
+      "types": "./dist/run-phase.d.ts",
+      "import": "./dist/run-phase.js"
     }
   }
 }

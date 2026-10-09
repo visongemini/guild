@@ -24,14 +24,16 @@ evidence, not a promise about later binaries. Guild renegotiates on every proces
 | Prompt embedded context | ACP | Advertised | Implement only after schema and workspace boundary tests |
 | HTTP/SSE MCP | ACP | Advertised | Disabled by default; opt-in configuration only |
 | Account allowance and reset time | ACP/official CLI | Not advertised or observed | Show bilingual unavailable copy; do not estimate |
-| Models and reasoning | Official CLI / ACP session config | `grok-4.6` and `grok-4.5` listed; ACP `session/set_model` and legacy `session/set_mode` accepted by installed 1.0.13 | Bounded selector exposes only Grok 4.6/4.5 and their verified efforts; persisted changes apply through the official process, never a provider adapter |
-| Dynamic config options | ACP `session/set_config_option` | Method and boolean/select schema verified; installed session currently returned an empty option list | Render only options actually reported by the session and reject invented values |
+| Models and reasoning | ACP `initialize` `_meta.modelState`, `session/new` `models` + `configOptions`, `session/set_config_option`; grok 1.0.50 | Official list decoded (4 xAI models plus owner-configured third-party entries, which Guild drops, D-011); `reasoning_effort` options change with the model; switching between turns keeps context | Catalog cached locally; model, effort and context window applied per session between turns; refusal keeps the previous selection; no process restart (D-054) |
+| Dynamic config options | ACP `session/set_config_option` + `config_option_update` | Verified live on 1.0.50: model and `reasoning_effort` (category `thought_level`); a bad value is -32602 | Render only options the session reports; reconcile from `config_option_update`; the adapter drains pending updates before returning a change so a stale snapshot cannot win |
 | Official commands | ACP `available_commands_update` | Core commands plus installed skills/plugins observed | Instant core fallback, replaced by the complete live list after connection |
 | Fork | Unstable ACP `session/fork` | Not advertised by installed 1.0.13; initialization reported only `close`, `list`, and `resume` session capabilities | Do not call the unadvertised method; keep the truthful local snapshot/new-session disclosure and re-probe after official runtime updates |
 | Login/logout | Official CLI/ACP | Official surfaces exist; destructive logout not exercised | User initiated only; no startup prompt |
 | Queue | Guild domain | Not ACP | Durable Guild operation that creates a later Run |
 | Sleep/wake | Guild domain + OS/process | Not ACP; real lid gate pending | Liveness and recovery state machine; packaged acceptance required |
 | Runtime incident evidence | Process host + Guild domain | Exit code/signal and bounded stderr byte accounting available locally | Private rotated JSONL without stderr content, recent-incident UI, exact-session recovery, no automatic prompt replay |
+| Extension notifications | `_x.ai/queue/changed`, `sessions/changed`, `session_notification` (hook, tool delta, interaction, retry, response/turn completion, model change), `session/prompt_complete`, `session/setup`, `mcp/init_progress`, `models/update` | Observed live on 1.0.50 | Allowlist only, bounded identifiers and counts, ephemeral; everything else including `_x.ai/mcp/servers_updated` is dropped undecoded (D-054) |
+| Extension requests | `_x.ai/*` (underscore prefix required) | Not advertised; -32601 when absent | `sendExtensionRequest` probes once per process and treats -32601 as unsupported |
 
 Evidence: `evidence/runtime/2026-08-26-acp-probe-summary.json` and
 `evidence/probes/grok-1.0.13-session-fork.json`.

@@ -93,6 +93,18 @@ behind the response barrier, disables side effects, and reconciles them against 
 xAI's optional `noReplay` metadata extension is not used in the first adapter because standard
 resume passed and the extension has not been independently accepted for this product path.
 
+## Model, effort and extension traffic
+
+`session/new` and `session/resume` may carry `"_meta": {"reasoningEffort": "<id>"}`; the runtime
+ignores an unknown value. Afterwards the selection is changed only between turns with
+`session/set_config_option {sessionId, configId, value}` for the `model` and `reasoning_effort`
+options the session itself reports. An error response (-32602 with `MODEL_SWITCH_INCOMPATIBLE_AGENT`
+or "unknown ... value") leaves the previous selection in force and does not fault the session.
+`session/set_model {sessionId, modelId, _meta: {reasoningEffort?, contextWindow?}}` is used only to
+change the context window. Extension notifications (`_x.ai/...`) are accepted only through the
+allowlist in `packages/runtime-grok/src/xai-extensions.ts`; extension requests need the `_x.ai/`
+prefix and treat -32601 as "unsupported".
+
 ## Prompt cancellation
 
 `session/cancel` is a notification and has no request ID:

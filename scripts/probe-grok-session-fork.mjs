@@ -131,8 +131,6 @@ try {
 class GrokProbeClient {
   static async start(label) {
     const argv = createGrokAcpProductionArgv({
-      model: "grok-4.6",
-      reasoningEffort: "low",
       permissionMode: "bypassPermissions",
     });
     const child = spawn(executable, argv, {

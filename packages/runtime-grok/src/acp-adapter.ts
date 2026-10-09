@@ -1,15 +1,16 @@
 import { performance } from "node:perf_hooks";
 import { types as nodeTypes } from "node:util";
 import {
+  parseGuildGrokContextWindow,
   parseGuildGrokModel,
   parseGuildGrokReasoningEffort,
-  supportsGuildGrokReasoningEffort,
   type GuildGrokModel,
   type GuildGrokReasoningEffort,
   type RuntimePermissionRequestPayload,
   type RuntimePromptTerminalPayload,
   type RuntimeConfigOption,
   type RuntimeReceiveTimestamp,
+  type XaiSignalEnvelope,
 } from "@guild/contracts";
 import {
   decodeAuthenticateResult,
@@ -31,7 +32,6 @@ import {
   encodeLoadSessionParams,
   encodeNewSessionParams,
   encodeResumeSessionParams,
-  encodeSetSessionModeParams,
   encodeSetSessionConfigOptionParams,
   encodeSetSessionModelParams,
   encodeSelectedPermissionResult,
@@ -41,6 +41,7 @@ import {
   type AcpV1InitializeResult,
   type AcpV1OfficialBillingSnapshot,
   type AcpV1PromptResourceLink,
+  type AcpV1SessionStartOptions,
   type AcpV1SessionState,
 } from "./acp-v1-codec.js";
 import { ACP_V1_METHODS } from "./acp-v1-methods.js";
@@ -66,6 +67,12 @@ import {
   type JsonValue,
 } from "./json-value.js";
 import { NdjsonDecoder, NdjsonProtocolError } from "./ndjson.js";
+import {
+  XAI_EXTENSION_METHOD_PATTERN,
+  isMethodNotFound,
+  parseXaiNotification,
+  type XaiExtensionOutcome,
+} from "./xai-extensions.js";
 import type {
   ProcessHostEvent,
   ProcessStartReceipt,
@@ -92,6 +99,8 @@ export type AcpV1AdapterErrorCode =
   | "adapter_closed"
   | "adapter_not_initialized"
   | "capability_not_advertised"
+  | "config_option_refused"
+  | "extension_request_failed"
   | "invalid_adapter_options"
   | "invalid_permission_decision"
   | "operation_failed"
@@ -108,6 +117,37 @@ export class AcpV1AdapterError extends Error {
     super(`ACP v1 adapter ${code}`);
     this.name = "AcpV1AdapterError";
     this.code = code;
+  }
+}
+
+/** Why the runtime refused `session/set_config_option` (JSON-RPC error response, not a transport fault). */
+export type AcpV1ConfigRefusalReason = "incompatible_agent" | "invalid_value" | "other";
+
+/**
+ * The runtime answered `session/set_config_option` with an error: the option, the value, or the
+ * switch itself was refused (for example `MODEL_SWITCH_INCOMPATIBLE_AGENT` after the first turn).
+ * The adapter and the session stay healthy and keep their previous selection.
+ */
+export class AcpV1ConfigOptionRefusedError extends AcpV1AdapterError {
+  readonly reason: AcpV1ConfigRefusalReason;
+  readonly remoteCode: number;
+
+  constructor(reason: AcpV1ConfigRefusalReason, remoteCode: number) {
+    super("config_option_refused");
+    this.name = "AcpV1ConfigOptionRefusedError";
+    this.reason = reason;
+    this.remoteCode = remoteCode;
+  }
+}
+
+/** An `_x.ai/*` extension request failed with an error response other than -32601. */
+export class AcpV1ExtensionRequestError extends AcpV1AdapterError {
+  readonly remoteCode: number;
+
+  constructor(remoteCode: number) {
+    super("extension_request_failed");
+    this.name = "AcpV1ExtensionRequestError";
+    this.remoteCode = remoteCode;
   }
 }
 
@@ -208,6 +248,12 @@ export type AcpV1AdapterSink = {
     readonly update: Extract<AcpV1DecodedUpdate, { readonly type: "turn" }>;
   }) => Promise<void>;
   /**
+   * Ephemeral, allowlisted `_x.ai/*` signal (queue, hooks, retry, setup progress, model list ...).
+   * Display state only: never awaited, never persisted, and a throw is swallowed so it can never
+   * affect delivery. Signals for sessions the adapter does not own are delivered with that id.
+   */
+  readonly observeSignal?: (envelope: XaiSignalEnvelope) => void;
+  /**
    * First-frame transaction: durably register the exact callback request, apply the decision, and
    * claim its outbox command before resolving. The adapter writes no response byte before this.
    */
@@ -301,6 +347,7 @@ type AdapterState = "created" | "starting" | "ready" | "faulted" | "closed";
 
 /** Not an ACP method: Grok rejects it with "method not found", which is all a liveness probe needs. */
 const LIVENESS_PROBE_METHOD = "_guild/ping";
+const UNSUPPORTED_EXTENSION = Object.freeze({ status: "unsupported" } as const);
 type SessionPhase = "committing" | "ready" | "replaying" | "barrier_committing";
 
 type Deferred<T> = {
@@ -403,6 +450,7 @@ export class AcpV1Adapter {
   private stderrDroppedBytes = 0;
   private readonly stderrTail: string[] = [];
   private readonly auxiliaryUpdateTails = new Map<string, Promise<void>>();
+  private readonly unsupportedExtensions = new Set<string>();
 
   constructor(options: AcpV1AdapterOptions) {
     this.adapterEpoch = positiveSafeInteger(options.adapterEpoch, "adapterEpoch");
@@ -517,9 +565,14 @@ export class AcpV1Adapter {
     }
   }
 
+  /**
+   * `session/set_model` is kept only for what `session/set_config_option` cannot express: the
+   * context window. Model and reasoning effort changes use `setConfigOption`.
+   */
   async setModel(
     session: AcpV1AdapterSession,
     model: GuildGrokModel,
+    options?: { readonly reasoningEffort?: GuildGrokReasoningEffort; readonly contextWindow?: number },
   ): Promise<void> {
     this.assertReady();
     const transport = this.requireSession(session);
@@ -527,10 +580,18 @@ export class AcpV1Adapter {
       throw new AcpV1AdapterError("overlapping_prompt");
     }
     const exactModel = parseGuildGrokModel(model);
+    const meta = {
+      ...(options?.reasoningEffort === undefined
+        ? {}
+        : { reasoningEffort: parseGuildGrokReasoningEffort(options.reasoningEffort) }),
+      ...(options?.contextWindow === undefined
+        ? {}
+        : { contextWindow: parseGuildGrokContextWindow(options.contextWindow) }),
+    };
     try {
       await this.request(
         ACP_V1_METHODS.sessionSetModel,
-        encodeSetSessionModelParams(transport.identity.sessionId, exactModel),
+        encodeSetSessionModelParams(transport.identity.sessionId, exactModel, meta),
         this.timeouts.sessionMs,
         (response) => this.decodeProtocol(() => decodeSessionSelectorResult(response)),
       );
@@ -539,36 +600,11 @@ export class AcpV1Adapter {
     }
   }
 
-  async setMode(
-    session: AcpV1AdapterSession,
-    model: GuildGrokModel,
-    reasoningEffort: GuildGrokReasoningEffort,
-  ): Promise<void> {
-    this.assertReady();
-    const transport = this.requireSession(session);
-    if (transport.activePrompt !== undefined) {
-      throw new AcpV1AdapterError("overlapping_prompt");
-    }
-    const exactModel = parseGuildGrokModel(model);
-    const exactReasoningEffort = parseGuildGrokReasoningEffort(reasoningEffort);
-    if (!supportsGuildGrokReasoningEffort(exactModel, exactReasoningEffort)) {
-      throw new AcpV1AdapterError("operation_failed");
-    }
-    try {
-      await this.request(
-        ACP_V1_METHODS.sessionSetMode,
-        encodeSetSessionModeParams(
-          transport.identity.sessionId,
-          exactReasoningEffort,
-        ),
-        this.timeouts.sessionMs,
-        (response) => this.decodeProtocol(() => decodeSessionSelectorResult(response)),
-      );
-    } catch (cause: unknown) {
-      throw this.normalizeOperationFailure(cause);
-    }
-  }
-
+  /**
+   * Applies one official session config option (model, reasoning effort ...). Must not run during
+   * a turn. A runtime refusal (-32602 and friends) rejects with `AcpV1ConfigOptionRefusedError`
+   * and leaves the session on its previous selection.
+   */
   async setConfigOption(
     session: AcpV1AdapterSession,
     configId: string,
@@ -580,18 +616,72 @@ export class AcpV1Adapter {
       throw new AcpV1AdapterError("overlapping_prompt");
     }
     try {
-      return await this.request(
+      const options = await this.request(
         ACP_V1_METHODS.sessionSetConfigOption,
         encodeSetSessionConfigOptionParams(transport.identity.sessionId, configId, value),
         this.timeouts.sessionMs,
         (response) => this.decodeProtocol(() => decodeSetSessionConfigOptionResult(response)),
       );
+      // The runtime also pushes a `config_option_update` snapshot for every change. Updates are
+      // committed asynchronously, so one from an earlier change could land after this response
+      // and overwrite the newer options. Draining them first makes the returned options the last
+      // word the caller applies.
+      await transport.updateTail.catch(() => undefined);
+      return options;
     } catch (cause: unknown) {
+      if (cause instanceof JsonRpcRemoteError) {
+        throw new AcpV1ConfigOptionRefusedError(
+          classifyConfigRefusal(cause),
+          cause.response.code,
+        );
+      }
       throw this.normalizeOperationFailure(cause);
     }
   }
 
-  async newSession(cwd: string): Promise<AcpV1AdapterSession> {
+  /**
+   * Sends one `_x.ai/*` extension request. Extensions are not advertised, so the first call per
+   * process is the probe: -32601 resolves to `{ status: "unsupported" }` (remembered for the
+   * life of this adapter, so an unsupported extension costs one round trip). Any other error
+   * response rejects with `AcpV1ExtensionRequestError`; transport faults reject as usual. The
+   * result is returned as plain JSON for the caller to validate against its own bounded schema.
+   */
+  async sendExtensionRequest(
+    method: string,
+    params: Readonly<Record<string, unknown>>,
+    options?: { readonly timeoutMs?: number },
+  ): Promise<XaiExtensionOutcome<JsonValue>> {
+    this.assertReady();
+    if (!XAI_EXTENSION_METHOD_PATTERN.test(method)) {
+      throw new AcpV1AdapterError("invalid_adapter_options");
+    }
+    if (this.unsupportedExtensions.has(method)) {
+      return UNSUPPORTED_EXTENSION;
+    }
+    try {
+      const result = await this.request(
+        method,
+        params,
+        options?.timeoutMs ?? this.timeouts.sessionMs,
+        (response) => response,
+      );
+      return Object.freeze({ status: "ok" as const, result });
+    } catch (cause: unknown) {
+      if (isMethodNotFound(cause)) {
+        this.unsupportedExtensions.add(method);
+        return UNSUPPORTED_EXTENSION;
+      }
+      if (cause instanceof JsonRpcRemoteError) {
+        throw new AcpV1ExtensionRequestError(cause.response.code);
+      }
+      throw this.normalizeOperationFailure(cause);
+    }
+  }
+
+  async newSession(
+    cwd: string,
+    startOptions?: AcpV1SessionStartOptions,
+  ): Promise<AcpV1AdapterSession> {
     this.requireInitialized();
     if (this.pendingNewSession !== undefined) {
       throw new AcpV1AdapterError("operation_failed");
@@ -600,7 +690,7 @@ export class AcpV1Adapter {
     try {
       const established = await this.request(
         ACP_V1_METHODS.sessionNew,
-        encodeNewSessionParams(cwd),
+        encodeNewSessionParams(cwd, startOptions),
         this.timeouts.sessionMs,
         (response) => {
           const decoded = this.decodeProtocol(() => decodeNewSessionResult(response));
@@ -652,7 +742,11 @@ export class AcpV1Adapter {
     }
   }
 
-  async resumeSession(sessionId: string, cwd: string): Promise<AcpV1AdapterSession> {
+  async resumeSession(
+    sessionId: string,
+    cwd: string,
+    startOptions?: AcpV1SessionStartOptions,
+  ): Promise<AcpV1AdapterSession> {
     const initialized = this.requireInitialized();
     if (!initialized.agentCapabilities.resumeSession) {
       throw new AcpV1AdapterError("capability_not_advertised");
@@ -663,7 +757,7 @@ export class AcpV1Adapter {
     try {
       const decoded = await this.request(
         ACP_V1_METHODS.sessionResume,
-        encodeResumeSessionParams(identity.sessionId, cwd),
+        encodeResumeSessionParams(identity.sessionId, cwd, startOptions),
         this.timeouts.sessionMs,
         (response) => {
           const state = this.decodeProtocol(() => decodeResumeSessionResult(response));
@@ -1163,7 +1257,10 @@ export class AcpV1Adapter {
   }
 
   private async onNotification(notification: JsonRpcInboundNotification): Promise<void> {
-    if (notification.method !== ACP_V1_METHODS.sessionUpdate) return;
+    if (notification.method !== ACP_V1_METHODS.sessionUpdate) {
+      this.observeExtensionNotification(notification);
+      return;
+    }
     try {
       const sessionId = this.sessionIdFromParams(notification.params);
       if (!this.sessions.has(sessionId) && this.pendingNewSession !== undefined) {
@@ -1247,6 +1344,25 @@ export class AcpV1Adapter {
           faultDiagnostic,
         );
       }
+    }
+  }
+
+  /**
+   * Only allowlisted `_x.ai/*` notifications become a typed signal; every other method is dropped
+   * here without being decoded, stored or logged (`_x.ai/mcp/servers_updated` carries secrets).
+   */
+  private observeExtensionNotification(notification: JsonRpcInboundNotification): void {
+    if (this.sink.observeSignal === undefined || !notification.method.startsWith("_x.ai/")) return;
+    let envelope: XaiSignalEnvelope | undefined;
+    try {
+      envelope = parseXaiNotification(
+        notification.method,
+        notification.params,
+        this.clock.monotonicMs(),
+      );
+      if (envelope !== undefined) this.sink.observeSignal(envelope);
+    } catch {
+      // Display-only signals must never affect the transport.
     }
   }
 
@@ -1747,6 +1863,7 @@ function adapterSession(
     ...(Object.hasOwn(state, "contextWindowSize")
       ? { contextWindowSize: state.contextWindowSize }
       : {}),
+    ...(Object.hasOwn(state, "modelCatalog") ? { modelCatalog: state.modelCatalog } : {}),
     ...(Object.hasOwn(state, "modes") ? { modes: state.modes } : {}),
     ...(Object.hasOwn(state, "configOptions") ? { configOptions: state.configOptions } : {}),
   });
@@ -1759,6 +1876,7 @@ function sessionStateFromNew(
     ...(Object.hasOwn(input, "contextWindowSize")
       ? { contextWindowSize: input.contextWindowSize }
       : {}),
+    ...(Object.hasOwn(input, "modelCatalog") ? { modelCatalog: input.modelCatalog } : {}),
     ...(Object.hasOwn(input, "modes") ? { modes: input.modes } : {}),
     ...(Object.hasOwn(input, "configOptions")
       ? { configOptions: input.configOptions }
@@ -1948,6 +2066,14 @@ function transportFaultDiagnostic(
 
 function isSinkLikeFailure(cause: unknown): boolean {
   return cause instanceof AcpV1AdapterError && cause.code === "sink_commit_failed";
+}
+
+/** `-32602` carries `MODEL_SWITCH_INCOMPATIBLE_AGENT` (in `data` or `message`) after the first turn. */
+function classifyConfigRefusal(cause: JsonRpcRemoteError): AcpV1ConfigRefusalReason {
+  const { code, message, data } = cause.response;
+  const evidence = `${message} ${typeof data === "string" ? data : JSON.stringify(data ?? "")}`.slice(0, 2_000);
+  if (/MODEL_SWITCH_INCOMPATIBLE_AGENT/iu.test(evidence)) return "incompatible_agent";
+  return code === -32602 ? "invalid_value" : "other";
 }
 
 function deferred<T>(): Deferred<T> {

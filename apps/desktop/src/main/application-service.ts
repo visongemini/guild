@@ -16,6 +16,8 @@ import type {
   PromptAttachment,
   SendMessageResponse,
   SearchConversationsResponse,
+  SetTaskRuntimeSettingsRequest,
+  SetTaskRuntimeSettingsResponse,
   StreamDeltaEvent,
   TaskId,
   TaskViewProjection,
@@ -44,6 +46,10 @@ export interface DesktopApplicationService {
     configId: string,
     value: string | boolean,
   ): Promise<TaskViewProjection>;
+  /** Pins the model and reasoning effort for one task; applied between turns, never mid-turn. */
+  setTaskRuntimeSettings(
+    request: SetTaskRuntimeSettingsRequest,
+  ): Promise<SetTaskRuntimeSettingsResponse>;
   updateWorkspace(
     workspaceId: WorkspaceId,
     action: "archive" | "restore" | "delete",
@@ -78,8 +84,8 @@ export interface DesktopApplicationService {
   openExternal(url: string): Promise<void>;
   setLocale(locale: GuildLocale): Promise<DesktopBootstrapProjection>;
   setRuntimeSettings(
-    model: GuildGrokModel,
-    reasoningEffort: GuildGrokReasoningEffort,
+    model: GuildGrokModel | null,
+    reasoningEffort: GuildGrokReasoningEffort | null,
     permissionMode: GuildGrokPermissionMode,
     startup: GuildGrokStartupSettings,
   ): Promise<DesktopBootstrapProjection>;

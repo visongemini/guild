@@ -9,7 +9,6 @@ export const ACP_V1_METHODS = Object.freeze({
   sessionPrompt: "session/prompt",
   sessionCancel: "session/cancel",
   sessionSetModel: "session/set_model",
-  sessionSetMode: "session/set_mode",
   sessionSetConfigOption: "session/set_config_option",
   sessionUpdate: "session/update",
   sessionRequestPermission: "session/request_permission",

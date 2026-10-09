@@ -22,6 +22,7 @@ export {
   type IntegrityReport,
   type LiveConversationEntryMutation,
   type LiveRuntimeEventCommitResult,
+  type ModelCatalogCacheRecord,
   type OpenGuildPersistenceOptions,
   type PendingPermissionRegistrationInput,
   type PersistedAdapterEpochStatus,
@@ -42,6 +43,7 @@ export {
   type RecordDisposition,
   type TaskAuthority,
   type TaskMetadataRecord,
+  type TaskRuntimeSettingsRecord,
   type WorkspaceListItem,
   type WorkspaceRecord,
 } from "./store.js";

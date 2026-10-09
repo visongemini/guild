@@ -21,6 +21,7 @@ const DESKTOP_IPC_CHANNELS = Object.freeze({
   searchConversations: "guild:v1:conversation:search",
   openTaskResource: "guild:v1:task:resource:open",
   setSessionConfigOption: "guild:v1:task:session-config:set",
+  setTaskRuntimeSettings: "guild:v1:task:runtime-settings:set",
   updateWorkspace: "guild:v1:workspace:update",
   updateTask: "guild:v1:task:update",
   sendMessage: "guild:v1:run:send",
@@ -74,6 +75,8 @@ const api = {
     invoke(DESKTOP_IPC_CHANNELS.openTaskResource, request),
   setSessionConfigOption: (request) =>
     invoke(DESKTOP_IPC_CHANNELS.setSessionConfigOption, request),
+  setTaskRuntimeSettings: (request) =>
+    invoke(DESKTOP_IPC_CHANNELS.setTaskRuntimeSettings, request),
   updateWorkspace: (request) => invoke(DESKTOP_IPC_CHANNELS.updateWorkspace, request),
   updateTask: (request) => invoke(DESKTOP_IPC_CHANNELS.updateTask, request),
   sendMessage: (request) => invoke(DESKTOP_IPC_CHANNELS.sendMessage, request),

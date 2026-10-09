@@ -24,7 +24,6 @@ import {
   encodePromptParams,
   encodeResumeSessionParams,
   encodeSetSessionConfigOptionParams,
-  encodeSetSessionModeParams,
   encodeSetSessionModelParams,
   encodeSelectedPermissionResult,
   encodeTextPromptParams,
@@ -123,10 +122,23 @@ describe("ACP v1 request encoders", () => {
       sessionId: "session-1",
       modelId: "grok-4.5",
     });
-    assert.deepEqual(encodeSetSessionModeParams("session-1", "medium"), {
-      sessionId: "session-1",
-      modeId: "medium",
-    });
+    assert.deepEqual(
+      encodeSetSessionModelParams("session-1", "grok-4.7", { reasoningEffort: "medium", contextWindow: 500_000 }),
+      {
+        sessionId: "session-1",
+        modelId: "grok-4.7",
+        _meta: { reasoningEffort: "medium", contextWindow: 500_000 },
+      },
+    );
+    assert.deepEqual(
+      encodeNewSessionParams("/tmp/project", { reasoningEffort: "low" }),
+      { cwd: "/tmp/project", mcpServers: [], _meta: { reasoningEffort: "low" } },
+    );
+    assert.deepEqual(
+      encodeResumeSessionParams("session-1", "/tmp/project", { reasoningEffort: "high" }),
+      { sessionId: "session-1", cwd: "/tmp/project", mcpServers: [], _meta: { reasoningEffort: "high" } },
+    );
+    assert.throws(() => encodeNewSessionParams("/tmp/project", { reasoningEffort: "Not Valid" }), /invalid_grok_reasoning_effort/u);
     assert.deepEqual(
       encodeSetSessionConfigOptionParams("session-1", "web-search", true),
       { sessionId: "session-1", configId: "web-search", type: "boolean", value: true },
@@ -443,13 +455,26 @@ describe("ACP v1 initialize and session result decoders", () => {
     }), {
       sessionId: "opaque",
       contextWindowSize: 500_000,
+      modelCatalog: {
+        models: [
+          { id: "grok-4.5", name: "grok-4.5", reasoningEfforts: [], contextWindows: [], defaultContextWindow: 400_000 },
+          { id: "grok-4.6", name: "grok-4.6", reasoningEfforts: [], contextWindows: [], defaultContextWindow: 500_000 },
+        ],
+        runtimeDefaultModelId: "grok-4.6",
+      },
     });
     assert.deepEqual(decodeResumeSessionResult({
       models: {
         currentModelId: "grok-4.6",
         availableModels: [{ modelId: "grok-4.6", _meta: { totalContextTokens: 500_000 } }],
       },
-    }), { contextWindowSize: 500_000 });
+    }), {
+      contextWindowSize: 500_000,
+      modelCatalog: {
+        models: [{ id: "grok-4.6", name: "grok-4.6", reasoningEfforts: [], contextWindows: [], defaultContextWindow: 500_000 }],
+        runtimeDefaultModelId: "grok-4.6",
+      },
+    });
     assert.deepEqual(decodeNewSessionResult({
       sessionId: "opaque",
       models: { currentModelId: "grok-4.6", availableModels: [] },

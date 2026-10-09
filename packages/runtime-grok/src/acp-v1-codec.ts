@@ -5,12 +5,19 @@ import {
   ACP_TOOL_KINDS,
   ACP_TOOL_STATUSES,
   classifyStopReason,
+  freezeGrokModelCatalog,
   freezeRuntimePayload,
+  GUILD_GROK_IDENTIFIER_LIMITS,
+  isOfficialGrokModelId,
+  parseGuildGrokReasoningEffort,
   RUNTIME_PAYLOAD_LIMITS,
   type AcpPermissionOptionKind,
   type AcpPromptStopReason,
   type AcpToolKind,
   type AcpToolStatus,
+  type GrokModelCatalog,
+  type GrokModelDescriptor,
+  type GrokReasoningEffortDescriptor,
   type JsonRpcCallbackId,
   type RuntimeConfigOption,
   type RuntimeConfigSelectChoice,
@@ -117,12 +124,16 @@ export type AcpV1InitializeResult = {
     readonly version: string;
     readonly title?: string | null;
   } | null;
+  /** Official models from `_meta.modelState`; absent when the runtime does not advertise any. */
+  readonly modelCatalog?: GrokModelCatalog;
 };
 
 const decodedInitializeAuthMethodIds = new WeakMap<object, ReadonlySet<string>>();
 
 export type AcpV1SessionState = {
   readonly contextWindowSize?: number;
+  /** Official models from the session response `models`; absent when not advertised. */
+  readonly modelCatalog?: GrokModelCatalog;
   readonly modes?: {
     readonly currentModeId: string;
     readonly availableModes: readonly {
@@ -194,18 +205,38 @@ export function encodeBillingParams(): Readonly<Record<string, never>> {
   return Object.freeze({});
 }
 
-export function encodeNewSessionParams(cwd: string): Readonly<Record<string, unknown>> {
-  return deepFreeze({ cwd: canonicalAbsolutePath(cwd, "$.cwd"), mcpServers: [] });
+export type AcpV1SessionStartOptions = {
+  /** Applied by the runtime at creation/resume; an unknown value is ignored by the runtime. */
+  readonly reasoningEffort?: string;
+};
+
+function sessionStartMeta(options: AcpV1SessionStartOptions | undefined): Readonly<Record<string, unknown>> {
+  return options?.reasoningEffort === undefined
+    ? {}
+    : { _meta: { reasoningEffort: parseGuildGrokReasoningEffort(options.reasoningEffort) } };
+}
+
+export function encodeNewSessionParams(
+  cwd: string,
+  options?: AcpV1SessionStartOptions,
+): Readonly<Record<string, unknown>> {
+  return deepFreeze({
+    cwd: canonicalAbsolutePath(cwd, "$.cwd"),
+    mcpServers: [],
+    ...sessionStartMeta(options),
+  });
 }
 
 export function encodeResumeSessionParams(
   sessionId: string,
   cwd: string,
+  options?: AcpV1SessionStartOptions,
 ): Readonly<Record<string, unknown>> {
   return deepFreeze({
     sessionId: identifier(sessionId, "$.sessionId"),
     cwd: canonicalAbsolutePath(cwd, "$.cwd"),
     mcpServers: [],
+    ...sessionStartMeta(options),
   });
 }
 
@@ -220,23 +251,26 @@ export function encodeLoadSessionParams(
   });
 }
 
+/**
+ * `session/set_model` is used only to change the context window, which `session/set_config_option`
+ * cannot express. Model and effort changes go through `session/set_config_option`.
+ */
 export function encodeSetSessionModelParams(
   sessionId: string,
   modelId: string,
+  meta?: { readonly reasoningEffort?: string; readonly contextWindow?: number },
 ): Readonly<Record<string, unknown>> {
+  const fields: Record<string, unknown> = {};
+  if (meta?.reasoningEffort !== undefined) {
+    fields["reasoningEffort"] = parseGuildGrokReasoningEffort(meta.reasoningEffort);
+  }
+  if (meta?.contextWindow !== undefined) {
+    fields["contextWindow"] = safeInteger(meta.contextWindow, "$.contextWindow");
+  }
   return deepFreeze({
     sessionId: identifier(sessionId, "$.sessionId"),
     modelId: identifier(modelId, "$.modelId"),
-  });
-}
-
-export function encodeSetSessionModeParams(
-  sessionId: string,
-  modeId: string,
-): Readonly<Record<string, unknown>> {
-  return deepFreeze({
-    sessionId: identifier(sessionId, "$.sessionId"),
-    modeId: identifier(modeId, "$.modeId"),
+    ...(Object.keys(fields).length === 0 ? {} : { _meta: fields }),
   });
 }
 
@@ -355,6 +389,10 @@ export function decodeInitializeResult(input: unknown): AcpV1InitializeResult {
   if (Object.hasOwn(rec, "agentInfo")) {
     result["agentInfo"] = rec["agentInfo"] === null ? null : parseImplementation(rec["agentInfo"], "$.agentInfo");
   }
+  if (Object.hasOwn(rec, "_meta")) {
+    const modelCatalog = decodeModelState(record(rec["_meta"], "$._meta")["modelState"], "$._meta.modelState");
+    if (modelCatalog !== undefined) result["modelCatalog"] = modelCatalog;
+  }
   const decoded = deepFreeze(result) as AcpV1InitializeResult;
   decodedInitializeAuthMethodIds.set(decoded, authIds);
   return decoded;
@@ -435,6 +473,109 @@ export function decodeNewSessionResult(input: unknown): AcpV1NewSessionResult {
   return deepFreeze({
     sessionId: identifier(rec["sessionId"], "$.sessionId"),
     ...parseSessionStateRecord(rec, "$"),
+  });
+}
+
+/**
+ * Decodes the official model list that appears as `initialize` `_meta.modelState`, as the
+ * `session/new` and `session/resume` `models` field, and as the `_x.ai/models/update` payload:
+ * `{ currentModelId, availableModels: [{ modelId, name, description?, _meta }] }`.
+ *
+ * The model list is advisory display data, so a malformed or older shape yields `undefined`
+ * (or skips the one bad entry) instead of faulting an otherwise valid session. Only official xAI
+ * model ids are kept (D-011); everything else the owner configured in the CLI is dropped here.
+ */
+export function decodeModelState(value: unknown, path: string): GrokModelCatalog | undefined {
+  try {
+    if (value === undefined || value === null) return undefined;
+    const state = record(value, path);
+    const available = array(state["availableModels"], `${path}.availableModels`, 256);
+    const limits = GUILD_GROK_IDENTIFIER_LIMITS;
+    const models: GrokModelDescriptor[] = [];
+    const seen = new Set<string>();
+    for (const entry of available) {
+      if (models.length >= limits.maxModels) break;
+      const model = decodeModelDescriptor(entry);
+      if (model === undefined || seen.has(model.id)) continue;
+      seen.add(model.id);
+      models.push(model);
+    }
+    // An empty list is "nothing advertised", never an instruction to forget the cached list.
+    if (models.length === 0) return undefined;
+    const current = typeof state["currentModelId"] === "string" ? state["currentModelId"] : undefined;
+    return freezeGrokModelCatalog({
+      models,
+      ...(current !== undefined && seen.has(current) ? { runtimeDefaultModelId: current } : {}),
+    });
+  } catch {
+    return undefined;
+  }
+}
+
+function catalogText(value: unknown, max: number): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const cleaned = value.replace(/[\u0000-\u001F\u007F-\u009F\u2028\u2029]/gu, " ").trim();
+  if (cleaned.length === 0 || hasUnpairedSurrogate(cleaned)) return undefined;
+  const cut = cleaned.slice(0, max);
+  return hasUnpairedSurrogate(cut) ? cut.slice(0, -1) : cut;
+}
+
+function decodeModelDescriptor(entry: unknown): GrokModelDescriptor | undefined {
+  if (entry === null || typeof entry !== "object" || Array.isArray(entry)) return undefined;
+  const model = entry as Record<string, unknown>;
+  const limits = GUILD_GROK_IDENTIFIER_LIMITS;
+  const id = model["modelId"];
+  if (typeof id !== "string" || !isOfficialGrokModelId(id)) return undefined;
+  const meta = model["_meta"] !== null && typeof model["_meta"] === "object" && !Array.isArray(model["_meta"])
+    ? model["_meta"] as Record<string, unknown>
+    : {};
+  const efforts: GrokReasoningEffortDescriptor[] = [];
+  const effortIds = new Set<string>();
+  if (Array.isArray(meta["reasoningEfforts"])) {
+    for (const effort of meta["reasoningEfforts"].slice(0, limits.maxEffortsPerModel)) {
+      if (effort === null || typeof effort !== "object" || Array.isArray(effort)) continue;
+      const item = effort as Record<string, unknown>;
+      let effortId: string;
+      try {
+        effortId = parseGuildGrokReasoningEffort(item["id"] ?? item["value"]);
+      } catch {
+        continue;
+      }
+      if (effortIds.has(effortId)) continue;
+      effortIds.add(effortId);
+      const description = catalogText(item["description"], limits.maxEffortDescriptionLength);
+      efforts.push(Object.freeze({
+        id: effortId,
+        label: catalogText(item["label"], limits.maxEffortLabelLength) ?? effortId,
+        ...(description === undefined ? {} : { description }),
+        isDefault: item["default"] === true && !efforts.some((candidate) => candidate.isDefault),
+      }));
+    }
+  }
+  const windows = Array.isArray(meta["contextWindows"])
+    ? [...new Set(
+        meta["contextWindows"].filter((window): window is number =>
+          typeof window === "number" &&
+          Number.isSafeInteger(window) &&
+          window >= 1 &&
+          window <= limits.maxContextWindow),
+      )].sort((a, b) => a - b).slice(0, limits.maxContextWindows)
+    : [];
+  const total = meta["totalContextTokens"];
+  const defaultContextWindow = typeof total === "number" &&
+    Number.isSafeInteger(total) && total >= 1 && total <= limits.maxContextWindow
+    ? total
+    : undefined;
+  const description = catalogText(model["description"], limits.maxDescriptionLength);
+  const agentType = catalogText(meta["agentType"], 64);
+  return Object.freeze({
+    id,
+    name: catalogText(model["name"], limits.maxNameLength) ?? id,
+    ...(description === undefined ? {} : { description }),
+    ...(agentType === undefined ? {} : { agentType }),
+    reasoningEfforts: Object.freeze(efforts),
+    contextWindows: Object.freeze(windows),
+    ...(defaultContextWindow === undefined ? {} : { defaultContextWindow }),
   });
 }
 
@@ -687,6 +828,8 @@ function parseSessionStateRecord(
   path: string,
 ): AcpV1SessionState {
   const result: Record<string, unknown> = { ...parseSessionContextWindow(rec) };
+  const modelCatalog = decodeModelState(rec["models"], `${path}.models`);
+  if (modelCatalog !== undefined) result["modelCatalog"] = modelCatalog;
   if (Object.hasOwn(rec, "modes")) {
     result["modes"] = rec["modes"] === null ? null : parseModes(rec["modes"], `${path}.modes`);
   }
