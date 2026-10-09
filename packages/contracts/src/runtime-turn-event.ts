@@ -94,6 +94,20 @@ export type RuntimeTurnEvent = {
   readonly envelope: RuntimeEnvelope;
 };
 
+/**
+ * Events returned by createRuntimeTurnEvent. The event, its envelope and its payload are deeply
+ * frozen, so membership proves the pair was validated in this process and cannot have changed since.
+ */
+const CONSTRUCTED_EVENTS = new WeakSet<object>();
+
+/**
+ * True only for events built by createRuntimeTurnEvent (directly or through parseRuntimeTurnEvent)
+ * in this process. Hot paths may skip revalidation for them; any other value must be parsed.
+ */
+export function isConstructedRuntimeTurnEvent(value: unknown): value is RuntimeTurnEvent {
+  return typeof value === "object" && value !== null && CONSTRUCTED_EVENTS.has(value);
+}
+
 /** Constructs a copied, deeply frozen turn event from authoritative inputs only. */
 export function createRuntimeTurnEvent(
   input: RuntimeTurnEventInput,
@@ -185,7 +199,9 @@ export function createRuntimeTurnEvent(
     toolCallId,
     windowId,
   });
-  return ok(Object.freeze({ payload, envelope }));
+  const event = Object.freeze({ payload, envelope });
+  CONSTRUCTED_EVENTS.add(event);
+  return ok(event);
 }
 
 /** Revalidates a paired event before a production admission boundary consumes it. */
