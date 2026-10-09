@@ -240,7 +240,12 @@ describe("live desktop service per-task worktrees [F3]", () => {
     });
     const task = await isolatedTask(harness);
     await runToCompletion(harness, task.task.taskId, "edit things");
-    const view = await harness.view();
+    // The end checkpoint is captured asynchronously after the terminal; under load it can lag.
+    let view = await harness.view();
+    for (const deadline = Date.now() + 5_000; view.runCheckpoints?.[0]?.status === "capturing" && Date.now() < deadline;) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      view = await harness.view();
+    }
     assert.equal(view.worktree?.dirtyFiles, 2);
     assert.equal(view.worktree?.ahead, 0);
     assert.equal(readFileSync(join(harness.workspace, "a.txt"), "utf8"), "alpha\nbeta\n");
