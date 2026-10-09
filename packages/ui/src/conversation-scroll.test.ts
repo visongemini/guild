@@ -74,7 +74,7 @@ test("retained task timeline bounds reject invalid capacities", () => {
 
 test("the conversation region owns the only flexible main-pane row", async () => {
   const css = await readFile(new URL("../src/styles.css", import.meta.url), "utf8");
-  assert.match(css, /grid-template-rows:\s*68px auto auto auto minmax\(0,\s*1fr\) auto/);
+  assert.match(css, /grid-template-rows:\s*52px auto auto auto minmax\(0,\s*1fr\) auto/);
   assert.match(css, /grid-area:\s*conversation/);
   assert.match(css, /\.guild-conversation[^{]*\{[^}]*overflow-y:\s*auto/);
 });

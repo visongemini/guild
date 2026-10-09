@@ -103,10 +103,29 @@ export function formatContextWindows(windows: readonly number[]): string | undef
   return windows.map(formatContextTokens).join(" / ");
 }
 
+/**
+ * A price tag appears only when the runtime's own description states a premium multiple, for
+ * example "2x the price" or "2 倍价格". Nothing is inferred from a model id or a name. Returns the
+ * multiple as text ("2", "1.5"), or undefined when the description makes no such claim.
+ */
+export function officialPriceMultiplier(description: string | undefined): string | undefined {
+  if (description === undefined) return undefined;
+  // Only a statement about price counts; "2x usage limits" or "3x cost savings" is not a premium.
+  const latin = /(?<![\w.])(\d+(?:\.\d+)?)\s*[x\u00d7]\s*(?:the\s+|of\s+the\s+)?(?:price|pricing|cost(?!\s*(?:saving|efficien|reduc|cut)))\b/iu.exec(description);
+  const chinese = /(\d+(?:\.\d+)?)\s*倍\s*(?:价格|价|费用)/u.exec(description);
+  const twice = /\btwice\s+the\s+(?:price|cost)\b/iu.test(description) ? ["", "2"] : undefined;
+  const match = latin ?? chinese ?? twice;
+  if (match === null || match === undefined) return undefined;
+  const multiple = Number(match[1]);
+  return Number.isFinite(multiple) && multiple > 1 ? String(multiple) : undefined;
+}
+
 export type ModelRowView = Readonly<{
   id: string;
   name: string;
   description?: string;
+  /** The premium multiple the official description states, if any (see `officialPriceMultiplier`). */
+  priceMultiplier?: string;
   /** For example "256K / 500K context". */
   contextLabel?: string;
   selected: boolean;
@@ -187,10 +206,12 @@ export function modelPickerView(input: {
   const models = catalog.models.map((candidate, index): ModelRowView => {
     const contextSizes = formatContextWindows(candidate.contextWindows);
     const selected = candidate.id === modelId;
+    const priceMultiplier = officialPriceMultiplier(candidate.description);
     return Object.freeze({
       id: candidate.id,
       name: candidate.name,
       ...(candidate.description === undefined ? {} : { description: candidate.description }),
+      ...(priceMultiplier === undefined ? {} : { priceMultiplier }),
       ...(contextSizes === undefined ? {} : { contextLabel: messages.modelPickerContext(contextSizes) }),
       selected,
       tabStop: model === undefined ? index === 0 : selected,

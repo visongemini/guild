@@ -3,6 +3,15 @@ import type { GuildMessages } from "./locales.js";
 
 export type Appearance = Readonly<{ theme: "light" | "dark" | "system"; textSize: 16 | 18; density: "comfortable" | "compact" }>;
 const KEY = "guild:v2:appearance";
+/**
+ * The stored ids are the 2.0 preference values (16 = standard, 18 = large) and stay as they are so
+ * saved settings keep their meaning. Standard text follows the refreshed 15 px scale; large text
+ * stays at 18 px so nobody who chose larger text gets smaller text.
+ */
+const MESSAGE_SIZE_PX: Readonly<Record<Appearance["textSize"], number>> = Object.freeze({ 16: 15, 18: 18 });
+export function messageSizePx(textSize: Appearance["textSize"]): number {
+  return MESSAGE_SIZE_PX[textSize];
+}
 export function readAppearance(storage: Pick<Storage, "getItem">): Appearance {
   const fallback: Appearance = { theme: "light", textSize: 16, density: "comfortable" };
   try {
@@ -23,7 +32,7 @@ export function useAppearance() {
     const apply = () => {
       document.documentElement.dataset.theme = appearance.theme === "system" ? query.matches ? "dark" : "light" : appearance.theme;
       document.documentElement.dataset.density = appearance.density;
-      document.documentElement.style.setProperty("--guild-message-size", `${appearance.textSize}px`);
+      document.documentElement.style.setProperty("--guild-message-size", `${messageSizePx(appearance.textSize)}px`);
     };
     apply();
     query.addEventListener("change", apply);

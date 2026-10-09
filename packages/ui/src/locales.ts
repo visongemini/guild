@@ -411,7 +411,7 @@ function pad2(value: number): string {
 
 const ZH_CN: GuildMessages = Object.freeze({
   ...WORKSHOP_ZH,
-  appName: "GUILD",
+  appName: "Guild",
   loading: "正在载入 Guild",
   newTask: "新建任务",
   projects: "项目",
@@ -792,7 +792,7 @@ const ZH_CN: GuildMessages = Object.freeze({
 
 const EN_US: GuildMessages = Object.freeze({
   ...WORKSHOP_EN,
-  appName: "GUILD",
+  appName: "Guild",
   loading: "Loading Guild",
   newTask: "New task",
   projects: "Projects",

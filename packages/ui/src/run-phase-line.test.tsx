@@ -21,25 +21,29 @@ function render(
   );
 }
 
-test("renders the label and the phase and total time with the run-status look", () => {
+test("renders a pulsing dot, the label with the time in this phase, and the whole turn on the right", () => {
   const markup = render({ phase: "thinking" }, TURN_START + 35_000);
   assert.match(markup, /^<div class="guild-run-status guild-run-phase thinking">/u);
-  assert.match(markup, /<span role="status" aria-live="polite">Thinking<\/span>/u);
-  assert.match(markup, /<time aria-hidden="true">23s \u00b7 total 35s<\/time>/u);
-  assert.match(markup, /guild-spin/u);
+  assert.match(markup, /<span class="guild-run-pip" aria-hidden="true"><\/span>/u);
+  assert.match(markup, /<span class="guild-run-label" role="status" aria-live="polite">Thinking<\/span>/u);
+  assert.match(markup, /<span class="guild-run-elapsed" aria-hidden="true">23s<\/span>/u);
+  assert.match(markup, /<time aria-hidden="true">total 35s<\/time>/u);
+  // A trail needs a phase that already ended while the line was mounted; a first render has none.
+  assert.doesNotMatch(markup, /guild-run-trail/u);
 });
 
 test("the live region is the label only, never the ticking time", () => {
   const markup = render({ phase: "running_tool", toolName: "Bash" }, TURN_START + 35_000);
   assert.equal(markup.match(/role="status"/gu)?.length, 1);
   assert.equal(markup.match(/aria-live="polite"/gu)?.length, 1);
-  assert.match(markup, /<span role="status" aria-live="polite">Running Bash<\/span>/u);
+  assert.match(markup, /<span class="guild-run-label" role="status" aria-live="polite">Running Bash<\/span>/u);
   assert.doesNotMatch(markup, /<time[^>]*role=/u);
 });
 
 test("omits the phase part when the phase began with the turn", () => {
   const markup = render({ phase: "starting_runtime", phaseStartedAtMs: TURN_START }, TURN_START + 12_000);
   assert.match(markup, /<time aria-hidden="true">total 12s<\/time>/u);
+  assert.doesNotMatch(markup, /guild-run-elapsed/u);
 });
 
 test("shows the soft notice without error styling once a sent prompt has waited ten seconds", () => {
@@ -56,7 +60,8 @@ test("shows the soft notice without error styling once a sent prompt has waited 
 test("localizes both the label and the time", () => {
   const markup = render({ phase: "waiting_for_model" }, TURN_START + 65_000, "zh-CN");
   assert.match(markup, />\u7b49\u5f85\u6a21\u578b\u54cd\u5e94<\/span>/u);
-  assert.match(markup, /<time aria-hidden="true">53 \u79d2 \u00b7 \u5171 1 \u5206 05 \u79d2<\/time>/u);
+  assert.match(markup, /<span class="guild-run-elapsed" aria-hidden="true">53 \u79d2<\/span>/u);
+  assert.match(markup, /<time aria-hidden="true">\u5171 1 \u5206 05 \u79d2<\/time>/u);
 });
 
 test("the only timer is one 1 Hz interval that is cleared on unmount", async () => {

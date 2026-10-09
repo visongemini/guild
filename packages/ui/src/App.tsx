@@ -15,6 +15,8 @@ import { CommandIcon as Command } from "@phosphor-icons/react/Command";
 import { CopyIcon as Copy } from "@phosphor-icons/react/Copy";
 import { DotsThreeIcon as DotsThree } from "@phosphor-icons/react/DotsThree";
 import { FolderOpenIcon as FolderOpen } from "@phosphor-icons/react/FolderOpen";
+import { FolderSimpleIcon as FolderSimple } from "@phosphor-icons/react/FolderSimple";
+import { FolderSimplePlusIcon as FolderSimplePlus } from "@phosphor-icons/react/FolderSimplePlus";
 import { FileTextIcon as FileText } from "@phosphor-icons/react/FileText";
 import { FilesIcon as Files } from "@phosphor-icons/react/Files";
 import { GitDiffIcon as GitDiff } from "@phosphor-icons/react/GitDiff";
@@ -22,8 +24,6 @@ import { GitForkIcon as GitFork } from "@phosphor-icons/react/GitFork";
 import { DownloadSimpleIcon as DownloadSimple } from "@phosphor-icons/react/DownloadSimple";
 import { GearSixIcon as GearSix } from "@phosphor-icons/react/GearSix";
 import { GlobeIcon as Globe } from "@phosphor-icons/react/Globe";
-import { HandPalmIcon as HandPalm } from "@phosphor-icons/react/HandPalm";
-import { HourglassMediumIcon as HourglassMedium } from "@phosphor-icons/react/HourglassMedium";
 import { InfoIcon as Info } from "@phosphor-icons/react/Info";
 import { ImageSquareIcon as ImageSquare } from "@phosphor-icons/react/ImageSquare";
 import { MagnifyingGlassIcon as MagnifyingGlass } from "@phosphor-icons/react/MagnifyingGlass";
@@ -36,13 +36,14 @@ import { PushPinSimpleSlashIcon as PushPinSimpleSlash } from "@phosphor-icons/re
 import { SlidersHorizontalIcon as SlidersHorizontal } from "@phosphor-icons/react/SlidersHorizontal";
 import { SidebarSimpleIcon as SidebarSimple } from "@phosphor-icons/react/SidebarSimple";
 import { SpinnerGapIcon as SpinnerGap } from "@phosphor-icons/react/SpinnerGap";
+import { ShieldCheckIcon as ShieldCheck } from "@phosphor-icons/react/ShieldCheck";
+import { ShieldWarningIcon as ShieldWarning } from "@phosphor-icons/react/ShieldWarning";
 import { StopIcon as Stop } from "@phosphor-icons/react/Stop";
 import { TerminalWindowIcon as TerminalWindow } from "@phosphor-icons/react/TerminalWindow";
 import { TrashIcon as Trash } from "@phosphor-icons/react/Trash";
 import { WrenchIcon as Wrench } from "@phosphor-icons/react/Wrench";
 import { WarningCircleIcon as WarningCircle } from "@phosphor-icons/react/WarningCircle";
 import { XIcon as X } from "@phosphor-icons/react/X";
-import { XCircleIcon as XCircle } from "@phosphor-icons/react/XCircle";
 import type {
   GuildGrokModel,
   GuildGrokPermissionMode,
@@ -85,6 +86,7 @@ import {
   type KeyboardEvent as ReactKeyboardEvent,
   type MouseEvent as ReactMouseEvent,
   type PointerEvent as ReactPointerEvent,
+  type ReactNode,
   type SetStateAction,
   type SyntheticEvent,
 } from "react";
@@ -134,7 +136,13 @@ import {
   type PendingSendState,
 } from "./pending-send.js";
 import { classifyComposerSendFailure, isComposerTextTooLong } from "./send-failure.js";
-import { sidebarTaskStatus, workspaceTaskStatus, type SidebarTaskStatus } from "./task-status.js";
+import {
+  nextUnreadTaskIds,
+  sidebarTaskStatus,
+  taskStatusSnapshot,
+  workspaceTaskStatus,
+  type SidebarTaskStatus,
+} from "./task-status.js";
 import {
   matchingSlashCommands,
   slashCommandCatalogue,
@@ -142,12 +150,16 @@ import {
   slashCommandText,
 } from "./slash-commands.js";
 import {
+  activityDurationMs,
   activityGroupState,
-  activityToolKinds,
+  activityStepTotal,
+  activityToolCounts,
   estimateTimelineGroupHeight,
   groupTimeline,
   isBareSymbolReply,
+  itemDurationMs,
   streamingActivity,
+  turnDurationsByRun,
 } from "./timeline.js";
 import { promptAttachmentsEqual, shouldClearSubmittedAttachments } from "./composer-submission.js";
 import { createFrameScheduler } from "./frame-scheduler.js";
@@ -159,6 +171,7 @@ const BANNY_ASSET_URL = new URL("./assets/banny.png", import.meta.url).href;
 const WORKBENCH_WIDTH_STORAGE_KEY = "guild:v1:workbench-width";
 const WORKBENCH_MIN_WIDTH = 280;
 const WORKBENCH_MAX_WIDTH = 480;
+const UNREAD_TASKS_STORAGE_KEY = "guild:v1:unread-tasks";
 
 export type GuildAppProps = {
   readonly api: GuildRendererApi;
@@ -245,6 +258,10 @@ export function GuildApp({ api }: GuildAppProps) {
   );
   const [bannyDragging, setBannyDragging] = useState(false);
   const [bannyDropTargetId, setBannyDropTargetId] = useState<string>();
+  const [unreadTaskIds, setUnreadTaskIds] = useState<ReadonlySet<string>>(() => readUnreadTasks(window.localStorage));
+  const unreadTaskIdsRef = useRef(unreadTaskIds);
+  unreadTaskIdsRef.current = unreadTaskIds;
+  const lastTaskStatuses = useRef<ReadonlyMap<string, SidebarTaskStatus>>(new Map());
   const [viewport, setViewport] = useState(() => ({
     width: window.innerWidth,
     height: window.innerHeight,
@@ -300,6 +317,7 @@ export function GuildApp({ api }: GuildAppProps) {
     readonly loadEarlierTimeline: () => Promise<void>;
     readonly openTask: (taskId: TaskSummaryProjection["taskId"]) => Promise<void>;
     readonly createTask: (workspaceId: string) => Promise<void>;
+    readonly createNewTask: () => Promise<void>;
     readonly toggleWorkspace: (workspaceId: string) => void;
     readonly beginBannyDrag: (event: ReactDragEvent<HTMLElement>) => void;
     readonly endBannyDrag: () => void;
@@ -317,6 +335,7 @@ export function GuildApp({ api }: GuildAppProps) {
     loadEarlierTimeline,
     openTask: (taskId) => openTask(taskId),
     createTask: (workspaceId) => createTask(workspaceId),
+    createNewTask: () => (busy || projection === undefined ? Promise.resolve() : createTask()),
     toggleWorkspace: (workspaceId) => setExpandedWorkspaces((current) => toggleSet(current, workspaceId)),
     beginBannyDrag,
     endBannyDrag,
@@ -368,6 +387,19 @@ export function GuildApp({ api }: GuildAppProps) {
     () => resolveBannySeatTaskId(projection?.workspaces ?? [], bannyPlacement),
     [projection?.workspaces, bannyPlacement],
   );
+
+  // "New result" marks come from watching the projection: a task that stops working quietly while
+  // another task is open has something to read. The marks survive a reload through localStorage.
+  useEffect(() => {
+    if (projection === undefined) return;
+    const tasks = projection.workspaces.flatMap((workspace) => workspace.archived ? [] : workspace.tasks.filter((task) => !task.archived));
+    const next = nextUnreadTaskIds(lastTaskStatuses.current, tasks, projection.activeTask?.task.taskId, unreadTaskIdsRef.current);
+    lastTaskStatuses.current = taskStatusSnapshot(tasks);
+    if (next !== unreadTaskIdsRef.current) {
+      writeUnreadTasks(window.localStorage, next);
+      setUnreadTaskIds(next);
+    }
+  }, [projection?.workspaces, projection?.activeTask?.task.taskId]);
 
   // A11Y-COMPOSER-001: mirror value writes that bypass React (accessibility
   // clients, UI automation) into the draft. Intentionally has no dependency
@@ -642,6 +674,21 @@ export function GuildApp({ api }: GuildAppProps) {
     window.addEventListener("keydown", onCommandShortcut);
     return () => window.removeEventListener("keydown", onCommandShortcut);
   }, [commandPaletteOpen]);
+
+  // The new-task button advertises Cmd+N; the shortcut does exactly what the button does.
+  useEffect(() => {
+    const onNewTaskShortcut = (event: KeyboardEvent) => {
+      // The app is macOS-only; Ctrl+N is cursor movement in a macOS text field.
+      if (!event.metaKey || event.ctrlKey || event.altKey || event.shiftKey || event.key.toLocaleLowerCase() !== "n") return;
+      if (event.repeat || event.defaultPrevented || event.isComposing) return;
+      // Behind a modal dialog the shortcut would act on a page the user cannot see.
+      if (document.querySelector('[aria-modal="true"]') !== null) return;
+      event.preventDefault();
+      void latestHandlers.current.createNewTask();
+    };
+    window.addEventListener("keydown", onNewTaskShortcut);
+    return () => window.removeEventListener("keydown", onNewTaskShortcut);
+  }, []);
 
   useEffect(() => {
     const close = () => {
@@ -1684,32 +1731,36 @@ export function GuildApp({ api }: GuildAppProps) {
       )}
       <aside className="guild-sidebar" aria-label={messages.projects} inert={workbenchOpen && viewport.width <= 1000}>
         <div className="guild-sidebar-drag" />
-        <div className="guild-wordmark"><img src={BANNY_ASSET_URL} alt="" /><span>{messages.appName}</span></div>
-        <button className="guild-brand" type="button" aria-expanded={workspacePickerOpen} aria-label={messages.chooseWorkspace}
-          onPointerDown={(event) => event.stopPropagation()} onClick={() => {
-            setAccountOpen(false); setWorkspacePickerOpen((value) => !value);
-          }}>
-          <FolderOpen size={18} /><span>{activeTask === undefined ? messages.chooseWorkspace
-            : workspaceName(projection.workspaces, activeTask.task.workspaceId, messages.workspaceFallback)}</span><CaretDown size={14} />
-        </button>
+        <div className="guild-wordmark">
+          <img src={BANNY_ASSET_URL} alt="" />
+          <span className="guild-wordmark-name">{messages.appName}</span>
+          {projection.runtimeVersion !== undefined && <small title={projection.runtimeVersion}>{projection.runtimeVersion}</small>}
+        </div>
         <div className="guild-new-row">
-          <button className="guild-new-task" type="button" disabled={busy} onClick={() => void createTask()}>
-            <Plus size={18} /><span>{messages.newTask}</span>
+          <button className="guild-new-task" type="button" disabled={busy} aria-keyshortcuts="Meta+N" onClick={() => void createTask()}>
+            <Plus size={16} /><span>{messages.newTask}</span><kbd aria-hidden="true">{messages.newTaskShortcut}</kbd>
           </button>
         </div>
-        <button className={`guild-search-trigger ${searchOpen ? "active" : ""}`} type="button" aria-expanded={searchOpen}
+        <button className={`guild-search-trigger ${searchOpen ? "active" : ""}`} type="button" aria-expanded={searchOpen} aria-keyshortcuts="Meta+K"
           onClick={() => {
             setWorkspacePickerOpen(false); setSearchOpen((value) => !value);
             if (searchOpen) setSearchQuery("");
-          }}><MagnifyingGlass size={17} /><span>{messages.search}</span></button>
+          }}><MagnifyingGlass size={16} /><span>{messages.search}</span><kbd aria-hidden="true">{messages.searchShortcut}</kbd></button>
         {searchOpen && (
           <div className="guild-search-box">
-            <MagnifyingGlass size={15} />
+            <MagnifyingGlass size={14} />
             <input autoFocus value={searchQuery} onChange={(event) => setSearchQuery(event.currentTarget.value)} placeholder={messages.searchPlaceholder} aria-label={messages.searchPlaceholder} />
             {searchQuery.length > 0 && <button type="button" aria-label={messages.clearSearch} onClick={() => setSearchQuery("")}><X size={13} /></button>}
           </div>
         )}
 
+        <div className="guild-section-head">
+          <span className="guild-section-label">{messages.projectAndChats}</span>
+          <button className={`guild-icon-button guild-section-action ${workspacePickerOpen ? "active" : ""}`} type="button"
+            aria-expanded={workspacePickerOpen} aria-haspopup="dialog" aria-label={messages.chooseWorkspace} title={messages.chooseWorkspace}
+            onPointerDown={(event) => event.stopPropagation()} onClick={() => {
+              setAccountOpen(false); setWorkspacePickerOpen((value) => !value);
+            }}><FolderSimplePlus size={16} /></button>
         {workspacePickerOpen && (
           <div className="guild-workspace-picker" role="dialog" aria-label={messages.chooseWorkspace} onPointerDown={(event) => event.stopPropagation()}>
             <strong>{messages.chooseWorkspace}</strong>
@@ -1742,11 +1793,9 @@ export function GuildApp({ api }: GuildAppProps) {
             )}
           </div>
         )}
-
-
+        </div>
 
         <div className="guild-project-section">
-          <div className="guild-section-label">{messages.projectAndChats}</div>
           {activeWorkspaces.length === 0 ? (
             <button className="guild-empty-workspace" type="button" onClick={() => void chooseWorkspace()}>
               <FolderOpen size={17} />
@@ -1765,6 +1814,7 @@ export function GuildApp({ api }: GuildAppProps) {
               bannyDragging={bannyDragging}
               bannyDropTargetId={bannyDropTargetId}
               pendingTaskIds={pendingTaskIds}
+              unreadTaskIds={unreadTaskIds}
               locale={projection.locale}
               onToggle={stableHandlers.onToggleWorkspace}
               onOpenTask={stableHandlers.onOpenTask}
@@ -1797,10 +1847,6 @@ export function GuildApp({ api }: GuildAppProps) {
           </>}
         </div>
 
-        <div className="guild-sidebar-utilities">
-          <button type="button" onClick={openGrokControlCenter}><Wrench size={17} />{messages.tools}</button>
-          <button type="button" onClick={() => openSettings()}><GearSix size={17} />{messages.settings}</button>
-        </div>
         <div className="guild-profile-bar">
           {accountOpen && (
             <div
@@ -1858,9 +1904,15 @@ export function GuildApp({ api }: GuildAppProps) {
             }
           }}>
             <AvatarMark nickname={projection.profile.nickname} grantUrl={projection.profile.avatarGrantUrl} />
-            <strong>{projection.profile.nickname}</strong>
+            <span className="guild-profile-text">
+              <strong>{projection.profile.nickname}</strong>
+              {projection.usage.status === "available" && <small>{projection.usage.usedLabel}</small>}
+            </span>
           </button>
-
+          <div className="guild-sidebar-utilities">
+            <button className="guild-icon-button" type="button" title={messages.tools} aria-label={messages.tools} onClick={openGrokControlCenter}><Wrench size={16} /></button>
+            <button className="guild-icon-button guild-profile-settings" type="button" title={messages.settings} aria-label={messages.settings} onClick={() => openSettings()}><GearSix size={16} /></button>
+          </div>
         </div>
       </aside>
 
@@ -1894,19 +1946,25 @@ export function GuildApp({ api }: GuildAppProps) {
       <main className="guild-main" inert={workbenchOpen && viewport.width <= 1000}>
         <header className="guild-topbar">
           <div className="guild-task-heading">
-            <ChatCircleDots size={17} />
-            <span>{activeTask?.task.title ?? messages.newTask}</span>
-            {activeTask !== undefined && <span className="guild-workspace-chip">{workspaceName(projection.workspaces, activeTask.task.workspaceId, messages.workspaceFallback)}</span>}
+            <span className="guild-task-heading-title">{activeTask?.task.title ?? messages.newTask}</span>
+            {activeTask !== undefined && (
+              <span className="guild-workspace-chip">
+                <FolderSimple size={12} aria-hidden="true" />
+                <span>{workspaceName(projection.workspaces, activeTask.task.workspaceId, messages.workspaceFallback)}</span>
+              </span>
+            )}
           </div>
           <div className="guild-top-actions">
             <button
               ref={workbenchTrigger}
-              className={`guild-workbench-trigger ${workbenchOpen ? "active" : ""}`}
+              className={`guild-icon-button guild-workbench-trigger ${workbenchOpen ? "active" : ""}`}
               type="button"
               aria-label={messages.workbench}
+              aria-expanded={workbenchOpen && activeTask !== undefined}
+              title={messages.workbench}
               disabled={activeTask === undefined}
               onClick={() => setWorkbenchOpen((value) => !value)}
-            ><SidebarSimple size={18} /><span>{messages.workbench}</span></button>
+            ><SidebarSimple size={16} mirrored /></button>
             <button className="guild-icon-button" type="button" aria-label={messages.openMenu} disabled={activeTask === undefined} onPointerDown={(event) => event.stopPropagation()} onClick={(event) => {
               event.stopPropagation();
               if (activeTask === undefined) return;
@@ -1930,7 +1988,7 @@ export function GuildApp({ api }: GuildAppProps) {
                   viewport.height,
                 ),
               });
-            }}><DotsThree size={20} /></button>
+            }}><DotsThree size={18} /></button>
           </div>
         </header>
 
@@ -2020,6 +2078,7 @@ export function GuildApp({ api }: GuildAppProps) {
               locale={projection.locale}
               recentResult={activeTask.recentResult}
               continuousTask={activeTask.continuousTask}
+              running={running}
               highlightedSequence={searchNavigation?.results[searchNavigation.index]?.taskId === activeTask.task.taskId
                 ? searchNavigation.results[searchNavigation.index]?.sequence : undefined}
               onOpenExternal={stableHandlers.onOpenExternal}
@@ -2106,41 +2165,6 @@ export function GuildApp({ api }: GuildAppProps) {
               onAction={(action) => void setContinuousTask(action)}
             />
           )}
-          {activeTask !== undefined && activeTask.queuedTurns.length > 0 && (
-            <div className="guild-queued-turns" aria-label={messages.queuedNext}>
-              <span className="guild-queued-label">{messages.queuedNext}</span>
-              {activeTask.queuedTurns.map((queued, index) => {
-                const preempting = index === 0 && activeTask.task.activeRunState === "cancel_requested";
-                return (
-                  <div className="guild-queued-turn" key={queued.queueId}>
-                    <span className="guild-queued-text">{queued.text}</span>
-                    {preempting ? (
-                      <span className="guild-queued-next-badge preempting">
-                        <SpinnerGap size={10} className="guild-spin" />
-                        {messages.preemptingQueued}
-                      </span>
-                    ) : isLiveRunState(activeTask.task.activeRunState) ? (
-                      <button
-                        type="button"
-                        className="guild-queue-priority"
-                        disabled={busy}
-                        aria-label={`${messages.preemptQueued}: ${queued.text}`}
-                        onClick={() => void preemptQueuedTurn(queued.queueId)}
-                      >
-                        <ArrowUp size={12} />
-                        {messages.preemptQueued}
-                      </button>
-                    ) : index === 0 ? (
-                      <span className="guild-queued-next-badge">{messages.queuedFirst}</span>
-                    ) : null}
-                    <button className="guild-queue-cancel" type="button" disabled={busy} aria-label={messages.cancelQueued} onClick={() => void cancelQueuedTurn(queued.queueId)}>
-                      <X size={13} />
-                    </button>
-                  </div>
-                );
-              })}
-            </div>
-          )}
           {slashMenuOpen && (
             <div className="guild-slash-menu" id="guild-slash-menu" role="listbox" aria-label={messages.slashCommands}>
               <div className="guild-slash-heading">{messages.slashCommands}</div>
@@ -2165,6 +2189,41 @@ export function GuildApp({ api }: GuildAppProps) {
             </div>
           )}
           <div className={`guild-composer ${running ? "running" : ""}`}>
+            {activeTask !== undefined && activeTask.queuedTurns.length > 0 && (
+              <div className="guild-queued-turns" aria-label={messages.queuedNext}>
+                <span className="guild-queued-label">{messages.queuedNext}</span>
+                {activeTask.queuedTurns.map((queued, index) => {
+                  const preempting = index === 0 && activeTask.task.activeRunState === "cancel_requested";
+                  return (
+                    <div className="guild-queued-turn" key={queued.queueId}>
+                      <span className="guild-queued-text">{queued.text}</span>
+                      {preempting ? (
+                        <span className="guild-queued-next-badge preempting">
+                          <SpinnerGap size={10} className="guild-spin" />
+                          {messages.preemptingQueued}
+                        </span>
+                      ) : isLiveRunState(activeTask.task.activeRunState) ? (
+                        <button
+                          type="button"
+                          className="guild-queue-priority"
+                          disabled={busy}
+                          aria-label={`${messages.preemptQueued}: ${queued.text}`}
+                          onClick={() => void preemptQueuedTurn(queued.queueId)}
+                        >
+                          <ArrowUp size={12} />
+                          {messages.preemptQueued}
+                        </button>
+                      ) : index === 0 ? (
+                        <span className="guild-queued-next-badge">{messages.queuedFirst}</span>
+                      ) : null}
+                      <button className="guild-queue-cancel" type="button" disabled={busy} aria-label={messages.cancelQueued} onClick={() => void cancelQueuedTurn(queued.queueId)}>
+                        <X size={13} />
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
             {promptAttachments.length > 0 && (
               <div className="guild-prompt-attachments" aria-label={messages.attachedFiles}>
                 {promptAttachments.map((attachment) => (
@@ -2177,14 +2236,6 @@ export function GuildApp({ api }: GuildAppProps) {
                 ))}
               </div>
             )}
-            <button
-              className="guild-attach"
-              type="button"
-              disabled={activeTask === undefined || running || busy || continuousMode || promptAttachments.length >= 8}
-              aria-label={messages.addWorkspaceFiles}
-              title={running ? messages.attachmentsCannotQueue : messages.addWorkspaceFiles}
-              onClick={() => void choosePromptFiles()}
-            ><Paperclip size={17} /></button>
             <textarea
               ref={composerInput}
               value={draft}
@@ -2249,70 +2300,94 @@ export function GuildApp({ api }: GuildAppProps) {
               readOnly={busy}
               rows={1}
             />
-            {running ? (
-              <button className="guild-send guild-stop" type="button" disabled={busy || activeTask?.task.activeRunState === "cancel_requested"} onClick={() => void cancelActiveRun()} aria-label={messages.stop}><Stop size={13} weight="fill" /></button>
-            ) : (
-              <button className="guild-send" type="submit" disabled={draft.trim().length === 0 || activeTask === undefined || !activeTask.canSend || busy || activePendingSend !== undefined || (running && promptAttachments.length > 0)} aria-label={messages.send}>
-                {busy || pendingSendForActive !== undefined ? <SpinnerGap size={17} className="guild-spin" /> : <ArrowUp size={17} weight="bold" />}
+            <div className="guild-composer-tools">
+              <button
+                className="guild-icon-button guild-attach"
+                type="button"
+                disabled={activeTask === undefined || running || busy || continuousMode || promptAttachments.length >= 8}
+                aria-label={messages.addWorkspaceFiles}
+                title={running ? messages.attachmentsCannotQueue : messages.addWorkspaceFiles}
+                onClick={() => void choosePromptFiles()}
+              ><Paperclip size={16} /></button>
+              <span className="guild-pill guild-workspace-pill">
+                <FolderSimple size={14} aria-hidden="true" />
+                <span>{activeTask === undefined ? messages.chooseWorkspace : workspaceName(projection.workspaces, activeTask.task.workspaceId, messages.workspaceFallback)}</span>
+              </span>
+              <button
+                type="button"
+                className={`guild-pill guild-permission-pill ${projection.runtimeSettings.permissionMode === "bypassPermissions" ? "warn" : ""}`}
+                title={messages.permissionHelp}
+                onClick={() => openSettings("grok")}
+              >
+                {projection.runtimeSettings.permissionMode === "bypassPermissions"
+                  ? <ShieldWarning size={14} aria-hidden="true" />
+                  : <ShieldCheck size={14} aria-hidden="true" />}
+                {messages.permissionModeName(projection.runtimeSettings.permissionMode)}
               </button>
-            )}
-          </div>
-          <div className="guild-composer-meta">
-            <span><FolderOpen size={14} />{activeTask === undefined ? messages.chooseWorkspace : workspaceName(projection.workspaces, activeTask.task.workspaceId, messages.workspaceFallback)}</span>
-            <button type="button" title={messages.permissionHelp} onClick={() => openSettings("grok")}>{messages.permissionModeName(projection.runtimeSettings.permissionMode)}</button>
-            <button
-              type="button"
-              className={`guild-continuous-toggle ${continuousMode ? "selected" : ""}`}
-              disabled={activeTask === undefined || running || busy || promptAttachments.length > 0 ||
-                activeTask?.continuousTask?.status === "active" || activeTask?.continuousTask?.status === "paused"}
-              aria-pressed={continuousMode}
-              title={messages.continuousModeHelp}
-              onClick={() => setContinuousMode((value) => !value)}
-            >
-              <ArrowsClockwise size={13} />
-              {messages.continuousMode}
-            </button>
-            {running && draft.trim().length > 0 && <span className="guild-queue-hint">{messages.queueReady}</span>}
-            <span className="guild-meta-spacer" />
-            <button
-              type="button"
-              className={`guild-context-usage ${contextWindow.available ? "available" : "unavailable"} ${contextWindow.hasSize ? "measured" : "used-only"} ${contextWindow.hasSize && contextWindow.percent >= 80 ? "high" : ""}`}
-              onPointerDown={(event) => event.stopPropagation()}
-              onClick={() => setContextUsageOpen((open) => !open)}
-              title={!contextWindow.available
-                ? messages.contextUsageUnavailable
-                : contextWindow.hasSize
-                  ? messages.contextUsageLabel(contextWindow.usedLabel, contextWindow.sizeLabel, contextWindow.percent)
-                  : messages.contextUsageUsedOnly(contextWindow.usedLabel)}
-              aria-label={!contextWindow.available
-                ? messages.contextUsageUnavailable
-                : contextWindow.hasSize
-                  ? messages.contextUsageLabel(contextWindow.usedLabel, contextWindow.sizeLabel, contextWindow.percent)
-                  : messages.contextUsageUsedOnly(contextWindow.usedLabel)}
-            >
-              <span
-                className="guild-context-ring"
-                aria-hidden="true"
-                style={{ "--guild-context-percent": `${contextWindow.percent}%` } as React.CSSProperties}
+              <button
+                type="button"
+                className={`guild-pill guild-continuous-toggle ${continuousMode ? "selected" : ""}`}
+                disabled={activeTask === undefined || running || busy || promptAttachments.length > 0 ||
+                  activeTask?.continuousTask?.status === "active" || activeTask?.continuousTask?.status === "paused"}
+                aria-pressed={continuousMode}
+                title={messages.continuousModeHelp}
+                onClick={() => setContinuousMode((value) => !value)}
+              >
+                <ArrowsClockwise size={14} aria-hidden="true" />
+                {messages.continuousMode}
+              </button>
+              {running && draft.trim().length > 0 && <span className="guild-queue-hint">{messages.queueReady}</span>}
+              <span className="guild-meta-spacer" />
+              <button
+                type="button"
+                className={`guild-context-usage ${contextWindow.available ? "available" : "unavailable"} ${contextWindow.hasSize ? "measured" : "used-only"} ${contextWindow.hasSize && contextWindow.percent >= 80 ? "high" : ""}`}
+                onPointerDown={(event) => event.stopPropagation()}
+                onClick={() => setContextUsageOpen((open) => !open)}
+                title={!contextWindow.available
+                  ? messages.contextUsageUnavailable
+                  : contextWindow.hasSize
+                    ? messages.contextUsageLabel(contextWindow.usedLabel, contextWindow.sizeLabel, contextWindow.percent)
+                    : messages.contextUsageUsedOnly(contextWindow.usedLabel)}
+                aria-label={!contextWindow.available
+                  ? messages.contextUsageUnavailable
+                  : contextWindow.hasSize
+                    ? messages.contextUsageLabel(contextWindow.usedLabel, contextWindow.sizeLabel, contextWindow.percent)
+                    : messages.contextUsageUsedOnly(contextWindow.usedLabel)}
+              >
+                <span
+                  className="guild-context-ring"
+                  aria-hidden="true"
+                  style={{ "--guild-context-percent": `${contextWindow.percent}%` } as React.CSSProperties}
+                />
+                {contextWindow.available && contextWindow.hasSize && (
+                  <span className="guild-context-percent">{contextWindow.percent}%</span>
+                )}
+                {contextUsageOpen && <span className="guild-context-usage-detail" role="status">{!contextWindow.available
+                  ? messages.contextUsageUnavailableCompact
+                  : contextWindow.hasSize
+                    ? messages.contextUsageCompact(contextWindow.usedLabel, contextWindow.sizeLabel, contextWindow.percent)
+                    : messages.contextUsageUsedOnly(contextWindow.usedLabel)}</span>}
+              </button>
+              <ModelPicker
+                key={activeTask?.task.taskId ?? "no-task"}
+                messages={messages}
+                catalog={modelCatalog}
+                selection={activeTask?.modelSelection}
+                onApply={applyTaskRuntimeSettings}
               />
-              <span>{!contextWindow.available
-                ? "—"
-                : contextWindow.hasSize
-                  ? `${contextWindow.percent}%`
-                  : "—"}</span>
-              {contextUsageOpen && <span className="guild-context-usage-detail" role="status">{!contextWindow.available
-                ? messages.contextUsageUnavailableCompact
-                : contextWindow.hasSize
-                  ? messages.contextUsageCompact(contextWindow.usedLabel, contextWindow.sizeLabel, contextWindow.percent)
-                  : messages.contextUsageUsedOnly(contextWindow.usedLabel)}</span>}
-            </button>
-            <ModelPicker
-              key={activeTask?.task.taskId ?? "no-task"}
-              messages={messages}
-              catalog={modelCatalog}
-              selection={activeTask?.modelSelection}
-              onApply={applyTaskRuntimeSettings}
-            />
+              {running ? (
+                <button className="guild-send guild-stop" type="button" disabled={busy || activeTask?.task.activeRunState === "cancel_requested"} onClick={() => void cancelActiveRun()} aria-label={messages.stop} title={messages.stop}><Stop size={12} weight="fill" /></button>
+              ) : (
+                <button className="guild-send" type="submit" disabled={draft.trim().length === 0 || activeTask === undefined || !activeTask.canSend || busy || activePendingSend !== undefined || (running && promptAttachments.length > 0)} aria-label={messages.send} title={messages.send}>
+                  {busy || pendingSendForActive !== undefined ? <SpinnerGap size={16} className="guild-spin" /> : <ArrowUp size={16} weight="bold" />}
+                </button>
+              )}
+            </div>
+          </div>
+          <div className="guild-composer-hints">
+            <span><b>↩</b> {running ? messages.hintQueue : messages.hintSend}</span>
+            <span><b>⇧↩</b> {messages.hintNewline}</span>
+            <span><b>/</b> {messages.hintCommands}</span>
           </div>
         </form>
       </main>
@@ -3062,7 +3137,7 @@ function isTaskManagementBlocked(task: TaskSummaryProjection): boolean {
   return isLiveRunState(task.activeRunState) || (task.queuedTurnCount ?? 0) > 0;
 }
 
-const WorkspaceTree = memo(function WorkspaceTree({ workspace, expanded, activeTaskId, bannySeatTaskId, bannyDragging, bannyDropTargetId, pendingTaskIds, locale, onToggle, onOpenTask, onNewTask, onBannyDragStart, onBannyDragEnd, onBannyDropTarget, onBannyDrop, onPinTask, onArchiveTask, onContextMenu }: {
+const WorkspaceTree = memo(function WorkspaceTree({ workspace, expanded, activeTaskId, bannySeatTaskId, bannyDragging, bannyDropTargetId, pendingTaskIds, unreadTaskIds, locale, onToggle, onOpenTask, onNewTask, onBannyDragStart, onBannyDragEnd, onBannyDropTarget, onBannyDrop, onPinTask, onArchiveTask, onContextMenu }: {
   readonly workspace: WorkspaceProjection;
   readonly expanded: boolean;
   readonly activeTaskId?: string;
@@ -3070,6 +3145,7 @@ const WorkspaceTree = memo(function WorkspaceTree({ workspace, expanded, activeT
   readonly bannyDragging: boolean;
   readonly bannyDropTargetId?: string;
   readonly pendingTaskIds: ReadonlySet<string>;
+  readonly unreadTaskIds: ReadonlySet<string>;
   readonly locale: GuildLocale;
   readonly onToggle: (workspaceId: WorkspaceProjection["workspaceId"]) => void;
   readonly onOpenTask: (taskId: TaskSummaryProjection["taskId"]) => void;
@@ -3083,14 +3159,19 @@ const WorkspaceTree = memo(function WorkspaceTree({ workspace, expanded, activeT
   readonly onContextMenu: (event: ReactMouseEvent, menu: ContextMenuSeed) => void;
 }) {
   const messages = messagesFor(locale);
-  const collapsedStatus = expanded ? "idle" : workspaceTaskStatus(workspace.tasks);
+  const collapsedStatus = expanded
+    ? "idle"
+    : workspaceTaskStatus(workspace.tasks) === "idle" && workspace.tasks.some((task) => unreadTaskIds.has(task.taskId))
+      ? "fresh"
+      : workspaceTaskStatus(workspace.tasks);
   return (
     <div className="guild-workspace-tree">
       <div className="guild-workspace-row" onContextMenu={(event) => onContextMenu(event, { type: "workspace", workspace })}>
         <button className="guild-workspace-main" type="button" onClick={() => onToggle(workspace.workspaceId)} aria-expanded={expanded}>
-          {expanded ? <CaretDown size={14} /> : <CaretRight size={14} />}
-          <span>{workspace.name}</span>
-          <small>
+          <CaretDown size={12} className="guild-workspace-chev" aria-hidden="true" />
+          <FolderSimple size={16} className="guild-workspace-icon" aria-hidden="true" />
+          <span className="guild-workspace-name">{workspace.name}</span>
+          <small className="guild-workspace-count">
             {collapsedStatus !== "idle" && (
               <span className={`guild-task-state ${collapsedStatus}`} aria-hidden="true">
                 <TaskStatusGlyph status={collapsedStatus} />
@@ -3099,12 +3180,13 @@ const WorkspaceTree = memo(function WorkspaceTree({ workspace, expanded, activeT
             {workspace.tasks.length}
           </small>
         </button>
-        <button className="guild-row-add" type="button" aria-label={messagesFor(locale).newTask} onClick={() => onNewTask(workspace.workspaceId)}><Plus size={14} /></button>
+        <button className="guild-row-add" type="button" aria-label={messagesFor(locale).newTask} title={messagesFor(locale).newTask} onClick={() => onNewTask(workspace.workspaceId)}><Plus size={14} /></button>
       </div>
       {expanded && (
         <div className="guild-task-list">
           {workspace.tasks.map((task) => {
-            const status = sidebarTaskStatus(task);
+            const baseStatus = sidebarTaskStatus(task);
+            const status = baseStatus === "idle" && unreadTaskIds.has(task.taskId) ? "fresh" : baseStatus;
             const managementBlocked = isTaskManagementBlocked(task) || pendingTaskIds.has(task.taskId);
             return (
             <div
@@ -3139,6 +3221,7 @@ const WorkspaceTree = memo(function WorkspaceTree({ workspace, expanded, activeT
               >
                 <span className={`guild-task-state ${status}`} title={taskStatusTitle(status, task, messages)}>
                   <TaskStatusGlyph status={status} />
+                  {status !== "idle" && <span className="guild-sr-only">{taskStatusTitle(status, task, messages)}</span>}
                 </span>
                 <span className="guild-task-title">{task.title}</span>
                 <span className="guild-task-trailing">
@@ -3162,9 +3245,15 @@ const WorkspaceTree = memo(function WorkspaceTree({ workspace, expanded, activeT
                       <PushPinSimple size={11} weight="fill" />
                     </span>
                   )}
-                  {status === "running" && task.activeActivity !== undefined
-                    ? <span className="guild-task-live-label">{messages.activeActivity(task.activeActivity)}</span>
-                    : <time>{shortTime(task.updatedAtMs, locale)}</time>}
+                  {status === "running"
+                    ? <span className="guild-task-live-label run">{task.activeRunState === "cancel_requested"
+                        ? messages.commandStopping
+                        : task.activeRunState === "queued" ? messages.runPhaseQueued(undefined) : messages.taskStatusRunning}</span>
+                    : status === "permission"
+                      ? <span className="guild-task-live-label wait">{messages.taskMetaPermission}</span>
+                      : status === "queued"
+                        ? <span className="guild-task-live-label">{messages.taskStatusQueued(task.queuedTurnCount ?? 1)}</span>
+                        : <time>{shortTime(task.updatedAtMs, locale)}</time>}
                 </span>
               </button>
               <span className="guild-task-hover-actions" aria-label={messages.conversation}>
@@ -3206,18 +3295,18 @@ const WorkspaceTree = memo(function WorkspaceTree({ workspace, expanded, activeT
   );
 });
 
-function TaskStatusGlyph({ status }: { readonly status: SidebarTaskStatus }) {
-  return status === "running" ? <SpinnerGap size={13} />
-    : status === "queued" ? <HourglassMedium size={14} />
-      : status === "permission" ? <HandPalm size={14} weight="fill" />
-        : status === "failed" ? <WarningCircle size={14} weight="fill" />
-          : status === "interrupted" ? <WarningCircle size={14} />
-            : status === "cancelled" ? <XCircle size={14} />
-              : <ChatCircleDots size={15} />;
+/**
+ * One small mark per task state, drawn by CSS from the parent's status class: a spinning ring
+ * while running, an amber dot when it waits for the user, a red dot after a failure or
+ * interruption, and a neutral dot otherwise. The blue "new result" dot is `.fresh`; the
+ * projection carries no unread flag yet, so nothing renders it today.
+ */
+function TaskStatusGlyph({ status }: { readonly status: SidebarTaskStatus | "fresh" }) {
+  return <i className={`guild-status-mark ${status}`} aria-hidden="true" />;
 }
 
 function taskStatusTitle(
-  status: SidebarTaskStatus,
+  status: SidebarTaskStatus | "fresh",
   task: TaskSummaryProjection,
   messages: ReturnType<typeof messagesFor>,
 ): string {
@@ -3228,7 +3317,8 @@ function taskStatusTitle(
         : status === "failed" ? messages.taskStatusFailed
           : status === "interrupted" ? messages.taskStatusInterrupted
             : status === "cancelled" ? messages.taskStatusCancelled
-              : messages.conversation;
+              : status === "fresh" ? messages.taskMetaUnread
+                : messages.conversation;
   if (status === "queued" || (task.queuedTurnCount ?? 0) === 0) return base;
   return `${base} · ${messages.taskStatusQueued(task.queuedTurnCount ?? 0)}`;
 }
@@ -3270,12 +3360,14 @@ type TimelineProps = {
   readonly recentResult?: TaskViewProjection["recentResult"];
   readonly continuousTask?: TaskViewProjection["continuousTask"];
   readonly highlightedSequence?: number;
+  /** A run is live: its turn is not finished, so it shows no duration yet. */
+  readonly running: boolean;
 } & TimelineHandlers;
 
 /** The newest groups always render fully so growth and scrolling at the bottom stay exact. */
 const LIVE_TAIL_GROUPS = 3;
 
-const Timeline = memo(function Timeline({ items, pendingUserText, runStatus, runPhase, locale, recentResult, continuousTask, highlightedSequence, onOpenExternal, onPermissionDecision, onBranch, onRetryToDraft, onOpenRuntimeDiagnostics }: TimelineProps) {
+export const Timeline = memo(function Timeline({ items, pendingUserText, runStatus, runPhase, locale, recentResult, continuousTask, highlightedSequence, running, onOpenExternal, onPermissionDecision, onBranch, onRetryToDraft, onOpenRuntimeDiagnostics }: TimelineProps) {
   const messages = messagesFor(locale);
   const groups = useMemo(() => groupTimeline(items), [items]);
   const handlers = useMemo(() => Object.freeze({
@@ -3285,6 +3377,28 @@ const Timeline = memo(function Timeline({ items, pendingUserText, runStatus, run
     ["completed", "stopped"].includes(continuousTask.status)
     ? items.findLast((item) => item.runId === continuousTask.lastRunId)?.sequence : undefined;
   const settledBefore = groups.length - LIVE_TAIL_GROUPS;
+  // "Took 4 min" belongs under the last answer of a finished turn; the newest answer keeps its footer visible.
+  const turnTook = useMemo(() => {
+    const durations = new Map(turnDurationsByRun(items));
+    // While a run is live its turn is unfinished, whatever the item flags say.
+    if (running) {
+      const liveRunId = items.findLast((item) => item.runId !== undefined)?.runId;
+      if (liveRunId !== undefined) durations.delete(liveRunId);
+    }
+    const lastAnswerOfRun = new Map<string, string>();
+    for (const item of items) {
+      if (item.kind === "assistant" && item.runId !== undefined) lastAnswerOfRun.set(item.runId, item.entryId);
+    }
+    const labels = new Map<string, string>();
+    for (const [runId, entryId] of lastAnswerOfRun) {
+      const milliseconds = durations.get(runId);
+      if (milliseconds !== undefined) {
+        labels.set(entryId, messages.turnTook(messages.runDuration(Math.round(milliseconds / 1000))));
+      }
+    }
+    return labels;
+  }, [items, messages, running]);
+  const lastAnswerEntryId = useMemo(() => items.findLast((item) => item.kind === "assistant")?.entryId, [items]);
   return <div className="guild-timeline">{groups.map((group, index) => {
     const entries = group.type === "activity" ? group.items : [group.item];
     const first = entries[0]!;
@@ -3298,6 +3412,8 @@ const Timeline = memo(function Timeline({ items, pendingUserText, runStatus, run
       settled={index < settledBefore && entries.every(isSettledTimelineItem)}
       locale={locale}
       handlers={handlers}
+      lastTurn={single !== undefined && single.entryId === lastAnswerEntryId}
+      turnMeta={single === undefined ? undefined : turnTook.get(single.entryId)}
       interruptedUser={single?.kind === "notice" && single.noticeType === "session_restored"
         ? [...items].reverse().find((item) =>
             item.sequence < single.sequence && item.kind === "user" && item.status === "interrupted")
@@ -3327,6 +3443,7 @@ const Timeline = memo(function Timeline({ items, pendingUserText, runStatus, run
   previous.recentResult === next.recentResult &&
   previous.continuousTask === next.continuousTask &&
   previous.highlightedSequence === next.highlightedSequence &&
+  previous.running === next.running &&
   previous.onOpenExternal === next.onOpenExternal &&
   previous.onPermissionDecision === next.onPermissionDecision &&
   previous.onBranch === next.onBranch &&
@@ -3349,12 +3466,16 @@ type TimelineGroupRowProps = {
   readonly settled: boolean;
   readonly locale: GuildLocale;
   readonly handlers: TimelineHandlers;
+  /** The newest answer: its footer stays visible instead of waiting for hover. */
+  readonly lastTurn: boolean;
+  /** Right-aligned footer text for the last answer of a finished turn, such as "Took 4 min 12 s". */
+  readonly turnMeta: string | undefined;
   readonly interruptedUser: TimelineItemProjection | undefined;
   readonly canRetry: boolean;
   readonly completionTask: TaskViewProjection["continuousTask"];
 };
 
-const TimelineGroupRow = memo(function TimelineGroupRow({ group, sequence, highlighted, settled, locale, handlers, interruptedUser, canRetry, completionTask }: TimelineGroupRowProps) {
+const TimelineGroupRow = memo(function TimelineGroupRow({ group, sequence, highlighted, settled, locale, handlers, lastTurn, turnMeta, interruptedUser, canRetry, completionTask }: TimelineGroupRowProps) {
   const className = [
     highlighted ? "guild-timeline-group search-highlight" : "guild-timeline-group",
     settled ? "settled" : "",
@@ -3377,6 +3498,8 @@ const TimelineGroupRow = memo(function TimelineGroupRow({ group, sequence, highl
           onOpenRuntimeDiagnostics={handlers.onOpenRuntimeDiagnostics}
           interruptedUser={interruptedUser}
           canRetry={canRetry}
+          lastTurn={lastTurn}
+          turnMeta={turnMeta}
         />}
     {completionTask !== undefined && <ContinuousCompletionRecord task={completionTask} locale={locale} />}
   </div>;
@@ -3386,6 +3509,8 @@ const TimelineGroupRow = memo(function TimelineGroupRow({ group, sequence, highl
   previous.settled === next.settled &&
   previous.locale === next.locale &&
   previous.handlers === next.handlers &&
+  previous.lastTurn === next.lastTurn &&
+  previous.turnMeta === next.turnMeta &&
   previous.interruptedUser === next.interruptedUser &&
   previous.canRetry === next.canRetry &&
   previous.completionTask === next.completionTask &&
@@ -3406,7 +3531,10 @@ function sameTimelineGroup(
 type ThoughtItem = Extract<TimelineItemProjection, { readonly kind: "thought" }>;
 type ToolItem = Extract<TimelineItemProjection, { readonly kind: "tool" }>;
 
-const ActivityGroupView = memo(function ActivityGroupView({ items, locale }: {
+/** At most this many tool kinds get their own count in the summary line; the rest are summed. */
+const ACTIVITY_STAT_LIMIT = 4;
+
+export const ActivityGroupView = memo(function ActivityGroupView({ items, locale }: {
   readonly items: readonly TimelineItemProjection[];
   readonly locale: GuildLocale;
 }) {
@@ -3415,36 +3543,58 @@ const ActivityGroupView = memo(function ActivityGroupView({ items, locale }: {
   const [open, setOpen] = useState(false);
   const thoughts = items.filter((item): item is ThoughtItem => item.kind === "thought");
   const tools = items.filter((item): item is ToolItem => item.kind === "tool");
-  const elapsed = Math.max(0, ...thoughts.map((item) => item.elapsedMs));
+  // Thought items run one after another, so their times add up.
+  const thoughtMs = thoughts.reduce((total, item) => total + Math.max(0, item.elapsedMs), 0);
+  const elapsedSeconds = Math.max(1, Math.round(thoughtMs / 1000));
   const state = activityGroupState(items);
   const streaming = state === "streaming";
-  const toolKinds = activityToolKinds(items);
-  const summary = streaming
-    ? elapsed > 0
-      ? messages.activeActivityFor(streamingActivity(items), Math.max(1, Math.round(elapsed / 1000)))
-      : messages.activeActivity(streamingActivity(items))
-    : [
-        state === "cancelled" ? messages.cancelledActivity
-          : state === "interrupted" ? messages.interruptedActivity
-            : state === "failed" ? messages.failedActivity
-              : "",
-        thoughts.length > 0 ? messages.thoughtFor(Math.max(1, Math.round(elapsed / 1000))) : "",
-        tools.length > 0 ? messages.usedTools(tools.length) : "",
-      ].filter(Boolean).join(" · ");
+  const steps = activityStepTotal(items);
+  const stateLabel = state === "cancelled" ? messages.cancelledActivity
+    : state === "interrupted" ? messages.interruptedActivity
+      : state === "failed" ? messages.failedActivity
+        : "";
+  const title = streaming
+    ? steps > 0
+      ? messages.activityRunning(steps)
+      : thoughtMs > 0
+        ? messages.activeActivityFor(streamingActivity(items), elapsedSeconds)
+        : messages.activeActivity(streamingActivity(items))
+    : state === "completed"
+      ? steps > 0 ? messages.activityDone(steps) : messages.thoughtFor(elapsedSeconds)
+      : [stateLabel, steps > 0 ? messages.activityStepCount(steps) : ""].filter(Boolean).join(" · ");
+  const failedSteps = tools.filter((item) => item.toolStatus === "failed").length;
+  const counts = activityToolCounts(items);
+  const shown = counts.slice(0, ACTIVITY_STAT_LIMIT);
+  const hidden = counts.slice(ACTIVITY_STAT_LIMIT).reduce((total, entry) => total + entry.count, 0);
+  // A thought-only group already says how long it thought; the span only adds to a group with steps.
+  const durationMs = streaming || steps === 0 ? undefined : activityDurationMs(items);
   return <details
-    className="guild-disclosure guild-activity"
+    className={`guild-activity ${state}`}
     onToggle={(event) => setOpen(event.currentTarget.open)}
   >
-    <summary onClick={(event) => setOpen(!(event.currentTarget.parentElement as HTMLDetailsElement).open)}>{streaming
-      ? <SpinnerGap size={14} className="guild-spin" />
-      : state === "completed"
-        ? <Check size={14} />
-        : state === "failed"
-          ? <WarningCircle size={14} />
-          : <Stop size={12} weight="fill" />}<span className="guild-activity-summary">{summary}</span>{toolKinds.length > 0 && <span className="guild-activity-tool-icons" aria-label={toolKinds.map((kind) => messages.toolKindLabel(kind)).join(", ")}>{toolKinds.map((kind) => <span title={messages.toolKindLabel(kind)} key={kind}><ToolKindIcon kind={kind} size={12} /></span>)}</span>}<CaretRight size={13} /></summary>
-    {open && <div>
+    <summary onClick={(event) => setOpen(!(event.currentTarget.parentElement as HTMLDetailsElement).open)}>
+      <span className="guild-activity-state" aria-hidden="true">{streaming
+        ? <span className="guild-mini-spin" />
+        : state === "completed"
+          ? <Check size={14} weight="bold" />
+          : state === "failed"
+            ? <WarningCircle size={14} />
+            : <Stop size={11} weight="fill" />}</span>
+      <b className="guild-activity-title">{title}</b>
+      {steps > 0 && (
+        <span className="guild-activity-stats">
+          {thoughts.length > 0 && <span>{messages.activityKindShort("think")} <b>{messages.runDuration(elapsedSeconds)}</b></span>}
+          {shown.map((entry) => <span key={entry.kind}>{messages.activityKindShort(entry.kind)} <b>{entry.count}</b></span>)}
+          {hidden > 0 && <span>{messages.activityOtherCount(hidden)}</span>}
+          {failedSteps > 0 && <span className="guild-activity-failed">{messages.stepFailed} <b>{failedSteps}</b></span>}
+        </span>
+      )}
+      {durationMs !== undefined && <span className="guild-activity-dur">{messages.runDuration(Math.round(durationMs / 1000))}</span>}
+      <CaretRight size={14} className="guild-activity-caret" aria-hidden="true" />
+    </summary>
+    {open && <div className="guild-activity-body">
       {thoughts.length > 0 && <ThoughtCopy thoughts={thoughts} />}
-      <div className="guild-tool-list">{tools.map((item) => <ToolRow item={item} locale={locale} key={item.entryId} />)}</div>
+      {tools.length > 0 && <div className="guild-tool-list">{tools.map((item) => <ToolRow item={item} locale={locale} key={item.entryId} />)}</div>}
     </div>}
   </details>;
 }, (previous, next) =>
@@ -3487,8 +3637,8 @@ function RunStatusLine({ status, locale }: {
           : status.stage === "awaiting_permission" ? messages.commandAwaitingPermission
             : messages.commandStopping;
   return <div className={`guild-run-status ${status.stage}`}>
-    <SpinnerGap size={14} className="guild-spin" aria-hidden="true" />
-    <span role="status" aria-live="polite">{label}</span>
+    <span className="guild-run-pip" aria-hidden="true" />
+    <span className="guild-run-now"><span className="guild-run-label" role="status" aria-live="polite">{label}</span></span>
     <time aria-hidden="true">{messages.runElapsed(elapsedSeconds)}</time>
   </div>;
 }
@@ -3577,9 +3727,22 @@ export const ToolRow = memo(function ToolRow({ item, locale }: {
     });
     return () => window.cancelAnimationFrame(frame);
   }, [previewedImage]);
+  const live = item.toolStatus === "pending" || item.toolStatus === "in_progress";
+  const durationMs = live ? undefined : itemDurationMs(item);
+  const meta = live
+    ? item.toolStatus === "pending" ? messages.stepPending : messages.stepRunning
+    : item.toolStatus === "failed"
+      ? messages.stepFailed
+      : durationMs === undefined ? undefined : messages.runDuration(Math.round(durationMs / 1000));
   return <div className={`guild-tool-row ${item.toolStatus}`}>
     <div className="guild-tool-heading">
-      <span>{item.toolStatus === "completed" ? <Check size={14} /> : item.toolStatus === "failed" ? <Stop size={12} weight="fill" /> : <SpinnerGap size={14} className="guild-spin" />}{item.title}</span>
+      <span className="guild-tool-state" aria-hidden="true">{item.toolStatus === "completed"
+        ? <Check size={14} weight="bold" />
+        : item.toolStatus === "failed"
+          ? <X size={13} weight="bold" />
+          : <span className="guild-mini-spin" />}</span>
+      <span className="guild-tool-kind" title={messages.toolKindLabel(item.toolKind)}>{messages.activityKindShort(item.toolKind)}</span>
+      <span className="guild-tool-title" title={item.title}>{item.title}</span>
       <span className="guild-tool-heading-actions">
         {images.map((image) => {
           const key = `${image.mediaSha256}:${image.grantUrl}`;
@@ -3593,7 +3756,7 @@ export const ToolRow = memo(function ToolRow({ item, locale }: {
             onClick={() => setPreviewKey((current) => current === key ? undefined : key)}
           ><ImageSquare size={13} />{messages.viewImage}</button>;
         })}
-        <small>{messages.toolKindLabel(item.toolKind)}</small>
+        {meta !== undefined && <small className="guild-tool-meta">{meta}</small>}
       </span>
     </div>
     {previewedImage !== undefined && <figure ref={previewRef} className="guild-tool-image-preview">
@@ -3620,10 +3783,12 @@ export const ToolRow = memo(function ToolRow({ item, locale }: {
 });
 
 /** Exported for tests. */
-export const TimelineItem = memo(function TimelineItem({ item, locale, onOpenExternal, onPermissionDecision, onBranch, onRetryToDraft, onOpenRuntimeDiagnostics, interruptedUser, canRetry }: {
+export const TimelineItem = memo(function TimelineItem({ item, locale, onOpenExternal, onPermissionDecision, onBranch, onRetryToDraft, onOpenRuntimeDiagnostics, interruptedUser, canRetry, lastTurn = false, turnMeta }: {
   readonly item: TimelineItemProjection;
   readonly locale: GuildLocale;
   readonly canRetry: boolean;
+  readonly lastTurn?: boolean;
+  readonly turnMeta?: string;
   readonly onOpenExternal: (url: string) => void;
   readonly onPermissionDecision: (
     item: Extract<TimelineItemProjection, { readonly kind: "permission" }>,
@@ -3671,7 +3836,7 @@ export const TimelineItem = memo(function TimelineItem({ item, locale, onOpenExt
   return <article className={`guild-message guild-message-${item.kind}`}>
     {(body.length > 0 || streamingAssistant) && <div className="guild-message-body"><MessageBody entryId={item.entryId} text={body} streaming={streamingAssistant} locale={locale} onOpenExternal={onOpenExternal} /></div>}
     {footer !== undefined && <ContinuousRoundRecord footer={footer} locale={locale} />}
-    {(item.kind === "user" || item.kind === "assistant") && (
+    {item.kind === "user" && (
       <MessageActions
         item={item}
         messages={messages}
@@ -3680,9 +3845,13 @@ export const TimelineItem = memo(function TimelineItem({ item, locale, onOpenExt
         onRetryToDraft={onRetryToDraft}
       />
     )}
+    {item.kind === "assistant" && !streamingAssistant && (
+      <TurnFooter item={item} messages={messages} lastTurn={lastTurn} meta={turnMeta} onBranch={onBranch} />
+    )}
   </article>;
 });
 
+/** Hover actions beside a user bubble: copy, branch, and (after a failed turn) put the text back in the draft. */
 function MessageActions({ item, messages, canRetry, onBranch, onRetryToDraft }: {
   readonly item: TimelineItemProjection;
   readonly messages: ReturnType<typeof messagesFor>;
@@ -3698,11 +3867,42 @@ function MessageActions({ item, messages, canRetry, onBranch, onRetryToDraft }: 
         setCopied(true);
         window.setTimeout(() => setCopied(false), 1_500);
       }).catch(() => undefined);
-    }}>{copied ? <Check size={13} /> : <Copy size={13} />}</button>
-    <button type="button" title={messages.branchMessageHelp} aria-label={messages.branchFromMessage} onClick={() => void onBranch(item)}><GitFork size={13} /></button>
+    }}>{copied ? <Check size={14} /> : <Copy size={14} />}</button>
+    <button type="button" title={messages.branchMessageHelp} aria-label={messages.branchFromMessage} onClick={() => void onBranch(item)}><GitFork size={14} /></button>
     {canRetry && item.kind === "user" && (
-      <button type="button" title={messages.retryToDraftHelp} aria-label={messages.retryToDraft} onClick={() => onRetryToDraft(item)}><ArrowsClockwise size={13} /></button>
+      <button type="button" title={messages.retryToDraftHelp} aria-label={messages.retryToDraft} onClick={() => onRetryToDraft(item)}><ArrowsClockwise size={14} /></button>
     )}
+  </div>;
+}
+
+/**
+ * The row under a finished answer: copy and branch as labelled ghost buttons (visible on hover and
+ * focus, always for the newest answer) with the turn's duration on the right. `slot` is the
+ * extension point for the per-turn changed-files card and "revert to before this turn"; nothing
+ * renders there until those features exist, so no placeholder is shown.
+ */
+function TurnFooter({ item, messages, lastTurn, meta, onBranch, slot }: {
+  readonly item: TimelineItemProjection;
+  readonly messages: ReturnType<typeof messagesFor>;
+  readonly lastTurn: boolean;
+  readonly meta?: string | undefined;
+  readonly onBranch: (item: TimelineItemProjection) => Promise<void>;
+  readonly slot?: ReactNode;
+}) {
+  const [copied, setCopied] = useState(false);
+  if (item.kind !== "assistant") return null;
+  return <div className={`guild-turn-footer${lastTurn ? " last" : ""}`}>
+    {slot !== undefined && slot !== null && <div className="guild-turn-slot">{slot}</div>}
+    <div className="guild-turn-actions" aria-label={messages.messageActions}>
+      <button type="button" className="guild-ghost-button" title={messages.copyMessage} onClick={() => {
+        void navigator.clipboard.writeText(item.text).then(() => {
+          setCopied(true);
+          window.setTimeout(() => setCopied(false), 1_500);
+        }).catch(() => undefined);
+      }}>{copied ? <Check size={14} /> : <Copy size={14} />}{copied ? messages.copiedShort : messages.copyShort}</button>
+      <button type="button" className="guild-ghost-button" title={messages.branchMessageHelp} onClick={() => void onBranch(item)}><GitFork size={14} />{messages.branchShort}</button>
+      {meta !== undefined && <span className="guild-turn-meta">{meta}</span>}
+    </div>
   </div>;
 }
 
@@ -3795,12 +3995,23 @@ function PermissionCard({ item, messages, onDecision }: {
       setSubmitting(false);
     }
   };
-  return <div className="guild-permission" aria-busy={submitting}>
-    <strong>{messages.permissionNeeded}</strong>
-    <span>{item.title}</span>
-    <div>
-      {item.options.map((option) => <button disabled={submitting} type="button" key={option.optionId} onClick={() => void decide({ type: "selected", optionId: option.optionId })}>{option.name}</button>)}
-      <button disabled={submitting} type="button" onClick={() => void decide({ type: "cancelled" })}>{messages.cancel}</button>
+  return <div className="guild-permission" role="group" aria-label={messages.permissionNeeded} aria-busy={submitting}>
+    <div className="guild-permission-head">
+      <ShieldWarning size={16} aria-hidden="true" />
+      <strong>{messages.permissionNeeded}</strong>
+    </div>
+    <code className="guild-permission-title">{item.title}</code>
+    <div className="guild-permission-actions">
+      {item.options.map((option) => (
+        <button
+          disabled={submitting}
+          type="button"
+          key={option.optionId}
+          className={`${option.kind.startsWith("allow") ? "allow" : "reject"}${option.kind === "allow_once" ? " primary" : ""}`}
+          onClick={() => void decide({ type: "selected", optionId: option.optionId })}
+        >{option.name}</button>
+      ))}
+      <button disabled={submitting} type="button" className="dismiss" onClick={() => void decide({ type: "cancelled" })}>{messages.cancel}</button>
     </div>
   </div>;
 }
@@ -3928,6 +4139,25 @@ function clampWorkbenchWidth(width: number): number {
 function readWorkbenchWidth(storage: Storage): number {
   const raw = Number(storage.getItem(WORKBENCH_WIDTH_STORAGE_KEY));
   return Number.isFinite(raw) && raw > 0 ? clampWorkbenchWidth(raw) : 340;
+}
+
+function readUnreadTasks(storage: Storage): ReadonlySet<string> {
+  try {
+    const parsed = JSON.parse(storage.getItem(UNREAD_TASKS_STORAGE_KEY) ?? "[]") as unknown;
+    return Array.isArray(parsed)
+      ? new Set(parsed.filter((value): value is string => typeof value === "string").slice(0, 500))
+      : new Set();
+  } catch {
+    return new Set();
+  }
+}
+
+function writeUnreadTasks(storage: Storage, unread: ReadonlySet<string>): void {
+  try {
+    storage.setItem(UNREAD_TASKS_STORAGE_KEY, JSON.stringify([...unread].slice(0, 500)));
+  } catch {
+    // The mark is a convenience; a full or blocked store only loses it on reload.
+  }
 }
 
 function writeWorkbenchWidth(storage: Storage, width: number): void {

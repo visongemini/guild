@@ -14,13 +14,13 @@ const single = (patch: Record<string, unknown>) => {
   return estimateTimelineGroupHeight(group!);
 };
 
-test("collapsed activity rows reserve exactly one disclosure line", () => {
+test("collapsed activity rows reserve exactly one summary line", () => {
   const [group] = groupTimeline([
     item({ kind: "thought", text: "x".repeat(5_000), startedAtMs: 1, elapsedMs: 1 }),
     item({ entryId: "tool", kind: "tool", title: "Read", toolKind: "read", toolStatus: "completed", content: [], locations: [] }),
   ]);
   assert.equal(group!.type, "activity");
-  assert.equal(estimateTimelineGroupHeight(group!), 18);
+  assert.equal(estimateTimelineGroupHeight(group!), 36);
 });
 
 test("message estimates grow with text, count wide characters double, and stay whole pixels", () => {
@@ -38,7 +38,7 @@ test("message estimates grow with text, count wide characters double, and stay w
 });
 
 test("other row kinds reserve a plausible fixed height", () => {
-  assert.equal(single({ kind: "permission", permissionId: "p", title: "Allow", options: [] }), 72);
+  assert.equal(single({ kind: "permission", permissionId: "p", title: "Allow", options: [] }), 136);
   assert.ok(single({ kind: "media", mediaType: "image", grantUrl: "guild-media://media/x.png", alt: "x", mimeType: "image/png" }) >= 100);
   assert.ok(single({ kind: "notice", text: "Session restored" }) >= 20);
   assert.ok(single({ kind: "error", text: "e".repeat(2_000) }) > single({ kind: "error", text: "e" }));
