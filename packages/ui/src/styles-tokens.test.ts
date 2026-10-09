@@ -3,7 +3,7 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 /*
- * The stylesheet's contract (D-047): every color lives in the two token blocks at the top, and the
+ * The stylesheet contract of the 2026-10 UI refresh: every color lives in the two token blocks at the top, and the
  * text tokens stay readable (WCAG AA, 4.5:1) on every surface they are used on, in both themes.
  */
 

@@ -110,8 +110,9 @@ export function formatContextWindows(windows: readonly number[]): string | undef
  */
 export function officialPriceMultiplier(description: string | undefined): string | undefined {
   if (description === undefined) return undefined;
-  const latin = /(?<![\w.])(\d+(?:\.\d+)?)\s*[x\u00d7]\s*(?:the\s+|of\s+the\s+)?(?:price|pricing|cost|credits?|usage)\b/iu.exec(description);
-  const chinese = /(\d+(?:\.\d+)?)\s*倍\s*(?:价格|价|消耗|额度|费用)/u.exec(description);
+  // Only a statement about price counts; "2x usage limits" or "3x cost savings" is not a premium.
+  const latin = /(?<![\w.])(\d+(?:\.\d+)?)\s*[x\u00d7]\s*(?:the\s+|of\s+the\s+)?(?:price|pricing|cost(?!\s*(?:saving|efficien|reduc|cut)))\b/iu.exec(description);
+  const chinese = /(\d+(?:\.\d+)?)\s*倍\s*(?:价格|价|费用)/u.exec(description);
   const twice = /\btwice\s+the\s+(?:price|cost)\b/iu.test(description) ? ["", "2"] : undefined;
   const match = latin ?? chinese ?? twice;
   if (match === null || match === undefined) return undefined;

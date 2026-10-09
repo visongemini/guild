@@ -5,9 +5,10 @@ export type Appearance = Readonly<{ theme: "light" | "dark" | "system"; textSize
 const KEY = "guild:v2:appearance";
 /**
  * The stored ids are the 2.0 preference values (16 = standard, 18 = large) and stay as they are so
- * saved settings keep their meaning. The refreshed type scale renders them at 15 px and 17 px.
+ * saved settings keep their meaning. Standard text follows the refreshed 15 px scale; large text
+ * stays at 18 px so nobody who chose larger text gets smaller text.
  */
-const MESSAGE_SIZE_PX: Readonly<Record<Appearance["textSize"], number>> = Object.freeze({ 16: 15, 18: 17 });
+const MESSAGE_SIZE_PX: Readonly<Record<Appearance["textSize"], number>> = Object.freeze({ 16: 15, 18: 18 });
 export function messageSizePx(textSize: Appearance["textSize"]): number {
   return MESSAGE_SIZE_PX[textSize];
 }

@@ -259,6 +259,8 @@ export function GuildApp({ api }: GuildAppProps) {
   const [bannyDragging, setBannyDragging] = useState(false);
   const [bannyDropTargetId, setBannyDropTargetId] = useState<string>();
   const [unreadTaskIds, setUnreadTaskIds] = useState<ReadonlySet<string>>(() => readUnreadTasks(window.localStorage));
+  const unreadTaskIdsRef = useRef(unreadTaskIds);
+  unreadTaskIdsRef.current = unreadTaskIds;
   const lastTaskStatuses = useRef<ReadonlyMap<string, SidebarTaskStatus>>(new Map());
   const [viewport, setViewport] = useState(() => ({
     width: window.innerWidth,
@@ -333,7 +335,7 @@ export function GuildApp({ api }: GuildAppProps) {
     loadEarlierTimeline,
     openTask: (taskId) => openTask(taskId),
     createTask: (workspaceId) => createTask(workspaceId),
-    createNewTask: () => (busy ? Promise.resolve() : createTask()),
+    createNewTask: () => (busy || projection === undefined ? Promise.resolve() : createTask()),
     toggleWorkspace: (workspaceId) => setExpandedWorkspaces((current) => toggleSet(current, workspaceId)),
     beginBannyDrag,
     endBannyDrag,
@@ -391,12 +393,12 @@ export function GuildApp({ api }: GuildAppProps) {
   useEffect(() => {
     if (projection === undefined) return;
     const tasks = projection.workspaces.flatMap((workspace) => workspace.archived ? [] : workspace.tasks.filter((task) => !task.archived));
-    setUnreadTaskIds((current) => {
-      const next = nextUnreadTaskIds(lastTaskStatuses.current, tasks, projection.activeTask?.task.taskId, current);
-      if (next !== current) writeUnreadTasks(window.localStorage, next);
-      return next;
-    });
+    const next = nextUnreadTaskIds(lastTaskStatuses.current, tasks, projection.activeTask?.task.taskId, unreadTaskIdsRef.current);
     lastTaskStatuses.current = taskStatusSnapshot(tasks);
+    if (next !== unreadTaskIdsRef.current) {
+      writeUnreadTasks(window.localStorage, next);
+      setUnreadTaskIds(next);
+    }
   }, [projection?.workspaces, projection?.activeTask?.task.taskId]);
 
   // A11Y-COMPOSER-001: mirror value writes that bypass React (accessibility
@@ -676,8 +678,11 @@ export function GuildApp({ api }: GuildAppProps) {
   // The new-task button advertises Cmd+N; the shortcut does exactly what the button does.
   useEffect(() => {
     const onNewTaskShortcut = (event: KeyboardEvent) => {
-      if (!(event.metaKey || event.ctrlKey) || event.altKey || event.shiftKey || event.key.toLocaleLowerCase() !== "n") return;
+      // The app is macOS-only; Ctrl+N is cursor movement in a macOS text field.
+      if (!event.metaKey || event.ctrlKey || event.altKey || event.shiftKey || event.key.toLocaleLowerCase() !== "n") return;
       if (event.repeat || event.defaultPrevented || event.isComposing) return;
+      // Behind a modal dialog the shortcut would act on a page the user cannot see.
+      if (document.querySelector('[aria-modal="true"]') !== null) return;
       event.preventDefault();
       void latestHandlers.current.createNewTask();
     };
@@ -2073,6 +2078,7 @@ export function GuildApp({ api }: GuildAppProps) {
               locale={projection.locale}
               recentResult={activeTask.recentResult}
               continuousTask={activeTask.continuousTask}
+              running={running}
               highlightedSequence={searchNavigation?.results[searchNavigation.index]?.taskId === activeTask.task.taskId
                 ? searchNavigation.results[searchNavigation.index]?.sequence : undefined}
               onOpenExternal={stableHandlers.onOpenExternal}
@@ -2353,7 +2359,7 @@ export function GuildApp({ api }: GuildAppProps) {
                   aria-hidden="true"
                   style={{ "--guild-context-percent": `${contextWindow.percent}%` } as React.CSSProperties}
                 />
-                {contextWindow.available && contextWindow.hasSize && contextWindow.percent >= 80 && (
+                {contextWindow.available && contextWindow.hasSize && (
                   <span className="guild-context-percent">{contextWindow.percent}%</span>
                 )}
                 {contextUsageOpen && <span className="guild-context-usage-detail" role="status">{!contextWindow.available
@@ -3215,6 +3221,7 @@ const WorkspaceTree = memo(function WorkspaceTree({ workspace, expanded, activeT
               >
                 <span className={`guild-task-state ${status}`} title={taskStatusTitle(status, task, messages)}>
                   <TaskStatusGlyph status={status} />
+                  {status !== "idle" && <span className="guild-sr-only">{taskStatusTitle(status, task, messages)}</span>}
                 </span>
                 <span className="guild-task-title">{task.title}</span>
                 <span className="guild-task-trailing">
@@ -3239,7 +3246,9 @@ const WorkspaceTree = memo(function WorkspaceTree({ workspace, expanded, activeT
                     </span>
                   )}
                   {status === "running"
-                    ? <span className="guild-task-live-label run">{messages.taskStatusRunning}</span>
+                    ? <span className="guild-task-live-label run">{task.activeRunState === "cancel_requested"
+                        ? messages.commandStopping
+                        : task.activeRunState === "queued" ? messages.runPhaseQueued(undefined) : messages.taskStatusRunning}</span>
                     : status === "permission"
                       ? <span className="guild-task-live-label wait">{messages.taskMetaPermission}</span>
                       : status === "queued"
@@ -3351,12 +3360,14 @@ type TimelineProps = {
   readonly recentResult?: TaskViewProjection["recentResult"];
   readonly continuousTask?: TaskViewProjection["continuousTask"];
   readonly highlightedSequence?: number;
+  /** A run is live: its turn is not finished, so it shows no duration yet. */
+  readonly running: boolean;
 } & TimelineHandlers;
 
 /** The newest groups always render fully so growth and scrolling at the bottom stay exact. */
 const LIVE_TAIL_GROUPS = 3;
 
-const Timeline = memo(function Timeline({ items, pendingUserText, runStatus, runPhase, locale, recentResult, continuousTask, highlightedSequence, onOpenExternal, onPermissionDecision, onBranch, onRetryToDraft, onOpenRuntimeDiagnostics }: TimelineProps) {
+export const Timeline = memo(function Timeline({ items, pendingUserText, runStatus, runPhase, locale, recentResult, continuousTask, highlightedSequence, running, onOpenExternal, onPermissionDecision, onBranch, onRetryToDraft, onOpenRuntimeDiagnostics }: TimelineProps) {
   const messages = messagesFor(locale);
   const groups = useMemo(() => groupTimeline(items), [items]);
   const handlers = useMemo(() => Object.freeze({
@@ -3368,7 +3379,12 @@ const Timeline = memo(function Timeline({ items, pendingUserText, runStatus, run
   const settledBefore = groups.length - LIVE_TAIL_GROUPS;
   // "Took 4 min" belongs under the last answer of a finished turn; the newest answer keeps its footer visible.
   const turnTook = useMemo(() => {
-    const durations = turnDurationsByRun(items);
+    const durations = new Map(turnDurationsByRun(items));
+    // While a run is live its turn is unfinished, whatever the item flags say.
+    if (running) {
+      const liveRunId = items.findLast((item) => item.runId !== undefined)?.runId;
+      if (liveRunId !== undefined) durations.delete(liveRunId);
+    }
     const lastAnswerOfRun = new Map<string, string>();
     for (const item of items) {
       if (item.kind === "assistant" && item.runId !== undefined) lastAnswerOfRun.set(item.runId, item.entryId);
@@ -3381,7 +3397,7 @@ const Timeline = memo(function Timeline({ items, pendingUserText, runStatus, run
       }
     }
     return labels;
-  }, [items, messages]);
+  }, [items, messages, running]);
   const lastAnswerEntryId = useMemo(() => items.findLast((item) => item.kind === "assistant")?.entryId, [items]);
   return <div className="guild-timeline">{groups.map((group, index) => {
     const entries = group.type === "activity" ? group.items : [group.item];
@@ -3427,6 +3443,7 @@ const Timeline = memo(function Timeline({ items, pendingUserText, runStatus, run
   previous.recentResult === next.recentResult &&
   previous.continuousTask === next.continuousTask &&
   previous.highlightedSequence === next.highlightedSequence &&
+  previous.running === next.running &&
   previous.onOpenExternal === next.onOpenExternal &&
   previous.onPermissionDecision === next.onPermissionDecision &&
   previous.onBranch === next.onBranch &&
@@ -3517,7 +3534,7 @@ type ToolItem = Extract<TimelineItemProjection, { readonly kind: "tool" }>;
 /** At most this many tool kinds get their own count in the summary line; the rest are summed. */
 const ACTIVITY_STAT_LIMIT = 4;
 
-const ActivityGroupView = memo(function ActivityGroupView({ items, locale }: {
+export const ActivityGroupView = memo(function ActivityGroupView({ items, locale }: {
   readonly items: readonly TimelineItemProjection[];
   readonly locale: GuildLocale;
 }) {
@@ -3526,7 +3543,8 @@ const ActivityGroupView = memo(function ActivityGroupView({ items, locale }: {
   const [open, setOpen] = useState(false);
   const thoughts = items.filter((item): item is ThoughtItem => item.kind === "thought");
   const tools = items.filter((item): item is ToolItem => item.kind === "tool");
-  const thoughtMs = Math.max(0, ...thoughts.map((item) => item.elapsedMs));
+  // Thought items run one after another, so their times add up.
+  const thoughtMs = thoughts.reduce((total, item) => total + Math.max(0, item.elapsedMs), 0);
   const elapsedSeconds = Math.max(1, Math.round(thoughtMs / 1000));
   const state = activityGroupState(items);
   const streaming = state === "streaming";
@@ -3544,6 +3562,7 @@ const ActivityGroupView = memo(function ActivityGroupView({ items, locale }: {
     : state === "completed"
       ? steps > 0 ? messages.activityDone(steps) : messages.thoughtFor(elapsedSeconds)
       : [stateLabel, steps > 0 ? messages.activityStepCount(steps) : ""].filter(Boolean).join(" · ");
+  const failedSteps = tools.filter((item) => item.toolStatus === "failed").length;
   const counts = activityToolCounts(items);
   const shown = counts.slice(0, ACTIVITY_STAT_LIMIT);
   const hidden = counts.slice(ACTIVITY_STAT_LIMIT).reduce((total, entry) => total + entry.count, 0);
@@ -3567,6 +3586,7 @@ const ActivityGroupView = memo(function ActivityGroupView({ items, locale }: {
           {thoughts.length > 0 && <span>{messages.activityKindShort("think")} <b>{messages.runDuration(elapsedSeconds)}</b></span>}
           {shown.map((entry) => <span key={entry.kind}>{messages.activityKindShort(entry.kind)} <b>{entry.count}</b></span>)}
           {hidden > 0 && <span>{messages.activityOtherCount(hidden)}</span>}
+          {failedSteps > 0 && <span className="guild-activity-failed">{messages.stepFailed} <b>{failedSteps}</b></span>}
         </span>
       )}
       {durationMs !== undefined && <span className="guild-activity-dur">{messages.runDuration(Math.round(durationMs / 1000))}</span>}
@@ -3710,7 +3730,7 @@ export const ToolRow = memo(function ToolRow({ item, locale }: {
   const live = item.toolStatus === "pending" || item.toolStatus === "in_progress";
   const durationMs = live ? undefined : itemDurationMs(item);
   const meta = live
-    ? messages.stepRunning
+    ? item.toolStatus === "pending" ? messages.stepPending : messages.stepRunning
     : item.toolStatus === "failed"
       ? messages.stepFailed
       : durationMs === undefined ? undefined : messages.runDuration(Math.round(durationMs / 1000));
@@ -3874,13 +3894,13 @@ function TurnFooter({ item, messages, lastTurn, meta, onBranch, slot }: {
   return <div className={`guild-turn-footer${lastTurn ? " last" : ""}`}>
     {slot !== undefined && slot !== null && <div className="guild-turn-slot">{slot}</div>}
     <div className="guild-turn-actions" aria-label={messages.messageActions}>
-      <button type="button" className="guild-ghost-button" title={messages.copyMessage} aria-label={messages.copyMessage} onClick={() => {
+      <button type="button" className="guild-ghost-button" title={messages.copyMessage} onClick={() => {
         void navigator.clipboard.writeText(item.text).then(() => {
           setCopied(true);
           window.setTimeout(() => setCopied(false), 1_500);
         }).catch(() => undefined);
       }}>{copied ? <Check size={14} /> : <Copy size={14} />}{copied ? messages.copiedShort : messages.copyShort}</button>
-      <button type="button" className="guild-ghost-button" title={messages.branchMessageHelp} aria-label={messages.branchFromMessage} onClick={() => void onBranch(item)}><GitFork size={14} />{messages.branchShort}</button>
+      <button type="button" className="guild-ghost-button" title={messages.branchMessageHelp} onClick={() => void onBranch(item)}><GitFork size={14} />{messages.branchShort}</button>
       {meta !== undefined && <span className="guild-turn-meta">{meta}</span>}
     </div>
   </div>;
@@ -3987,7 +4007,7 @@ function PermissionCard({ item, messages, onDecision }: {
           disabled={submitting}
           type="button"
           key={option.optionId}
-          className={option.kind.startsWith("allow") ? "allow" : "reject"}
+          className={`${option.kind.startsWith("allow") ? "allow" : "reject"}${option.kind === "allow_once" ? " primary" : ""}`}
           onClick={() => void decide({ type: "selected", optionId: option.optionId })}
         >{option.name}</button>
       ))}

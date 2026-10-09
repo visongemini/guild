@@ -65,6 +65,9 @@ test("a price tag appears only when the official description states a premium mu
   assert.equal(officialPriceMultiplier("Fast. Context 2x larger"), undefined);
   assert.equal(officialPriceMultiplier("Half price: 0.5x the price"), undefined, "a discount is not a premium tag");
   assert.equal(officialPriceMultiplier("Up to 10x cheaper than before"), undefined);
+  assert.equal(officialPriceMultiplier("2x usage limits for subscribers"), undefined);
+  assert.equal(officialPriceMultiplier("Delivers 3x cost savings"), undefined);
+  assert.equal(officialPriceMultiplier("Roughly 2x credits included"), undefined);
   assert.equal(officialPriceMultiplier(undefined), undefined);
   assert.equal(messagesFor("zh-CN").modelPriceTag("2"), "2 倍价格");
   assert.equal(messagesFor("en-US").modelPriceTag("2"), "2x price");
@@ -103,9 +106,9 @@ test("a phase shorter than a second is left off the visible trail", () => {
   assert.deepEqual(describeRunPhaseTrail(history, messagesFor("en-US")), []);
 });
 
-test("stored text-size ids keep their meaning and render on the 15 and 17 px scale", () => {
+test("stored text-size ids keep their meaning: standard follows the 15 px scale, large stays 18 px", () => {
   assert.equal(messageSizePx(16), 15);
-  assert.equal(messageSizePx(18), 17);
+  assert.equal(messageSizePx(18), 18, "large text never gets smaller than it was");
 });
 
 test("the refresh strings exist in both catalogs and format their arguments", () => {
@@ -113,7 +116,7 @@ test("the refresh strings exist in both catalogs and format their arguments", ()
     const m = messagesFor(locale);
     for (const text of [
       m.activityDone(38), m.activityRunning(5), m.activityStepCount(3), m.activityKindShort("execute"), m.activityOtherCount(2),
-      m.stepRunning, m.stepFailed, m.turnTook("4 min"), m.copyShort, m.copiedShort, m.branchShort, m.taskMetaPermission,
+      m.stepRunning, m.stepPending, m.stepFailed, m.turnTook("4 min"), m.copyShort, m.copiedShort, m.branchShort, m.taskMetaPermission,
       m.taskMetaUnread, m.hintSend, m.hintNewline, m.hintCommands, m.hintQueue, m.modelPickerFootnote, m.newTaskShortcut, m.searchShortcut,
     ]) {
       assert.ok(text.length > 0 && !text.includes("undefined"), `${locale}: ${text}`);

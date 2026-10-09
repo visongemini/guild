@@ -1,10 +1,10 @@
 import type { AcpToolKind } from "@guild/contracts";
 
 // D-046: frontend redesign strings stay in paired locale catalogs.
-// D-047: the warm-paper refresh adds the activity summary, turn footer, composer hints and model footnote here.
+// 2026-10 UI refresh: the warm-paper refresh adds the activity summary, turn footer, composer hints and model footnote here.
 export const WORKSHOP_ZH = {
   tools: "工具", appearance: "外观与阅读", theme: "主题", lightTheme: "暖白", darkTheme: "深色", systemTheme: "跟随系统",
-  textSize: "正文字号", standardText: "标准 · 15", largeText: "大字 · 17", density: "界面密度", comfortable: "舒适", compact: "紧凑",
+  textSize: "正文字号", standardText: "标准 · 15", largeText: "大字 · 18", density: "界面密度", comfortable: "舒适", compact: "紧凑",
   starterTitle: "从一个清楚的目标开始", starterHelp: "选一个起点，补充细节后发送。", starterReview: "审查项目", starterBuild: "实现功能", starterExplain: "理解代码",
   starterReviewDraft: "请审查这个项目，找出影响正确性、使用体验和维护成本的问题。先给出证据和修复优先级。",
   starterBuildDraft: "我想在这个项目中实现一个功能：\n\n请先确认现有实现，再完成修改和必要验证。",
@@ -29,19 +29,19 @@ export const WORKSHOP_ZH = {
     execute: "命令", think: "思考", fetch: "联网", switch_mode: "模式", other: "其他",
   })[kind],
   activityOtherCount: (count: number) => `其他 ${count}`,
-  stepRunning: "进行中", stepFailed: "失败",
+  stepRunning: "进行中", stepPending: "待开始", stepFailed: "失败",
   turnTook: (duration: string) => `用时 ${duration}`,
   copyShort: "复制", copiedShort: "已复制", branchShort: "从这里分支",
   taskMetaPermission: "等你确认", taskMetaUnread: "有新结果",
   hintSend: "发送", hintNewline: "换行", hintCommands: "命令", hintQueue: "排队发送",
-  modelPickerFootnote: "从下一轮开始生效，沿用同一个会话，上下文不会丢。",
+  modelPickerFootnote: "从下一轮开始生效，沿用同一个会话。",
   modelPriceTag: (multiplier: string) => `${multiplier} 倍价格`,
   newTaskShortcut: "⌘N", searchShortcut: "⌘K",
   expandActivity: "展开步骤", collapseActivity: "收起步骤",
 } as const;
 export const WORKSHOP_EN: { readonly [K in keyof typeof WORKSHOP_ZH]: typeof WORKSHOP_ZH[K] extends (...args: infer A) => string ? (...args: A) => string : string } = {
   tools: "Tools", appearance: "Appearance & reading", theme: "Theme", lightTheme: "Warm light", darkTheme: "Dark", systemTheme: "System",
-  textSize: "Message size", standardText: "Standard · 15", largeText: "Large · 17", density: "Density", comfortable: "Comfortable", compact: "Compact",
+  textSize: "Message size", standardText: "Standard · 15", largeText: "Large · 18", density: "Density", comfortable: "Comfortable", compact: "Compact",
   starterTitle: "Start with a clear goal", starterHelp: "Choose a starting point, add details, then send.", starterReview: "Review project", starterBuild: "Build a feature", starterExplain: "Understand code",
   starterReviewDraft: "Review this project for correctness, usability, and maintainability. Show evidence and prioritize fixes first.",
   starterBuildDraft: "I want to add this feature to the project:\n\nInspect the current implementation, make the changes, and verify the result.",
@@ -66,12 +66,12 @@ export const WORKSHOP_EN: { readonly [K in keyof typeof WORKSHOP_ZH]: typeof WOR
     execute: "Run", think: "Think", fetch: "Fetch", switch_mode: "Mode", other: "Other",
   })[kind],
   activityOtherCount: (count) => `Other ${count}`,
-  stepRunning: "Running", stepFailed: "Failed",
+  stepRunning: "Running", stepPending: "Pending", stepFailed: "Failed",
   turnTook: (duration) => `Took ${duration}`,
   copyShort: "Copy", copiedShort: "Copied", branchShort: "Branch from here",
   taskMetaPermission: "Needs you", taskMetaUnread: "New result",
   hintSend: "send", hintNewline: "new line", hintCommands: "commands", hintQueue: "queue",
-  modelPickerFootnote: "Takes effect from the next turn, in the same session. Context is kept.",
+  modelPickerFootnote: "Takes effect from the next turn, in the same session.",
   modelPriceTag: (multiplier) => `${multiplier}x price`,
   newTaskShortcut: "⌘N", searchShortcut: "⌘K",
   expandActivity: "Show steps", collapseActivity: "Hide steps",

@@ -136,7 +136,9 @@ export function turnDurationsByRun(
     const span = spans.get(item.runId) ?? { start: item.createdAtMs, end: item.updatedAtMs, live: false };
     span.start = Math.min(span.start, item.createdAtMs);
     span.end = Math.max(span.end, item.updatedAtMs);
-    span.live ||= item.status === "streaming" || item.status === "waiting";
+    // The projection can mark a tool item finished while its call is still working, so the call's own status counts too.
+    span.live ||= item.status === "streaming" || item.status === "waiting" ||
+      (item.kind === "tool" && (item.toolStatus === "pending" || item.toolStatus === "in_progress"));
     spans.set(item.runId, span);
   }
   const durations = new Map<string, number>();
@@ -195,7 +197,7 @@ export function estimateTimelineGroupHeight(group: TimelineGroup): number {
   if (group.type === "activity") return ACTIVITY_ROW_HEIGHT_PX;
   const item = group.item;
   switch (item.kind) {
-    case "permission": return 96;
+    case "permission": return 136;
     case "media": return 220;
     case "notice":
     case "error": return Math.max(20, Math.ceil(textLineCount(item.text, MESSAGE_CHARS_PER_LINE + 16)) * 19);
