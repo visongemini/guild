@@ -23,9 +23,10 @@ Baseline: 2.1.6 (`b010cd2` + test commits), branch `guild-2.2-speed`.
 
 - Every upstream request is still made by the official `grok` process. No auth-file reads.
 - Single-user local client. Adapter only on 127.0.0.1 (unchanged).
-- A Run's terminal state is persisted before it is shown as finished. A crash may lose at most
-  the last ~100 ms of streamed text of a still-running Run, never a completed Run, a permission
-  decision, or a queued turn.
+- A Run's terminal state is persisted before it is shown as finished. A process crash may lose
+  at most the last ~100 ms of streamed text of a still-running Run; an OS crash or power loss at
+  most the last ~2 s of it (see "Crash window" below). Neither may lose a completed Run, a
+  permission decision, or a queued turn.
 - No replay of prompts after transport loss (existing rule).
 - All existing tests pass, or are updated only where they asserted the removed per-chunk
   behavior; any such test change is listed in the PR notes.
@@ -103,3 +104,120 @@ silently change it.
 `scripts/bench/` (node, no Electron UI): open a copy of a given DB and time open/verify, first
 task open, search; feed a synthetic 2,000-chunk stream through the live write path and report
 per-flush times and DB growth. Numbers before and after go into the PR notes.
+
+## WP2 and WP3 implementation notes (persistence)
+
+Branch `speed-persist`. Code: `packages/persistence/src/store.ts`, `schema.ts` (migration v15),
+`packages/contracts/src/runtime-turn-event.ts` (constructed-event registry),
+`apps/desktop/src/main/live-service.ts` (`notePromptActivity`, `searchConversations`).
+Benchmark: `node scripts/bench/persistence-bench.mjs --db <copy of guild.sqlite3> --repeat 3`.
+
+### Stream coalescing
+
+- The store, not the live service, coalesces. `commitLiveRuntimeEvent` keeps its signature and
+  results. The first chunk of an entry (`create`) is committed at once. The next chunk is admitted
+  against stored state (all historical checks), then opens a window; further chunks of the same
+  entry, kind, protocol message id, task, Run, session and epoch with the next receive sequence and
+  the next revision are admitted in memory only, because every other store call writes the open
+  window before it runs, so stored state cannot change under a window.
+- A window is written in ONE commit after 100 ms, or before any other store call (tool or plan
+  update, permission, cancel, terminal, queue, settings, backup, close, OS suspend and so on).
+  Anything unusual (gap, stale revision, size limit, other entry or kind, replay marker) writes
+  the window and is judged by the ordinary path, so the historical error is returned exactly.
+- Envelope shape: one `committed_envelopes` row per window holding the event of the window's
+  LAST chunk (its `receive_sequence`, `idempotency_key`) with the concatenated payload text, built
+  with `createRuntimeTurnEvent` so it parses and digests like any event. The row stands for the
+  contiguous receive-sequence range ending at its sequence; `UNIQUE(task, epoch, sequence)` and
+  the gapless-successor rule are unchanged. Earlier keys of a window are not stored: an exact
+  replay of one is denied as `stale_receive_sequence`, and a replay of the last key of a
+  multi-chunk row is reported as `idempotency_collision` (its fingerprint covers the merged
+  payload) rather than `duplicate`. In-window duplicates and collisions are answered from memory.
+  In-process keys are random UUIDs and are never replayed, so no real path is affected.
+- Entry `revision` still counts chunks (a window advances it by its chunk count), so every
+  caller's compare-and-set token and the planned `{entryId, appendText, revision}` delta stay
+  valid. Readers (`loadConversationEntry`, the three list calls) return the entry with pending
+  text applied; `searchConversationEntries` and `verifyIntegrity` write the window first.
+- A failed timed write has no caller: the window is dropped (same effect as a crash), the error
+  is stored and rethrown by the next store call.
+- The stream path never runs the automatic WAL checkpoint (it stalled commits by 20+ ms). A
+  checkpoint runs once the stream is quiet for 1 s, or when stream flushes are estimated to have
+  written 32 MiB since the last one.
+
+### Durability and crash window
+
+`PRAGMA synchronous = NORMAL` under WAL. Every commit is synchronous (`FULL` for that commit)
+except the commits of streamed text and thought chunks (entry create, window flush), which are
+synchronous only when 2 s have passed since the last synchronous commit. A synchronous commit
+also makes every earlier commit durable. The open-time dirty marker and migrations are
+synchronous.
+
+| Event | Process crash (SIGKILL, app crash) | OS crash or power loss |
+|---|---|---|
+| Streamed text of a running Run | loses the open window, at most 100 ms | loses at most about 2.1 s (open window plus unsynced flushes) |
+| Tool, plan, user message, prompt acceptance, queued turn | durable | durable |
+| Permission registration, decision, outbox, ACK | durable | durable |
+| Terminal commit (Run, correlation, final text, context tokens) | durable | durable |
+
+Neither case can tear a row: each flush is one commit holding the entry text and its envelope.
+A completed Run is never lost because its commit is synchronous and orders after all earlier
+ones. `fullfsync` is unchanged (off), as before.
+
+### Startup, context tokens, search
+
+- Open verifies the whole database (`integrity_check`, foreign keys, every aggregate, every
+  entry and envelope through a cursor, one row alive at a time) only after an unclean shutdown or
+  a reaped writer lease. After a clean shutdown it validates lazily when rows are read. An
+  explicit `verifyIntegrity()` (backups) still checks everything, now streamed.
+- `task_context_usage(task_id, session_id, tokens_used)` is written in the terminal commit.
+  For databases written before v15 the value is recovered from the session's most recent terminal
+  Runs (`prompt_correlations.terminal_key`, then the envelope by primary key, at most 64 Runs);
+  `committed_envelopes` is never scanned.
+- `searchConversationEntries` runs `LIKE ... ESCAPE ... LIMIT` over visible user and assistant
+  text of active conversations as one sequential pass (`NOT INDEXED`; the default plan fetches
+  rows at random, which is several times slower on a cold page cache). ASCII folds in SQL; a
+  needle with cased non-ASCII letters is matched in JavaScript over the same rows through a
+  cursor. The live service still confirms each candidate with `conversationMatches` and builds
+  the snippet.
+- Migration v15 (metadata only, no row is read or rewritten): replaces the append-only trigger
+  with an O(1) guard (revision strictly increases, byte length never shrinks, first 64
+  characters unchanged, plus every old column check) and creates `task_context_usage`. It takes
+  about 70 ms on the owner's database.
+
+### Measured
+
+Copy of the owner's 1.02 GB database (115,628 entries, 571,680 envelopes), Node 26.8, APFS
+clone per scenario. Other agents' benchmarks and an ffmpeg encode were running (load average
+4-9 on 10 cores), so absolute numbers are pessimistic and noisy; the stream rows interleave
+before and after runs. "Before" is `45ac713`. Only counts and timings are printed.
+
+| Scenario | Before | After |
+|---|---|---|
+| Open + verify, clean shutdown | 12.8 to 13.0 s (3 runs) | 6 ms (v15 migration, once: 70 ms) |
+| Open + verify, unclean shutdown | 11.9 to 17.4 s (3 runs) | 8.7 s quiet, 12 to 23 s under load (same full verification, streamed, one scan instead of two) |
+| First open of the largest task (60,984 entries): restore + context tokens + first page | 626 to 1,510 ms (context tokens 621 to 1,498 ms) | 5 to 12 ms (context tokens about 1 ms) |
+| Search, common word / rare word | 727 to 950 ms / 712 to 787 ms | 29 ms / 27 ms |
+| 2,000 chunks of 1 to 4 characters, one every ~5 ms: total main-thread persistence time (8 runs, median and range) | 1,710 ms (1,178 to 2,298) | 102 ms (86 to 127): 16.7x less |
+| Same, CPU time inside persistence | 1,493 ms | 102 ms |
+| Per call p99 / per flush p99 (worst run, worst single flush) | 3.2 ms / none | 0.46 ms / 1.3 ms (2.6 ms, 4.9 ms) |
+| Envelope rows for the message | 2,001 | 115 |
+| Database bytes added for the message | 3.15 MB | 0.21 MB: 15x less |
+
+On a quieter machine the stream total was 54 to 64 ms (profile runs). Reproduce with
+`node scripts/bench/persistence-bench.mjs --db <copy> --repeat 3`; build the pre-change commit in
+a separate directory to compare.
+
+### Known behavior differences and follow-ups
+
+- Exact replay of a covered, non-last chunk key is denied as stale instead of reported as a
+  duplicate (see the envelope-shape bullet above). Nothing in-process replays keys.
+- Search folds ASCII case in SQL; cased non-ASCII letters take the cursor path. Case folding that
+  maps non-ASCII text to ASCII (for example the Kelvin sign) is not matched by an ASCII needle.
+- Unclean-shutdown verification is unchanged work (about 9 to 20 s on this database) and still
+  blocks startup. Moving it after first paint, or limiting history decode to rows newer than the
+  last clean checkpoint, is a separate decision.
+- Each flush still rewrites the whole entry row, so WAL bytes grow with the entry's text. A very
+  long answer (hundreds of KiB) costs a few MiB of WAL per second; chunked text storage would
+  remove that and is out of scope here.
+- A later compaction of old `committed_envelopes` rows is compatible: nothing reads them on the
+  hot path any more, and the context-token value no longer depends on them.
+
