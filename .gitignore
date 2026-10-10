@@ -19,3 +19,6 @@ design-qa*.md
 security_best_practices_report.md
 AGENTS.md
 docs/14-CURSOR-HANDOFF-*.md
+
+# Local working notes (owner machine details); never published.
+tasks/
