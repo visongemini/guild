@@ -1065,7 +1065,7 @@ Decision
   receive only their own key. The Anthropic registry and `noteAnthropicModels` plumbing, the Anthropic
   header allowlist branch and the Anthropic-specific thinking-signature rule are removed; a thinking block
   is kept only for the source that produced it.
-- One way. A task that is routed (`task_metadata.routed_at` set, or its process is routed) can no longer
+- One way (superseded by D-062). A task that is routed (`task_metadata.routed_at` set, or its process is routed) can no longer
   use a Claude subscription model. The picker shows the Claude rows disabled under one line, the main
   process refuses the selection with the reason `claude_locked`, a Claude choice stored by an earlier build
   (or the Claude global default) no longer counts for such a task, and a turn that would start on a
