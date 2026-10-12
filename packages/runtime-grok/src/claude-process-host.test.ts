@@ -4,12 +4,14 @@ import { chmod, constants, copyFile, mkdir, mkdtemp, readFile, realpath, rm, sym
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
+import { readdir } from "node:fs/promises";
 import {
   CLAUDE_ADAPTER_PACKAGE_NAME,
   pinClaudeAdapter,
   type ClaudeAdapterPin,
 } from "./adapter-pin.js";
 import { CLAUDE_ENGINE_PROFILE, CLAUDE_ENVIRONMENT_POLICY_VERSION } from "./engine-profile.js";
+import { pruneStalePinnedExecutables } from "./executable-pin.js";
 import {
   EngineProcessHost,
   GrokProcessHostError,
@@ -259,5 +261,22 @@ describe("Claude engine on the process host (PC-ENG-001, PC-ENG-002)", { concurr
       assert.equal(cause.failure.type === "preflight_failure" && cause.failure.code, "hash_mismatch");
       return true;
     });
+  });
+  it("lets one staging root hold the Grok and the node pin: pruning keeps every pin still in use", async () => {
+    const host = new EngineProcessHost(hostOptions());
+    try {
+      await bounded(host.start());
+    } finally {
+      await bounded(host.stop());
+    }
+    const stage = `.grok-pin-${nodeSha256}`;
+    const otherPin = `.grok-pin-${"1".repeat(64)}`;
+    await mkdir(join(stagingRoot, otherPin), { mode: 0o700 });
+    assert.equal((await readdir(stagingRoot)).includes(stage), true);
+    // The Grok warm-up passes its own pin and the node pin; only the unrelated stage is removed.
+    assert.equal(await pruneStalePinnedExecutables(stagingRoot, ["2".repeat(64), nodeSha256]), 1);
+    assert.deepEqual((await readdir(stagingRoot)).filter((name) => name.startsWith(".grok-pin-")), [stage]);
+    // A single string still works as before and drops the node stage when it is not the kept pin.
+    assert.equal(await pruneStalePinnedExecutables(stagingRoot, "2".repeat(64)), 1);
   });
 });

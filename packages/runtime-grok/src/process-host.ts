@@ -1,8 +1,7 @@
 import { Buffer } from "node:buffer";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { lstat, realpath } from "node:fs/promises";
-import { homedir } from "node:os";
-import { isAbsolute, join } from "node:path";
+import { isAbsolute } from "node:path";
 import { performance } from "node:perf_hooks";
 import type {
   GuildGrokPermissionMode,
