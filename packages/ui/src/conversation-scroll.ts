@@ -30,12 +30,23 @@ export function scrollTopAfterPrepend(
   return Math.max(0, previousScrollTop + Math.max(0, nextScrollHeight - previousScrollHeight));
 }
 
+/**
+ * Retained history survives a newer window; incoming items replace retained ones by identity.
+ * A `permission` item is the exception: it exists in a task projection only while the request is
+ * pending, and main appends every pending request to every projection whatever its page range
+ * (its sequence is only an ordering hint). So a retained permission item that the incoming window
+ * does not carry has been decided and is dropped; every other kind outside the incoming page stays.
+ */
 export function mergeTimelineWindows(
   retained: readonly TimelineItemProjection[],
   incoming: readonly TimelineItemProjection[],
 ): readonly TimelineItemProjection[] {
   const merged = new Map<string, TimelineItemProjection>();
-  for (const item of retained) merged.set(timelineIdentity(item), item);
+  const incomingIdentities = new Set(incoming.map(timelineIdentity));
+  for (const item of retained) {
+    if (item.kind === "permission" && !incomingIdentities.has(timelineIdentity(item))) continue;
+    merged.set(timelineIdentity(item), item);
+  }
   for (const item of incoming) merged.set(timelineIdentity(item), item);
   return Object.freeze([...merged.values()].sort((left, right) =>
     left.sequence - right.sequence ||
