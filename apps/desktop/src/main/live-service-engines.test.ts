@@ -29,6 +29,7 @@ import {
   type XaiExtensionOutcome,
 } from "@guild/runtime-grok";
 import { ClaudeEngineIntegrityError, ClaudeLocatorError } from "./claude-locator.js";
+import type { GitCheckpointPort } from "./git-checkpoints.js";
 import { toDesktopIpcFailure } from "./workspace-folder.js";
 import type { BrowserMcpPort, ModelRouterHostPort, RoutedModelInfo } from "./engine-ports.js";
 import { openGuildPersistence, type GuildPersistence } from "@guild/persistence";
@@ -939,6 +940,62 @@ describe("dual engine orchestration [PC-ENG-001, PC-MODEL-001]", () => {
     await h.completed(2);
     assert.deepEqual(h.world.adapters.at(-1)!.prompts, ["again"]);
     assert.equal(h.world.inputs.at(-1)!.extraEnvironment?.["ANTHROPIC_BASE_URL"], undefined);
+  });
+
+  it("never writes a prompt to a process of the wrong mode, even when the selection changes under a started turn [D-062]", async () => {
+    const router = new FakeRouterHost([DEEPSEEK]);
+    let store!: GuildPersistence;
+    let flip: (() => void) | undefined;
+    // The start checkpoint is the one await between the send's gating and the prompt: the selection changes there.
+    const unavailable = { status: "unavailable", reason: "git_failed" } as const;
+    const checkpoints: GitCheckpointPort = {
+      capture: async () => { flip?.(); return unavailable; },
+      summarize: async () => unavailable,
+      fileDiff: async () => unavailable,
+      planRewind: async () => unavailable,
+      restore: async () => ({ restored: [], removed: [], failed: [] }),
+    };
+    const h = await harness({ modelRouterHost: router, checkpoints }, {}, (path) => {
+      store = openGuildPersistence({ path });
+      return store;
+    });
+    const task = await h.service.createTask(h.workspaceId, undefined, "claude");
+    const taskId = task.task.taskId;
+    await h.send(taskId, "native");
+    await h.completed();
+    await h.idle();
+    assert.equal((await h.service.setTaskRuntimeSettings({ taskId, model: "deepseek-v4-flash", reasoningEffort: null, contextWindow: null })).status, "applied");
+    await h.idle();
+
+    // The routed process is live; the stored choice becomes a Claude model under the started turn. The routed
+    // session offers that model too (its list holds Claude's own), so only the mode check keeps the prompt back.
+    flip = () => {
+      flip = undefined;
+      store.saveTaskRuntimeSettings({
+        taskId, expectedRevision: store.loadTaskRuntimeSettings(taskId)?.revision ?? 0,
+        modelId: "opus", reasoningEffort: null, contextWindow: null,
+      });
+    };
+    await h.send(taskId, "second");
+    const failed = await eventuallyValue(async () => {
+      const view = (await h.service.bootstrap()).activeTask;
+      return view?.timeline.some((item) =>
+        item.kind === "error" && /could not switch to the model|未能切换到这个任务选择的模型/u.test(item.text)) === true
+        ? view
+        : undefined;
+    });
+    assert.equal(failed.task.activeRunState, "failed");
+    assert.deepEqual(h.world.adapters[1]!.prompts, [], "the turn never reached the routed process with a Claude selection");
+    assert.ok(!h.world.adapters[1]!.log.includes("config:model=opus"), "and the Claude model was not even applied to it");
+
+    // The stored choice is what the next turn follows: the process is replaced by a native one first.
+    await h.idle();
+    await h.send(taskId, "third");
+    await h.completed(2);
+    assert.equal(h.world.adapters.length, 3);
+    assert.equal(h.world.inputs.at(-1)!.extraEnvironment?.["ANTHROPIC_BASE_URL"], undefined);
+    assert.deepEqual(h.world.adapters.at(-1)!.prompts, ["third"]);
+    assert.deepEqual(h.world.adapters[1]!.prompts, []);
   });
 
   it("refuses the prompt with model_selection_failed when the session cannot take the selected Claude model [docs/20 3.3]", async () => {
