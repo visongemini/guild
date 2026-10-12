@@ -2543,6 +2543,7 @@ export function GuildApp({ api }: GuildAppProps) {
               key={activeTask.task.taskId}
               task={activeTask.continuousTask}
               locale={projection.locale}
+              engine={activeEngine}
               running={running}
               busy={busy}
               onAction={(action) => void setContinuousTask(action)}
@@ -4030,6 +4031,7 @@ export const Timeline = memo(function Timeline({ items, pendingUserText, runStat
       highlighted={highlightedSequence === sequence}
       settled={index < settledBefore && entries.every(isSettledTimelineItem)}
       locale={locale}
+      engine={engine}
       handlers={handlers}
       lastTurn={single !== undefined && single.entryId === lastAnswerEntryId}
       turnMeta={single === undefined ? undefined : turnTook.get(single.entryId)}
@@ -4098,6 +4100,7 @@ type TimelineGroupRowProps = {
   readonly highlighted: boolean;
   readonly settled: boolean;
   readonly locale: GuildLocale;
+  readonly engine: GuildEngine;
   readonly handlers: TimelineHandlers;
   /** The newest answer: its footer stays visible instead of waiting for hover. */
   readonly lastTurn: boolean;
@@ -4110,7 +4113,7 @@ type TimelineGroupRowProps = {
   readonly card: RunCardData | undefined;
 };
 
-const TimelineGroupRow = memo(function TimelineGroupRow({ group, sequence, highlighted, settled, locale, handlers, lastTurn, turnMeta, interruptedUser, canRetry, completionTask, card }: TimelineGroupRowProps) {
+const TimelineGroupRow = memo(function TimelineGroupRow({ group, sequence, highlighted, settled, locale, engine, handlers, lastTurn, turnMeta, interruptedUser, canRetry, completionTask, card }: TimelineGroupRowProps) {
   const className = [
     highlighted ? "guild-timeline-group search-highlight" : "guild-timeline-group",
     settled ? "settled" : "",
@@ -4123,12 +4126,13 @@ const TimelineGroupRow = memo(function TimelineGroupRow({ group, sequence, highl
   >
     {group.type === "activity"
       ? <>
-          <ActivityGroupView items={group.items} locale={locale} />
-          {card !== undefined && <div className="guild-turn-slot"><RunCardView card={card} locale={locale} onViewRunDiff={handlers.onViewRunDiff} onRewind={handlers.onRewind} /></div>}
+          <ActivityGroupView items={group.items} locale={locale} engine={engine} />
+          {card !== undefined && <div className="guild-turn-slot"><RunCardView card={card} locale={locale} engine={engine} onViewRunDiff={handlers.onViewRunDiff} onRewind={handlers.onRewind} /></div>}
         </>
       : <TimelineItem
           item={group.item}
           locale={locale}
+          engine={engine}
           onOpenExternal={handlers.onOpenExternal}
           onPermissionDecision={handlers.onPermissionDecision}
           onBranch={handlers.onBranch}
@@ -4149,6 +4153,7 @@ const TimelineGroupRow = memo(function TimelineGroupRow({ group, sequence, highl
   previous.highlighted === next.highlighted &&
   previous.settled === next.settled &&
   previous.locale === next.locale &&
+  previous.engine === next.engine &&
   previous.handlers === next.handlers &&
   previous.lastTurn === next.lastTurn &&
   previous.turnMeta === next.turnMeta &&
@@ -4176,11 +4181,13 @@ type ToolItem = Extract<TimelineItemProjection, { readonly kind: "tool" }>;
 /** At most this many tool kinds get their own count in the summary line; the rest are summed. */
 const ACTIVITY_STAT_LIMIT = 4;
 
-export const ActivityGroupView = memo(function ActivityGroupView({ items, locale }: {
+export const ActivityGroupView = memo(function ActivityGroupView({ items, locale, engine = "grok" }: {
   readonly items: readonly TimelineItemProjection[];
   readonly locale: GuildLocale;
+  /** Engine of the task: the tool output notes name its runtime. Grok when absent. */
+  readonly engine?: GuildEngine;
 }) {
-  const messages = messagesFor(locale);
+  const messages = messagesFor(locale, engine);
   // Collapsed groups hold no thought text or tool output in the DOM; the body mounts on open.
   const [open, setOpen] = useState(false);
   const thoughts = items.filter((item): item is ThoughtItem => item.kind === "thought");
@@ -4236,11 +4243,12 @@ export const ActivityGroupView = memo(function ActivityGroupView({ items, locale
     </summary>
     {open && <div className="guild-activity-body">
       {thoughts.length > 0 && <ThoughtCopy thoughts={thoughts} />}
-      {tools.length > 0 && <div className="guild-tool-list">{tools.map((item) => <ToolRow item={item} locale={locale} key={item.entryId} />)}</div>}
+      {tools.length > 0 && <div className="guild-tool-list">{tools.map((item) => <ToolRow item={item} locale={locale} engine={engine} key={item.entryId} />)}</div>}
     </div>}
   </details>;
 }, (previous, next) =>
   previous.locale === next.locale &&
+  previous.engine === next.engine &&
   previous.items.length === next.items.length &&
   previous.items.every((item, index) => item === next.items[index]));
 
@@ -4349,11 +4357,13 @@ function ToolKindIcon({ kind, size }: { readonly kind: AcpToolKind; readonly siz
   }
 }
 
-export const ToolRow = memo(function ToolRow({ item, locale }: {
+export const ToolRow = memo(function ToolRow({ item, locale, engine = "grok" }: {
   readonly item: Extract<TimelineItemProjection, { readonly kind: "tool" }>;
   readonly locale: GuildLocale;
+  /** Engine of the task: the terminal-output note names its session. Grok when absent. */
+  readonly engine?: GuildEngine;
 }) {
-  const messages = messagesFor(locale);
+  const messages = messagesFor(locale, engine);
   // Tool output can be large; its text is mounted only while the details are open.
   const [detailsOpen, setDetailsOpen] = useState(false);
   const images = item.content.filter(
@@ -4427,9 +4437,11 @@ export const ToolRow = memo(function ToolRow({ item, locale }: {
 });
 
 /** Exported for tests. */
-export const TimelineItem = memo(function TimelineItem({ item, locale, onOpenExternal, onPermissionDecision, onBranch, onRetryToDraft, onOpenRuntimeDiagnostics, interruptedUser, canRetry, lastTurn = false, turnMeta, card, onViewRunDiff, onRewind }: {
+export const TimelineItem = memo(function TimelineItem({ item, locale, engine = "grok", onOpenExternal, onPermissionDecision, onBranch, onRetryToDraft, onOpenRuntimeDiagnostics, interruptedUser, canRetry, lastTurn = false, turnMeta, card, onViewRunDiff, onRewind }: {
   readonly item: TimelineItemProjection;
   readonly locale: GuildLocale;
+  /** Engine of the task: recovery and Steer notices name its runtime. Grok when absent. */
+  readonly engine?: GuildEngine;
   readonly canRetry: boolean;
   readonly lastTurn?: boolean;
   readonly turnMeta?: string;
@@ -4447,7 +4459,7 @@ export const TimelineItem = memo(function TimelineItem({ item, locale, onOpenExt
   readonly onOpenRuntimeDiagnostics: () => void;
   readonly interruptedUser?: TimelineItemProjection;
 }) {
-  const messages = messagesFor(locale);
+  const messages = messagesFor(locale, engine);
   if (item.kind === "permission") {
     return <PermissionCard item={item} messages={messages} onDecision={onPermissionDecision} />;
   }
@@ -4518,7 +4530,7 @@ export const TimelineItem = memo(function TimelineItem({ item, locale, onOpenExt
         lastTurn={lastTurn}
         meta={turnMeta}
         onBranch={onBranch}
-        slot={card === undefined ? undefined : <RunCardView card={card} locale={locale} onViewRunDiff={onViewRunDiff} onRewind={onRewind} />}
+        slot={card === undefined ? undefined : <RunCardView card={card} locale={locale} engine={engine} onViewRunDiff={onViewRunDiff} onRewind={onRewind} />}
       />
     )}
   </article>;
@@ -4551,15 +4563,17 @@ function MessageActions({ item, messages, canRetry, onBranch, onRetryToDraft }: 
 const NO_RUN_DIFF = () => undefined;
 
 /** The changed-files card of a run, wired to the timeline's handlers. */
-function RunCardView({ card, locale, onViewRunDiff, onRewind }: {
+function RunCardView({ card, locale, engine, onViewRunDiff, onRewind }: {
   readonly card: RunCardData;
   readonly locale: GuildLocale;
+  /** Engine of the task: the Rewind note names its runtime. */
+  readonly engine: GuildEngine;
   readonly onViewRunDiff?: ((runId: RunId, path?: string) => void) | undefined;
   readonly onRewind?: ((runId: RunId, trigger: HTMLElement) => void) | undefined;
 }) {
   return <RunChangesCard
     data={card}
-    messages={messagesFor(locale)}
+    messages={messagesFor(locale, engine)}
     onViewDiff={onViewRunDiff ?? NO_RUN_DIFF}
     onRewind={onRewind ?? NO_RUN_DIFF}
   />;

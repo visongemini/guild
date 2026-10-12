@@ -1,4 +1,4 @@
-import type { GuildLocale, TaskViewProjection } from "@guild/contracts";
+import type { GuildEngine, GuildLocale, TaskViewProjection } from "@guild/contracts";
 import { ArrowsClockwiseIcon as ArrowsClockwise } from "@phosphor-icons/react/ArrowsClockwise";
 import { CaretRightIcon as CaretRight } from "@phosphor-icons/react/CaretRight";
 import { CheckIcon as Check } from "@phosphor-icons/react/Check";
@@ -6,14 +6,16 @@ import { InfoIcon as Info } from "@phosphor-icons/react/Info";
 import { messagesFor } from "./locales.js";
 import type { ContinuousFooter } from "./continuous-display.js";
 
-export function ContinuousTaskCard({ task, locale, running, busy, onAction }: {
+export function ContinuousTaskCard({ task, locale, engine = "grok", running, busy, onAction }: {
   readonly task: NonNullable<TaskViewProjection["continuousTask"]>;
   readonly locale: GuildLocale;
+  /** Engine of the task: the stop reasons name its runtime. Grok when absent. */
+  readonly engine?: GuildEngine;
   readonly running: boolean;
   readonly busy: boolean;
   readonly onAction: (action: "pause" | "resume" | "stop") => void;
 }) {
-  const messages = messagesFor(locale);
+  const messages = messagesFor(locale, engine);
   const status = task.status === "active"
     ? task.phase === "work" ? messages.continuousWorkPhase : messages.continuousAuditPhase
     : task.status === "paused" ? messages.continuousPaused

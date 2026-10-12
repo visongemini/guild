@@ -1627,6 +1627,11 @@ const CLAUDE_ZH = (base: GuildMessages): Partial<GuildMessages> => ({
     ? "Claude Code 暂时不可用，稍后再试"
     : base.rewindDisabledReason(reason),
   rewindRefused: (reason) => base.rewindRefused(reason).replaceAll("Grok", "Claude Code"),
+  rewindRuntimeRestoreHeading: (count) => base.rewindRuntimeRestoreHeading(count).replaceAll("Grok", "Claude Code"),
+  interjectionReason: (reason) => base.interjectionReason(reason).replaceAll("Grok", "Claude Code"),
+  steerNotice: (kind, reason) => base.steerNotice(kind, reason).replaceAll("Grok", "Claude Code"),
+  // Why a continuous task stopped (runtime_unavailable, empty_runtime_response, transport_interrupted name the runtime).
+  continuousStopReason: (reason) => base.continuousStopReason(reason).replaceAll("Grok", "Claude Code"),
 });
 
 const CLAUDE_EN = (base: GuildMessages): Partial<GuildMessages> => ({
@@ -1667,6 +1672,11 @@ const CLAUDE_EN = (base: GuildMessages): Partial<GuildMessages> => ({
     ? "Claude Code is unavailable right now. Try again in a moment"
     : base.rewindDisabledReason(reason),
   rewindRefused: (reason) => base.rewindRefused(reason).replaceAll("Grok", "Claude Code"),
+  rewindRuntimeRestoreHeading: (count) => base.rewindRuntimeRestoreHeading(count).replaceAll("Grok", "Claude Code"),
+  interjectionReason: (reason) => base.interjectionReason(reason).replaceAll("Grok", "Claude Code"),
+  steerNotice: (kind, reason) => base.steerNotice(kind, reason).replaceAll("Grok", "Claude Code"),
+  // Why a continuous task stopped (runtime_unavailable, empty_runtime_response, transport_interrupted name the runtime).
+  continuousStopReason: (reason) => base.continuousStopReason(reason).replaceAll("Grok", "Claude Code"),
 });
 
 const CLAUDE_LOCALES: Readonly<Record<GuildLocale, GuildMessages>> = Object.freeze({
