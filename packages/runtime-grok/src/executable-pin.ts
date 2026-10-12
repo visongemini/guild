@@ -651,6 +651,25 @@ function assertSpawnSafe(stats: BigIntStats): void {
   }
 }
 
+/**
+ * Whether `path` itself (links are not followed) is a regular executable file that starts with a
+ * Mach-O magic number. A cheap check for binaries that are located but not copied (PC-ENG-002).
+ */
+export async function isMachOExecutableFile(path: string): Promise<boolean> {
+  if (!isAbsolute(path)) return false;
+  let handle: FileHandle | undefined;
+  try {
+    handle = await openReadNoFollow(path);
+    assertRegularExecutable(await handle.stat({ bigint: true }));
+    await assertMachO(handle);
+    return true;
+  } catch {
+    return false;
+  } finally {
+    await closeQuietly(handle);
+  }
+}
+
 async function assertMachO(handle: FileHandle): Promise<void> {
   const header = Buffer.alloc(4);
   try {

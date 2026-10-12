@@ -8,6 +8,18 @@ import type {
   GuildGrokPermissionMode,
   GuildGrokStartupSettings,
 } from "@guild/contracts";
+import { AdapterPinError, type AdapterPinFailureCode } from "./adapter-pin.js";
+import {
+  CLAUDE_ENVIRONMENT_POLICY_VERSION,
+  GROK_ENGINE_PROFILE,
+  GROK_ENVIRONMENT_POLICY,
+  GROK_ENVIRONMENT_POLICY_VERSION,
+  buildEngineEnvironment,
+  planGrokLaunchWithArgv,
+  type EngineLaunch,
+  type EngineLaunchPlan,
+  type EngineProfile,
+} from "./engine-profile.js";
 import {
   ExecutablePinError,
   pinExecutable,
@@ -16,12 +28,11 @@ import {
   type PinnedExecutable,
   type PinnedExecutableCleanup,
 } from "./executable-pin.js";
-import {
-  GROK_ACP_PRODUCTION_ARGV,
-  createGrokAcpProductionArgv,
-} from "./grok-acp-profile.js";
 
-export type ProcessHostPreflightCode = ExecutablePinFailureCode | "working_directory_not_absolute";
+export type ProcessHostPreflightCode =
+  | ExecutablePinFailureCode
+  | AdapterPinFailureCode
+  | "working_directory_not_absolute";
 
 export type ProcessGroupSignalEvidence = {
   readonly signal: "SIGTERM" | "SIGKILL";
@@ -57,7 +68,7 @@ export class GrokProcessHostError extends Error {
   }
 }
 
-export const PROCESS_ENVIRONMENT_POLICY_VERSION = "macos-posix-v3";
+export const PROCESS_ENVIRONMENT_POLICY_VERSION = GROK_ENVIRONMENT_POLICY_VERSION;
 
 export type ProcessStartReceipt = {
   readonly type: "process_started";
@@ -69,7 +80,9 @@ export type ProcessStartReceipt = {
   readonly shell: false;
   readonly stdio: "piped";
   readonly workingDirectory: string;
-  readonly environmentPolicyVersion: typeof PROCESS_ENVIRONMENT_POLICY_VERSION;
+  readonly environmentPolicyVersion:
+    | typeof PROCESS_ENVIRONMENT_POLICY_VERSION
+    | typeof CLAUDE_ENVIRONMENT_POLICY_VERSION;
 };
 
 export type ProcessWriteReceipt = {
@@ -147,6 +160,18 @@ export type GrokProcessHostOptions = {
   readonly stopGraceMs?: number;
 };
 
+/** Everything the owned-process core needs besides the engine launch plan. */
+type ProcessHostCoreOptions = Omit<GrokProcessHostOptions, "runtimeSettings">;
+
+/**
+ * PC-ENG-001: the engine-neutral host. `executablePath` / `expectedSha256` name the one Mach-O
+ * binary that is pinned and spawned: the engine itself for Grok, `node` for the Claude adapter.
+ */
+export type EngineProcessHostOptions = ProcessHostCoreOptions & {
+  readonly profile: EngineProfile;
+  readonly launch: EngineLaunch;
+};
+
 /** @internal Only the non-root package testing entry may construct this seam. */
 export type InternalProcessHostTestConfiguration = {
   readonly fixtureArgs?: readonly string[];
@@ -173,41 +198,12 @@ const DEFAULT_KILL_GRACE_MS = 2_000;
 const PRODUCTION_CLEANUP_DEADLINE_MS = 500;
 const LATE_CLEANUP_LISTENER_RETENTION_MS = 1_000;
 const SHA256_PATTERN = /^[a-fA-F0-9]{64}$/u;
-const MACOS_FALLBACK_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
 const STOP_POLL_MS = 25;
-const ALLOWED_ENVIRONMENT_KEYS = new Set([
-  "PATH", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "TMP", "TEMP",
-  "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
-  "http_proxy", "https_proxy", "all_proxy", "no_proxy",
-  "SSL_CERT_FILE", "SSL_CERT_DIR", "SSH_AUTH_SOCK",
-]);
-const ENVIRONMENT_DENYLIST = new Set([
-  "NODE_OPTIONS", "NODE_PATH", "ELECTRON_RUN_AS_NODE", "BASH_ENV", "ENV", "ZDOTDIR",
-]);
-/**
- * Fixed Guild-owned values, never inherited from the parent. OpenViking memory is for Claude
- * Code and Codex only (owner decision, 2026-10-10), but grok imports the OpenViking Claude
- * plugin. These values turn every plugin hook into a no-op (no recall, no capture), point its
- * config files at nothing, and point its MCP proxy at a closed local port, so a Guild session
- * can neither read nor write the memory store.
- */
-const GUILD_OWNED_CHILD_ENVIRONMENT = Object.freeze({
-  OPENVIKING_MEMORY_ENABLED: "0",
-  OPENVIKING_CONFIG_FILE: "/dev/null",
-  OPENVIKING_CLI_CONFIG_FILE: "/dev/null",
-  OPENVIKING_URL: "http://127.0.0.1:9",
-  OPENVIKING_BASE_URL: "http://127.0.0.1:9",
-} as const);
-const DISABLED_EXTERNAL_INSTRUCTION_IMPORTS = Object.freeze([
-  "GROK_CLAUDE_AGENTS_ENABLED",
-  "GROK_CLAUDE_RULES_ENABLED",
-  "GROK_CURSOR_AGENTS_ENABLED",
-  "GROK_CURSOR_RULES_ENABLED",
-] as const);
 
 class ProcessHostCore {
   readonly executablePath: string;
   readonly expectedSha256: string;
+  private readonly plan: EngineLaunchPlan;
   private readonly argv: readonly string[];
   private readonly workingDirectoryInput: string;
   private readonly stagingRoot: string;
@@ -243,7 +239,7 @@ class ProcessHostCore {
   private cleanupEvidenceOperation: Promise<ProcessCleanupEvidence> | undefined;
   private terminalListenersFinished = false;
 
-  constructor(options: GrokProcessHostOptions, lifecycle: ProcessHostLifecycle, argv: readonly string[]) {
+  constructor(options: ProcessHostCoreOptions, lifecycle: ProcessHostLifecycle, plan: EngineLaunchPlan) {
     this.executablePath = options.executablePath;
     this.workingDirectoryInput = options.workingDirectory;
     this.stagingRoot = options.stagingRoot;
@@ -251,7 +247,8 @@ class ProcessHostCore {
       throw new TypeError("expectedSha256 must be exactly 64 hexadecimal characters");
     }
     this.expectedSha256 = options.expectedSha256.toLowerCase();
-    this.argv = Object.freeze([...argv]);
+    this.plan = plan;
+    this.argv = Object.freeze([...plan.argv]);
     for (const argument of this.argv) {
       if (typeof argument !== "string" || argument.includes("\0")) {
         throw new TypeError("process arguments must be NUL-free strings");
@@ -262,7 +259,9 @@ class ProcessHostCore {
     this.stopGraceMs = positiveSafeInteger(options.stopGraceMs ?? DEFAULT_STOP_GRACE_MS, "stopGraceMs");
     this.killGraceMs = positiveSafeInteger(options.killGraceMs ?? DEFAULT_KILL_GRACE_MS, "killGraceMs");
     this.lifecycle = lifecycle;
-    this.redactValues = Object.freeze([...(options.redactValues ?? [])].filter((value) => value.length > 0));
+    this.redactValues = Object.freeze(
+      [...(options.redactValues ?? []), ...plan.redactValues].filter((value) => value.length > 0),
+    );
     this.stderrCollector = new BoundedStderrCollector(this.maxStderrBytes, this.redactValues, (event) => this.emit(event));
     void this.termination.promise.then(() => undefined, () => undefined);
   }
@@ -345,7 +344,7 @@ class ProcessHostCore {
     let environment: Readonly<Record<string, string>>;
     try {
       workingDirectory = await resolveWorkingDirectory(this.workingDirectoryInput);
-      environment = buildChildEnvironment(this.baseEnvironment);
+      environment = this.plan.buildEnvironment(this.baseEnvironment);
     } catch (cause) {
       return this.failPreflight(cause);
     }
@@ -365,6 +364,7 @@ class ProcessHostCore {
     }
     try {
       await pinned.verifyForSpawn();
+      await this.plan.verifyBeforeSpawn?.();
     } catch (cause) {
       const cleanup = await this.cleanupPin();
       return this.failPreflight(cause, cleanup);
@@ -410,7 +410,7 @@ class ProcessHostCore {
           shell: false,
           stdio: "piped",
           workingDirectory,
-          environmentPolicyVersion: PROCESS_ENVIRONMENT_POLICY_VERSION,
+          environmentPolicyVersion: this.plan.environmentPolicyVersion as ProcessStartReceipt["environmentPolicyVersion"],
         };
         this.emit({ type: "process_started", receipt });
         resolve(receipt);
@@ -775,18 +775,20 @@ export function createInternalProcessHostForTesting(
     delay: configuration.delay ?? PRODUCTION_LIFECYCLE.delay,
     monotonicNow: configuration.monotonicNow ?? PRODUCTION_LIFECYCLE.monotonicNow,
     cleanupDeadlineMs,
-  }), ["agent", "stdio", ...(configuration.fixtureArgs ?? [])]);
+  }), planGrokLaunchWithArgv(["agent", "stdio", ...(configuration.fixtureArgs ?? [])]));
 }
 
-/** Owned, independently pinned official process boundary (PC-SEC-001, PC-TRN-001/002/003, D-008). */
-export class GrokProcessHost {
+/**
+ * Owned, independently pinned process boundary for any engine (PC-SEC-001, PC-TRN-001/002/003,
+ * D-008, PC-ENG-001). The profile decides argv, environment and pre-spawn checks.
+ */
+export class EngineProcessHost {
   private readonly core: ProcessHostCore;
+  readonly profile: EngineProfile;
 
-  constructor(options: GrokProcessHostOptions) {
-    const argv = options.runtimeSettings === undefined
-      ? GROK_ACP_PRODUCTION_ARGV
-      : createGrokAcpProductionArgv(options.runtimeSettings);
-    this.core = new ProcessHostCore(options, PRODUCTION_LIFECYCLE, argv);
+  constructor(options: EngineProcessHostOptions) {
+    this.profile = options.profile;
+    this.core = new ProcessHostCore(options, PRODUCTION_LIFECYCLE, options.profile.planLaunch(options.launch));
   }
 
   get executablePath(): string {
@@ -822,43 +824,23 @@ export class GrokProcessHost {
   }
 }
 
-export function buildChildEnvironment(
-  baseEnvironment: Readonly<Record<string, string | undefined>> = Object.freeze(Object.create(null) as Record<string, string>),
-): Readonly<Record<string, string>> {
-  const result = Object.create(null) as Record<string, string>;
-  for (const [key, value] of Object.entries(baseEnvironment)) {
-    if (key.length === 0 || key.includes("\0") || key.includes("=") || (value !== undefined && value.includes("\0"))) {
-      throw new TypeError("child environment contains an invalid key or value");
-    }
-    if (value === undefined || isDeniedEnvironmentKey(key) || !ALLOWED_ENVIRONMENT_KEYS.has(key)) {
-      continue;
-    }
-    result[key] = value;
+/** The official Grok process: the Grok profile on the engine-neutral host. */
+export class GrokProcessHost extends EngineProcessHost {
+  constructor(options: GrokProcessHostOptions) {
+    const { runtimeSettings, ...core } = options;
+    super({
+      ...core,
+      profile: GROK_ENGINE_PROFILE,
+      launch: { engine: "grok", ...(runtimeSettings === undefined ? {} : { runtimeSettings }) },
+    });
   }
-  const home = homedir();
-  if (home.includes("\0")) {
-    throw new TypeError("child environment contains an invalid key or value");
-  }
-  result.HOME = home;
-  result.PATH = mergeExecutableSearchPath(result.PATH, home);
-  for (const key of DISABLED_EXTERNAL_INSTRUCTION_IMPORTS) {
-    result[key] = "false";
-  }
-  Object.assign(result, GUILD_OWNED_CHILD_ENVIRONMENT);
-  return Object.freeze(result);
 }
 
-function mergeExecutableSearchPath(environmentPath: string | undefined, homeDirectory: string): string {
-  const directories = [
-    environmentPath,
-    join(homeDirectory, ".grok", "bin"),
-    join(homeDirectory, ".local", "bin"),
-    MACOS_FALLBACK_PATH,
-  ]
-    .flatMap((value) => value?.split(":") ?? [])
-    .map((value) => value.trim())
-    .filter((value) => value.length > 0);
-  return [...new Set(directories)].join(":");
+/** The Grok environment policy; kept as the stable entry for callers that spawn grok themselves. */
+export function buildChildEnvironment(
+  baseEnvironment?: Readonly<Record<string, string | undefined>>,
+): Readonly<Record<string, string>> {
+  return buildEngineEnvironment(GROK_ENVIRONMENT_POLICY, baseEnvironment);
 }
 
 class BoundedStderrCollector {
@@ -950,7 +932,7 @@ function normalizePreflightFailure(cause: unknown): Extract<ProcessHostFailure, 
   if (cause instanceof GrokProcessHostError && cause.failure.type === "preflight_failure") {
     return cause.failure;
   }
-  if (cause instanceof ExecutablePinError) {
+  if (cause instanceof ExecutablePinError || cause instanceof AdapterPinError) {
     return { type: "preflight_failure", code: cause.code, message: cause.message };
   }
   if (cause !== null && typeof cause === "object" && (cause as { readonly type?: unknown }).type === "preflight_failure") {
@@ -965,10 +947,6 @@ function spawnFailure(): Extract<ProcessHostFailure, { type: "spawn_failure" }> 
 
 function writeFailure(writeId: number, message: string): Extract<ProcessHostFailure, { type: "write_failure" }> {
   return { type: "write_failure", writeId, message };
-}
-
-function isDeniedEnvironmentKey(key: string): boolean {
-  return key.startsWith("DYLD_") || key.startsWith("LD_") || ENVIRONMENT_DENYLIST.has(key);
 }
 
 function snapshotEnvironment(input: Readonly<Record<string, string | undefined>> | undefined): Readonly<Record<string, string | undefined>> {
