@@ -29,21 +29,6 @@ export function taskEngineFixed(
 }
 
 /**
- * True for a Claude task that has already run a turn on a native (subscription) session and does not run through
- * the model router yet. Its first switch to an Online or Local model moves it there for good (D-061), so the picker
- * asks first. A new Claude task with no turn yet chooses freely, and a Grok task never routes.
- */
-export function taskHasNativeClaudeSession(
-  view: Pick<TaskViewProjection, "task" | "timeline" | "queuedTurns" | "hasEarlierTimeline" | "engineStatus"> | undefined,
-  sendPending: boolean,
-): boolean {
-  return view !== undefined &&
-    taskEngineOf(view.task) === "claude" &&
-    view.engineStatus?.routed !== true &&
-    taskEngineFixed(view, sendPending);
-}
-
-/**
  * Engine markers on the sidebar rows appear only while both engines are in use, so a user who only
  * ever uses one engine sees no change at all, and with both every row carries a marker.
  */

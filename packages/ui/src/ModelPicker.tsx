@@ -40,8 +40,8 @@ export type ModelPickerProps = Readonly<{
   engineFixed: boolean;
   /** Claude Code's state, when the main process reports one; see `modelPickerView`. */
   claudeState?: ClaudeStatusState;
-  /** The task runs through the model router: its Claude rows are shown disabled (D-061). */
-  routed?: boolean;
+  /** A switch between a Claude model and an Online / Local one is running for this task (D-062): the trigger says so. */
+  switching?: boolean;
   /**
    * Applies a change for the active task and resolves with the response. The caller owns the API
    * calls (moving the task to the other engine first, the Online reminder) and replaces its task
@@ -98,7 +98,7 @@ export function ModelPicker({
   taskEngine,
   engineFixed,
   claudeState,
-  routed = false,
+  switching = false,
   onApply,
   onOpenModelSources,
   initialOpen = false,
@@ -115,6 +115,7 @@ export function ModelPicker({
   const popoverRef = useRef<HTMLDivElement>(null);
   const mountedRef = useRef(false);
   const popoverId = useId();
+  const restartHintId = `${popoverId}-restart`;
   const view = modelPickerView({
     messages,
     catalogs,
@@ -122,7 +123,7 @@ export function ModelPicker({
     pending,
     taskEngine,
     engineFixed,
-    routed,
+    switching,
     ...(olderOpen === undefined ? {} : { olderExpanded: olderOpen }),
     ...(claudeState === undefined ? {} : { claudeState }),
   });
@@ -143,8 +144,8 @@ export function ModelPicker({
     if (!panelOpen) return;
     const popover = popoverRef.current;
     if (popover === null) return;
-    // The selected row, else the first row that can be chosen (a hint or a disabled row is an option too, but a
-    // choosable row is what the person came to pick).
+    // The selected row, else the first row that can be chosen (a hint is an option too, but a choosable row is what
+    // the person came to pick).
     const target = popover.querySelector<HTMLElement>('[role="option"][aria-selected="true"]') ??
       popover.querySelector<HTMLElement>('button[role="option"]:not([aria-disabled="true"])') ??
       popover.querySelector<HTMLElement>('button[role="option"]') ??
@@ -196,13 +197,12 @@ export function ModelPicker({
         type="button"
         role="option"
         aria-selected={row.selected}
-        aria-disabled={pending || row.disabled === true || undefined}
+        aria-disabled={pending || undefined}
+        aria-describedby={row.restarts === true ? restartHintId : undefined}
+        title={row.restarts === true ? messages.modelPickerRestartHint : undefined}
         tabIndex={row.tabStop ? 0 : -1}
-        className={`guild-model-row${row.selected ? " selected" : ""}${row.disabled === true ? " locked" : ""}`}
-        onClick={() => {
-          if (row.disabled === true) return;
-          void apply(selectionForRow(catalogs, row, view.selectedEffortId, taskEngine));
-        }}
+        className={`guild-model-row${row.selected ? " selected" : ""}`}
+        onClick={() => void apply(selectionForRow(catalogs, row, view.selectedEffortId, taskEngine))}
       >
         <span className="guild-model-row-name">
           <span className="guild-model-row-title">
@@ -212,6 +212,7 @@ export function ModelPicker({
             )}
           </span>
           {row.selected && <Check size={14} weight="bold" aria-hidden="true" />}
+          {row.restarts === true && <em className="guild-model-restart-tag" aria-hidden="true">{messages.modelPickerRestartTag}</em>}
         </span>
         {row.description !== undefined && <small className="guild-model-row-description">{row.description}</small>}
         {row.contextLabel !== undefined && <small className="guild-model-row-meta">{row.contextLabel}</small>}
@@ -239,7 +240,7 @@ export function ModelPicker({
       }}
     >
       <span>{view.triggerText}</span>
-      {pending
+      {pending || view.switching
         ? <SpinnerGap size={11} className="guild-spin" aria-hidden="true" />
         : <CaretDown size={11} className="guild-model-picker-caret" aria-hidden="true" />}
     </button>
@@ -252,6 +253,8 @@ export function ModelPicker({
       aria-busy={pending || undefined}
       tabIndex={-1}
     >
+      {(view.models.some((row) => row.restarts === true) || view.useDefaultRestarts) &&
+        <span id={restartHintId} className="guild-sr-only">{messages.modelPickerRestartHint}</span>}
       {view.catalogEmpty ? (
         <EmptyHint empty={view.groups[0]?.empty} fallback={messages.modelPickerEmpty} inListbox={false} />
       ) : (
@@ -270,7 +273,6 @@ export function ModelPicker({
                   id={headingId}
                   className={view.showGroupHeadings ? "guild-model-heading guild-model-group-heading" : "guild-sr-only"}
                 >{group.label}</div>
-                {group.note !== undefined && <p className="guild-model-group-note">{group.note}</p>}
                 {group.models.map(renderRow)}
                 {group.older !== undefined && <>
                   <button
@@ -358,8 +360,13 @@ export function ModelPicker({
           type="button"
           className="guild-model-use-default"
           aria-disabled={pending || undefined}
+          aria-describedby={view.useDefaultRestarts ? restartHintId : undefined}
+          title={view.useDefaultRestarts ? messages.modelPickerRestartHint : undefined}
           onClick={() => void apply(CLEAR_MODEL_OVERRIDE)}
-        >{messages.modelPickerUseDefault}</button>
+        >
+          {messages.modelPickerUseDefault}
+          {view.useDefaultRestarts && <em className="guild-model-restart-tag" aria-hidden="true">{messages.modelPickerRestartTag}</em>}
+        </button>
       )}
     </div>}
   </div>;

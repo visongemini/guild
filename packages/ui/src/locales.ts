@@ -172,8 +172,6 @@ export type GuildMessages = WorkshopMessages & ChangeMessages & {
   readonly modelPickerClaudeNotStarted: string;
   /** The Claude group's one row while Claude Code lists no model yet: the task follows Claude Code's own default. */
   readonly modelPickerClaudeDefault: string;
-  /** The trigger of a routed task that selects no model of the router (its Claude choice is gone). */
-  readonly modelPickerChooseModel: string;
   /** The Default row of the Claude group, with the model it stands for when the adapter says which. */
   readonly modelPickerClaudeDefaultRow: (model: string | undefined) => string;
   /** The collapsed row that holds every Claude model but the newest of each family. */
@@ -181,8 +179,14 @@ export type GuildMessages = WorkshopMessages & ChangeMessages & {
   /** Spoken after the label of that row, so a screen reader hears whether it is open. */
   readonly modelPickerOlderState: (expanded: boolean) => string;
   readonly modelPickerEngineNote: string;
-  /** One line under the disabled Claude rows of a task that runs through the model router (D-061). */
-  readonly modelPickerClaudeLockedNote: string;
+  /** The muted tag on a row whose choice restarts Claude Code (a switch between a Claude and an Online / Local model). */
+  readonly modelPickerRestartTag: string;
+  /** Tooltip and accessible description of such a row. */
+  readonly modelPickerRestartHint: string;
+  /** The picker trigger while that restart runs. */
+  readonly modelPickerSwitching: string;
+  /** The composer line while it runs. */
+  readonly modelSwitchStatus: (model: string) => string;
   readonly taskEngineName: (engine: GuildEngine) => string;
   readonly taskEngineMarkerTitle: (engine: GuildEngine) => string;
   // Online-model reminder (PC-PRIV-001)
@@ -194,10 +198,6 @@ export type GuildMessages = WorkshopMessages & ChangeMessages & {
   readonly onlineReminderItemBrowser: string;
   readonly onlineReminderDontRemind: string;
   readonly onlineReminderSwitch: string;
-  // First switch of a task with a Claude session to an Online or Local model (D-061)
-  readonly routedSwitchTitle: string;
-  readonly routedSwitchBody: (model: string) => string;
-  readonly routedSwitchConfirm: string;
   readonly privacyOnlineReminder: string;
   readonly privacyOnlineReminderHelp: string;
   readonly privacyOnlineReminderNoWorkspace: string;
@@ -719,7 +719,6 @@ const ZH_CN: GuildMessages = Object.freeze({
     incompatible_agent: "对话开始后不能改用这个模型，已保留你之前的选择。",
     unsupported_value: "Grok 目前没有为这个任务提供该选项，已保留你之前的选择。",
     unavailable: "Grok 暂时无法切换，已保留你之前的选择。",
-    claude_locked: "这个任务用过在线或本地模型，不能再切回 Claude 订阅。要用 Claude 请新建任务。",
   })[reason],
   modelGroupName: (group) => ({ grok: "Grok", claude: "Claude（订阅）", online: "在线", local: "本地" })[group],
   modelPickerGroupEmpty: (group) => group === "online"
@@ -730,12 +729,14 @@ const ZH_CN: GuildMessages = Object.freeze({
   modelPickerClaudeUnavailableHelp: "请先安装 Claude Code，并在终端运行一次 claude 完成登录。",
   modelPickerClaudeNotStarted: "Claude 启动后才会显示可选的模型。",
   modelPickerClaudeDefault: "Claude Code（默认模型）",
-  modelPickerChooseModel: "选择模型",
   modelPickerClaudeDefaultRow: (model) => model === undefined ? "默认" : `默认（${model}）`,
   modelPickerOlderModels: (count) => `更早的模型（${count}）`,
   modelPickerOlderState: (expanded) => expanded ? "，已展开" : "，已折叠",
   modelPickerEngineNote: "第一条消息选的模型，决定这个对话用 Grok 还是 Claude，之后不能更换。",
-  modelPickerClaudeLockedNote: "这个任务用过在线或本地模型，不能再切回 Claude 订阅。要用 Claude 请新建任务。",
+  modelPickerRestartTag: "需重启",
+  modelPickerRestartHint: "切换后要重启 Claude Code，再接上这段对话",
+  modelPickerSwitching: "切换中…",
+  modelSwitchStatus: (model) => `正在切换到「${model}」，需要重启引擎，通常 30–90 秒。消息会在切换完成后发出。`,
   taskEngineName: (engine) => ({ grok: "Grok", claude: "Claude" })[engine],
   taskEngineMarkerTitle: (engine) => ({ grok: "Grok 对话", claude: "Claude Code 对话" })[engine],
   onlineReminderTitle: (vendor) => `要把这段对话发给「${vendor}」吗？`,
@@ -746,9 +747,6 @@ const ZH_CN: GuildMessages = Object.freeze({
   onlineReminderItemBrowser: "对话中出现的网页文字和截图",
   onlineReminderDontRemind: "在此工作区不再提醒",
   onlineReminderSwitch: "切换",
-  routedSwitchTitle: "切换后不能再切回 Claude 订阅",
-  routedSwitchBody: (model) => `切到「${model}」后，这个任务会改用 Guild 的本地转发，之后不能再选 Claude 订阅模型。Claude 订阅的登录信息不会经过转发。要继续用 Claude，可以新建一个任务。`,
-  routedSwitchConfirm: "继续切换",
   privacyOnlineReminder: "发给在线模型前先提醒我",
   privacyOnlineReminderHelp: "在此工作区的每个对话里，第一次使用某个在线服务商的模型时，先确认一次；换到另一个服务商会再确认。本地模型和 Claude 订阅模型不会提醒。",
   privacyOnlineReminderNoWorkspace: "打开一个对话后，才能修改它所在工作区的这项设置。",
@@ -1263,7 +1261,6 @@ const EN_US: GuildMessages = Object.freeze({
     incompatible_agent: "This model cannot be used in this conversation after it has started. Your previous selection was kept.",
     unsupported_value: "Grok does not offer that option for this task right now. Your previous selection was kept.",
     unavailable: "Grok could not switch right now. Your previous selection was kept.",
-    claude_locked: "This task has used an online or local model and cannot go back to a Claude subscription. Start a new task to use Claude.",
   })[reason],
   modelGroupName: (group) => ({ grok: "Grok", claude: "Claude", online: "Online", local: "Local" })[group],
   modelPickerGroupEmpty: (group) => group === "online"
@@ -1274,12 +1271,14 @@ const EN_US: GuildMessages = Object.freeze({
   modelPickerClaudeUnavailableHelp: "Install Claude Code, then run `claude` once in Terminal and log in.",
   modelPickerClaudeNotStarted: "Model choices appear once Claude has started.",
   modelPickerClaudeDefault: "Claude Code (default model)",
-  modelPickerChooseModel: "Choose a model",
   modelPickerClaudeDefaultRow: (model) => model === undefined ? "Default" : `Default (${model})`,
   modelPickerOlderModels: (count) => `Older models (${count})`,
   modelPickerOlderState: (expanded) => expanded ? ", expanded" : ", collapsed",
   modelPickerEngineNote: "The model you pick for the first message decides whether this conversation runs on Grok or Claude. It cannot change afterwards.",
-  modelPickerClaudeLockedNote: "This task has used an online or local model and cannot go back to a Claude subscription. Start a new task to use Claude.",
+  modelPickerRestartTag: "Restarts",
+  modelPickerRestartHint: "Switching restarts Claude Code, then reconnects this conversation",
+  modelPickerSwitching: "Switching\u2026",
+  modelSwitchStatus: (model) => `Switching to \u201c${model}\u201d. The engine needs a restart, usually 30\u201390 seconds. Your message will be sent once the switch is done.`,
   taskEngineName: (engine) => ({ grok: "Grok", claude: "Claude" })[engine],
   taskEngineMarkerTitle: (engine) => ({ grok: "Grok conversation", claude: "Claude Code conversation" })[engine],
   onlineReminderTitle: (vendor) => `Send this conversation to ${vendor}?`,
@@ -1290,9 +1289,6 @@ const EN_US: GuildMessages = Object.freeze({
   onlineReminderItemBrowser: "Text and screenshots of web pages in this conversation",
   onlineReminderDontRemind: "Don't remind me again in this workspace",
   onlineReminderSwitch: "Switch",
-  routedSwitchTitle: "You can't switch back to a Claude subscription",
-  routedSwitchBody: (model) => `After you switch to "${model}", this task runs through Guild's local relay and can no longer use Claude subscription models. Your Claude login never passes through the relay. To keep using Claude, start a new task.`,
-  routedSwitchConfirm: "Continue",
   privacyOnlineReminder: "Remind me before sending to an online model",
   privacyOnlineReminderHelp: "Asks once per conversation for each online vendor, the first time it uses that vendor's model; switching to another vendor asks again. Local models and your Claude subscription never ask.",
   privacyOnlineReminderNoWorkspace: "Open a conversation to change this for its workspace.",
@@ -1636,7 +1632,6 @@ const CLAUDE_ZH = (base: GuildMessages): Partial<GuildMessages> => ({
     incompatible_agent: base.modelPickerRefused("incompatible_agent"),
     unsupported_value: "Claude Code 目前没有为这个任务提供该选项，已保留你之前的选择。",
     unavailable: "Claude Code 暂时无法切换，已保留你之前的选择。",
-    claude_locked: base.modelPickerRefused("claude_locked"),
   })[reason],
   runPhaseStartingRuntime: "正在启动 Claude",
   runPhasePromptSentSlow: "已发送 · Claude 尚未接手",
@@ -1682,7 +1677,6 @@ const CLAUDE_EN = (base: GuildMessages): Partial<GuildMessages> => ({
     incompatible_agent: base.modelPickerRefused("incompatible_agent"),
     unsupported_value: "Claude Code does not offer that option for this task right now. Your previous selection was kept.",
     unavailable: "Claude Code could not switch right now. Your previous selection was kept.",
-    claude_locked: base.modelPickerRefused("claude_locked"),
   })[reason],
   runPhaseStartingRuntime: "Starting Claude",
   runPhasePromptSentSlow: "Sent \u00b7 Claude has not picked it up yet",

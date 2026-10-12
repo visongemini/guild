@@ -136,53 +136,27 @@ test("the dialog asks to send the conversation to the vendor and lists what goes
   assert.match(markup, /<button autofocus="" type="button">Cancel<\/button>/u);
 });
 
-test("a Claude conversation's first switch says it is one way; with an Online vendor the same box carries the reminder too [D-061]", async () => {
-  const routedOnly = (messages = EN) => renderToStaticMarkup(
-    <OnlineReminderDialog messages={messages} routedModelName="Local 27B" onCancel={noop} onSwitch={noop} onDialogKeyDown={noop} />,
-  );
-  const local = routedOnly();
-  assert.match(local, /<strong id="[^"]+">You can&#x27;t switch back to a Claude subscription<\/strong>/u);
-  assert.match(local, /After you switch to &quot;Local 27B&quot;, this task runs through Guild&#x27;s local relay and can no longer use Claude subscription models\. Your Claude login never passes through the relay\. To keep using Claude, start a new task\./u);
-  // Nothing is sent to a vendor, so there is no list and no checkbox to silence.
-  assert.doesNotMatch(local, /<li>|type="checkbox"|is an online model/u);
-  assert.match(local, /class="primary">Continue<\/button>/u);
-  assert.match(local, /<button autofocus="" type="button">Cancel<\/button>/u);
-
-  const zh = routedOnly(ZH);
-  assert.match(zh, /<strong id="[^"]+">切换后不能再切回 Claude 订阅<\/strong>/u);
-  assert.match(zh, /切到「Local 27B」后，这个任务会改用 Guild 的本地转发，之后不能再选 Claude 订阅模型。Claude 订阅的登录信息不会经过转发。要继续用 Claude，可以新建一个任务。/u);
-  assert.match(zh, /class="primary">继续切换<\/button>/u);
-  assert.match(zh, /<button autofocus="" type="button">取消<\/button>/u);
-
-  // An Online model of a vendor not agreed yet: one dialog, the one-way notice first, then what goes to the vendor.
-  const both = renderToStaticMarkup(
-    <OnlineReminderDialog messages={ZH} vendorLabel="DeepSeek" routedModelName="DeepSeek V4 Flash" onCancel={noop} onSwitch={noop} onDialogKeyDown={noop} />,
-  );
-  assert.equal(both.match(/role="alertdialog"/gu)?.length, 1);
-  assert.match(both, /<strong id="[^"]+">切换后不能再切回 Claude 订阅<\/strong>/u);
-  assert.ok(both.indexOf("切到「DeepSeek V4 Flash」后") < both.indexOf("是在线模型"));
-  for (const item of ["CLAUDE.md", "记忆", "本次对话"]) assert.match(both, new RegExp(`<li>${item}</li>`, "u"));
-  assert.match(both, /type="checkbox"/u);
-  assert.match(both, /class="primary">继续切换<\/button>/u);
-  assert.doesNotMatch(both, /class="primary">切换<\/button>/u);
-  // Without the one-way notice the dialog is exactly the Online reminder.
-  assert.match(dialog(), /Send this conversation to DeepSeek\?/u);
-  assert.doesNotMatch(dialog(), /local relay/u);
-});
-
-test("one dialog serves both messages: the app asks once per switch, and only a Claude conversation with turns asks the one-way question [D-061]", async () => {
+test("the app asks once per switch, only for an Online vendor not agreed yet, and never about leaving the subscription [D-062]", async () => {
   const app = await readFile(new URL("../src/App.tsx", import.meta.url), "utf8");
   const start = app.indexOf("async function confirmModelSwitch");
   const flow = app.slice(start, app.indexOf("async function setSessionConfigOption", start));
   assert.equal(flow.match(/new Promise<OnlineReminderAnswer>/gu)?.length, 1, "a single dialog per switch");
-  assert.match(flow, /const routedNotice = taskHasNativeClaudeSession\(task, pendingSends\.has\(taskId\)\);/u);
-  assert.match(flow, /if \(!reminderNeeded && !routedNotice\) \{/u);
-  assert.match(flow, /\.\.\.\(reminderNeeded \? \{ vendorLabel \} : \{\}\),\s*\n\s*\.\.\.\(routedNotice \? \{ routedModelName: target\?\.name \?\? modelId \?\? "" \} : \{\}\),/u);
-  // The vendor checkbox is only honoured when the reminder was part of the dialog.
+  assert.match(flow, /if \(!reminderNeeded\) \{\s*\n\s*if \(change\.group === "online"\) onlineConsent\.current\.agree\(taskId, targetSource\);\s*\n\s*return true;/u);
+  assert.match(flow, /setOnlineReminder\(Object\.freeze\(\{ vendorLabel \}\)\);/u);
   assert.match(flow, /if \(reminderNeeded && answer\.dontRemindAgain\) \{/u);
   const gate = app.slice(app.indexOf("async function applyTaskRuntimeSettings"), start);
   assert.match(gate, /\(change\.group === "online" \|\| change\.group === "local"\) && !\(await confirmModelSwitch\(task, change\)\)/u);
-  assert.match(app, /routedModelName=\{|\{\.\.\.\(onlineReminder\.routedModelName === undefined/u);
+  assert.doesNotMatch(app, /routedModelName|taskHasNativeClaudeSession|routedNotice/u);
+  const component = await readFile(new URL("../src/OnlineReminderDialog.tsx", import.meta.url), "utf8");
+  assert.doesNotMatch(component, /routed/iu);
+  // The reminder is per vendor and per task: Online A, Claude, Online A again does not ask a second time for A, B asks.
+  const ledger = createOnlineConsentLedger();
+  ledger.agree("t", "source:a");
+  const afterClaude = agreedSourcesOf({ ledger, taskId: "t", currentModelId: "opus", currentGroup: "claude", sources: [] });
+  assert.equal(onlineReminderNeeded({ targetGroup: "online", targetSource: "source:a", agreedSources: afterClaude, dismissedForWorkspace: false }), false);
+  assert.equal(onlineReminderNeeded({ targetGroup: "online", targetSource: "source:b", agreedSources: afterClaude, dismissedForWorkspace: false }), true);
+  assert.equal(onlineReminderNeeded({ targetGroup: "claude", targetSource: "", agreedSources: new Set(), dismissedForWorkspace: false }), false);
+  assert.equal(onlineReminderNeeded({ targetGroup: "local", targetSource: "model:x", agreedSources: new Set(), dismissedForWorkspace: false }), false);
 });
 
 test("the checkbox starts unticked, the dialog is localized, and the key handling is the app's", async () => {

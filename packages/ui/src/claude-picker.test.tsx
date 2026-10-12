@@ -14,12 +14,11 @@ import { messagesFor } from "./locales.js";
 import { CLAUDE_ADAPTER_CATALOG, CLAUDE_CATALOG, REAL_CATALOG } from "./model-catalog.fixture.js";
 import { modelPickerView, nextPickerIndex, selectionForRow } from "./model-picker.js";
 import { ModelPicker } from "./ModelPicker.js";
-import { taskHasNativeClaudeSession } from "./task-engine.js";
 
 /*
  * The Claude group of the picker: the Default row and the newest model of each family up front, the rest under
- * "Older models (N)" (W2), and, for a task that runs through the model router, every Claude row disabled with one
- * line that says why (D-061).
+ * "Older models (N)" (W2), and the "Restarts" tag on the rows that switch between a Claude model and an Online or
+ * Local one (D-062).
  */
 
 const EN = messagesFor("en-US");
@@ -283,88 +282,160 @@ test("arrow keys reach the expander and every row after it; the component wires 
   assert.match(source, /moveFocus\(event, '\[role="option"\]', "vertical"\)/u);
 });
 
-// ---- a task that runs through the model router (D-061)
+// ---- switching between a Claude model and an Online / Local one (D-062)
 
-test("a routed task shows its Claude rows disabled under one line that says why; Online and Local stay choosable", () => {
-  const view = claudeView({ routed: true, selection: selection("deepseek-v4-flash"), olderExpanded: true });
-  const claude = groupOf(view, "claude");
-  assert.equal(claude.note, "这个任务用过在线或本地模型，不能再切回 Claude 订阅。要用 Claude 请新建任务。");
-  assert.equal(groupOf(claudeView({ routed: true, messages: EN, selection: selection("deepseek-v4-flash") }), "claude").note,
-    "This task has used an online or local model and cannot go back to a Claude subscription. Start a new task to use Claude.");
-  assert.equal([...claude.models, ...(claude.older?.models ?? [])].every((row) => row.disabled === true), true);
-  assert.equal(groupOf(view, "online").note, undefined);
-  assert.equal(groupOf(view, "online").models.every((row) => row.disabled === undefined), true);
-  assert.equal(groupOf(view, "local").models.every((row) => row.disabled === undefined), true);
-  assert.deepEqual(view.models.filter((row) => row.selected).map((row) => row.id), ["deepseek-v4-flash"]);
-  assert.deepEqual(view.models.filter((row) => row.tabStop).map((row) => row.id), ["deepseek-v4-flash"]);
-  assert.equal(view.routed, true);
-  // The note is a routed-task fact: absent for a native task.
-  assert.equal(groupOf(claudeView(), "claude").note, undefined);
-  assert.equal(claudeView().models.some((row) => row.disabled === true), false);
+const allRows = (view: ReturnType<typeof modelPickerView>) => view.groups.flatMap((entry) => [...entry.models, ...(entry.older?.models ?? [])]);
+const tagged = (view: ReturnType<typeof modelPickerView>) => allRows(view).filter((row) => row.restarts === true).map((row) => row.id);
+
+test("a native Claude task tags its Online and Local rows: choosing one restarts Claude Code", () => {
+  const view = claudeView({ olderExpanded: true });
+  assert.deepEqual(tagged(view), ["deepseek-v4-flash", "local-27b-model"]);
+  assert.equal(groupOf(view, "claude").models.some((row) => row.restarts === true), false, "a Claude row of a Claude task does not");
+  assert.equal(groupOf(view, "claude").older?.models.some((row) => row.restarts === true), false);
+  // Every Claude row stays choosable: nothing is disabled or noted any more.
+  assert.equal(allRows(view).some((row) => "disabled" in row), false);
+  assert.equal(view.groups.some((entry) => "note" in entry), false);
 });
 
-test("a routed task never marks a Claude row selected, offers no way back to a default, and never starts on a Claude tab stop", () => {
-  // The projection of a task routed by an earlier build may still name a Claude model.
-  const stale = claudeView({ routed: true, selection: selection("opus", "high", "runtime") });
-  assert.equal(stale.models.some((row) => row.selected), false);
-  assert.equal(stale.models.find((row) => row.tabStop)?.id, "deepseek-v4-flash", "the first row that can be chosen");
-  assert.equal(stale.showUseDefault, false);
-  assert.equal(claudeView({ routed: true, selection: selection("deepseek-v4-flash") }).showUseDefault, false);
-  assert.equal(claudeView({ selection: selection("opus") }).showUseDefault, true, "a native task still can");
-  // No model at all: the trigger asks for one instead of naming Claude's default.
-  const none = modelPickerView({
-    messages: ZH, catalogs: CATALOGS, selection: selection(null, null, "runtime"), taskEngine: "claude", engineFixed: true, routed: true,
+test("a routed task tags every Claude row, the Default row and 'Use default', and no Online or Local row", () => {
+  const view = claudeView({ selection: selection("deepseek-v4-flash"), olderExpanded: true });
+  const claudeIds = [...groupOf(view, "claude").models, ...(groupOf(view, "claude").older?.models ?? [])].map((row) => row.id);
+  assert.deepEqual(tagged(view), claudeIds);
+  assert.equal(claudeIds.length, 5 + 8);
+  assert.equal(groupOf(view, "online").models.some((row) => row.restarts === true), false, "the vendor the task runs on, even another model of it");
+  assert.equal(groupOf(view, "local").models.some((row) => row.restarts === true), false, "Local to Online is a plain switch inside the router");
+  assert.equal(view.showUseDefault, true, "a routed task can go back to Claude's default too");
+  assert.equal(view.useDefaultRestarts, true);
+  // The routed model is the selection and the one tab stop; Claude rows are ordinary rows again.
+  assert.deepEqual(allRows(view).filter((row) => row.selected).map((row) => row.id), ["deepseek-v4-flash"]);
+  assert.deepEqual(allRows(view).filter((row) => row.tabStop).map((row) => row.id), ["deepseek-v4-flash"]);
+  // A local model is routed too.
+  assert.deepEqual(tagged(claudeView({ selection: selection("local-27b-model") })).includes("opus"), true);
+  assert.equal(claudeView({ selection: selection("opus") }).useDefaultRestarts, false);
+});
+
+test("the Default row and a task that follows a default count as Claude", () => {
+  // Following the runtime default (nothing pinned): native, so only the routed rows restart.
+  const following = claudeView({ selection: selection("default", null, "runtime") });
+  assert.deepEqual(tagged(following), ["deepseek-v4-flash", "local-27b-model"]);
+  // Before the adapter listed any model, the one Claude row is the follow-the-default row.
+  const unlisted = modelPickerView({
+    messages: ZH,
+    catalogs: { grok: REAL_CATALOG, claude: freezeClaudeRoutedOnly() },
+    selection: selection(null, null, "runtime"),
+    taskEngine: "claude",
+    engineFixed: true,
   });
-  assert.equal(none.modelName, "选择模型");
-  assert.equal(modelPickerView({ messages: EN, catalogs: CATALOGS, selection: selection(null, null, "runtime"), taskEngine: "claude", engineFixed: true, routed: true }).modelName, "Choose a model");
-  // Routed means nothing for a Grok task.
-  assert.equal(modelPickerView({ messages: ZH, catalogs: CATALOGS, selection: selection("grok-4.7"), taskEngine: "grok", engineFixed: true, routed: true }).routed, false);
+  assert.deepEqual(allRows(unlisted).filter((row) => row.restarts === true).map((row) => row.id), ["deepseek-v4-flash", "local-27b-model"]);
+  const routedUnlisted = modelPickerView({
+    messages: ZH,
+    catalogs: { grok: REAL_CATALOG, claude: freezeClaudeRoutedOnly() },
+    selection: selection("deepseek-v4-flash"),
+    taskEngine: "claude",
+    engineFixed: true,
+  });
+  const defaultRow = allRows(routedUnlisted).find((row) => row.runtimeDefault === true);
+  assert.equal(defaultRow?.restarts, true, "the follow-the-default row restarts a routed task");
 });
 
-test("a routed task's markup: aria-disabled Claude options, the note, locked class, and nothing to activate", async () => {
-  const markup = render({ selection: selection("deepseek-v4-flash"), routed: true, initialOlderOpen: true });
-  assert.match(markup, /<p class="guild-model-group-note">这个任务用过在线或本地模型，不能再切回 Claude 订阅。要用 Claude 请新建任务。<\/p>/u);
+function freezeClaudeRoutedOnly() {
+  return { ...CLAUDE_ADAPTER_CATALOG, models: CLAUDE_ADAPTER_CATALOG.models.filter((model) => model.group !== "claude") };
+}
+
+test("no tag for a brand-new task with no turn, for a Grok task, or for a task that has no router", () => {
+  // A new task starts in the right mode whatever it picks: engineFixed is false until its first message.
+  const fresh = claudeView({ engineFixed: false, selection: selection(null, null, "runtime") });
+  assert.deepEqual(tagged(fresh), []);
+  assert.deepEqual(tagged(claudeView({ engineFixed: false, selection: selection("deepseek-v4-flash") })), []);
+  assert.equal(claudeView({ engineFixed: false, selection: selection("deepseek-v4-flash") }).useDefaultRestarts, false);
+  const grok = modelPickerView({ messages: ZH, catalogs: CATALOGS, selection: selection("grok-4.7"), taskEngine: "grok", engineFixed: true });
+  assert.deepEqual(tagged(grok), []);
+  assert.equal(grok.useDefaultRestarts, false);
+  assert.equal(grok.switching, false);
+  // A Claude task without Online or Local sources has nothing to tag.
+  const nativeOnly = modelPickerView({
+    messages: ZH,
+    catalogs: { grok: REAL_CATALOG, claude: { ...CLAUDE_ADAPTER_CATALOG, models: CLAUDE_ADAPTER_CATALOG.models.filter((model) => model.group === "claude") } },
+    selection: selection("opus"),
+    taskEngine: "claude",
+    engineFixed: true,
+  });
+  assert.deepEqual(tagged(nativeOnly), []);
+});
+
+test("the tag, its tooltip and its description are worded in both languages", () => {
+  assert.equal(ZH.modelPickerRestartTag, "需重启");
+  assert.equal(ZH.modelPickerRestartHint, "切换后要重启 Claude Code，再接上这段对话");
+  assert.equal(EN.modelPickerRestartTag, "Restarts");
+  assert.match(EN.modelPickerRestartHint, /restarts Claude Code/u);
+  assert.equal(ZH.modelPickerSwitching, "切换中…");
+  assert.equal(EN.modelPickerSwitching, "Switching\u2026");
+  assert.equal(ZH.modelSwitchStatus("DeepSeek V4 Flash"), "正在切换到「DeepSeek V4 Flash」，需要重启引擎，通常 30–90 秒。消息会在切换完成后发出。");
+  assert.match(EN.modelSwitchStatus("Opus 5.5"), /Opus 5\.5.*restart.*30\u201390 seconds.*once the switch is done/u);
+});
+
+test("the markup of a native task: tags aria-hidden on the Online and Local rows, the meaning in one shared description", () => {
+  const markup = render();
+  const tags = optionTags(markup).filter((tag) => /aria-describedby/u.test(tag));
+  assert.equal(tags.length, 2, "the two routed rows");
+  for (const tag of tags) {
+    assert.match(tag, /title="切换后要重启 Claude Code，再接上这段对话"/u);
+    assert.match(tag, /role="option"/u);
+    assert.doesNotMatch(tag, /aria-disabled/u, "a tagged row is an ordinary, choosable option");
+  }
+  assert.equal(markup.match(/<em class="guild-model-restart-tag" aria-hidden="true">需重启<\/em>/gu)?.length, 2);
+  const describedBy = /aria-describedby="([^"]+)"/u.exec(tags[0] ?? "")?.[1];
+  assert.ok(describedBy !== undefined);
+  assert.equal(tags.every((tag) => tag.includes(`aria-describedby="${describedBy}"`)), true);
+  assert.match(markup, new RegExp(`<span id="${describedBy.replace(/[:]/gu, "\\:")}" class="guild-sr-only">切换后要重启 Claude Code，再接上这段对话</span>`, "u"));
+  // The English wording.
+  assert.equal(render({ messages: EN }).match(/<em class="guild-model-restart-tag" aria-hidden="true">Restarts<\/em>/gu)?.length, 2);
+  // A task with no turn yet shows none of it.
+  const fresh = render({ engineFixed: false, selection: selection(null, null, "runtime") });
+  assert.doesNotMatch(fresh, /guild-model-restart-tag|aria-describedby|guild-sr-only">切换后/u);
+});
+
+test("the markup of a routed task: Claude rows tagged and choosable, one tab stop, 'Use default' tagged too", () => {
+  const markup = render({ selection: selection("deepseek-v4-flash"), initialOlderOpen: true });
   const tags = optionTags(markup);
-  const locked = tags.filter((tag) => /guild-model-row locked/u.test(tag));
-  assert.equal(locked.length, 5 + 8);
-  for (const tag of locked) {
-    assert.match(tag, /aria-disabled="true"/u);
-    assert.match(tag, /tabindex="-1"/u);
-  }
+  const described = tags.filter((tag) => /aria-describedby/u.test(tag));
+  assert.equal(described.length, 5 + 8, "the Claude rows, the expander excluded");
+  assert.equal(tags.some((tag) => /guild-model-row locked|aria-disabled/u.test(tag)), false, "nothing is disabled");
   assert.equal(tags.filter((tag) => /tabindex="0"/u.test(tag)).length, 1);
-  const online = tags.find((tag) => /aria-selected="true"/u.test(tag));
-  assert.ok(online !== undefined && !/aria-disabled/u.test(online), "the chosen Online row is a normal row");
-  // No "Use default" way out for a routed task.
-  assert.doesNotMatch(markup, /guild-model-use-default/u);
-  // A disabled row does nothing, and the first focus goes to a row that can be chosen.
-  const source = await readFile(new URL("../src/ModelPicker.tsx", import.meta.url), "utf8");
-  assert.match(source, /if \(row\.disabled === true\) return;\s*\n\s*void apply\(/u);
-  assert.match(source, /button\[role="option"\]:not\(\[aria-disabled="true"\]\)/u);
-  const css = await readFile(new URL("../src/styles.css", import.meta.url), "utf8");
-  for (const name of ["guild-model-row.locked", "guild-model-group-note", "guild-model-older", "guild-model-older-caret"]) {
-    assert.match(css, new RegExp(`\\.${name.replace(".", "\\.")}[\\s,:{.\\[]`), `${name} is not styled`);
-  }
+  const selected = tags.filter((tag) => /aria-selected="true"/u.test(tag));
+  assert.equal(selected.length, 1);
+  assert.doesNotMatch(selected[0] ?? "", /aria-describedby/u, "the row it runs on has no tag");
+  assert.doesNotMatch(markup, /guild-model-group-note/u);
+  assert.match(markup, /<button type="button" class="guild-model-use-default"[^>]*aria-describedby="[^"]+"[^>]*title="切换后要重启 Claude Code，再接上这段对话">使用默认设置<em class="guild-model-restart-tag" aria-hidden="true">需重启<\/em><\/button>/u);
 });
 
-test("the picker is told a task is routed only by the projection, and a Claude conversation asks before it is", async () => {
+test("the trigger says Switching while a cross-mode switch of the task runs, and never otherwise", () => {
+  const idle = claudeView();
+  assert.equal(idle.switching, false);
+  assert.equal(idle.triggerText, "Opus 5.5 · 高");
+  const running = claudeView({ switching: true });
+  assert.equal(running.switching, true);
+  assert.equal(running.triggerText, "切换中…");
+  assert.match(running.ariaLabel, /切换中…/u);
+  assert.equal(claudeView({ switching: true, messages: EN }).triggerText, "Switching\u2026");
+  const markup = render({ switching: true });
+  assert.match(markup, /<span>切换中…<\/span><svg[^>]*class="guild-spin"/u);
+  assert.doesNotMatch(render(), /guild-spin/u);
+  // Only a Claude task switches modes.
+  assert.equal(modelPickerView({ messages: ZH, catalogs: CATALOGS, selection: selection("grok-4.7"), taskEngine: "grok", engineFixed: true, switching: true }).switching, false);
+});
+
+test("the lock is gone: no routed prop, no disabled row, no note, no one-way notice in the app", async () => {
   const app = await readFile(new URL("../src/App.tsx", import.meta.url), "utf8");
-  assert.match(app, /routed=\{activeTask\?\.engineStatus\?\.routed === true\}/u);
-  type NativeInput = NonNullable<Parameters<typeof taskHasNativeClaudeSession>[0]>;
-  const view = (over: { engine?: "grok" | "claude"; turns?: number; engineStatus?: NativeInput["engineStatus"] } = {}): NativeInput => ({
-    task: { taskId: "t", workspaceId: "w", title: "T", pinned: false, archived: false, updatedAtMs: 1, engine: over.engine ?? "claude" },
-    timeline: Array.from({ length: over.turns ?? 1 }, () => ({ kind: "user" })),
-    queuedTurns: [],
-    hasEarlierTimeline: false,
-    ...(over.engineStatus === undefined ? {} : { engineStatus: over.engineStatus }),
-  }) as unknown as NativeInput;
-  // A Claude task that has run, on the subscription: its first switch to Online / Local asks.
-  assert.equal(taskHasNativeClaudeSession(view(), false), true);
-  assert.equal(taskHasNativeClaudeSession(view({ engineStatus: { accountLabel: "Claude Max" } }), false), true);
-  // A new Claude task with no turn yet chooses freely, until its first message is being sent.
-  assert.equal(taskHasNativeClaudeSession(view({ turns: 0 }), false), false);
-  assert.equal(taskHasNativeClaudeSession(view({ turns: 0 }), true), true, "a first message being sent counts");
-  // Already routed, a Grok task, and no task: nothing to confirm.
-  assert.equal(taskHasNativeClaudeSession(view({ engineStatus: { routed: true } }), false), false);
-  assert.equal(taskHasNativeClaudeSession(view({ engine: "grok" }), false), false);
-  assert.equal(taskHasNativeClaudeSession(undefined, false), false);
+  assert.doesNotMatch(app, /engineStatus\?\.routed|routedModelName|taskHasNativeClaudeSession|routedNotice/u);
+  assert.match(app, /switching=\{modelSwitchRunning\(modelSwitch, activeTask\?\.task\.taskId\)\}/u);
+  const component = await readFile(new URL("../src/ModelPicker.tsx", import.meta.url), "utf8");
+  assert.doesNotMatch(component, /routed|row\.disabled|guild-model-row locked/u);
+  const messagesSource = await readFile(new URL("../src/locales.ts", import.meta.url), "utf8");
+  assert.doesNotMatch(messagesSource, /claude_locked|ClaudeLockedNote|routedSwitch|modelPickerChooseModel/u);
+  const css = await readFile(new URL("../src/styles.css", import.meta.url), "utf8");
+  assert.doesNotMatch(css, /guild-model-row\.locked|guild-model-group-note/u);
+  for (const name of ["guild-model-restart-tag", "guild-composer-switch", "guild-model-older", "guild-model-older-caret"]) {
+    assert.match(css, new RegExp(`\\.${name}[\\s,:{.\\[]`), `${name} is not styled`);
+  }
 });
