@@ -208,10 +208,10 @@ test("the trigger names the real model and the effort: Default resolves to the m
   assert.equal(plain.triggerText, "默认模型 · 默认");
 });
 
-test("the effort segment of a Claude model reads Default, Low, Medium, High, Extra high, Max", () => {
+test("the effort segment of a Claude model reads Default, Max, Extra high, High, Medium, Low, the same direction as Grok", () => {
   const labels = (messages: typeof ZH) => claudeView({ messages, selection: selection("opus", "high") }).efforts.map((effort) => effort.label);
-  assert.deepEqual(labels(ZH), ["默认", "低", "中", "高", "超高", "最高"]);
-  assert.deepEqual(labels(EN), ["Default", "Low", "Medium", "High", "Extra high", "Max"]);
+  assert.deepEqual(labels(ZH), ["默认", "最高", "超高", "高", "中", "低"]);
+  assert.deepEqual(labels(EN), ["Default", "Max", "Extra high", "High", "Medium", "Low"]);
 });
 
 test("choosing a row of the older list is an ordinary Claude choice", () => {

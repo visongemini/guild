@@ -139,6 +139,8 @@ export type ModelDescriptor = Readonly<{
   reasoningEfforts: readonly GrokReasoningEffortDescriptor[];
   contextWindows: readonly number[];
   defaultContextWindow?: number;
+  /** An Online or Local model its source states accepts images; absent when the source says nothing. */
+  supportsImages?: true;
 }>;
 
 export type ModelCatalog = Readonly<{
@@ -321,7 +323,7 @@ export function freezeModelCatalog(engine: GuildEngine, input: unknown): ModelCa
     const record = exactKeys(
       entry,
       ["id", "name", "reasoningEfforts", "contextWindows"],
-      ["description", "agentType", "defaultContextWindow", "group"],
+      ["description", "agentType", "defaultContextWindow", "group", "supportsImages"],
       path,
       fail,
     );
@@ -408,6 +410,11 @@ export function freezeModelCatalog(engine: GuildEngine, input: unknown): ModelCa
               fail,
             ),
           }),
+      ...(record["supportsImages"] === undefined
+        ? {}
+        : record["supportsImages"] === true
+          ? { supportsImages: true as const }
+          : fail("invalid_boolean", `${path}.supportsImages`)),
     });
   });
   let runtimeDefaultModelId: string | undefined;

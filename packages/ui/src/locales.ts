@@ -161,6 +161,8 @@ export type GuildMessages = WorkshopMessages & ChangeMessages & {
   readonly modelPickerDisabledRunning: string;
   readonly modelPickerDisabledPending: string;
   readonly modelPickerContext: (sizes: string) => string;
+  /** Muted note on an Online or Local row whose source states that the model accepts images. */
+  readonly modelPickerImages: string;
   readonly modelPickerDefaultMark: string;
   readonly modelPickerUseDefault: string;
   readonly modelPickerEmpty: string;
@@ -722,6 +724,7 @@ const ZH_CN: GuildMessages = Object.freeze({
   modelPickerDisabledRunning: "当前轮次结束后才能更换模型",
   modelPickerDisabledPending: "正在应用更改",
   modelPickerContext: (sizes) => `${sizes} 上下文`,
+  modelPickerImages: "支持图片",
   modelPickerDefaultMark: "默认",
   modelPickerUseDefault: "使用默认设置",
   modelPickerEmpty: "Grok 启动后才会显示可选的模型。",
@@ -1267,6 +1270,7 @@ const EN_US: GuildMessages = Object.freeze({
   modelPickerDisabledRunning: "The model can be changed after the current turn finishes",
   modelPickerDisabledPending: "Applying the change",
   modelPickerContext: (sizes) => `${sizes} context`,
+  modelPickerImages: "Supports images",
   modelPickerDefaultMark: "default",
   modelPickerUseDefault: "Use default",
   modelPickerEmpty: "Model choices appear once Grok has started.",

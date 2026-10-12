@@ -3,6 +3,7 @@ import { CaretDownIcon as CaretDown } from "@phosphor-icons/react/CaretDown";
 import { CheckIcon as Check } from "@phosphor-icons/react/Check";
 import { SpinnerGapIcon as SpinnerGap } from "@phosphor-icons/react/SpinnerGap";
 import {
+  useCallback,
   useEffect,
   useId,
   useRef,
@@ -13,12 +14,15 @@ import type { ClaudeStatusState } from "./claude-engine.js";
 import type { GuildMessages } from "./locales.js";
 import {
   CLEAR_MODEL_OVERRIDE,
+  MODEL_PICKER_SEPARATOR,
+  headingIsStuck,
   isSameSelection,
   modelPickerView,
   nextPickerIndex,
   noticeForResponse,
   noticeText,
   pickerIsLocked,
+  scrollCues,
   selectionForRow,
   type ModelGroupEmptyView,
   type ModelPickerCatalogs,
@@ -150,6 +154,32 @@ export function ModelPicker({
     if (modalOpen) setOpen(false);
   }, [modalOpen]);
 
+  /**
+   * Draws the scroll cues: a fade on each edge that has more content past it, and a soft edge under a group
+   * heading that is stuck to the top. Set straight on the elements (no render per scroll tick).
+   */
+  const syncScrollCues = useCallback(() => {
+    const popover = popoverRef.current;
+    if (popover === null) return;
+    const cues = scrollCues(popover);
+    popover.dataset["fadeTop"] = String(cues.top);
+    popover.dataset["fadeBottom"] = String(cues.bottom);
+    const portTop = popover.getBoundingClientRect().top + popover.clientTop;
+    for (const heading of popover.querySelectorAll<HTMLElement>(".guild-model-group-heading")) {
+      heading.dataset["stuck"] = String(headingIsStuck(heading.getBoundingClientRect().top, portTop));
+    }
+  }, []);
+  // Rows come and go (older models, notices), which moves the edges without a scroll.
+  useEffect(() => { if (panelOpen) syncScrollCues(); });
+  useEffect(() => {
+    if (!panelOpen) return;
+    const popover = popoverRef.current;
+    if (popover === null || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(syncScrollCues);
+    observer.observe(popover);
+    return () => observer.disconnect();
+  }, [panelOpen, syncScrollCues]);
+
   useEffect(() => {
     if (!panelOpen) return;
     const popover = popoverRef.current;
@@ -225,7 +255,10 @@ export function ModelPicker({
           {row.restarts === true && <em className="guild-model-restart-tag" aria-hidden="true">{messages.modelPickerRestartTag}</em>}
         </span>
         {row.description !== undefined && <small className="guild-model-row-description">{row.description}</small>}
-        {row.contextLabel !== undefined && <small className="guild-model-row-meta">{row.contextLabel}</small>}
+        {(row.contextLabel !== undefined || row.supportsImages === true) && <small className="guild-model-row-meta">
+          {[row.contextLabel, row.supportsImages === true ? messages.modelPickerImages : undefined]
+            .filter((part): part is string => part !== undefined).join(MODEL_PICKER_SEPARATOR)}
+        </small>}
       </button>
     );
   }
@@ -262,7 +295,9 @@ export function ModelPicker({
       aria-label={messages.modelPickerTitle}
       aria-busy={pending || undefined}
       tabIndex={-1}
+      onScroll={syncScrollCues}
     >
+      <div className="guild-model-fade top" aria-hidden="true" />
       {(view.models.some((row) => row.restarts === true) || view.useDefaultRestarts) &&
         <span id={restartHintId} className="guild-sr-only">{messages.modelPickerRestartHint}</span>}
       {view.catalogEmpty ? (
@@ -378,6 +413,7 @@ export function ModelPicker({
           {view.useDefaultRestarts && <em className="guild-model-restart-tag" aria-hidden="true">{messages.modelPickerRestartTag}</em>}
         </button>
       )}
+      <div className="guild-model-fade bottom" aria-hidden="true" />
     </div>}
   </div>;
 }

@@ -942,7 +942,7 @@ export function createLiveDesktopService(
   function claudeCatalogProjection(): ModelCatalog {
     const routed = routedModels();
     if (routed.length === 0) return claudeNativeCatalog;
-    const key = routed.map((model) => `${model.id}\0${model.label}\0${model.group}\0${model.sourceLabel}\0${model.contextWindow ?? ""}`).join("\n");
+    const key = routed.map((model) => `${model.id}\0${model.label}\0${model.group}\0${model.sourceLabel}\0${model.contextWindow ?? ""}\0${model.supportsImages === true}`).join("\n");
     if (claudeCatalogMemo?.native === claudeNativeCatalog && claudeCatalogMemo.key === key) {
       return claudeCatalogMemo.value;
     }
@@ -964,6 +964,7 @@ export function createLiveDesktopService(
             ? [model.contextWindow]
             : [],
         ),
+        ...(model.supportsImages === true ? { supportsImages: true as const } : {}),
       }));
     }
     let value = claudeNativeCatalog;

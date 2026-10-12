@@ -526,7 +526,7 @@ test("the Grok group of a not-yet-started runtime keeps its own hint, whatever e
 test("effort control follows the selected model; Online and Local models hide it unless they list efforts", () => {
   const base = { messages: EN, catalogs: CATALOGS, taskEngine: "claude" as const, engineFixed: true };
   const opus = modelPickerView({ ...base, selection: selection("opus", "high") });
-  assert.deepEqual(opus.efforts.map((effort) => effort.id), ["default", "low", "medium", "high", "xhigh", "max"]);
+  assert.deepEqual(opus.efforts.map((effort) => effort.id), ["default", "max", "xhigh", "high", "medium", "low"], "strongest first, like Grok");
   assert.equal(opus.showEfforts, true);
   assert.equal(opus.triggerText, "Opus \u00b7 High");
   // A Claude model without efforts keeps today's explanatory hint.
@@ -538,7 +538,7 @@ test("effort control follows the selected model; Online and Local models hide it
   assert.equal(modelPickerView({ ...base, selection: selection("local-27b-model", null) }).showEfforts, false);
   const reasoner = modelPickerView({ ...base, selection: selection("deepseek-v4-reasoner", null) });
   assert.equal(reasoner.showEfforts, true);
-  assert.deepEqual(reasoner.efforts.map((effort) => effort.id), ["high", "max"]);
+  assert.deepEqual(reasoner.efforts.map((effort) => effort.id), ["max", "high"]);
   assert.equal(reasoner.selectedEffortId, "high");
 });
 

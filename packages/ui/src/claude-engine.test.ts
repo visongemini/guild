@@ -54,7 +54,7 @@ test("the permission mode of a Claude task is the live session mode, else the Se
 test("the default-model control offers the adapter's own models, not the Online and Local ones", () => {
   assert.deepEqual(claudeNativeCatalog(CLAUDE_CATALOG).models.map((model) => model.id), ["default", "opus", "haiku"]);
   const view = claudeDefaultsView({ catalog: CLAUDE_CATALOG, model: "opus", reasoningEffort: "xhigh" });
-  assert.deepEqual(view.efforts.map((effort) => effort.id), ["default", "low", "medium", "high", "xhigh", "max"]);
+  assert.deepEqual(view.efforts.map((effort) => effort.id), ["default", "max", "xhigh", "high", "medium", "low"]);
   assert.equal(view.effortId, "xhigh");
   assert.equal(view.unlistedModelId, undefined);
   // The adapter default (null) has no effort control; a stored Online id is kept visible rather than hidden.

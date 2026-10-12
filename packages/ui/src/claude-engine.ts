@@ -1,7 +1,7 @@
 import type { GrokModelDescriptor, GuildClaudePermissionMode, ModelCatalog } from "@guild/contracts";
 import { modelGroupOf } from "@guild/contracts/grok-models";
 import type { GuildMessages } from "./locales.js";
-import { globalDefaultView } from "./model-picker.js";
+import { effortsDescending, globalDefaultView } from "./model-picker.js";
 
 /*
  * What the renderer shows about the Claude engine itself: whether Claude Code can run, the account
@@ -80,7 +80,7 @@ export function claudeDefaultsView(input: {
     models: catalog.models,
     unlistedModelId: view.unlistedModelId,
     effortId: view.effortId,
-    efforts: view.efforts,
+    efforts: effortsDescending(view.efforts),
   });
 }
 

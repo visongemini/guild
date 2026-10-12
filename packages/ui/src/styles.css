@@ -732,7 +732,7 @@ span.guild-pill { cursor: default; }
 .guild-model-picker-trigger:disabled { cursor: default; opacity: .62; }
 .guild-model-picker-trigger[aria-disabled="true"]:not(:disabled) { cursor: progress; }
 .guild-composer-wrap:has(.guild-model-popover) { overflow: visible; }
-.guild-model-popover { position: absolute; z-index: 75; right: 0; bottom: calc(100% + 7px); width: 320px; max-width: min(360px, calc(100vw - 32px)); max-height: min(520px, calc(100vh - 220px)); padding: 6px; display: grid; gap: 2px; overflow-y: auto; border: 1px solid var(--guild-line); border-radius: 12px; background: var(--guild-surface); color: var(--guild-text); box-shadow: var(--guild-shadow-pop); font-size: var(--guild-fs-sm); line-height: 1.4; animation: guild-pop-in var(--guild-dur-1) var(--guild-ease); }
+.guild-model-popover { position: absolute; z-index: 75; right: 0; bottom: calc(100% + 7px); width: 344px; max-width: min(360px, calc(100vw - 32px)); max-height: min(520px, calc(100vh - 220px)); padding: 6px; scroll-padding: 34px 0 24px; display: grid; gap: 2px; overflow-y: auto; border: 1px solid var(--guild-line); border-radius: 12px; background: var(--guild-surface); color: var(--guild-text); box-shadow: var(--guild-shadow-pop); font-size: var(--guild-fs-sm); line-height: 1.4; animation: guild-pop-in var(--guild-dur-1) var(--guild-ease); }
 .guild-model-popover:focus { outline: 0; }
 .guild-model-popover button:focus-visible { outline: 2px solid color-mix(in srgb, var(--guild-accent) 50%, transparent); outline-offset: -2px; }
 .guild-model-popover button:focus:not(:focus-visible) { outline: none; }
@@ -777,7 +777,17 @@ span.guild-pill { cursor: default; }
 /* Guild 3.0 grouped picker (PC-MODEL-001): one listbox, a labelled group per engine group. */
 .guild-model-group { display: grid; gap: 1px; }
 .guild-model-group + .guild-model-group { margin-top: var(--guild-s2); padding-top: var(--guild-s1); border-top: 1px solid var(--guild-line); }
-.guild-model-group-heading { margin-bottom: 2px; }
+.guild-model-group-heading { position: sticky; top: 0; z-index: 2; margin: 0 -6px 2px; padding: 6px calc(6px + var(--guild-s2)) 4px; background: var(--guild-surface); }
+.guild-model-group-heading::after { content: ""; position: absolute; left: 0; right: 0; top: 100%; height: 10px; background: linear-gradient(to bottom, var(--guild-surface), transparent); opacity: 0; pointer-events: none; transition: opacity var(--guild-dur-2) var(--guild-ease); }
+.guild-model-group-heading[data-stuck="true"]::after { opacity: 1; }
+/* Scroll cues: zero-height sticky markers at both ends of the popover draw a fade only on an edge with content past it. */
+.guild-model-fade { position: sticky; z-index: 1; height: 0; margin: 0; padding: 0; pointer-events: none; }
+.guild-model-fade.top { top: 0; margin-bottom: -2px; }
+.guild-model-fade.bottom { bottom: 0; margin-top: -2px; }
+.guild-model-fade::before { content: ""; position: absolute; left: -6px; right: -6px; height: 22px; opacity: 0; transition: opacity var(--guild-dur-2) var(--guild-ease); }
+.guild-model-fade.top::before { top: 0; background: linear-gradient(to bottom, var(--guild-surface), transparent); }
+.guild-model-fade.bottom::before { bottom: 0; background: linear-gradient(to top, var(--guild-surface), transparent); }
+.guild-model-popover[data-fade-top="true"] .guild-model-fade.top::before, .guild-model-popover[data-fade-bottom="true"] .guild-model-fade.bottom::before { opacity: 1; }
 .guild-model-list + .guild-model-heading { margin-top: var(--guild-s2); }
 .guild-model-action { min-height: 28px; margin: 0 var(--guild-s2) var(--guild-s1); padding: 0 var(--guild-s3); justify-self: start; border: 1px solid var(--guild-line-strong); border-radius: var(--guild-r-sm); background: var(--guild-surface); color: var(--guild-text); font-size: var(--guild-fs-sm); cursor: pointer; transition: background-color var(--guild-dur-1) var(--guild-ease); }
 .guild-model-action:hover { background: var(--guild-soft); }

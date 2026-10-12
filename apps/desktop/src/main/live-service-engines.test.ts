@@ -52,7 +52,7 @@ const BROWSER_URL = "http://127.0.0.1:43211/fedcba9876543210fedcba9876543210/mcp
 const NATIVE_MODELS = ["default", "opus", "sonnet", "haiku"] as const;
 const DEEPSEEK: RoutedModelInfo = {
   id: "deepseek-v4-flash", label: "DeepSeek V4 Flash", group: "online",
-  sourceId: "deepseek", sourceLabel: "DeepSeek", contextWindow: 128_000,
+  sourceId: "deepseek", sourceLabel: "DeepSeek", contextWindow: 128_000, supportsImages: true,
 };
 const LOCAL_MODEL: RoutedModelInfo = {
   id: "local-27b-model", label: "Local 27B", group: "local",
@@ -150,6 +150,9 @@ describe("dual engine orchestration [PC-ENG-001, PC-MODEL-001]", () => {
     assert.equal(claude.runtimeDefaultModelId, "default");
     assert.equal(claude.models.find((model) => model.id === "deepseek-v4-flash")?.name, "DeepSeek V4 Flash");
     assert.deepEqual(claude.models.find((model) => model.id === "deepseek-v4-flash")?.contextWindows, [128_000]);
+    // Image support the source states reaches the picker row; a source that says nothing leaves the field out.
+    assert.equal(claude.models.find((model) => model.id === "deepseek-v4-flash")?.supportsImages, true);
+    assert.equal("supportsImages" in claude.models.find((model) => model.id === "local-27b-model")!, false);
     assert.deepEqual(catalogs.grok.models, [], "the Grok list is not touched by a Claude session");
 
     // A source change reaches the picker without a restart of anything.

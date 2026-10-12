@@ -64,6 +64,25 @@ export function modelDefaultEffort(model: GrokModelDescriptor | undefined): stri
 export const modelOffersEffort = modelSupportsReasoningEffort;
 
 /**
+ * Where an effort sits in a list read from the strongest down: the adapter's own default first, then max, extra
+ * high, high, medium and low. An id this table does not know keeps the adapter's order after the known ones.
+ */
+const EFFORT_DESCENDING_RANK: Readonly<Record<string, number>> = Object.freeze({
+  default: 0, max: 1, xhigh: 2, high: 3, medium: 4, low: 5,
+});
+
+/**
+ * The Claude adapter lists its efforts weakest first and Grok lists its strongest first. Both pickers read from
+ * the strongest down, so a Claude list is turned around here (the default row stays on top); the sort is stable.
+ */
+export function effortsDescending<T extends Readonly<{ id: string }>>(efforts: readonly T[]): readonly T[] {
+  const rank = (effort: T) => EFFORT_DESCENDING_RANK[effort.id] ?? Object.keys(EFFORT_DESCENDING_RANK).length;
+  return Object.freeze(efforts.map((effort, index) => ({ effort, index }))
+    .sort((a, b) => rank(a.effort) - rank(b.effort) || a.index - b.index)
+    .map(({ effort }) => effort));
+}
+
+/**
  * Choosing a model keeps the current effort when the new model offers it, otherwise it takes the
  * new model's own default effort (null when the model has no effort setting).
  */
@@ -152,6 +171,8 @@ export type ModelRowView = Readonly<{
   priceMultiplier?: string;
   /** For example "256K / 500K context". */
   contextLabel?: string;
+  /** An Online or Local model its source states accepts images. */
+  supportsImages?: true;
   selected: boolean;
   /** Roving tab stop: the selected row, else the first one. */
   tabStop: boolean;
@@ -420,6 +441,7 @@ export function modelPickerView(input: {
       ...(description === undefined ? {} : { description }),
       ...(priceMultiplier === undefined ? {} : { priceMultiplier }),
       ...(contextSizes === undefined ? {} : { contextLabel: messages.modelPickerContext(contextSizes) }),
+      ...(candidate.supportsImages === true ? { supportsImages: true as const } : {}),
       selected: engine === taskEngine && candidate.id === modelId,
       group,
       engine,
@@ -492,7 +514,8 @@ export function modelPickerView(input: {
     });
   });
   const models = groups.flatMap((entry) => [...entry.models, ...(entry.older?.models ?? [])]);
-  const efforts = (model?.reasoningEfforts ?? []).map((candidate, index): EffortChoiceView => {
+  const offeredEfforts = model?.reasoningEfforts ?? [];
+  const efforts = (taskEngine === "claude" ? effortsDescending(offeredEfforts) : offeredEfforts).map((candidate, index): EffortChoiceView => {
     const selected = candidate.id === effortId;
     return Object.freeze({
       id: candidate.id,
@@ -596,6 +619,25 @@ export function noticeText(
   if (notice.kind === "saved") return messages.modelPickerSaved;
   if (notice.kind === "refused") return messages.modelPickerRefused(notice.reason);
   return messages.operationFailed;
+}
+
+/** Which edges of a scrolled list have content past them. A fade is drawn only on those, so a list that fits shows none. */
+export type ScrollCues = Readonly<{ top: boolean; bottom: boolean }>;
+
+export function scrollCues(box: Readonly<{ scrollTop: number; scrollHeight: number; clientHeight: number }>): ScrollCues {
+  // A pixel of slack: fractional scroll positions (zoom, high-density screens) never read as "more above".
+  return Object.freeze({
+    top: box.scrollTop > 1,
+    bottom: box.scrollHeight - box.scrollTop - box.clientHeight > 1,
+  });
+}
+
+/**
+ * A sticky heading is stuck once it sits on the top edge of the scroll port: its natural place is further down,
+ * so something is scrolling under it and its lower edge gets a soft fade instead of a hard cut.
+ */
+export function headingIsStuck(headingTop: number, portTop: number): boolean {
+  return headingTop <= portTop + 0.5;
 }
 
 export type PickerNavigationOrientation = "vertical" | "horizontal" | "both";
