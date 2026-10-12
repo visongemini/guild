@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { describe, it } from "node:test";
 import type { JsonObject } from "./json.js";
-import { looksLikeAnthropicSignature, ProvenanceRecorder, sanitizeThinking, signatureHash } from "./provenance.js";
+import { ProvenanceRecorder, sanitizeThinking, signatureHash } from "./provenance.js";
 import type { ProvenanceStore } from "./types.js";
 
 class MemoryStore implements ProvenanceStore {
@@ -46,73 +46,41 @@ describe("signature hash", () => {
   });
 });
 
-describe("anthropic signature heuristic", () => {
-  it("accepts only base64 strings longer than 100 characters", () => {
-    assert.equal(looksLikeAnthropicSignature(LONG_BASE64), true);
-    assert.equal(looksLikeAnthropicSignature("A".repeat(100)), false);
-    assert.equal(looksLikeAnthropicSignature("A".repeat(101)), true);
-    assert.equal(looksLikeAnthropicSignature("A".repeat(120) + "!"), false);
-    assert.equal(looksLikeAnthropicSignature("A".repeat(60) + " " + "B".repeat(60)), false);
-    assert.equal(looksLikeAnthropicSignature(""), false);
-  });
-});
-
 describe("thinking sanitize", () => {
   it("keeps blocks the target produced and drops blocks other sources produced", () => {
     const store = new MemoryStore();
     store.put(signatureHash("sig-a"), "deepseek");
     store.put(signatureHash("sig-b"), "other");
-    const result = sanitizeThinking(history(thinking("sig-a"), thinking("sig-b")), { sourceId: "deepseek", kind: "online" }, store);
+    const result = sanitizeThinking(history(thinking("sig-a"), thinking("sig-b")), { sourceId: "deepseek" }, store);
     assert.deepEqual(assistantContent(result.body), [thinking("sig-a"), { type: "text", text: "answer" }]);
     assert.equal(result.kept, 1);
     assert.equal(result.dropped, 1);
   });
 
-  it("drops unknown provenance for online and local targets", () => {
+  it("drops unknown provenance, however much the signature looks like a long base64 one", () => {
     const store = new MemoryStore();
-    for (const kind of ["online", "local"] as const) {
-      const result = sanitizeThinking(history(thinking(LONG_BASE64), thinking("short")), { sourceId: "x", kind }, store);
+    for (const sourceId of ["x", "local-1"]) {
+      const result = sanitizeThinking(history(thinking(LONG_BASE64), thinking("short")), { sourceId }, store);
       assert.deepEqual(assistantContent(result.body), [{ type: "text", text: "answer" }]);
       assert.equal(result.dropped, 2);
     }
   });
 
-  it("keeps unknown provenance for anthropic only when the signature is long base64", () => {
+  it("drops a block recorded as produced by anthropic, for every source", () => {
     const store = new MemoryStore();
-    const result = sanitizeThinking(
-      history(thinking(LONG_BASE64), thinking("short"), thinking("A".repeat(120) + "!")),
-      { sourceId: "anthropic", kind: "anthropic" },
-      store,
-    );
-    assert.deepEqual(assistantContent(result.body), [thinking(LONG_BASE64), { type: "text", text: "answer" }]);
-    assert.equal(result.kept, 1);
-    assert.equal(result.dropped, 2);
-  });
-
-  it("drops a long base64 signature that is recorded as foreign when the target is anthropic", () => {
-    const store = new MemoryStore();
-    store.put(signatureHash(LONG_BASE64), "deepseek");
-    const result = sanitizeThinking(history(thinking(LONG_BASE64)), { sourceId: "anthropic", kind: "anthropic" }, store);
-    assert.equal(result.dropped, 1);
-  });
-
-  it("keeps a short signature recorded as produced by anthropic", () => {
-    const store = new MemoryStore();
+    store.put(signatureHash(LONG_BASE64), "anthropic");
     store.put(signatureHash("short-anthropic"), "anthropic");
-    const result = sanitizeThinking(history(thinking("short-anthropic")), { sourceId: "anthropic", kind: "anthropic" }, store);
-    assert.equal(result.kept, 1);
-    assert.equal(result.dropped, 0);
+    for (const sourceId of ["deepseek", "local-1"]) {
+      const result = sanitizeThinking(history(thinking(LONG_BASE64), thinking("short-anthropic")), { sourceId }, store);
+      assert.equal(result.kept, 0, sourceId);
+      assert.equal(result.dropped, 2, sourceId);
+    }
   });
 
   it("drops unsigned thinking blocks for every target, even with a stale empty-signature record [PC-ROUTE-003]", () => {
     const missing: JsonObject = { type: "thinking", thinking: "no signature field" };
     const emptyRedacted: JsonObject = { type: "redacted_thinking", data: "" };
-    const targets = [
-      { sourceId: "local-1", kind: "local" },
-      { sourceId: "local-2", kind: "local" },
-      { sourceId: "deepseek", kind: "online" },
-      { sourceId: "anthropic", kind: "anthropic" },
-    ] as const;
+    const targets = [{ sourceId: "local-1" }, { sourceId: "local-2" }, { sourceId: "deepseek" }] as const;
     // A row written by an older build attributed the empty signature to local-1; it must stay inert.
     const stale = new MemoryStore();
     stale.put(signatureHash(""), "local-1");
@@ -130,30 +98,30 @@ describe("thinking sanitize", () => {
     const store = new MemoryStore();
     store.put(signatureHash("redacted-data"), "deepseek");
     const redacted = (data: string): JsonObject => ({ type: "redacted_thinking", data });
-    const result = sanitizeThinking(history(redacted("redacted-data"), redacted("other-data")), { sourceId: "deepseek", kind: "online" }, store);
+    const result = sanitizeThinking(history(redacted("redacted-data"), redacted("other-data")), { sourceId: "deepseek" }, store);
     assert.deepEqual(assistantContent(result.body), [redacted("redacted-data"), { type: "text", text: "answer" }]);
   });
 
   it("returns the same body object when nothing is dropped and ignores non-assistant messages", () => {
     const store = new MemoryStore();
     const body = history();
-    assert.equal(sanitizeThinking(body, { sourceId: "a", kind: "online" }, store).body, body);
+    assert.equal(sanitizeThinking(body, { sourceId: "a" }, store).body, body);
     const userThinking: JsonObject = { model: "m", messages: [{ role: "user", content: [thinking("x")] }] };
-    const result = sanitizeThinking(userThinking, { sourceId: "a", kind: "online" }, store);
+    const result = sanitizeThinking(userThinking, { sourceId: "a" }, store);
     assert.equal(result.body, userThinking);
     assert.equal(result.dropped, 0);
   });
 
   it("replaces an assistant message that only held dropped thinking with (empty) text", () => {
     const body: JsonObject = { model: "m", messages: [{ role: "assistant", content: [thinking("foreign")] }] };
-    const result = sanitizeThinking(body, { sourceId: "a", kind: "online" }, new MemoryStore());
+    const result = sanitizeThinking(body, { sourceId: "a" }, new MemoryStore());
     assert.deepEqual((result.body.messages as JsonObject[])[0]?.content, [{ type: "text", text: "(empty)" }]);
   });
 
   it("does not mutate the input body", () => {
     const body = history(thinking("foreign"));
     const before = JSON.stringify(body);
-    sanitizeThinking(body, { sourceId: "a", kind: "online" }, new MemoryStore());
+    sanitizeThinking(body, { sourceId: "a" }, new MemoryStore());
     assert.equal(JSON.stringify(body), before);
   });
 });
@@ -175,7 +143,7 @@ describe("provenance recorder", () => {
 
   it("records redacted_thinking data and non-streamed message content", () => {
     const store = new MemoryStore();
-    const recorder = new ProvenanceRecorder(store, "anthropic");
+    const recorder = new ProvenanceRecorder(store, "local-1");
     recorder.observeMessage({
       type: "message",
       content: [
@@ -185,13 +153,13 @@ describe("provenance recorder", () => {
       ],
     });
     recorder.observeEvent({ type: "content_block_start", index: 0, content_block: { type: "redacted_thinking", data: "redacted-stream" } });
-    assert.equal(store.get(signatureHash("sig-json")), "anthropic");
-    assert.equal(store.get(signatureHash("redacted-json")), "anthropic");
-    assert.equal(store.get(signatureHash("redacted-stream")), "anthropic");
+    assert.equal(store.get(signatureHash("sig-json")), "local-1");
+    assert.equal(store.get(signatureHash("redacted-json")), "local-1");
+    assert.equal(store.get(signatureHash("redacted-stream")), "local-1");
   });
 
   it("never records an empty signature, for any source [PC-ROUTE-003]", () => {
-    for (const sourceId of ["local-1", "deepseek", "anthropic"]) {
+    for (const sourceId of ["local-1", "deepseek"]) {
       const store = new MemoryStore();
       const recorder = new ProvenanceRecorder(store, sourceId);
       recorder.observeEvent({ type: "content_block_start", index: 0, content_block: { type: "thinking", thinking: "", signature: "" } });

@@ -102,7 +102,7 @@ describe("dual engine orchestration [PC-ENG-001, PC-MODEL-001]", () => {
     assert.deepEqual(h.world.adapters[1]!.prompts, ["hi"]);
   });
 
-  it("projects Claude's own models with the router's Online and Local ones and tells the router the native ids [PC-MODEL-001]", async () => {
+  it("projects Claude's own models with the router's Online and Local ones [PC-MODEL-001]", async () => {
     const router = new FakeRouterHost([DEEPSEEK, LOCAL_MODEL]);
     const h = await harness({ modelRouterHost: router });
     const before = (await h.service.bootstrap()).runtimeSettings;
@@ -124,7 +124,6 @@ describe("dual engine orchestration [PC-ENG-001, PC-MODEL-001]", () => {
     assert.equal(claude.models.find((model) => model.id === "deepseek-v4-flash")?.name, "DeepSeek V4 Flash");
     assert.deepEqual(claude.models.find((model) => model.id === "deepseek-v4-flash")?.contextWindows, [128_000]);
     assert.deepEqual(catalogs.grok.models, [], "the Grok list is not touched by a Claude session");
-    assert.deepEqual(router.noted, [[...NATIVE_MODELS]], "the router learns Claude's ids, not its own");
 
     // A source change reaches the picker without a restart of anything.
     const seen: string[][] = [];
@@ -291,7 +290,6 @@ describe("dual engine orchestration [PC-ENG-001, PC-MODEL-001]", () => {
     // The routed session's picker models never become Claude's own.
     const claudeModels = (await h.service.bootstrap()).runtimeSettings.modelCatalogs!.claude.models;
     assert.deepEqual(claudeModels.filter((model) => model.group === "claude").map((model) => model.id), [...NATIVE_MODELS]);
-    assert.deepEqual(router.noted.at(-1), [...NATIVE_MODELS]);
 
     // Switching among models of a routed session is a plain config option, with no restart.
     const back = await h.service.setTaskRuntimeSettings({
@@ -1316,7 +1314,6 @@ class FakeRouterHost implements ModelRouterHostPort {
   /** True while a held call waits for its gate. */
   waiting = false;
   private heldCall: { readonly at: number; readonly gate: Promise<void> } | undefined;
-  readonly noted: string[][] = [];
   private readonly listeners = new Set<() => void>();
   constructor(models: readonly RoutedModelInfo[]) { this.models = models; }
   listRoutedModels(): readonly RoutedModelInfo[] { return this.models; }
@@ -1337,7 +1334,6 @@ class FakeRouterHost implements ModelRouterHostPort {
     this.heldCall = { at, gate: new Promise<void>((resolve) => { open = resolve; }) };
     return { open };
   }
-  noteAnthropicModels(ids: readonly string[]): void { this.noted.push([...ids]); }
   onChange(listener: () => void): () => void {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);

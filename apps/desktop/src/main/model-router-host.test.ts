@@ -173,9 +173,8 @@ describe("model router host: which sources are routable", () => {
 
     const { baseUrl } = await h.host.ensureStarted();
     const shadow = await post(baseUrl, "claude-opus-4");
-    assert.equal(shadow.status, 200);
-    assert.equal(h.calls.at(-1)?.url, "https://api.anthropic.com/v1/messages", "a Claude id always goes to Anthropic");
-    assert.equal(h.calls.at(-1)?.via, "proxied");
+    assert.equal(shadow.status, 400, "a Claude id is refused, whatever a source lists");
+    assert.equal(h.calls.length, 0, "and nothing is sent anywhere");
   });
 
   it("primes itself on the first listing and tells listeners once the list is known", async (t) => {
@@ -190,24 +189,14 @@ describe("model router host: which sources are routable", () => {
   });
 });
 
-describe("model router host: isAnthropicModel and credentials", () => {
-  it("sends claude-* and noted ids to Anthropic with the client credential, never an id a source claims", async (t) => {
+describe("model router host: routing and credentials", () => {
+  it("serves only the ids a source claims; Claude ids, aliases and unknown ids are refused and never forwarded [D-061]", async (t) => {
     const h = harness(t);
     add(h.store, draft());
     await h.host.refresh();
-    h.host.noteAnthropicModels(["haiku", "flash-local", "x".repeat(200)]);
     const { baseUrl } = await h.host.ensureStarted();
 
-    assert.equal((await post(baseUrl, "claude-sonnet-5")).status, 200);
-    assert.equal((await post(baseUrl, "haiku")).status, 200);
-    for (const call of h.calls) {
-      assert.equal(call.url, "https://api.anthropic.com/v1/messages");
-      assert.equal(call.via, "proxied");
-      assert.equal(call.headers["authorization"], "Bearer client-oauth-secret");
-    }
-
-    h.calls.length = 0;
-    // A source's id wins over a noted Claude id (the adapter lists routed models too), and the OAuth credential never reaches it.
+    // The client credential never reaches a Local source, and it has no key of its own.
     assert.equal((await post(baseUrl, "flash-local")).status, 200);
     assert.equal(h.calls.length, 1);
     assert.equal(h.calls[0]?.url, `${LOCAL_URL}/v1/messages`);
@@ -215,11 +204,25 @@ describe("model router host: isAnthropicModel and credentials", () => {
     assert.equal(h.calls[0]?.headers["authorization"], undefined);
     assert.equal(h.calls[0]?.headers["x-api-key"], undefined, "keyless: no credential at all");
 
-    // Unknown or overlong ids are never forwarded.
     h.calls.length = 0;
+    assert.equal((await post(baseUrl, "claude-sonnet-5")).status, 400);
+    assert.equal((await post(baseUrl, "haiku")).status, 404);
     assert.equal((await post(baseUrl, "mystery-model")).status, 404);
     assert.equal((await post(baseUrl, "x".repeat(200))).status, 404);
     assert.equal(h.calls.length, 0);
+  });
+
+  it("refuses a subscription credential outright: nothing reaches any transport [D-061]", async (t) => {
+    t.mock.method(console, "warn", () => undefined);
+    const h = harness(t);
+    add(h.store, draft());
+    await h.host.refresh();
+    const { baseUrl } = await h.host.ensureStarted();
+    const oauth = "sk-ant-oat01-host-test-secret";
+    assert.equal((await post(baseUrl, "flash-local", { authorization: `Bearer ${oauth}` })).status, 400);
+    assert.equal((await post(baseUrl, "flash-local", { "x-api-key": oauth })).status, 400);
+    assert.equal(h.calls.length, 0);
+    assert.equal(JSON.stringify(h.logs).includes(oauth), false);
   });
 
   it("picks the direct or proxied transport from the source kind alone, not from the URL [PC-ROUTE-002]", async (t) => {

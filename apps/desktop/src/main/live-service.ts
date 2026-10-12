@@ -654,7 +654,6 @@ export function createLiveDesktopService(
   // Claude's own models, the same way; the router's Online and Local ones are added when projected.
   let claudeNativeCatalog: ModelCatalog = store.loadModelCatalogCache("claude")?.catalog ?? EMPTY_CLAUDE_MODEL_CATALOG;
   let claudeCatalogMemo: { readonly native: ModelCatalog; readonly key: string; readonly value: ModelCatalog } | undefined;
-  let reportedAnthropicModelKey = "";
   let claudeRuntimeVersion: string | undefined;
   // What the Claude engine last said about its login. Account-level: one login serves every Claude task.
   let claudeAuth: Readonly<{ kind: string; label?: string }> | undefined;
@@ -917,15 +916,6 @@ export function createLiveDesktopService(
       });
     } catch {
       return;
-    }
-    const key = ids.join("\0");
-    if (key !== reportedAnthropicModelKey) {
-      reportedAnthropicModelKey = key;
-      try {
-        modelRouterHost?.noteAnthropicModels(ids);
-      } catch {
-        // The router's registry also learns models from its own traffic; this only seeds it.
-      }
     }
     if (JSON.stringify(next) === JSON.stringify(claudeNativeCatalog)) return;
     claudeNativeCatalog = next;

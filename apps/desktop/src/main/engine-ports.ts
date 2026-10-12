@@ -18,8 +18,6 @@ export interface ModelRouterHostPort {
   listRoutedModels(): readonly RoutedModelInfo[];
   /** Starts the loopback router if needed. The URL carries the router token: never log it. */
   ensureStarted(): Promise<{ readonly baseUrl: string }>;
-  /** Claude model ids the adapter reported in native sessions, for the router's exact registry. */
-  noteAnthropicModels(ids: readonly string[]): void;
   /** Called after sources are added, confirmed, edited, disabled or deleted. */
   onChange(listener: () => void): () => void;
   close(): Promise<void>;

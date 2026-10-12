@@ -1,4 +1,4 @@
-export type SourceKind = "anthropic" | "online" | "local";
+export type SourceKind = "online" | "local";
 
 export interface RouterModel {
   readonly id: string;
@@ -11,9 +11,9 @@ export interface RouterSource {
   readonly id: string;
   readonly kind: SourceKind;
   readonly label: string;
-  /** Online/local: vendor or server base URL. Anthropic entries are informational only. */
+  /** Vendor or server base URL. */
   readonly baseUrl: string;
-  /** Online/local only. Held in memory; never logged. */
+  /** Held in memory; never logged. */
   readonly key?: string;
   /** Host (URL.host, including a non-default port) the key was confirmed for. */
   readonly confirmedHost?: string;
@@ -42,10 +42,8 @@ export interface UpstreamRequestContext {
 export type UpstreamFetch = (input: string, init: RequestInit, context: UpstreamRequestContext) => Promise<Response>;
 
 export interface ModelRouterOptions {
-  /** Online and local sources. Entries of kind "anthropic" are never routable. */
+  /** Online and local sources: the only models the router serves. */
   readonly sources: readonly RouterSource[];
-  /** Registry predicate supplied by Guild: true for Claude model ids served by Anthropic. */
-  readonly isAnthropicModel: (model: string) => boolean;
   readonly provenance: ProvenanceStore;
   readonly logger: RouterLogger;
   /** Production: Electron net.fetch (system proxy). Tests: global fetch, which ignores the context. */
@@ -64,5 +62,8 @@ export interface ModelRouterHandle {
   close(): Promise<void>;
 }
 
-export const ANTHROPIC_BASE_URL = "https://api.anthropic.com";
+/**
+ * Reserved source id. Guild 3.0.0 recorded Anthropic as the producer of thinking signatures under this id,
+ * and those rows persist, so no source may ever take it (a new source would inherit them).
+ */
 export const ANTHROPIC_SOURCE_ID = "anthropic";
