@@ -169,7 +169,7 @@ describe("model sources service: native confirmation of the host [PC-ROUTE-002]"
     assert.equal(confirmed.source.confirmedHost, "api.deepseek.com");
     assert.equal(h.prompts.length, 1);
     const prompt = h.prompts[0];
-    assert.equal(prompt?.message, "Allow Guild to send DEEPSEEK_API_KEY from /Users/tester/keys.env to api.deepseek.com?");
+    assert.equal(prompt?.message, "Allow Guild to send DEEPSEEK_API_KEY from /Users/tester/keys.env and Claude task conversations to api.deepseek.com?");
     assert.match(prompt?.detail ?? "", /stays in memory and is only sent to api\.deepseek\.com/u);
     assert.deepEqual([prompt?.cancelLabel, prompt?.allowLabel], ["Cancel", "Allow"]);
     assert.equal(h.changes.count, 2, "upsert and confirmation both reach the router host");
@@ -180,7 +180,7 @@ describe("model sources service: native confirmation of the host [PC-ROUTE-002]"
     h.locale.value = "zh-CN";
     await h.service.upsert(online());
     await h.service.confirm("deepseek");
-    assert.equal(h.prompts[0]?.message, `允许 Guild 把 ${DEFAULT_KEY_FILE} 中的 DEEPSEEK_API_KEY 发送到 api.deepseek.com 吗？`);
+    assert.equal(h.prompts[0]?.message, `允许 Guild 把 ${DEFAULT_KEY_FILE} 中的 DEEPSEEK_API_KEY 和 Claude 任务的对话发送到 api.deepseek.com 吗？`);
     assert.deepEqual([h.prompts[0]?.cancelLabel, h.prompts[0]?.allowLabel], ["取消", "允许"]);
   });
 
@@ -193,6 +193,16 @@ describe("model sources service: native confirmation of the host [PC-ROUTE-002]"
     await h.service.upsert(local({ id: "second", baseUrl: "http://127.0.0.1:8082", models: [{ id: "flash-two", label: "Two" }] }));
     await h.service.confirm("second");
     assert.equal(h.prompts[1]?.message, "允许 Guild 把 Claude 任务的对话发送到 127.0.0.1:8082 吗？");
+  });
+
+  it("refuses a key-less Online source, and words a keyed Local source by its key alone", async (t) => {
+    const h = harness(t);
+    assert.equal(await refusal(h.service.upsert(online({ keyVariable: null }))), "model_source_invalid", "Online always names its key");
+    assert.equal(await refusal(h.service.upsert(online({ keyVariable: null, keyFile: null }))), "model_source_invalid");
+    assert.deepEqual((await h.service.list()).sources, []);
+    await h.service.upsert(local({ keyFile: "/Users/tester/keys.env", keyVariable: "WORKSTATION_KEY" }));
+    await h.service.confirm("workstation");
+    assert.equal(h.prompts[0]?.message, "Allow Guild to send WORKSTATION_KEY from /Users/tester/keys.env to 127.0.0.1:8081?");
   });
 
   it("Cancel confirms nothing and leaves the source unconfirmed", async (t) => {
@@ -264,7 +274,7 @@ describe("model sources service: native confirmation of the host [PC-ROUTE-002]"
     await h.service.confirm("deepseek");
     const message = h.prompts[0]?.message ?? "";
     assert.ok(message.length < 300, String(message.length));
-    assert.match(message, /^Allow Guild to send DEEPSEEK_API_KEY from \/Users\/tester\/nested.*\.\.\..*keys\.env to api\.deepseek\.com\?$/u);
+    assert.match(message, /^Allow Guild to send DEEPSEEK_API_KEY from \/Users\/tester\/nested.*\.\.\..*keys\.env and Claude task conversations to api\.deepseek\.com\?$/u);
   });
 });
 

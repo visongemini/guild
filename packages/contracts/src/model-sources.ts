@@ -48,7 +48,10 @@ export type ModelSourceProjection = Readonly<{
   baseUrl: string;
   /** Absolute path of the env file holding the key; `null` means the default key file. */
   keyFile: string | null;
-  /** Name of the variable inside the key file (never its value); `null` when the source needs no key. */
+  /**
+   * Name of the variable inside the key file (never its value). Always set for an Online source,
+   * which sends the key to its vendor; `null` only for a Local source that needs no key.
+   */
   keyVariable: string | null;
   models: readonly ModelSourceModel[];
   enabled: boolean;
@@ -211,6 +214,9 @@ export function parseModelSourceDraft(input: unknown): ModelSourceDraft {
     ? null
     : parseModelSourceKeyVariable(record["keyVariable"]);
   if (keyFile !== null && keyVariable === null) throw new TypeError("invalid_model_source_key_variable");
+  // An Online source is a vendor's endpoint: a keyless one would send the conversation to a remote host unauthenticated
+  // and unnoticed, so it must name the key it will send (`keyFile` stays optional: `null` is the default key file).
+  if (kind === "online" && keyVariable === null) throw new TypeError("invalid_model_source_key_variable");
   if (typeof record["enabled"] !== "boolean") throw new TypeError("invalid_model_source_enabled");
   const label = plainText(record["label"], GUILD_MODEL_SOURCE_LIMITS.labelLength, "invalid_model_source_label").trim();
   if (label.length === 0) throw new TypeError("invalid_model_source_label");
