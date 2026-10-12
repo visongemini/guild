@@ -1408,12 +1408,10 @@ export function createLiveDesktopService(
     previous: ReturnType<GuildPersistence["loadTaskRuntimeSettings"]>;
   }>;
 
-  /** The session runs on a model its own model list does not offer. */
+  /** The session runs on a model its own model list does not offer (the codec marks it `unlisted`). */
   function sessionModelUnoffered(options: readonly RuntimeConfigOption[]): boolean {
     const modelOption = selectionOptionsOf(options).model;
-    return modelOption !== undefined &&
-      typeof modelOption.currentValue === "string" &&
-      !optionOffers(modelOption, modelOption.currentValue);
+    return modelOption?.type === "select" && modelOption.unlisted === true;
   }
 
   /** Whether the session's own model list offers this model. */
@@ -1566,9 +1564,15 @@ export function createLiveDesktopService(
     schedulePhasePublish();
   }
 
-  /** Display-only engine signals: the Claude account summary and frames dropped after a turn ended. */
+  /**
+   * Display-only engine signals: the Claude account summary and frames dropped after a turn ended. A routed process
+   * authenticates with Guild's throwaway token, so what it reports about its identity says nothing about the
+   * subscription: only a native process may set or change the account summary, and the label stays what a native
+   * process last reported (D-062).
+   */
   function observeEngineSignal(taskId: TaskId, signal: EngineSignal): void {
     if (signal.type === "auth_status") {
+      if (controllers.get(taskId)?.routedProcess === true) return;
       const label = signal.status.label ?? signal.status.plan;
       if (claudeAuth?.kind === signal.status.kind && claudeAuth.label === label) return;
       claudeAuth = Object.freeze({ kind: signal.status.kind, ...(label === undefined ? {} : { label }) });

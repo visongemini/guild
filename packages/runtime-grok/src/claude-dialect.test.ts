@@ -12,9 +12,12 @@ import {
 import {
   AcpV1CodecError,
   decodeInitializeResult,
+  decodeLoadSessionResult,
   decodeNewSessionResult,
   decodePromptResult,
+  decodeResumeSessionResult,
   decodeSessionUpdate,
+  decodeSetSessionConfigOptionResult,
   deriveClaudeModelCatalog,
   encodeInitializeParams,
   encodeNewSessionParams,
@@ -197,6 +200,98 @@ describe("Claude dialect: session decoding and the model catalog", () => {
     for (const id of ["", "-x", "[x]", "a b", "a/b", "a".repeat(129), "a\nb"]) {
       assert.equal(isClaudeModelId(id), false, id);
     }
+  });
+});
+
+describe("Claude dialect: a model option whose current value is not a choice [D-062]", () => {
+  // The adapter restores the model of the transcript's last turn on resume: after routed turns a native session's
+  // list holds Claude's own models, so the current value is the Online id of the last turn.
+  const nativeModels = [{ value: "default", name: "Default" }, { value: "opus", name: "Opus 5.5" }, { value: "haiku", name: "Haiku 5.5" }];
+  const wireOption = (id: string, category: string, currentValue: string, options: readonly Record<string, unknown>[]) =>
+    ({ id, name: id, category, type: "select", currentValue, options });
+  const strayState = (currentModel: string) => ({
+    sessionId: "b9b4ee19-8ea2-486a-ba0a-81f46577b4ef",
+    configOptions: [
+      wireOption("mode", "mode", "default", [{ value: "default", name: "Default" }]),
+      wireOption("model", "model", currentModel, nativeModels),
+      wireOption("effort", "thought_level", "medium", [{ value: "low", name: "Low" }, { value: "medium", name: "Medium" }]),
+    ],
+  });
+
+  it("decodes a resumed native session on a routed id: accepted, marked unlisted, never a model", () => {
+    for (const decode of [decodeResumeSessionResult, decodeLoadSessionResult]) {
+      const decoded = decode(strayState("deepseek-v4-flash"), "claude");
+      const model = decoded.configOptions?.find((option) => option.category === "model");
+      assert.equal(model?.type, "select");
+      if (model?.type !== "select") return;
+      assert.equal(model.currentValue, "deepseek-v4-flash");
+      assert.equal(model.unlisted, true, "consumers can tell it is not one of the choices");
+      assert.deepEqual(
+        (model.choices.form === "flat" ? model.choices.options : []).map((choice) => choice.value),
+        ["default", "opus", "haiku"],
+        "the choices are the adapter's own, nothing is added",
+      );
+      // The catalog is the choices: the routed id is not a native Claude model, has no efforts and is no default.
+      assert.deepEqual(decoded.modelCatalog?.models.map((entry) => entry.id), ["default", "opus", "haiku"]);
+      assert.equal(decoded.modelCatalog?.models.some((entry) => entry.reasoningEfforts.length > 0), false);
+      assert.equal(decoded.modelCatalog?.runtimeDefaultModelId, undefined);
+      assert.deepEqual(deriveClaudeModelCatalog(decoded.configOptions ?? [])?.models.map((entry) => entry.id), ["default", "opus", "haiku"]);
+      // The other options of the session are untouched and not marked.
+      assert.equal(decoded.configOptions?.filter((option) => option.type === "select" && option.unlisted === true).length, 1);
+    }
+    // A listed current value carries no flag.
+    const listed = decodeResumeSessionResult(strayState("opus"), "claude");
+    assert.equal(listed.configOptions?.some((option) => option.type === "select" && "unlisted" in option), false);
+  });
+
+  it("accepts it in a set_config_option answer and a config_option_update too, in the Claude dialect only", () => {
+    const options = strayState("deepseek-v4-flash").configOptions;
+    const answer = decodeSetSessionConfigOptionResult({ configOptions: options }, "claude");
+    assert.equal(answer.find((option) => option.category === "model" && option.type === "select")?.type === "select", true);
+    const update = decodeSessionUpdate(
+      { sessionId: "s-1", update: { sessionUpdate: "config_option_update", configOptions: options } },
+      "s-1",
+      received,
+      "claude",
+    );
+    assert.equal(update.type, "session_context");
+    if (update.type === "session_context" && update.payload.context.kind === "config") {
+      const model = update.payload.context.options.find((option) => option.category === "model");
+      assert.equal(model?.type === "select" && model.unlisted, true);
+    }
+    // Grok keeps the strict rule on every path: the current value is one of the choices.
+    for (const strict of [
+      () => decodeResumeSessionResult(strayState("deepseek-v4-flash")),
+      () => decodeResumeSessionResult(strayState("deepseek-v4-flash"), "grok"),
+      () => decodeNewSessionResult(strayState("deepseek-v4-flash")),
+      () => decodeSetSessionConfigOptionResult({ configOptions: options }),
+      () => decodeSessionUpdate(
+        { sessionId: "s-1", update: { sessionUpdate: "config_option_update", configOptions: options } },
+        "s-1",
+        received,
+      ),
+    ]) {
+      assert.throws(strict, (cause: unknown) => cause instanceof AcpV1CodecError && cause.code === "invalid_value");
+    }
+  });
+
+  it("keeps the strict rule for every select option of the Claude dialect that is not the model", () => {
+    for (const category of ["mode", "thought_level"]) {
+      const state = {
+        sessionId: "s-1",
+        configOptions: [wireOption("other", category, "not-a-choice", [{ value: "a", name: "A" }])],
+      };
+      assert.throws(
+        () => decodeResumeSessionResult(state, "claude"),
+        (cause: unknown) => cause instanceof AcpV1CodecError && cause.code === "invalid_value",
+        category,
+      );
+    }
+    // A model option without a category is not the model option.
+    assert.throws(
+      () => decodeResumeSessionResult({ sessionId: "s-1", configOptions: [{ id: "model", name: "Model", type: "select", currentValue: "x", options: nativeModels }] }, "claude"),
+      (cause: unknown) => cause instanceof AcpV1CodecError && cause.code === "invalid_value",
+    );
   });
 });
 

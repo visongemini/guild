@@ -1123,8 +1123,11 @@ Decision
   (the routed small-fast and subagent model variables may keep naming the model of the last start until the next
   one, as recorded in D-061).
 - A native process resumed after routed turns reads the model of its last turn from the transcript, an Online or
-  Local id that Claude does not offer. Guild applies the selected Claude model, or the Claude default when the
-  choice was cleared, before the first turn.
+  Local id that Claude does not offer. The Claude dialect of the codec accepts that value for the `model` option
+  only (marked `unlisted`, never a catalog model), and Guild applies the selected Claude model, or the Claude
+  default when the choice was cleared, before the first turn.
+- Account summary. A routed process authenticates with the throwaway token, so the identity it reports is ignored;
+  only a native process sets the account label and the login state.
 - `task_metadata.routed_at_ms` stays, with a new meaning: the task has used an Online or Local model at least
   once. It is written once, after a routed process took the selection, and never cleared. It no longer forces any
   process mode. There is no schema migration (schema v19).

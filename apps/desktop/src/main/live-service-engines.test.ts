@@ -446,9 +446,82 @@ describe("dual engine orchestration [PC-ENG-001, PC-MODEL-001]", () => {
     assert.equal(cleared.task.modelSelection.modelId, "default");
     assert.equal(cleared.task.modelSelection.source, "runtime");
 
+    // The routed id the resumed session reported is never one of Claude's own models.
+    const native = (await h.service.bootstrap()).runtimeSettings.modelCatalogs!.claude.models;
+    assert.deepEqual(native.filter((model) => model.group === "claude").map((model) => model.id), [...NATIVE_MODELS]);
+    assert.equal(native.filter((model) => model.id === "deepseek-v4-flash").every((model) => model.group === "online"), true);
+    assert.equal((await h.service.bootstrap()).runtimeSettings.modelCatalogs!.claude.runtimeDefaultModelId, "default");
+
     await h.send(taskId, "default turn");
     await h.completed(3);
     assert.deepEqual(h.world.adapters[2]!.prompts, ["default turn"]);
+  });
+
+  it("applies the selected Claude model, or the default, after a resume whose transcript ended on the other mode, also after a Guild restart [D-062]", async () => {
+    const router = new FakeRouterHost([DEEPSEEK]);
+    const spec: EngineSpec = { restoreTranscriptModel: true };
+    const h = await harness({ modelRouterHost: router }, { claude: spec });
+    const task = await h.service.createTask(h.workspaceId, undefined, "claude");
+    const taskId = task.task.taskId;
+    await h.send(taskId, "native");
+    await h.completed();
+    await h.idle();
+    await h.service.setTaskRuntimeSettings({ taskId, model: "deepseek-v4-flash", reasoningEffort: null, contextWindow: null });
+    await h.send(taskId, "routed");
+    await h.completed(2);
+    await h.idle();
+    // The choice is cleared (Claude's default); the transcript's last turn is still DeepSeek's.
+    await h.service.setTaskRuntimeSettings({ taskId, model: null, reasoningEffort: null, contextWindow: null });
+    await h.idle();
+
+    // A Guild restart resumes natively on the DeepSeek id: the default is applied before the first prompt.
+    const restarted = await h.restart();
+    await h.service.openTask(taskId);
+    await h.send(taskId, "after restart");
+    await h.completed(3);
+    const native = restarted.adapters[0]!;
+    assert.equal(restarted.inputs[0]!.extraEnvironment?.["ANTHROPIC_BASE_URL"], undefined);
+    const modelCalls = native.log.filter((entry) => entry.startsWith("config:model="));
+    assert.deepEqual(modelCalls, ["config:model=default"]);
+    assert.ok(native.log.indexOf("config:model=default") < native.log.indexOf("prompt:after restart"));
+    await h.idle();
+
+    // A pinned Claude model is applied the same way when the transcript ended on a routed turn.
+    await h.service.setTaskRuntimeSettings({ taskId, model: "deepseek-v4-flash", reasoningEffort: null, contextWindow: null });
+    await h.send(taskId, "routed again");
+    await h.completed(4);
+    await h.idle();
+    await h.service.setTaskRuntimeSettings({ taskId, model: "sonnet", reasoningEffort: null, contextWindow: null });
+    const second = await h.restart();
+    await h.service.openTask(taskId);
+    await h.send(taskId, "sonnet after restart");
+    await h.completed(5);
+    assert.deepEqual(second.adapters[0]!.log.filter((entry) => entry.startsWith("config:model=")), ["config:model=sonnet"]);
+    assert.deepEqual(second.adapters[0]!.prompts, ["sonnet after restart"]);
+  });
+
+  it("resumes a routed process whose transcript ended on a Claude id its list does not offer, and applies the routed selection [D-062]", async () => {
+    const router = new FakeRouterHost([DEEPSEEK]);
+    const spec: EngineSpec = {};
+    const h = await harness({ modelRouterHost: router }, { claude: spec });
+    const task = await h.service.createTask(h.workspaceId, undefined, "claude");
+    const taskId = task.task.taskId;
+    await h.send(taskId, "native");
+    await h.completed();
+    await h.idle();
+    // The adapter restores a dated Claude id (no row of the list has it) from the transcript.
+    spec.resumedModel = "claude-opus-5-5-20260101";
+    const switched = await h.service.setTaskRuntimeSettings({ taskId, model: "deepseek-v4-flash", reasoningEffort: null, contextWindow: null });
+    assert.equal(switched.status, "applied");
+    assert.equal(h.world.adapters.length, 2);
+    assertRoutedEnvironment(h.world.inputs[1]!.extraEnvironment, "deepseek-v4-flash");
+    assert.deepEqual(h.world.adapters[1]!.log.filter((entry) => entry.startsWith("config:model=")), ["config:model=deepseek-v4-flash"]);
+    // The unlisted Claude id is no model of the catalog either.
+    const ids = (await h.service.bootstrap()).runtimeSettings.modelCatalogs!.claude.models.map((model) => model.id);
+    assert.equal(ids.includes("claude-opus-5-5-20260101"), false);
+    await h.send(taskId, "routed");
+    await h.completed(2);
+    assert.deepEqual(h.world.adapters[1]!.prompts, ["routed"]);
   });
 
   it("starts every process in the mode of the selected model: crash recovery and a Guild restart, both directions [D-062]", async () => {
@@ -1263,6 +1336,69 @@ describe("dual engine orchestration [PC-ENG-001, PC-MODEL-001]", () => {
     assert.equal(grokTask.engineStatus, undefined);
   });
 
+  it("keeps the subscription's account label in either mode: a routed process reports its throwaway identity and none of it is shown [D-062]", async () => {
+    const router = new FakeRouterHost([DEEPSEEK]);
+    const h = await harness({ modelRouterHost: router });
+    const claudeReport = async () => {
+      const bootstrap = await h.service.bootstrap();
+      return { settings: bootstrap.runtimeSettings.claude, task: bootstrap.activeTask?.engineStatus };
+    };
+    const task = await h.service.createTask(h.workspaceId, undefined, "claude");
+    const taskId = task.task.taskId;
+    await h.send(taskId, "native");
+    await h.completed();
+    h.world.adapters[0]!.emitAuthStatus({ kind: "account", label: "Claude Max", plan: "max" });
+    await eventually(async () => (await claudeReport()).settings?.accountLabel === "Claude Max");
+    await h.idle();
+
+    // The routed process authenticates with the throwaway token; whatever it says about itself is not the subscription.
+    const switched = await h.service.setTaskRuntimeSettings({ taskId, model: "deepseek-v4-flash", reasoningEffort: null, contextWindow: null });
+    assert.equal(switched.status, "applied");
+    const routed = h.world.adapters[1]!;
+    for (const status of [
+      { kind: "api_key", label: "Anthropic API key" },
+      { kind: "gateway", label: "Custom model gateway" },
+      { kind: "none", label: "Not logged in" },
+    ]) {
+      routed.emitAuthStatus(status);
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      const report = await claudeReport();
+      assert.equal(report.settings?.accountLabel, "Claude Max", status.kind);
+      assert.equal(report.settings?.status, "ready", `${status.kind} does not turn into a login prompt`);
+      assert.deepEqual(report.task, { accountLabel: "Claude Max" }, status.kind);
+    }
+
+    // And back: the native process is the one that reports the subscription.
+    await h.idle();
+    assert.equal((await h.service.setTaskRuntimeSettings({ taskId, model: "opus", reasoningEffort: null, contextWindow: null })).status, "applied");
+    h.world.adapters[2]!.emitAuthStatus({ kind: "account", label: "Claude Pro", plan: "pro" });
+    await eventually(async () => (await claudeReport()).settings?.accountLabel === "Claude Pro");
+    h.world.adapters[2]!.emitAuthStatus({ kind: "none", label: "Not logged in" });
+    await eventually(async () => (await claudeReport()).settings?.status === "not_logged_in", );
+    h.world.adapters[2]!.emitAuthStatus({ kind: "account", label: "Claude Max", plan: "max" });
+    await eventually(async () => (await claudeReport()).settings?.accountLabel === "Claude Max");
+  });
+
+  it("shows no account label rather than a throwaway-derived one when only a routed process has started since Guild opened [D-062]", async () => {
+    const router = new FakeRouterHost([DEEPSEEK]);
+    const h = await harness({ modelRouterHost: router });
+    const task = await h.service.createTask(h.workspaceId, undefined, "claude");
+    const taskId = task.task.taskId;
+    await h.service.setTaskRuntimeSettings({ taskId, model: "deepseek-v4-flash", reasoningEffort: null, contextWindow: null });
+    await h.send(taskId, "routed first");
+    await h.completed();
+    await h.idle();
+    const restarted = await h.restart();
+    await h.service.openTask(taskId);
+    await eventually(() => restarted.adapters.length === 1 && restarted.adapters[0]!.session !== undefined);
+    assertRoutedEnvironment(restarted.inputs[0]!.extraEnvironment, "deepseek-v4-flash");
+    restarted.adapters[0]!.emitAuthStatus({ kind: "api_key", label: "Anthropic API key" });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const report = (await h.service.bootstrap()).runtimeSettings.claude;
+    assert.equal(report?.accountLabel, undefined, "unknown, not a label from the throwaway token");
+    assert.notEqual(report?.status, "not_logged_in");
+  });
+
   it("maps Steer to the Claude steering request and queues what it cannot inject [docs/20 3.8]", async () => {
     // injected
     const injected = await harness();
@@ -1662,6 +1798,8 @@ type EngineSpec = {
    * transcript: an Online / Local id after routed turns, which a native model list does not offer.
    */
   readonly restoreTranscriptModel?: boolean;
+  /** A resumed session comes back on this model whatever the transcript says (listed or not). */
+  resumedModel?: string;
   /** A resume waits for this promise, so a test can hold a mode switch half way. */
   resumeGate?: Promise<void>;
   /** Claude: the Default row describes no model (the real adapter does, but a version of it may not). */
@@ -1916,8 +2054,12 @@ class EngineFake implements RuntimeAdapterPort {
       throw new AcpV1ConfigOptionRefusedError("invalid_value", -32602);
     }
     this.note(`config:${configId}=${String(value)}`);
-    this.options = Object.freeze(this.options.map((option) =>
-      option.id === configId ? Object.freeze({ ...option, currentValue: value }) as RuntimeConfigOption : option));
+    // The answer lists the value it was given: no option is `unlisted` after a set.
+    this.options = Object.freeze(this.options.map((option) => {
+      if (option.id !== configId) return option;
+      const { unlisted: _unlisted, ...rest } = option as RuntimeConfigOption & { unlisted?: true };
+      return Object.freeze({ ...rest, currentValue: value }) as RuntimeConfigOption;
+    }));
     await this.world.onConfigOption?.(this.label, configId, value);
     return this.options;
   }
@@ -1979,12 +2121,18 @@ class EngineFake implements RuntimeAdapterPort {
         { settings?: { modelPicker?: { options?: Array<{ model: string }> } } } | undefined)
         ?.settings?.modelPicker?.options?.map((entry) => entry.model) ?? [];
       this.options = claudeOptions([...NATIVE_MODELS, ...picker], this.options, this.spec.vagueDefault === true);
-      const lastModel = establishedBy === "resume" && this.spec.restoreTranscriptModel === true
-        ? transcriptModels.get(this.spec)?.get(sessionId)
-        : undefined;
+      const lastModel = establishedBy !== "resume"
+        ? undefined
+        : this.spec.resumedModel ??
+          (this.spec.restoreTranscriptModel === true ? transcriptModels.get(this.spec)?.get(sessionId) : undefined);
       if (lastModel !== undefined) {
-        this.options = Object.freeze(this.options.map((option) => option.id === "model"
-          ? Object.freeze({ ...option, currentValue: lastModel }) as RuntimeConfigOption
+        // Like the codec: a current value the list does not offer is accepted and marked `unlisted`.
+        this.options = Object.freeze(this.options.map((option) => option.id === "model" && option.type === "select"
+          ? Object.freeze({
+              ...option,
+              currentValue: lastModel,
+              ...(optionOffersValue(option, lastModel) ? {} : { unlisted: true as const }),
+            }) as RuntimeConfigOption
           : option));
       }
     } else {
@@ -2109,6 +2257,12 @@ class EngineFake implements RuntimeAdapterPort {
       },
     });
   }
+}
+
+function optionOffersValue(option: RuntimeConfigOption, value: string): boolean {
+  if (option.type !== "select") return false;
+  return (option.choices.form === "flat" ? option.choices.options : option.choices.groups.flatMap((group) => group.options))
+    .some((choice) => choice.value === value);
 }
 
 /** The model of the last turn per session, per spec: what a resumed session reads back (`restoreTranscriptModel`). */

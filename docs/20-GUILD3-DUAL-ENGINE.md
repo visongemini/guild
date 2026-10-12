@@ -47,7 +47,7 @@ server.
 | Thinking | Cross-vendor thinking blocks: dropping blocks whose signature was not produced by the target vendor kept every request at 200. Local llama.cpp returns thinking with an empty signature. |
 | llama.cpp SSE | Not conformant: it opens the text block (index 1) before closing the thinking block (index 0) and sends block 0's `signature_delta` after text started. Claude Code then duplicated the reply text. The router must re-sequence local streams. |
 | Subscription token | With only `ANTHROPIC_BASE_URL` (no token), requests reach the router with `Authorization: Bearer sk-ant-oat...`, Claude Code's own subscription token. With `ANTHROPIC_AUTH_TOKEN=<dummy>` also set (`claude` 2.1.296, clean environment) Claude Code sends only `Authorization: Bearer <dummy>` and the subscription token never leaves it. Anthropic's rules forbid intermediating the token, so Guild never lets it reach the router (D-061, section 3.3). |
-| Native resume after routed turns | `claude -p --resume <id>` run natively (no `ANTHROPIC_BASE_URL`, the subscription login, straight to `api.anthropic.com`) continues a session whose history contains DeepSeek turns, a DeepSeek thinking block included, with both Haiku and Opus 5.5 (`claude` 2.1.296, clean environment). So the way back to Claude needs no router (D-062). The adapter restores the model of the transcript's last turn on resume (`resumedModelHint`, 0.89.1), so after routed turns a native session reports an id its own model list does not offer; Guild applies the selected Claude model before the first turn. |
+| Native resume after routed turns | `claude -p --resume <id>` run natively (no `ANTHROPIC_BASE_URL`, the subscription login, straight to `api.anthropic.com`) continues a session whose history contains DeepSeek turns, a DeepSeek thinking block included, with both Haiku and Opus 5.5 (`claude` 2.1.296, clean environment). So the way back to Claude needs no router (D-062). The adapter restores the model of the transcript's last turn on resume (`resumedModelHint`, 0.89.1), so after routed turns a native session reports a `model` option whose current value (the Online id of the last turn) is none of its choices (live QA of 3.0.2: the first codec refused it as `invalid_value` and the switch back failed). The Claude dialect accepts that for the `model` select option only and marks it `unlisted: true`; Guild applies the selected Claude model before the first turn. |
 | Browser MCP | An HTTP MCP server passed in `mcpServers` (`{type:"http", name, url, headers:[]}`) is used by Claude; each tool call produces a `session/request_permission` (permission card). The client first sends `server/discover` (answer -32601 or a valid result). `webContents.capturePage()` fails with "Current display surface not available" when the window is not visible; CDP `Page.captureScreenshot` works. Attach `webContents.debugger` only after the first page load; `sendCommand` before that hangs. |
 | Steering | `initialize` result `_meta.steering.supported: true`; method `_session/steering {sessionId, prompt, _meta:{steering:{idleBehavior:"promptRequired"}}}` -> `{outcome:"injected"}` / `{outcome:"promptRequired", reason:"noRunningTurn"}` / `{outcome:"startedNewTurn"}`. Guild's Steer maps to it for the Claude engine. |
 | Account | `_auth/status_update {authStatus:{kind:"account", label:"Claude Max", account:{plan, email, organization}}}`. Guild may show the label/plan; never store, log or display the email. |
@@ -143,8 +143,18 @@ created and never changes. Process topology stays one engine process per task (D
   failure the selection rolls back to what was running and the refusal is surfaced like other selection failures
   (`unavailable`); a resume that gets no answer in time keeps the session (the binding stays `restore_pending`),
   and only the agent's own "no such session" answer (ACP -32002) replaces it. A session resumed natively after
-  routed turns can come back on the routed model of its last turn, which the native model list does not offer;
-  the selected Claude model, or the Claude default when nothing is pinned, is applied before the first turn.
+  routed turns can come back on the routed model of its last turn, which the native model list does not offer. The
+  codec accepts that current value for the Claude dialect's `model` option (Grok and every other select option keep
+  the strict rule that the current value is a choice) and marks the option `unlisted: true`, which is also how a
+  routed process resumed on a Claude id its list lacks reads. An unlisted value is never added to the catalog, never
+  has an effort list and is never the runtime default. The selected Claude model, or the Claude default when nothing
+  is pinned, is applied before the first turn; the same holds for a Guild restart whose transcript ended on the
+  other mode.
+- **Account summary.** A routed process authenticates with the throwaway token, so its `_auth/status_update`
+  (an API key, a gateway, "not logged in") says nothing about the subscription: Guild ignores it. Only a native
+  process sets or changes the account label and the login state, so the popover keeps the label a native process
+  last reported (for example "Claude Max") in either mode, and nothing derived from the throwaway token is shown. A
+  Guild that has started only routed processes shows no label until a native one reports.
 - Between models of the same mode nothing restarts: Claude to Claude is a plain `set_config_option`, and so is
   Online to Local or Online to Online (the routed model variables below keep naming the model of the last start).
 - **Routed environment (D-061).** Every start of a routed process (the switch, a crash recovery, a Guild

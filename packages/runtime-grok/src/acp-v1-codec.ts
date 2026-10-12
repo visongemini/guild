@@ -393,10 +393,11 @@ export function encodeSetSessionConfigOptionParams(
 
 export function decodeSetSessionConfigOptionResult(
   input: unknown,
+  dialect: AcpDialect = "grok",
 ): readonly RuntimeConfigOption[] {
   boundedJson(input);
   const rec = record(input, "$");
-  return Object.freeze(parseConfigOptions(rec["configOptions"], "$.configOptions"));
+  return Object.freeze(parseConfigOptions(rec["configOptions"], "$.configOptions", dialect));
 }
 
 export function encodeTextPromptParams(
@@ -711,7 +712,9 @@ function decodeModelDescriptor(entry: unknown): GrokModelDescriptor | undefined 
  * Every model is in the `claude` picker group (routed Online / Local models are labelled by the
  * caller); the engine's runtime default is the selected model. The result is validated by
  * `freezeModelCatalog("claude", ...)`, so the Grok catalog validator refuses it. Returns
- * `undefined` when no usable model option is present.
+ * `undefined` when no usable model option is present. Models come from the option's choices only: an `unlisted`
+ * current value (a resumed session on the model of its last turn) is never a model, has no effort list and never
+ * becomes the runtime default.
  */
 export function deriveClaudeModelCatalog(
   options: readonly RuntimeConfigOption[],
@@ -852,6 +855,7 @@ export function decodeSessionUpdate(
   input: unknown,
   expectedSessionId: string,
   received: RuntimeReceiveTimestamp,
+  dialect: AcpDialect = "grok",
 ): AcpV1DecodedUpdate {
   // Session updates can carry very large agent-owned raw input/output extensions.
   // Validate only the allowlisted fields below; ignored extensions must not consume
@@ -897,7 +901,7 @@ export function decodeSessionUpdate(
     case "current_mode_update":
       return contextResult(parseMode(sessionId, update, received));
     case "config_option_update":
-      return contextResult(parseConfig(sessionId, update, received));
+      return contextResult(parseConfig(sessionId, update, received, dialect));
     case "session_info_update":
       return contextResult(parseInfo(sessionId, update, received));
     case "usage_update":
@@ -1067,7 +1071,7 @@ function parseSessionStateRecord(
   if (Object.hasOwn(rec, "configOptions")) {
     const configOptions = rec["configOptions"] === null
       ? null
-      : parseConfigOptions(rec["configOptions"], `${path}.configOptions`);
+      : parseConfigOptions(rec["configOptions"], `${path}.configOptions`, dialect);
     result["configOptions"] = configOptions;
     if (dialect === "claude" && configOptions !== null) {
       const modelCatalog = deriveClaudeModelCatalog(configOptions);
@@ -1588,6 +1592,7 @@ function parseConfig(
   sessionId: string,
   update: Record<string, unknown>,
   received: RuntimeReceiveTimestamp,
+  dialect: AcpDialect,
 ): RuntimePayload {
   return freezeRuntimePayload({
     type: "session_context",
@@ -1595,7 +1600,7 @@ function parseConfig(
     received,
     context: {
       kind: "config",
-      options: parseConfigOptions(update["configOptions"], "$.update.configOptions"),
+      options: parseConfigOptions(update["configOptions"], "$.update.configOptions", dialect),
     },
   });
 }
@@ -1635,7 +1640,13 @@ function parseUsage(
   return freezeRuntimePayload({ type: "session_context", sessionId, received, context });
 }
 
-function parseConfigOptions(value: unknown, path: string): readonly RuntimeConfigOption[] {
+/**
+ * Claude dialect only: a select option of category `model` may name a current value that is none of its choices and
+ * then carries `unlisted: true`. The adapter restores the model of the transcript's last turn when it resumes a
+ * session, and after routed turns that is an Online / Local id a native session does not list. Every other select
+ * option, and every option of the Grok dialect, keeps the strict rule that the current value is a choice.
+ */
+function parseConfigOptions(value: unknown, path: string, dialect: AcpDialect = "grok"): readonly RuntimeConfigOption[] {
   const options = array(value, path, ACP_V1_CODEC_LIMITS.maxContentCollectionItems).map((entry, index) => {
     const itemPath = `${path}[${index}]`;
     const option = record(entry, itemPath, ["currentValue", "id", "name", "type"]);
@@ -1657,11 +1668,13 @@ function parseConfigOptions(value: unknown, path: string): readonly RuntimeConfi
           ? choices.options.map((choice) => choice.value)
           : choices.groups.flatMap((group) => group.options.map((choice) => choice.value));
       assertUniqueIds(values, `${itemPath}.options.value`);
-      if (!values.includes(currentValue)) {
+      const listed = values.includes(currentValue);
+      if (!listed && !(dialect === "claude" && result["category"] === "model")) {
         throw new AcpV1CodecError("invalid_value", `${itemPath}.currentValue`);
       }
       result["currentValue"] = currentValue;
       result["choices"] = choices;
+      if (!listed) result["unlisted"] = true;
     }
     return result as RuntimeConfigOption;
   });

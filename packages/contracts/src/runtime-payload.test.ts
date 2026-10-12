@@ -489,6 +489,35 @@ describe("normalized runtime payload", () => {
     }
   });
 
+  it("lets only a model select say its current value is not a choice, and only with the flag [D-062]", () => {
+    const payload = (option: Record<string, unknown>) => freezeRuntimePayload({
+      type: "session_context",
+      sessionId: "session-1",
+      received,
+      context: { kind: "config", options: [option] },
+    });
+    const select = (over: Record<string, unknown>) => ({
+      id: "model",
+      name: "Model",
+      category: "model",
+      type: "select",
+      currentValue: "deepseek-v4-flash",
+      choices: { form: "flat", options: [{ value: "opus", name: "Opus" }] },
+      ...over,
+    });
+    const accepted = payload(select({ unlisted: true }));
+    if (accepted.type !== "session_context" || accepted.context.kind !== "config") assert.fail("not a config payload");
+    const option = accepted.context.options[0];
+    assert.equal(option?.type === "select" && option.unlisted, true);
+    assert.equal(option?.type === "select" && option.currentValue, "deepseek-v4-flash");
+    // Without the flag, with the flag on a listed value, with a flag that is not `true`, or on another option: refused.
+    assert.throws(() => payload(select({})), RuntimePayloadError);
+    assert.throws(() => payload(select({ currentValue: "opus", unlisted: true })), RuntimePayloadError);
+    assert.throws(() => payload(select({ unlisted: false })), RuntimePayloadError);
+    assert.throws(() => payload(select({ category: "mode", unlisted: true })), RuntimePayloadError);
+    assert.throws(() => payload(select({ category: undefined, unlisted: true })), RuntimePayloadError);
+  });
+
   it("requires canonical absolute paths in normalized diffs and locations", () => {
     for (const candidate of [
       {
