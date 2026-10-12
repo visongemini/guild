@@ -195,7 +195,11 @@ test("the popover is wider, its group headings stick, and both edges have a fade
   assert.match(block(".guild-model-popover"), /width:\s*344px/u);
   assert.match(block(".guild-model-popover"), /max-width:\s*min\(360px,\s*calc\(100vw - 32px\)\)/u);
   assert.match(block(".guild-model-group-heading"), /position:\s*sticky/u);
-  assert.match(block(".guild-model-group-heading"), /top:\s*0/u);
+  // Flush with the popover's top edge: sticky offsets start at the padding edge, so the heading takes the padding as a negative top.
+  assert.match(block(".guild-model-popover"), /padding:\s*6px/u);
+  assert.match(block(".guild-model-group-heading"), /top:\s*-6px/u);
+  assert.match(block(".guild-model-fade.top"), /top:\s*-6px/u);
+  assert.match(block(".guild-model-fade.bottom"), /bottom:\s*-6px/u);
   assert.match(block(".guild-model-group-heading"), /background:\s*var\(--guild-surface\)/u);
   assert.match(css, /\.guild-model-group-heading\[data-stuck="true"\]::after \{ opacity: 1; \}/u);
   assert.match(css, /\.guild-model-popover\[data-fade-top="true"\] \.guild-model-fade\.top::before, \.guild-model-popover\[data-fade-bottom="true"\] \.guild-model-fade\.bottom::before \{ opacity: 1; \}/u);

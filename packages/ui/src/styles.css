@@ -783,13 +783,14 @@ span.guild-pill { cursor: default; }
 /* Guild 3.0 grouped picker (PC-MODEL-001): one listbox, a labelled group per engine group. */
 .guild-model-group { display: grid; gap: 1px; }
 .guild-model-group + .guild-model-group { margin-top: var(--guild-s2); padding-top: var(--guild-s1); border-top: 1px solid var(--guild-line); }
-.guild-model-group-heading { position: sticky; top: 0; z-index: 2; margin: 0 -6px 2px; padding: 6px calc(6px + var(--guild-s2)) 4px; background: var(--guild-surface); }
+/* Sticky offsets are measured from the popover's padding edge, so -6px (its padding) puts the heading flush with the top edge. */
+.guild-model-group-heading { position: sticky; top: -6px; z-index: 2; margin: 0 -6px 2px; padding: 6px calc(6px + var(--guild-s2)) 4px; background: var(--guild-surface); }
 .guild-model-group-heading::after { content: ""; position: absolute; left: 0; right: 0; top: 100%; height: 10px; background: linear-gradient(to bottom, var(--guild-surface), transparent); opacity: 0; pointer-events: none; transition: opacity var(--guild-dur-2) var(--guild-ease); }
 .guild-model-group-heading[data-stuck="true"]::after { opacity: 1; }
 /* Scroll cues: zero-height sticky markers at both ends of the popover draw a fade only on an edge with content past it. */
 .guild-model-fade { position: sticky; z-index: 1; height: 0; margin: 0; padding: 0; pointer-events: none; }
-.guild-model-fade.top { top: 0; margin-bottom: -2px; }
-.guild-model-fade.bottom { bottom: 0; margin-top: -2px; }
+.guild-model-fade.top { top: -6px; margin-bottom: -2px; }
+.guild-model-fade.bottom { bottom: -6px; margin-top: -2px; }
 .guild-model-fade::before { content: ""; position: absolute; left: -6px; right: -6px; height: 22px; opacity: 0; transition: opacity var(--guild-dur-2) var(--guild-ease); }
 .guild-model-fade.top::before { top: 0; background: linear-gradient(to bottom, var(--guild-surface), transparent); }
 .guild-model-fade.bottom::before { bottom: 0; background: linear-gradient(to top, var(--guild-surface), transparent); }
