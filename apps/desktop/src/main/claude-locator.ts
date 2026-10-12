@@ -40,8 +40,10 @@ export class ClaudeLocatorError extends Error {
 export type ClaudeEngineComponent = "node" | "adapter" | "claude";
 
 /**
- * The pinned pieces changed on disk without an update: same version, different bytes (or a claude
- * path outside the installer's `versions/<ver>` layout). Guild refuses to run them (PC-ENG-002).
+ * The pinned pieces changed on disk in a way no update explains: another `node` than the one this
+ * launch trusted, the same adapter version with other bytes, or a claude binary that is not a new
+ * release. Guild refuses to run them, and nothing that differs from its pin is executed to find
+ * that out (PC-ENG-002).
  */
 export class ClaudeEngineIntegrityError extends Error {
   readonly component: ClaudeEngineComponent;
@@ -79,17 +81,17 @@ export const MINIMUM_NODE_MAJOR = 22;
 const CLAUDE_VERSIONED_PATH = /[\\/]versions[\\/]\d+\.\d+\.\d+[^\\/]*$/u;
 
 /**
- * Decides whether a second locate may replace the first after a pin check failed (PC-ENG-002). A
- * piece may differ only the way an update changes it: another `node --version`, another adapter
- * package version, or the claude link now resolving to a different `versions/<ver>` file. The same
- * version with other bytes (node SHA-256, adapter fingerprint) is an unexpected change. Returns the
- * first offending piece, or undefined when re-pinning is allowed.
+ * Decides whether a second locate may replace the first after a pin check failed (PC-ENG-002). The
+ * node is never replaced within an app launch (it is trusted on first use, see `locateNode`); the
+ * adapter may differ only by its package version, which is what an update changes: the same version
+ * with another fingerprint is an unexpected change. Returns the first offending piece, or undefined
+ * when re-pinning is allowed.
  */
 export function unexpectedEngineChange(
   before: LocatedClaudeEngine,
   after: LocatedClaudeEngine,
 ): ClaudeEngineComponent | undefined {
-  if (before.node.version === after.node.version && before.node.sha256 !== after.node.sha256) return "node";
+  if (before.node.executablePath !== after.node.executablePath || before.node.sha256 !== after.node.sha256) return "node";
   if (
     before.adapter.version === after.adapter.version &&
     before.adapter.fingerprintSha256 !== after.adapter.fingerprintSha256
@@ -158,29 +160,67 @@ export function invalidateClaudeLocatorCache(): void {
   claudeCache.clear();
 }
 
+/**
+ * Trust on first use, once per app launch (PC-ENG-002): the first supported `node` this launch found.
+ * From then on that exact file is the only node: its SHA-256 is compared (the file is only read)
+ * before anything runs it again, the version probe included, and a node that differs, moved or is
+ * gone raises `ClaudeEngineIntegrityError` without being executed. A node update is therefore
+ * accepted on the next Guild launch. Unlike the identity caches this is not cleared by
+ * `invalidateClaudeLocatorCache`, because re-locating is exactly what a tampered file would want.
+ */
+let launchNode: LocatedNode | undefined;
+
+/** Starts a fresh app launch: the next `locateNode` trusts what it finds first. Tests only. */
+export function resetClaudeLaunchPinsForTesting(): void {
+  launchNode = undefined;
+}
+
 export async function locateNode(options: ClaudeLocatorOptions = {}): Promise<LocatedNode> {
+  const pinned = launchNode;
+  if (pinned !== undefined) return reverifyLaunchNode(pinned);
   const context = resolveContext(options);
   let tooOld: string | undefined;
   for (const candidate of await findCandidates("node", "node", context)) {
     if (!(await isMachOExecutableFile(candidate))) continue;
     const cached = await readCache(nodeCache, candidate);
-    if (cached !== undefined) return cached;
+    if (cached !== undefined) {
+      launchNode = cached;
+      return cached;
+    }
+    // Hash before the first run, so what is probed is what was hashed (the staged copy is checked
+    // against this hash again at every spawn).
+    const identity = await identityOf(candidate);
+    const sha256 = await digestFile(candidate).catch(() => undefined);
+    if (sha256 === undefined) continue;
     const version = parseNodeVersion(await context.execute(candidate, ["--version"], context.probeEnvironment).catch(() => ""));
     if (version === undefined) continue;
     if (!isSupportedNode(version)) {
       tooOld ??= version;
       continue;
     }
-    const identity = await identityOf(candidate);
-    const sha256 = await digestFile(candidate);
     const located: LocatedNode = Object.freeze({ executablePath: candidate, sha256, version });
-    // Cache only an identity that was stable across hashing; a torn hash must not be remembered.
+    // Trust and cache only an identity that was stable across hashing and probing; a torn hash must
+    // not be remembered (the spawn-time check still holds the bytes to the hash).
     if (identity !== undefined && sameIdentity(identity, await identityOf(candidate))) {
       nodeCache.set(candidate, Object.freeze({ identity, located }));
+      launchNode = located;
     }
     return located;
   }
   throw tooOld === undefined ? new ClaudeLocatorError("node_missing") : new ClaudeLocatorError("node_too_old", tooOld);
+}
+
+/** The launch's node again: unchanged bytes are the same node; anything else is refused unrun. */
+async function reverifyLaunchNode(pinned: LocatedNode): Promise<LocatedNode> {
+  const cached = await readCache(nodeCache, pinned.executablePath);
+  if (cached !== undefined) return cached;
+  const identity = await identityOf(pinned.executablePath);
+  const sha256 = await digestFile(pinned.executablePath).catch(() => undefined);
+  if (sha256 !== pinned.sha256) throw new ClaudeEngineIntegrityError("node");
+  if (identity !== undefined && sameIdentity(identity, await identityOf(pinned.executablePath))) {
+    nodeCache.set(pinned.executablePath, Object.freeze({ identity, located: pinned }));
+  }
+  return pinned;
 }
 
 export async function locateClaudeAdapter(options: ClaudeLocatorOptions = {}): Promise<ClaudeAdapterPin> {

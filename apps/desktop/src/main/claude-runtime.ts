@@ -25,8 +25,9 @@ import { resolveOfficialGrokEnvironment } from "./runtime-locator.js";
  */
 
 /**
- * Preflight failures that mean "the installed pieces changed": locate again, once, and accept the
- * result only when the change is an update (`unexpectedEngineChange`); otherwise refuse to run.
+ * Preflight failures that mean "the installed pieces changed": locate again, once, without running
+ * anything that differs from its pin, and accept the result only when the change is an update
+ * (`unexpectedEngineChange`); otherwise refuse to run.
  */
 const RELOCATE_PREFLIGHT_CODES: ReadonlySet<string> = new Set([
   "adapter_changed",
@@ -50,13 +51,42 @@ export type ClaudeRuntimeDependencies = Readonly<{
   baseEnvironment?: () => Promise<Readonly<Record<string, string | undefined>>>;
 }>;
 
+export type ClaudeRuntime = Readonly<{
+  adapter: AcpV1Adapter;
+  /** Absent when the runtime was refused before the claude version was known. */
+  runtimeVersion?: string;
+  /**
+   * True once the pieces changed unexpectedly and the process refused to run. The adapter reports
+   * every failed start the same way, so the owner asks here to name the reason.
+   */
+  refusedForIntegrity: () => boolean;
+}>;
+
 export async function createClaudeRuntime(
   input: ClaudeRuntimeInput,
   dependencies: ClaudeRuntimeDependencies = {},
-) {
+): Promise<ClaudeRuntime> {
   const locate = dependencies.locate ?? (() => locateClaudeEngine());
   const baseEnvironment = await (dependencies.baseEnvironment ?? resolveOfficialGrokEnvironment)();
-  const located = await locate();
+  let located: LocatedClaudeEngine;
+  try {
+    located = await locate();
+  } catch (cause: unknown) {
+    // The pieces already differ from what this launch trusted: a runtime that refuses to start, so
+    // the owner reports the integrity state like any other refusal.
+    if (cause instanceof ClaudeEngineIntegrityError) {
+      return Object.freeze({
+        adapter: new AcpV1Adapter({
+          adapterEpoch: input.adapterEpoch,
+          process: new RefusedEngineProcess(cause),
+          sink: input.sink,
+          profile: CLAUDE_ENGINE_PROFILE,
+        }),
+        refusedForIntegrity: () => true,
+      });
+    }
+    throw cause;
+  }
   const buildHost = (engine: LocatedClaudeEngine): EngineProcessHost => {
     const options: EngineProcessHostOptions = {
       profile: CLAUDE_ENGINE_PROFILE,
@@ -78,6 +108,8 @@ export async function createClaudeRuntime(
     initial: buildHost(located),
     relocate: async () => {
       (dependencies.invalidateLocatorCache ?? invalidateClaudeLocatorCache)();
+      // The locator hashes the node (it is never run if it differs from the launch's pin) and only
+      // reads the adapter, so nothing that changed is executed before this comparison.
       const relocated = await locate();
       // Same version, other bytes: not an update. Pinning whatever is on disk now would defeat the pin.
       const component = unexpectedEngineChange(located, relocated);
@@ -93,22 +125,28 @@ export async function createClaudeRuntime(
       profile: CLAUDE_ENGINE_PROFILE,
     }),
     runtimeVersion: `Claude Code ${located.claude.version}`,
-    /**
-     * True once the pieces changed unexpectedly and the process refused to run. The adapter reports
-     * every failed start the same way, so the owner asks here to name the reason.
-     */
     refusedForIntegrity: () => process.refusal !== undefined,
   });
+}
+
+/** The process port of a runtime that was refused before it was built: it never starts anything. */
+class RefusedEngineProcess implements AcpV1ProcessPort {
+  constructor(private readonly refusal: ClaudeEngineIntegrityError) {}
+  readonly onEvent = (): (() => void) => () => undefined;
+  readonly start = (): Promise<never> => Promise.reject(this.refusal);
+  readonly stop = (): Promise<unknown> => Promise.resolve({});
+  readonly waitForTermination = (): Promise<unknown> => Promise.resolve({});
+  readonly write = (): Promise<unknown> => Promise.resolve({});
 }
 
 /**
  * The adapter's process port. When the first start fails its preflight because the adapter
  * package, the claude binary or the pinned node changed on disk, the locator cache is dropped
- * and the pieces are located once more, but only an update (another version) is accepted; the
- * same version with other bytes raises `ClaudeEngineIntegrityError` and nothing is executed, on
- * this start and every later one. A second preflight failure is reported as it is. The first
- * failure's event is withheld from the adapter, which would otherwise treat it as a dead
- * process.
+ * and the pieces are located once more, but only an update is accepted (a new adapter package
+ * version, a new claude release); a changed node, or the same adapter version with other bytes,
+ * raises `ClaudeEngineIntegrityError` and nothing is executed, on this start and every later one.
+ * A second preflight failure is reported as it is. The first failure's event is withheld from
+ * the adapter, which would otherwise treat it as a dead process.
  */
 export class RelocatingEngineProcess implements AcpV1ProcessPort {
   private host: EngineProcessHost;
