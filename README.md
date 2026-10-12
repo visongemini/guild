@@ -155,8 +155,9 @@ and a different vendor asks again; requests to Local models stay on your machine
 Tailscale network. In such a routed task Claude Code carries a throwaway token that Guild generated,
 so your Claude subscription login never reaches the router and the router never connects to Anthropic;
 Claude Code's own background requests (titles, summaries) and subagents use the third-party model the
-process started with, and the task cannot switch back to a Claude subscription model (start a new task
-to use Claude). Keys for Online and Local sources are read from an env file you
+process started with. Switching the task back to a Claude subscription model restarts Claude Code natively
+and resumes the same conversation, so the login goes straight to Anthropic and still never passes through
+the router, and OpenViking's automatic capture stays off for a task that has used a third-party model. Keys for Online and Local sources are read from an env file you
 designate, kept in memory only and never stored, and adding or changing a source needs a native
 confirmation. The browser pane runs in its own sandboxed partition, and agents reach it only through a
 fixed tool set with no eval, where every call follows the engine's permission mode (it prompts unless

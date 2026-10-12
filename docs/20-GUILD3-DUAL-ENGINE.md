@@ -1,6 +1,6 @@
 # Guild 3.0 — Claude Code engine, model sources, browser pane
 
-Date: 2026-10-12. Owner decision recorded as D-057..D-061 in `docs/04-DECISION-LOG.md`.
+Date: 2026-10-12, amended 2026-10-13. Owner decision recorded as D-057..D-062 in `docs/04-DECISION-LOG.md`.
 This document is the implementation brief for every work package (WP). Read it fully before
 changing code. Facts marked **[spike]** were verified on this machine on 2026-10-12 with
 `@agentclientprotocol/claude-agent-acp` 0.89.1 (Agent SDK 0.3.293) and `claude` 2.1.291 (the
@@ -18,9 +18,10 @@ One Guild window, two engines:
 
 Inside a Claude task the model picker switches, between turns and inside the same conversation,
 among three groups: **Claude (subscription)**, **Online** (vendor Anthropic-compatible endpoints such
-as DeepSeek) and **Local** (llama.cpp / Ollama `/v1/messages`). The switch from Claude to Online or Local
-is one-way: a task that goes through the model router can never use a Claude subscription model again
-(3.3, D-061). A new task's picker also shows the **Grok** group; the group chosen for the first turn
+as DeepSeek) and **Local** (llama.cpp / Ollama `/v1/messages`). The switch is two-way: a Claude model runs in
+a native process, an Online or Local model in a routed one, and a switch that crosses between them restarts
+the engine process and resumes the same session; the Claude subscription login never goes through the router
+(3.3, D-062). A new task's picker also shows the **Grok** group; the group chosen for the first turn
 fixes the task's engine (PC-TASK-001: no silent rebinding).
 
 Plus an isolated **browser pane** in the workbench, controllable by the agent through a loopback MCP
@@ -46,6 +47,7 @@ server.
 | Thinking | Cross-vendor thinking blocks: dropping blocks whose signature was not produced by the target vendor kept every request at 200. Local llama.cpp returns thinking with an empty signature. |
 | llama.cpp SSE | Not conformant: it opens the text block (index 1) before closing the thinking block (index 0) and sends block 0's `signature_delta` after text started. Claude Code then duplicated the reply text. The router must re-sequence local streams. |
 | Subscription token | With only `ANTHROPIC_BASE_URL` (no token), requests reach the router with `Authorization: Bearer sk-ant-oat...`, Claude Code's own subscription token. With `ANTHROPIC_AUTH_TOKEN=<dummy>` also set (`claude` 2.1.296, clean environment) Claude Code sends only `Authorization: Bearer <dummy>` and the subscription token never leaves it. Anthropic's rules forbid intermediating the token, so Guild never lets it reach the router (D-061, section 3.3). |
+| Native resume after routed turns | `claude -p --resume <id>` run natively (no `ANTHROPIC_BASE_URL`, the subscription login, straight to `api.anthropic.com`) continues a session whose history contains DeepSeek turns, a DeepSeek thinking block included, with both Haiku and Opus 5.5 (`claude` 2.1.296, clean environment). So the way back to Claude needs no router (D-062). The adapter restores the model of the transcript's last turn on resume (`resumedModelHint`, 0.89.1), so after routed turns a native session reports an id its own model list does not offer; Guild applies the selected Claude model before the first turn. |
 | Browser MCP | An HTTP MCP server passed in `mcpServers` (`{type:"http", name, url, headers:[]}`) is used by Claude; each tool call produces a `session/request_permission` (permission card). The client first sends `server/discover` (answer -32601 or a valid result). `webContents.capturePage()` fails with "Current display surface not available" when the window is not visible; CDP `Page.captureScreenshot` works. Attach `webContents.debugger` only after the first page load; `sendCommand` before that hangs. |
 | Steering | `initialize` result `_meta.steering.supported: true`; method `_session/steering {sessionId, prompt, _meta:{steering:{idleBehavior:"promptRequired"}}}` -> `{outcome:"injected"}` / `{outcome:"promptRequired", reason:"noRunningTurn"}` / `{outcome:"startedNewTurn"}`. Guild's Steer maps to it for the Claude engine. |
 | Account | `_auth/status_update {authStatus:{kind:"account", label:"Claude Max", account:{plan, email, organization}}}`. Guild may show the label/plan; never store, log or display the email. |
@@ -117,18 +119,34 @@ created and never changes. Process topology stays one engine process per task (D
   fails with auth required, show "Run `claude` once in Terminal and log in" (named reduced state).
 
 ### 3.3 Native vs routed sessions
-- A Claude session starts **native**: no `ANTHROPIC_BASE_URL`, no `ANTHROPIC_AUTH_TOKEN`, the model list is
-  the adapter's own.
-- The first time the user picks an Online or Local model, Guild (between turns, as one serialized start
-  operation that concurrent callers join): restarts the task's adapter with the routed environment below,
-  resumes the same session with `_meta.claudeCode.options.settings.modelPicker` listing every
-  enabled Online/Local model, sets the model, and only after the model is confirmed applied (and the start's projection
-  published) records `task_metadata.routed_at` as the last step that can fail (review fix 2026-10-12); a projection
+- The mode of the engine process follows the task's selected model (D-062). A task whose selected model is an
+  Online or Local model runs in a **routed** process; any other selection, a Claude model or the Claude default,
+  runs in a **native** one: no `ANTHROPIC_BASE_URL`, no `ANTHROPIC_AUTH_TOKEN`, the model list is the adapter's own.
+  This holds at every start of a process: the switch, a crash recovery and a Guild restart.
+- Native to routed. The first time the user picks an Online or Local model in a task whose process is native,
+  Guild (between turns, as one serialized start operation that concurrent callers join): restarts the task's
+  adapter with the routed environment below, resumes the same session with
+  `_meta.claudeCode.options.settings.modelPicker` listing every enabled Online/Local model, sets the model, and
+  only after the model is confirmed applied (and the start's projection published) records
+  `task_metadata.routed_at_ms` as the last step that can fail (review fix 2026-10-12); a projection
   that cannot be built after the marker is logged, not raised. Every prompt launch (send, queued turn, continuous
-  round) first joins a start in flight or due and uses the session it produced. If a run became active before the native process
-  closed, the switch is deferred without marking; any failure leaves the task unmarked and surfaces
+  round) first joins a start in flight or due and uses the session it produced. If a run became active before the
+  old process closed, the switch is deferred without marking; any failure leaves the task unmarked and surfaces
   `model_router_unavailable` / `model_selection_failed`. For the Claude engine a model that cannot be
   applied refuses the prompt (`model_selection_failed`) instead of running on another model.
+- Routed to native (D-062). Picking a Claude model, or clearing the choice (the Claude default), in a task whose
+  process is routed restarts the process natively between turns, with the same one serialized start operation:
+  the routed process is closed, a native one starts without the router and without any routed variable, resumes
+  the same session (same start options as before minus the routed `modelPicker`; the browser MCP server stays),
+  and then applies the model. No router is involved, so a router that cannot start does not block the way back.
+  Queued and sent prompts wait for the switch (`sessionStartPending`) and go out on the new process only. On any
+  failure the selection rolls back to what was running and the refusal is surfaced like other selection failures
+  (`unavailable`); a resume that gets no answer in time keeps the session (the binding stays `restore_pending`),
+  and only the agent's own "no such session" answer (ACP -32002) replaces it. A session resumed natively after
+  routed turns can come back on the routed model of its last turn, which the native model list does not offer;
+  the selected Claude model, or the Claude default when nothing is pinned, is applied before the first turn.
+- Between models of the same mode nothing restarts: Claude to Claude is a plain `set_config_option`, and so is
+  Online to Local or Online to Online (the routed model variables below keep naming the model of the last start).
 - **Routed environment (D-061).** Every start of a routed process (the switch, a crash recovery, a Guild
   restart) adds exactly these per-spawn variables, each validated by the Claude profile:
   `ANTHROPIC_BASE_URL=<router url>`; `ANTHROPIC_AUTH_TOKEN=guild-router-<32 random hex>`, new for each
@@ -142,24 +160,22 @@ created and never changes. Process topology stays one engine process per task (D
   `ANTHROPIC_API_KEY` is never set (inherited `ANTHROPIC_*` stays stripped). The model variables follow the
   last (re)start: a switch between routed models of a live session is a plain `set_config_option`, so they
   keep naming the earlier source until the next start.
-- **One way (D-061).** Once routed, always routed (every later process start for that task uses the routed
-  env, also after Guild restarts), and a routed task can no longer use a Claude subscription model:
-  - the picker shows the Claude group's rows disabled under one line ("This task has used an online or
-    local model and cannot go back to a Claude subscription. Start a new task to use Claude."), with no
-    selection, roving tab stop or "Use default" for it;
-  - the main process refuses a selection of any non-routed model, and clearing the choice, for a routed
-    task (`claude_locked`, surfaced like other selection refusals);
-  - a Claude choice a task stored before it was routed, and the Claude global default, are ignored when its
-    selection is resolved; a turn that would start with no routed model selected (a task an earlier build
-    routed and took back to Claude) ends with `model_selection_failed` before the prompt is sent, and
-    choosing a routed model fixes it;
-  - a Claude task that has already run turns on a native session confirms before its first switch to an
-    Online or Local model (title "You can't switch back to a Claude subscription"): after the switch the
-    task runs through Guild's local relay and can no longer use Claude subscription models, the Claude login
-    never passes through the relay, and a new task is the way to keep using Claude. When the Online reminder
-    (3.7) is also due, one dialog carries both messages and its button reads "Continue". A new task with
-    no turn yet picks freely; routing is decided at its first run.
+- **Native environment.** A native process gets none of the routed variables. The only per-spawn variable it can
+  carry is `OPENVIKING_AUTO_CAPTURE=false`, set when the task has used a routed model at least once
+  (`task_metadata.routed_at_ms`, D-062; the dev-only QA capture switch sets it for every native spawn). The
+  subscription login therefore goes straight from `claude` to Anthropic.
+- **The marker.** `task_metadata.routed_at_ms` means "this task has used an Online or Local model at least
+  once". It is written once, after a routed process took the selection, never cleared, and no longer forces a
+  process mode (no schema change, schema v19).
 - Switching among models of a routed session is a plain `set_config_option` (no restart).
+- **Switch UX (D-062).** A cross-mode switch takes 30 to 120 seconds. In a Claude task that has run turns the
+  picker shows a muted "Restarts" tag (tooltip "Switching restarts Claude Code, then reconnects this
+  conversation", aria-hidden, the meaning in the row's accessible description) on the rows that cross the
+  boundary: Online and Local rows while the task runs a Claude model, and the Claude rows and "Use default"
+  while it runs an Online or Local one. While the switch runs the picker trigger shows a spinner and
+  "Switching...", and one status line above the composer hints says that the engine restarts, usually in 30 to 90
+  seconds, and that the message is sent once the switch is done; on failure the line shows the selection-failure
+  message. A new task with no turn, a Grok task and rows of the same mode show none of it.
 - Selection before Claude has started: the runtime default of a Claude task is Claude's own pick (the
   adapter-reported list, group `claude`) or nothing, which the picker shows as "Claude Code (default model)";
   never a routed model and never a Grok model (a Grok id is refused as a Claude choice unless a router source
@@ -268,18 +284,18 @@ created and never changes. Process topology stays one engine process per task (D
   count), `DOM.*` and `Input.*` steps need the page not to have navigated since the call began (a ref or
   coordinate belongs to that page).
 
-### 3.6 OpenViking (D-060)
+### 3.6 OpenViking (D-060, D-062)
 Claude engine: OpenViking on (no kill-switch env). Routed Claude sessions: `OPENVIKING_AUTO_CAPTURE=false`
-(recall stays). Grok engine: unchanged kill-switch block.
+(recall stays), and so does every process, native ones included, of a task that has used a routed model
+(`task_metadata.routed_at_ms`), so third-party output never enters the memory store. A task that never used a
+routed model keeps capture as the user configured it. Grok engine: unchanged kill-switch block.
 
 ### 3.7 Online-model reminder
 Whenever a task switches to an Online model of a vendor (model source) not yet agreed to in that task, a confirmation states that CLAUDE.md, memory,
 the conversation, and browser page text/screenshots in the conversation will be sent to <vendor>.
 Option "Don't remind me again in this workspace" persists in `workspace_prefs`. Local and Claude
-models never remind. When the task is a Claude task that has already run turns on a native session,
-the first switch also needs the one-way confirmation of 3.3; the same dialog then carries both
-messages (the one-way notice first, then the vendor list and the checkbox), so the user never gets
-two dialogs back to back. A switch to a Local model from such a task shows the one-way notice alone.
+models never remind, and neither does a switch back to Claude (D-062). The reminder is per task and per vendor
+and stands alone in its dialog: the one-way notice of D-061 is gone with the lock.
 
 ### 3.8 Grok-only features under the Claude engine (truthful reduced capability, PC-FALLBACK-001)
 Steer -> `_session/steering` (queue when `promptRequired`). Conversation rewind -> files only (existing fallback).
@@ -311,7 +327,8 @@ adapter reported, never a hard-coded list of models:
 Decisions: **D-057** dual engine and per-task binding; **D-058** model router; **D-059** browser pane
 and browser MCP; **D-060** OpenViking amendment (supersedes the D-052 amendment for the Claude engine);
 **D-061** subscription credentials never traverse the router and the Claude-to-routed switch is one-way
-(amends D-058).
+(amends D-058); **D-062** the switch is two-way, switching back restarts natively and resumes, the subscription
+still never traverses the router (supersedes the one-way clause of D-061).
 
 Requirements (new; old ones remain with disposition `superseded_by`):
 
@@ -319,14 +336,14 @@ Requirements (new; old ones remain with disposition `superseded_by`):
 |---|---|---|
 | PC-ENG-001 | Two engines; engine fixed per task at the first turn; truthful reduced capability per engine | — |
 | PC-ENG-002 | Claude engine runs the user-installed adapter and claude binary, pinned; Guild never reads Claude credentials | — |
-| PC-MODEL-001 | Grouped model picker (Grok / Claude / Online / Local); only models reported by the engine or configured sources; a routed task cannot go back to a Claude subscription model | PC-ACC-001 (model clauses) |
+| PC-MODEL-001 | Grouped model picker (Grok / Claude / Online / Local); only models reported by the engine or configured sources; the switch between a Claude model and an Online or Local one is two-way (native or routed process by selected model, restart and resume, "Restarts" tags and switching status) | PC-ACC-001 (model clauses) |
 | PC-ROUTE-001 | Router loopback-only, random token, exact registry of Online/Local models, unknown model 404 (Claude model 400), no redirects | PC-SEC-001 (gateway clause, extended) |
 | PC-ROUTE-002 | Credential rules: no Claude credential ever reaches the router (throwaway auth token, Anthropic-looking credentials rejected), no Anthropic upstream; third-party keys from a user env file, host-bound by native confirmation, never persisted or logged | — |
 | PC-ROUTE-003 | Compat layer, thinking provenance, local SSE normalization | — |
 | PC-BROWSER-001 | Isolated browser pane (partition, sandbox, navigation and permission policy, security-profile split) | — |
 | PC-BROWSER-002 | Browser MCP loopback server, tool set without eval, permission cards, user takeover | — |
 | PC-PRIV-001 | Online-model reminder with per-workspace opt-out | — |
-| PC-OV-001 | OpenViking policy per engine and routed state | — |
+| PC-OV-001 | OpenViking policy per engine and routed state; capture stays off for every process of a task that has used a routed model | — |
 | PC-SET-002 | Settings tabs General / Engines / Model sources / Privacy / About | PC-SET-001 |
 
 Commit messages cite at least one of these IDs (traceability policy).
@@ -352,13 +369,16 @@ Order: WP0, WP-B, WP-C, WP-D in parallel -> WP-A (needs WP-B contracts) -> WP-E 
 
 1. All existing tests pass; real Grok two-turn queued task passes.
 2. Claude subscription task: file write/read, permission card, restart + resume; `/status` shows no gateway.
-3. Same task Opus -> DeepSeek with tools: one dialog carries the one-way notice and the reminder; afterwards
-   the Claude rows are disabled and the main process refuses a Claude model; the routed process has the
-   throwaway token and no API key; the router log shows no request served by Anthropic, no `claude-*`
-   request answered and no rejected Anthropic credential.
+3. Same task Opus -> DeepSeek with tools: the Online reminder is the only dialog; the rows of the other mode
+   carry the "Restarts" tag and the composer shows the switching status while the engine restarts; the routed
+   process has the throwaway token and no API key. Then back to Opus 5.5: the native process has no
+   `ANTHROPIC_BASE_URL`, no `ANTHROPIC_AUTH_TOKEN`, no `ANTHROPIC_API_KEY` and `OPENVIKING_AUTO_CAPTURE=false`,
+   an Opus turn recalls what the DeepSeek turn said, and the router log shows no request served by Anthropic,
+   no `claude-*` request answered and no rejected Anthropic credential.
 4. Local model turn through the router; no duplicated text.
 5. Browser: manual login persists across restart; agent navigates a local dev server, screenshots,
    clicks; badge + takeover work; pane cannot reach Node or Guild UI.
-6. OpenViking recall in Claude tasks; no capture in routed sessions; nothing in Grok tasks.
+6. OpenViking recall in Claude tasks; no capture in routed sessions, nor in the native ones of a task that has used
+   a routed model; nothing in Grok tasks.
 7. Security tests: non-loopback bind fails, bad token 404, no secrets in logs, package scan passes.
 8. Reduced capability states render truthfully (no blank or stuck spinner).

@@ -888,8 +888,9 @@ and PC-PRIV-001; amends D-003 and D-011 and narrows the gateway clause of PC-SEC
 
 Amended by D-061 (2026-10-12): the Anthropic upstream described below (the Anthropic ids of the exact
 registry, forwarding of the Authorization header to `api.anthropic.com`, the Anthropic header allowlist
-and the Anthropic thinking-signature rule) no longer exists, and a routed task can no longer use Claude
-subscription models. The router serves Online and Local models only. The text below is kept as decided.
+and the Anthropic thinking-signature rule) no longer exists. The router serves Online and Local models only.
+D-061 also made a routed task unable to use Claude subscription models; D-062 (2026-10-13) lifted that, and a
+task now switches both ways. The text below is kept as decided.
 
 Context: measured facts in `docs/20-GUILD3-DUAL-ENGINE.md` section 2. Claude Code can drive an
 Anthropic-compatible backend through `ANTHROPIC_BASE_URL`, but it then sends request shapes that
@@ -1030,6 +1031,11 @@ Date: 2026-10-12. Owner decision. Implements PC-ROUTE-001, PC-ROUTE-002 and PC-M
 (credential rules, exact registry, thinking provenance, native and routed sessions) and D-057 (the model
 group choice inside a Claude task).
 
+Amended by D-062 (2026-10-13): the "One way" clause below, its picker lock, the `claude_locked` refusal and
+the one-way confirmation are superseded; the switch between a Claude model and an Online or Local model is
+two-way. Everything else in this entry stands: the throwaway token, the router without an Anthropic upstream
+and the credential rejection are unchanged. The text below is kept as decided.
+
 Context: Anthropic's legal and compliance terms for Claude Code
 (`code.claude.com/docs/en/legal-and-compliance`) and its Acceptable Use Policy (effective 2026-11-12)
 forbid intermediating Claude subscription (OAuth) credentials and proxying requests through consumer
@@ -1084,3 +1090,61 @@ Consequences
 - Requirement text of PC-ROUTE-001, PC-ROUTE-002, PC-ROUTE-003 and PC-MODEL-001 and the acceptance story
   AS-011 are updated in `requirements/requirements.yml`; `docs/20-GUILD3-DUAL-ENGINE.md` sections 2, 3.3,
   3.4, 3.7 and 6 follow this entry.
+
+## D-062 — Switching between a Claude model and an Online or Local model is two-way; the subscription still never traverses the router
+
+Date: 2026-10-13. Owner decision. Implements PC-ROUTE-002, PC-MODEL-001, PC-PRIV-001 and PC-OV-001; supersedes
+the "One way" clause of D-061 and the "native until the first Online or Local selection, then routed for good"
+rule of D-058 and `docs/20-GUILD3-DUAL-ENGINE.md` 3.3.
+
+Context: D-061 made the switch from Claude to Online or Local one-way so the Claude subscription token could
+never pass through Guild's router. The lock was a means, not the goal. Verified on this machine with Claude Code
+2.1.296 in a clean environment: a session can go native Claude, then routed DeepSeek, then
+native Claude again. `claude -p --resume <id>` run natively (no `ANTHROPIC_BASE_URL`, the subscription login,
+straight to `api.anthropic.com`) continues a session whose history contains DeepSeek turns, including a DeepSeek
+thinking block, with both Haiku and Opus 5.5. So the way back does not need the router at all.
+
+Decision
+- Two-way. A Claude task can switch between a Claude subscription model and an Online or Local model in either
+  direction, between turns, in the same conversation. The mode of the engine process at every start (the switch,
+  a crash recovery, a Guild restart) follows the task's selected model: an Online or Local model starts a routed
+  process (the 3.0.1 routed environment, unchanged), a Claude model or the Claude default starts a native process
+  with none of the routed variables. There is no lock any more: no disabled Claude rows, no `claude_locked`
+  refusal, no main-process refusal of a Claude model for a routed task, no one-way notice in the switch dialog.
+- Switching back restarts natively. Between turns Guild closes the routed process, starts the native one with the
+  same start options minus the routed `modelPicker` (the browser MCP server stays), `session/resume`s the same
+  session, and then applies the model. This mirrors the native to routed switch, one serialized start operation
+  that concurrent callers join: prompts, queued turns and continuous rounds wait for it (`sessionStartPending`)
+  and never go out on the wrong backend. On failure the selection rolls back to what was running and the error
+  is surfaced like other selection failures; a resume timeout keeps the session and only the agent's own
+  no-such-session answer (-32002) replaces it. The Claude subscription login therefore goes only from the native
+  `claude` process to Anthropic and never to the router; a routed process still carries only the throwaway token.
+- Between models of the same mode nothing restarts: Claude to Claude, and Online to Local or Online to Online
+  (the routed small-fast and subagent model variables may keep naming the model of the last start until the next
+  one, as recorded in D-061).
+- A native process resumed after routed turns reads the model of its last turn from the transcript, an Online or
+  Local id that Claude does not offer. Guild applies the selected Claude model, or the Claude default when the
+  choice was cleared, before the first turn.
+- `task_metadata.routed_at_ms` stays, with a new meaning: the task has used an Online or Local model at least
+  once. It is written once, after a routed process took the selection, and never cleared. It no longer forces any
+  process mode. There is no schema migration (schema v19).
+- OpenViking. Capture stays off (`OPENVIKING_AUTO_CAPTURE=false`) for every process of a task that has the marker,
+  native ones included, so third-party output never enters the memory store; recall stays on. A task that never
+  used a routed model keeps D-060 as it was.
+- Privacy. The per-vendor Online reminder is unchanged (first switch to each online vendor per task, "do not
+  remind me again in this workspace"). Switching back to Claude and switching to a Local model never ask.
+- Switch UX. Crossing the boundary can take 30 to 120 seconds. In a Claude task that has run turns, the picker
+  tags the rows whose choice crosses it ("Restarts"), the picker trigger shows a spinner and "Switching..." and
+  the composer shows one status line above the hints while the switch runs; a failure shows the existing
+  selection-failure message. A new task with no turn, a Grok task and same-mode rows show none of this.
+- The router keeps every D-061 guard: it never connects to Anthropic, refuses `claude-*` models, rejects
+  `sk-ant-` credentials and refuses Anthropic hosts as sources.
+
+Consequences
+- A user no longer starts a new task to get Claude back after trying an Online or Local model.
+- The cost of a cross-mode switch is a process restart and a resume, paid once per crossing.
+- A task that goes native after routed turns still has OpenViking capture off for good. A task that never routed
+  is unaffected.
+- Requirement text of PC-MODEL-001, PC-ROUTE-002, PC-OV-001 and PC-PRIV-001 and the acceptance story AS-011 are
+  updated in `requirements/requirements.yml`; `docs/20-GUILD3-DUAL-ENGINE.md` sections 1, 3.3, 3.6, 3.7 and 6
+  follow this entry.

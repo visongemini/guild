@@ -31,8 +31,9 @@ product decision and their own parity and release gates.
    user initiates the corresponding feature.
 6. Claude credentials are never read by Guild. The user's `claude` binary uses its own login. In a
    routed session `claude` carries a throwaway auth token that Guild generated, so its subscription
-   login never reaches Guild's router; the router never connects to Anthropic and rejects any request
-   that carries an Anthropic credential (D-061).
+   login never reaches Guild's router; a native session, which a task returns to when it switches back to
+   a Claude model, carries none of that. The router never connects to Anthropic and rejects any request
+   that carries an Anthropic credential (D-061, D-062).
 7. The model router is loopback-only and single-user (D-058). Keys for Online and Local sources come
    from a user-designated env file, live in memory only and are never stored, shown or logged.
 8. The browser pane and its MCP server are isolated and loopback-only (D-059); Guild's own renderer
@@ -241,8 +242,9 @@ product decision and their own parity and release gates.
   message only when the adapter answers `promptRequired`, rewind restores files only, and the usage
   panel shows context usage and says the quota is managed by Claude Code. The Grok control center and the Grok slash snapshot are
   offered for Grok tasks only, and the phase line shows generic phases only.
-- OpenViking memory is on in Claude tasks and its automatic capture is off in routed sessions
-  (PC-OV-001). Grok tasks keep OpenViking out of the session as before.
+- OpenViking memory is on in Claude tasks and its automatic capture is off in routed sessions and in
+  every session of a task that has used a routed model (PC-OV-001). Grok tasks keep OpenViking out of
+  the session as before.
 
 ### Model sources and the router (Guild 3.0, D-058)
 
@@ -256,13 +258,14 @@ product decision and their own parity and release gates.
   needs a native confirmation that names the variable and the host (for an Online source it also says
   that Claude task conversations go to that host). Online sources use https; Local sources must
   resolve to a loopback or Tailscale (100.64.0.0/10) address.
-- The first Online or Local selection in a Claude task moves that task to a routed session through
-  Guild's loopback model router, and a routed task stays routed: it can no longer use a Claude
-  subscription model, its Claude rows in the picker are disabled, and the user starts a new task to use
-  Claude again. A Claude task that has already run turns confirms before that first switch, in the same
-  dialog as the Online reminder when one is due. The router listens on 127.0.0.1 only, serves only
-  configured Online and Local models, never forwards a Claude credential or anything else to Anthropic,
-  and does not translate to the OpenAI protocol.
+- Selecting an Online or Local model in a Claude task runs it through Guild's loopback model router, and
+  selecting a Claude model (or the Claude default) again runs it natively: the switch is two-way (D-062).
+  A switch that crosses between the two restarts Claude Code and resumes the same conversation, which can
+  take 30 to 120 seconds; the picker marks such rows "Restarts" and the composer says so while it runs.
+  Switching to an Online model of a vendor not yet agreed in that conversation shows the Online reminder;
+  switching back to Claude never asks. The router listens on 127.0.0.1 only, serves only configured
+  Online and Local models, never forwards a Claude credential or anything else to Anthropic, and does not
+  translate to the OpenAI protocol.
 - The Claude group of the picker shows the Default row and the newest model of each family; the other
   Claude models are one collapsed "Older models" row (D-061, `docs/20-GUILD3-DUAL-ENGINE.md` 3.9).
 
@@ -387,14 +390,15 @@ product decision and their own parity and release gates.
    certificate-stable rather than pinned to each package hash.
 10. (Guild 3.0, AS-011) Start a task on the Claude engine with the user's own login, write and read a
     file through a permission card, quit, reopen and resume. Switch the same task from Claude to an
-    Online model with tools through one dialog that carries the one-way notice and the Online reminder,
-    see the Claude rows disabled afterwards, run a Local model turn without duplicated reply text, and
-    confirm that no Claude credential reached the router and nothing went to `api.anthropic.com`.
+    Online model with tools through the Online reminder, see the Restarts tags and the switching status
+    while the engine restarts, switch back to a Claude model and have it recall what the Online model
+    said, run a Local model turn without duplicated reply text, and confirm that no Claude credential
+    reached the router and nothing went to `api.anthropic.com`.
 11. (Guild 3.0, AS-012) Log in manually in the browser pane and keep the login across restart. Let an
     agent navigate a local dev server, take a screenshot and click. See the operating badge, take over
     and resume, and confirm the pane cannot reach Node or the Guild interface.
 12. (Guild 3.0, AS-013) Observe OpenViking recall in Claude tasks, no capture in routed Claude
-    sessions and nothing in Grok tasks, and see every reduced-capability state render truthfully.
+    sessions (nor in the native ones of a task that used a routed model) and nothing in Grok tasks, and see every reduced-capability state render truthfully.
 
 
 ## Guild 2.1 frontend redesign (2026-09-12, D-046)

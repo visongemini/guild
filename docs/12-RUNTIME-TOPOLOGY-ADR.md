@@ -6,8 +6,8 @@ Date: 2026-08-26
 > Guild 3.0 note (D-057, 2026-10-12): this ADR now reads "one engine process per active task". A
 > task bound to the Claude engine gets one process of the user-installed ACP adapter instead of the
 > official Grok process; the isolation reasoning below is unchanged. A Claude session that becomes
-> routed (D-058) has its adapter restarted once, between turns, with the router environment, and
-> keeps one process afterwards. See `docs/20-GUILD3-DUAL-ENGINE.md` sections 3.1 to 3.3.
+> routed (D-058) has its adapter restarted, between turns, with the router environment, and a routed
+> one that returns to a Claude model has it restarted natively (D-062); there is one process at any time. See `docs/20-GUILD3-DUAL-ENGINE.md` sections 3.1 to 3.3.
 
 ## Decision
 

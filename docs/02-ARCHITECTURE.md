@@ -192,13 +192,14 @@ notarization when Guild is publicly distributed.
   installed files. Guild never reads Claude credentials.
 - **Model router** (`packages/model-router`, in main; D-058). Loopback-only, random port and path
   token, exact model registry, credential rules, a compat layer for Online and Local sources,
-  thinking-signature provenance and a local SSE normalizer. A Claude session is native until the
-  first Online or Local selection, then routed for good: its process carries a throwaway auth token, the
-  router has no Anthropic upstream, and the task can no longer use Claude subscription models (D-061).
+  thinking-signature provenance and a local SSE normalizer. The mode of a Claude process follows the
+  selected model: an Online or Local model runs it routed (a throwaway auth token, the router has no
+  Anthropic upstream), a Claude model runs it native, and a switch between the two restarts the process and
+  resumes the same session in both directions (D-061, D-062).
 - **Browser pane and MCP server** (D-059). An isolated `WebContentsView` in its own partition and a
   loopback MCP server in main with a fixed tool set and no eval. The split Electron profile is in
   `docs/09-ELECTRON-SECURITY-PROFILE.md`.
-- **OpenViking** (D-060). Per engine and routed state, as set in the decision log.
+- **OpenViking** (D-060, D-062). Per engine and routed state, as set in the decision log.
 - The repository target gains `packages/model-router/`; the work packages and file ownership are in
   `docs/20-GUILD3-DUAL-ENGINE.md`.
 
