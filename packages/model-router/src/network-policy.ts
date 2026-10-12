@@ -25,18 +25,26 @@ export function isAllowedLocalAddress(address: string): boolean {
   }
 }
 
+/** The bare form of a URL hostname: IPv6 literals arrive bracketed (`[::1]`). */
+export function bareHostname(hostname: string): string {
+  return hostname.startsWith("[") && hostname.endsWith("]") ? hostname.slice(1, -1) : hostname;
+}
+
 /**
- * True only when every address the host resolves to is allowed for a Local source.
- * A literal IP host is judged directly without a lookup.
+ * Resolves a Local source host exactly once and returns the address the request must be sent to:
+ * the first resolved address, but only when EVERY resolved address is allowed. A literal IP host is
+ * judged directly without a lookup and returned as is. Undefined means denied. The caller connects
+ * to the returned literal, so a later DNS answer can never reach the connection (DNS rebinding).
  */
-export async function isAllowedLocalHost(hostname: string, lookup: HostLookup): Promise<boolean> {
-  const bare = hostname.startsWith("[") && hostname.endsWith("]") ? hostname.slice(1, -1) : hostname;
-  if (isIP(bare) !== 0) return isAllowedLocalAddress(bare);
+export async function resolveAllowedLocalAddress(hostname: string, lookup: HostLookup): Promise<string | undefined> {
+  const bare = bareHostname(hostname);
+  if (isIP(bare) !== 0) return isAllowedLocalAddress(bare) ? bare : undefined;
   let addresses: string[];
   try {
     addresses = await lookup(bare);
   } catch {
-    return false;
+    return undefined;
   }
-  return addresses.length > 0 && addresses.every(isAllowedLocalAddress);
+  const [first] = addresses;
+  return first !== undefined && addresses.every(isAllowedLocalAddress) ? first : undefined;
 }

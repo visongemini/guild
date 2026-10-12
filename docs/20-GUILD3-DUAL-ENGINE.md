@@ -103,8 +103,12 @@ created and never changes. Process topology stays one engine process per task (D
 - **Host binding.** Adding a source or changing its base URL / key variable requires a native
   confirmation dialog in main (`dialog.showMessageBox`) naming the variable and the host. The router
   only sends a key to the host it was confirmed for. Renderer requests alone cannot activate a change.
-- Online sources: https only. Local sources: http or https; resolved IPs must be loopback or in
-  100.64.0.0/10 (Tailscale), checked before connecting.
+- Online sources: https only. Local sources: http or https; the host is resolved once per request,
+  every resolved address must be loopback or in 100.64.0.0/10 (Tailscale), and the request is then
+  sent to the first validated address as an IP literal (IPv6 bracketed), never to the hostname, so
+  a second DNS answer cannot reach the connection (DNS rebinding). Local https is allowed only when
+  the host is already an IP literal or `localhost` (a certificate name cannot match a rewritten IP);
+  any other https host answers 403 `local_https_requires_ip`. No `Host` header is set.
 - **Compat layer** (Online/Local only; Anthropic gets the original body):
   1. `role:"system"` messages are removed; their text is queued and inserted as one
      `<system-reminder>` text block into the next user message **after** its `tool_result` blocks

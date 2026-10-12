@@ -6,7 +6,7 @@ import {
   type Server,
   type ServerResponse,
 } from "node:http";
-import { connect, type AddressInfo } from "node:net";
+import { connect, isIP, type AddressInfo } from "node:net";
 import { networkInterfaces } from "node:os";
 import { describe, it, type TestContext } from "node:test";
 import {
@@ -231,6 +231,8 @@ async function startHarness(t: TestContext, options: HarnessOptions = {}): Promi
     ["vendor.example", online.port],
     ["llm.tailnet.example:8080", local.port],
     ["100.64.0.5:8080", local.port],
+    ["100.101.102.103:8080", local.port],
+    ["[::1]:8080", local.port],
   ]);
   const fetchImpl: typeof fetch = async (input, init) => {
     const url = new URL(String(input));
@@ -753,14 +755,77 @@ describe("online and local credential rules", () => {
     assert.ok(lookups.includes("llm.tailnet.example"));
   });
 
-  it("allows https for local sources", async (t) => {
-    const h = await startHarness(t);
+  it("allows https for local sources only on an IP literal or localhost", async (t) => {
+    const h = await startHarness(t, { lookup: async (host) => (host === "localhost" ? ["127.0.0.1"] : ["100.101.102.103"]) });
+    const tls = (id: string, baseUrl: string): RouterSource => {
+      const host = new URL(baseUrl).host;
+      return { id, kind: "local", label: id, baseUrl, key: LOCAL_KEY, confirmedHost: host, models: [{ id: `${id}-model`, label: id }] };
+    };
     h.router.updateSources([
-      { id: "tls-local", kind: "local", label: "x", baseUrl: "https://127.0.0.1:9", key: LOCAL_KEY, confirmedHost: "127.0.0.1:9", models: [{ id: "tls-model", label: "x" }] },
+      tls("tls-ip", "https://127.0.0.1:9"),
+      tls("tls-v6", "https://[::1]:9"),
+      tls("tls-localhost", "https://localhost:9"),
+      tls("tls-name", "https://llm.tailnet.example:9"),
     ]);
-    const response = await h.post("v1/messages", simpleBody("tls-model"));
-    assert.equal(response.status, 502, "policy passed; the connection itself fails");
+    for (const id of ["tls-ip", "tls-v6", "tls-localhost"]) {
+      assert.equal((await h.post("v1/messages", simpleBody(`${id}-model`))).status, 502, `${id}: policy passed; the connection itself fails`);
+    }
+    assert.equal(h.calls.length, 3);
+
+    const callsBefore = h.calls.length;
+    const response = await h.post("v1/messages", simpleBody("tls-name-model"));
+    assert.equal(response.status, 403);
+    const payload = (await response.json()) as { error: { type: string; message: string } };
+    assert.equal(payload.error.type, "permission_error");
+    assert.match(payload.error.message, /IP address or localhost/u);
+    assert.equal(h.calls.length, callsBefore, "a named https host must not be contacted");
+    assert.equal(h.requestLogs().at(-1)?.fields.outcome, "local_https_requires_ip");
+  });
+
+  it("connects to the validated IP literal and never to the hostname (DNS rebinding) [PC-ROUTE-002]", async (t) => {
+    // The first answer is safe; every later answer points at a public host. A router that resolved
+    // again for the connection would see the public one.
+    const answers = [["100.101.102.103"], ["8.8.8.8"], ["8.8.8.8"]];
+    let lookups = 0;
+    const h = await startHarness(t, { lookup: async () => answers[Math.min(lookups++, answers.length - 1)] ?? [] });
+    h.router.updateSources([
+      { id: "rebind", kind: "local", label: "x", baseUrl: "http://llm.tailnet.example:8080/anthropic", key: LOCAL_KEY, confirmedHost: "llm.tailnet.example:8080", models: [{ id: "rebind-model", label: "x" }] },
+    ]);
+    const response = await h.post("v1/messages?beta=true", simpleBody("rebind-model"));
+    assert.equal(response.status, 200);
+    assert.equal(lookups, 1, "the host is resolved exactly once per request");
     assert.equal(h.calls.length, 1);
+    assert.equal(h.calls[0]?.url, "http://100.101.102.103:8080/anthropic/v1/messages?beta=true");
+    assert.equal(h.local.requests[0]?.url, "/anthropic/v1/messages?beta=true");
+    assert.equal(h.local.requests[0]?.headers["x-api-key"], LOCAL_KEY);
+
+    // The next request resolves again, now to a public address, and is refused before any connection.
+    assert.equal((await h.post("v1/messages", simpleBody("rebind-model"))).status, 403);
+    assert.equal(h.calls.length, 1);
+    assert.equal(lookups, 2);
+  });
+
+  it("sends every Local request to an IP literal, IPv6 bracketed, and keeps literal hosts as is", async (t) => {
+    const h = await startHarness(t, {
+      lookup: async (host) => (host === "v6.example" ? ["::1", "127.0.0.1"] : ["127.0.0.1", "::1"]),
+    });
+    const local = (id: string, baseUrl: string): RouterSource => ({
+      id, kind: "local", label: id, baseUrl, key: LOCAL_KEY, confirmedHost: new URL(baseUrl).host, models: [{ id: `${id}-model`, label: id }],
+    });
+    h.router.updateSources([
+      local("named-v6", "http://v6.example:8080"),
+      local("literal-v6", "http://[::1]:8080"),
+      local("literal-v4", `http://127.0.0.1:${h.local.port}`),
+      local("localhost", `http://localhost:${h.local.port}`),
+    ]);
+    for (const id of ["named-v6", "literal-v6", "literal-v4", "localhost"]) {
+      assert.equal((await h.post("v1/messages", simpleBody(`${id}-model`))).status, 200, id);
+    }
+    assert.deepEqual(
+      h.calls.map((call) => new URL(call.url).host),
+      ["[::1]:8080", "[::1]:8080", `127.0.0.1:${h.local.port}`, `127.0.0.1:${h.local.port}`],
+    );
+    assert.ok(h.calls.every((call) => isIP(new URL(call.url).hostname.replace(/^\[|\]$/gu, "")) !== 0), "no hostname may reach the transport");
   });
 });
 
