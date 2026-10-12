@@ -61,7 +61,7 @@ created and never changes. Process topology stays one engine process per task (D
   over its installed `package.json` and `dist/` tree; mismatch refuses to start with a named error.
 - Locator: `claude-agent-acp` from `~/.npm-global/bin`, the user's PATH and Homebrew paths;
   `claude` from `~/.local/bin/claude` / PATH (Mach-O). `node` from PATH (>= 22).
-- Env (allowlist + Guild-owned values): PATH, HOME, LANG/LC_*, TMPDIR, proxy vars, SSL vars,
+- Env (allowlist + Guild-owned values): PATH, HOME, USER, LOGNAME (claude looks up its Keychain login by account name; without USER it reports "not logged in" [WP-A smoke]), LANG/LC_*, TMPDIR, proxy vars, SSL vars,
   `NO_PROXY=127.0.0.1,localhost` (always), `CLAUDE_CODE_EXECUTABLE=<pinned claude>`. Strip every
   inherited `ANTHROPIC_*` and `CLAUDE_CODE_*` variable first. Do NOT inject the Grok OpenViking
   kill-switch block (D-060). Routed sessions add the variables of 3.3.
@@ -167,7 +167,7 @@ models never remind.
 ### 3.8 Grok-only features under the Claude engine (truthful reduced capability, PC-FALLBACK-001)
 Steer -> `_session/steering` (queue when `promptRequired`). Conversation rewind -> files only (existing fallback).
 Usage panel -> context usage from `usage_update`; quota "Managed by Claude Code". Grok control
-center and Grok slash snapshot -> Grok engine only. Phase line -> generic phases only.
+center and Grok slash snapshot -> Grok engine only. Phase line -> generic phases only. Content the adapter emits after a prompt response (rare: v1 holds a turn open while its background work runs) is dropped and reported as `late_update_dropped` (known 3.0 limitation); `async_task_*` session updates are ignored extensions.
 
 ## 4. New identifiers
 
