@@ -229,6 +229,9 @@ test("only a task override offers Use default, and no-ops are not sent", () => {
   // Choosing what is merely inherited pins it to the task; clearing nothing is a no-op.
   assert.equal(isSameSelection(inherited, { model: "grok-4.7", reasoningEffort: "high" }), false);
   assert.equal(isSameSelection(inherited, CLEAR_MODEL_OVERRIDE), true);
+  // A change that also moves the task to the other engine is never a no-op, even for "no model, nothing pinned".
+  assert.equal(isSameSelection(inherited, { ...CLEAR_MODEL_OVERRIDE, group: "claude", engine: "claude" }), false);
+  assert.equal(isSameSelection(pinned, { model: "grok-4.7", reasoningEffort: "high", engine: "claude" }), false);
 });
 
 test("the picker is disabled with a stated reason while a turn runs, without a task, or in flight", () => {
@@ -439,6 +442,70 @@ test("the Claude group is unavailable when the status says so, or the Claude cat
   assert.equal(groupView(refused, "claude").empty?.kind, "claude_unavailable");
   assert.equal(groupView(refused, "claude").empty?.text, EN.claudeStatusIntegrityChanged);
   assert.match(groupView(refused, "claude").empty?.text ?? "", /reinstall claude-agent-acp or restart Guild/u);
+});
+
+test("an empty Claude catalog offers Claude Code (default model), so a Claude task can still start (PC-ENG-001)", () => {
+  const emptyClaude = { grok: REAL_CATALOG, claude: EMPTY_CLAUDE_MODEL_CATALOG };
+  const fresh = { messages: EN, catalogs: emptyClaude, selection: selection("grok-4.7", "high", "runtime"), taskEngine: "grok" as const, engineFixed: false };
+  // Unknown, ready, not logged in or unusable: only a missing installation withholds the row.
+  for (const claudeState of [undefined, "ready", "not_logged_in", "unavailable"] as const) {
+    const view = modelPickerView({ ...fresh, ...(claudeState === undefined ? {} : { claudeState }) });
+    const claude = groupView(view, "claude");
+    assert.deepEqual(
+      claude.models.map((row) => [row.id, row.name, row.group, row.engine, row.runtimeDefault, row.selected]),
+      [["", "Claude Code (default model)", "claude", "claude", true, false]],
+      String(claudeState),
+    );
+    // The hint about the missing list stays under the row, and the row is part of the keyboard walk.
+    assert.ok(claude.empty !== undefined, String(claudeState));
+    assert.equal(view.models.some((row) => row.runtimeDefault === true), true);
+    assert.equal(view.catalogEmpty, false);
+  }
+  assert.equal(groupView(modelPickerView({ ...fresh, claudeState: "not_found" }), "claude").models.length, 0);
+  assert.equal(groupView(modelPickerView({ ...fresh, claudeState: "not_found" }), "claude").empty?.kind, "claude_unavailable");
+  // Only models of Claude's own count: Online and Local models alone do not make the list.
+  const routedOnly = { grok: REAL_CATALOG, claude: freezeClaude([{ id: "deepseek-v4-flash", name: "DeepSeek V4 Flash", group: "online" }]) };
+  const onlyRouted = modelPickerView({ ...fresh, catalogs: routedOnly, claudeState: "ready" });
+  assert.deepEqual(groupView(onlyRouted, "claude").models.map((row) => row.name), ["Claude Code (default model)"]);
+  assert.deepEqual(groupView(onlyRouted, "online").models.map((row) => row.id), ["deepseek-v4-flash"]);
+  // Once Claude lists its own models there is nothing to stand in for them.
+  for (const claudeState of [undefined, "ready"] as const) {
+    const listed = modelPickerView({ ...fresh, catalogs: CATALOGS, ...(claudeState === undefined ? {} : { claudeState }) });
+    assert.equal(listed.models.some((row) => row.runtimeDefault === true), false);
+    assert.equal(groupView(listed, "claude").empty, undefined);
+  }
+  // A task bound to Grok never sees the Claude group, so it never sees the row.
+  assert.equal(
+    modelPickerView({ ...fresh, engineFixed: true }).models.some((row) => row.runtimeDefault === true),
+    false,
+  );
+  assert.equal(modelPickerView({ ...fresh, messages: ZH }).models.find((row) => row.runtimeDefault)?.name, "Claude Code\uff08\u9ed8\u8ba4\u6a21\u578b\uff09");
+});
+
+test("the Claude default row is selected while a Claude task follows a default, and picking it clears the override and moves the task if needed", () => {
+  const emptyClaude = { grok: REAL_CATALOG, claude: EMPTY_CLAUDE_MODEL_CATALOG };
+  const view = (taskSelection: TaskModelSelectionProjection, taskEngine: "grok" | "claude", engineFixed: boolean) =>
+    modelPickerView({ messages: EN, catalogs: emptyClaude, selection: taskSelection, taskEngine, engineFixed, claudeState: "ready" });
+  const following = view(selection(null, null, "runtime"), "claude", true);
+  const row = following.models.find((candidate) => candidate.runtimeDefault)!;
+  assert.deepEqual(following.models.filter((candidate) => candidate.selected).map((candidate) => candidate.name), ["Claude Code (default model)"]);
+  assert.equal(row.tabStop, true);
+  // Already on Claude with nothing pinned: the row changes nothing, so it is not sent.
+  const same = selectionForRow(emptyClaude, row, null, "claude");
+  assert.deepEqual(same, { model: null, reasoningEffort: null, group: "claude" });
+  assert.equal(isSameSelection(selection(null, null, "runtime"), same), true);
+  // A pinned model (for example a routed one) is cleared back to Claude's default by picking it.
+  const pinned = view(selection("deepseek-v4-flash", null, "task"), "claude", true);
+  assert.equal(pinned.models.find((candidate) => candidate.runtimeDefault)!.selected, false);
+  assert.equal(isSameSelection(selection("deepseek-v4-flash", null, "task"), same), false);
+  // On a Grok task that has not run, picking it moves the task to Claude, whatever the Grok selection says.
+  const fromGrok = view(selection("grok-4.7", "high", "runtime"), "grok", false);
+  const grokRow = fromGrok.models.find((candidate) => candidate.runtimeDefault)!;
+  assert.equal(grokRow.selected, false);
+  const move = selectionForRow(emptyClaude, grokRow, fromGrok.selectedEffortId, "grok");
+  assert.deepEqual(move, { model: null, reasoningEffort: null, group: "claude", engine: "claude" });
+  assert.equal(isSameSelection(selection("grok-4.7", "high", "runtime"), move), false);
+  assert.equal(isSameSelection(selection(null, null, "runtime"), move), false);
 });
 
 test("the Grok group of a not-yet-started runtime keeps its own hint, whatever engine the task sits on", () => {

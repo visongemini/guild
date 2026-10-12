@@ -136,7 +136,6 @@ describe("model router host: which sources are routable", () => {
     add(h.store, onlineDraft({ id: "disabled", baseUrl: "https://disabled.vendor.test", keyFile: keys, enabled: false, models: [{ id: "disabled-model", label: "D" }] }));
     add(h.store, onlineDraft({ id: "no-file", baseUrl: "https://nofile.vendor.test", keyFile: join(h.dir, "absent.env"), models: [{ id: "no-file-model", label: "N" }] }));
     add(h.store, onlineDraft({ id: "no-variable", baseUrl: "https://novar.vendor.test", keyFile: keys, keyVariable: "ABSENT_KEY", models: [{ id: "no-variable-model", label: "V" }] }));
-    add(h.store, onlineDraft({ id: "keyless-online", baseUrl: "https://keyless.vendor.test", keyVariable: null, models: [{ id: "keyless-online-model", label: "K" }] }));
     add(h.store, draft({ id: "keyed-local", baseUrl: "http://127.0.0.1:9000", keyFile: join(h.dir, "absent.env"), keyVariable: "LOCAL_KEY", models: [{ id: "keyed-local-model", label: "L" }] }));
     add(h.store, onlineDraft({ id: "unreadable", baseUrl: "https://unreadable.vendor.test", keyFile: h.dir + "/", models: [{ id: "unreadable-model", label: "R" }] }));
 

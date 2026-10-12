@@ -11,9 +11,12 @@ import {
   formFromSource,
   newSourceId,
   sourceHost,
+  sourceSaveFailureOf,
+  sourceSaveFailureReason,
   sourceStatus,
   validateSourceForm,
   type SourceForm,
+  type SourceSaveFailure,
 } from "./model-sources-form.js";
 
 const EN = messagesFor("en-US");
@@ -167,7 +170,9 @@ test("the list shows each source with its type and status chip, its host and mod
 
 test("an Online source that needs confirmation names the key variable and the host", () => {
   const markup = render({ initialSources: [online({ confirmedHost: null })] });
-  assert.match(markup, /confirm that the key in EXAMPLE_API_KEY may be sent to api\.example\.com\./u);
+  assert.match(markup, /confirm that the key in EXAMPLE_API_KEY and Claude task conversations may be sent to api\.example\.com\./u);
+  // A Local source with a key sends the key alone, as its native window says.
+  assert.match(render({ initialSources: [local({ keyVariable: "LOCAL_KEY" })] }), /confirm that the key in LOCAL_KEY may be sent to 127\.0\.0\.1:8080\./u);
 });
 
 test("empty and loading states are stated", () => {
@@ -232,4 +237,107 @@ test("saving, confirming and deleting call the matching API, and a source needin
   assert.doesNotMatch(source.slice(source.indexOf("async function save()"), source.indexOf("async function confirm(")), /confirmModelSource/u);
   // The form never holds a key value.
   assert.doesNotMatch(source, /type="password"|apiKey/iu);
+});
+
+// ---- Save failures: the main process's refusals (`model_source_<reason>`) land next to what can be fixed
+
+/** What Electron raises in the renderer for a main-process refusal. */
+const remote = (reason: string) => new Error(`Error invoking remote method 'guild:v1:model-source:upsert': Error: model_source_${reason}`);
+
+test("a failed save is read from the error the preload raises, and only the main process's own codes count", () => {
+  for (const reason of ["invalid", "reserved_id", "reserved_model", "duplicate_model", "limit", "changed", "not_found", "rejected"] as const) {
+    assert.equal(sourceSaveFailureReason(remote(reason)), reason, reason);
+    assert.equal(sourceSaveFailureReason(new Error(`model_source_${reason}`)), reason, `${reason} without the wrapper`);
+  }
+  for (const other of [
+    new Error("guild_operation_failed"),
+    new Error("model_source_something_new"),
+    new Error("model_sources_invalid"),
+    new Error("xmodel_source_invalid"),
+    new TypeError("Failed to fetch"),
+    "boom",
+    undefined,
+    null,
+  ]) {
+    assert.equal(sourceSaveFailureReason(other), undefined, String(other));
+  }
+});
+
+test("each refusal is placed where it can be fixed: the Name, the rows that repeat an ID, the model list, or the form", () => {
+  const taken = [online({ id: "other", models: Object.freeze([{ id: "model-a", label: "A" }, { id: "model-b", label: "B" }]) })];
+  const form = valid({ models: [
+    { id: "fresh", label: "Fresh", contextWindow: "", supportsImages: false },
+    { id: " model-b ", label: "Repeats B", contextWindow: "", supportsImages: false },
+    { id: "", label: "", contextWindow: "", supportsImages: false },
+    { id: "model-a", label: "Repeats A", contextWindow: "", supportsImages: false },
+  ] });
+  const place = (reason: string, over: SourceForm = form) => sourceSaveFailureOf(remote(reason), over, taken);
+  assert.deepEqual([place("reserved_id").place, place("reserved_id").rows], ["label", []]);
+  assert.deepEqual([place("reserved_model").place, place("reserved_model").rows], ["models", []]);
+  // The rows are the ones that repeat another source's ID (blank rows are skipped, whitespace is trimmed).
+  assert.deepEqual([place("duplicate_model").place, place("duplicate_model").rows], ["models", [1, 3]]);
+  // The source being edited does not collide with itself.
+  assert.deepEqual(place("duplicate_model", valid({ id: "other", models: form.models })).rows, []);
+  for (const reason of ["invalid", "limit", "changed", "not_found", "rejected"]) {
+    assert.deepEqual([place(reason).place, place(reason).reason, place(reason).rows], ["form", reason, []], reason);
+  }
+  // A failure that is not one of the refusals keeps the generic line at the foot of the form.
+  assert.deepEqual(sourceSaveFailureOf(new Error("guild_operation_failed"), form, taken), { place: "form", reason: "unknown", rows: [] });
+});
+
+test("the Name carries a reserved-name refusal, the repeated rows carry the duplicate-ID refusal, the list carries the rest", () => {
+  const failure = (reason: SourceSaveFailure["reason"], place: SourceSaveFailure["place"], rows: readonly number[] = []): SourceSaveFailure =>
+    ({ reason, place, rows });
+  const two = valid({ models: [
+    { id: "model-a", label: "A", contextWindow: "", supportsImages: false },
+    { id: "model-b", label: "B", contextWindow: "", supportsImages: false },
+  ] });
+  const show = (initialSaveFailure: SourceSaveFailure, messages = EN, initialForm = two) =>
+    render({ initialSources: [], initialForm, initialSaveFailure }, messages);
+
+  const reservedName = show(failure("reserved_id", "label"));
+  assert.match(reservedName, /id="([^"]+)-label-error" role="alert">This name is reserved for Claude&#x27;s own models\. Choose a different name\.<\/p>/u);
+  assert.match(reservedName, /<input type="text" maxLength="80" autoComplete="off" aria-invalid="true" aria-describedby="[^"]+-label-error" value="DeepSeek"\/>/u);
+  // Nothing else is flagged.
+  assert.equal(reservedName.match(/class="guild-source-error"/gu)?.length, 1);
+
+  const repeated = show(failure("duplicate_model", "models", [1]));
+  assert.equal(repeated.match(/class="guild-source-error" role="alert">Another model source already offers this model ID\./gu)?.length, 1);
+  assert.equal(repeated.match(/aria-invalid="true"/gu)?.length, 1);
+  assert.match(repeated, /aria-label="Model ID 2"[^>]*aria-invalid="true"|aria-invalid="true"[^>]*aria-label="Model ID 2"/u);
+  assert.doesNotMatch(repeated, /aria-label="Model ID 1"[^>]*aria-invalid/u);
+
+  const reservedModel = show(failure("reserved_model", "models"));
+  assert.match(reservedModel, /role="alert">A model ID here belongs to Claude Code \(one that starts with claude-, or a name such as default, opus, sonnet or haiku\)/u);
+  assert.doesNotMatch(reservedModel, /aria-invalid/u);
+  // A repeat the renderer could not locate still says so, under the list.
+  assert.match(show(failure("duplicate_model", "models")), /role="alert">Another model source already offers this model ID\./u);
+
+  const foot = (reason: SourceSaveFailure["reason"], text: RegExp, messages = EN) => {
+    const markup = show(failure(reason, "form"), messages);
+    assert.match(markup, text, reason);
+    // The foot message sits above the buttons and is the only error shown.
+    assert.equal(markup.match(/class="guild-source-error"/gu)?.length, 1, reason);
+    assert.ok(markup.indexOf("guild-source-error") < markup.indexOf("guild-sources-actions"), reason);
+  };
+  foot("limit", /role="alert">You can keep up to 32 model sources\. Delete one to add another\./u);
+  foot("changed", /role="alert">This source was changed somewhere else while you were editing\./u);
+  foot("not_found", /role="alert">This source no longer exists\./u);
+  foot("rejected", /role="alert">Guild could not save this source\./u);
+  foot("invalid", /role="alert">Some values were not accepted\./u);
+  foot("unknown", /role="alert">It could not be saved\. Check the fields and try again\./u);
+  foot("limit", /role="alert">模型源最多 32 个。请先删除一个再添加。/u, ZH);
+  assert.match(show(failure("reserved_id", "label"), ZH), /这个名称是 Claude 自带模型保留的/u);
+  assert.match(show(failure("duplicate_model", "models", [0]), ZH), /别的模型源已经提供了这个模型 ID/u);
+  // No failure, no message.
+  assert.doesNotMatch(render({ initialSources: [], initialForm: two }), /class="guild-source-error"/u);
+});
+
+test("a failed save reads the refusal, refreshes the list when the source moved, and clears on the next try", async () => {
+  const source = await readFile(new URL("../src/ModelSourcesSettings.tsx", import.meta.url), "utf8");
+  const save = source.slice(source.indexOf("async function save()"), source.indexOf("async function confirm("));
+  assert.match(save, /\} catch \(cause\) \{\s*\n\s*if \(!alive\.current\) return;\s*\n\s*const failure = sourceSaveFailureOf\(cause, form, sources \?\? \[\]\);\s*\n\s*setSaveFailure\(failure\);/u);
+  assert.match(save, /if \(failure\.reason === "changed" \|\| failure\.reason === "not_found"\) await load\(\);/u);
+  assert.match(save, /setSaveFailure\(undefined\);\s*\n\s*if \(found\.length > 0\) return;/u);
+  assert.doesNotMatch(source, /saveFailed/u);
 });

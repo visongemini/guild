@@ -170,6 +170,8 @@ export type GuildMessages = WorkshopMessages & ChangeMessages & {
   readonly modelPickerClaudeUnavailable: string;
   readonly modelPickerClaudeUnavailableHelp: string;
   readonly modelPickerClaudeNotStarted: string;
+  /** The Claude group's one row while Claude Code lists no model yet: the task follows Claude Code's own default. */
+  readonly modelPickerClaudeDefault: string;
   readonly modelPickerEngineNote: string;
   readonly taskEngineName: (engine: GuildEngine) => string;
   readonly taskEngineMarkerTitle: (engine: GuildEngine) => string;
@@ -219,7 +221,7 @@ export type GuildMessages = WorkshopMessages & ChangeMessages & {
   readonly sourcesModelCount: (count: number) => string;
   readonly sourcesConfirm: string;
   readonly sourcesConfirming: string;
-  readonly sourcesConfirmHelp: (host: string, variable: string | null) => string;
+  readonly sourcesConfirmHelp: (host: string, variable: string | null, kind: "online" | "local") => string;
   readonly sourcesConfirmedNotice: string;
   readonly sourcesConfirmCancelled: string;
   readonly sourcesConfirmFailed: string;
@@ -244,6 +246,7 @@ export type GuildMessages = WorkshopMessages & ChangeMessages & {
   readonly sourcesEnabled: string;
   readonly sourcesSaving: string;
   readonly sourcesSaveFailed: string;
+  readonly sourcesSaveError: (reason: "invalid" | "reserved_id" | "reserved_model" | "duplicate_model" | "limit" | "changed" | "not_found" | "rejected", maxSources: number) => string;
   readonly sourcesInvalid: (problem: "label" | "base_url" | "base_url_https" | "key_file" | "key_variable" | "key_variable_secret" | "models" | "model_id" | "model_duplicate" | "model_label" | "model_context") => string;
   // Claude usage popover (PC-ENG-001)
   readonly usageClaudeHeading: string;
@@ -709,6 +712,7 @@ const ZH_CN: GuildMessages = Object.freeze({
   modelPickerClaudeUnavailable: "未找到 Claude Code，或尚未登录",
   modelPickerClaudeUnavailableHelp: "请先安装 Claude Code，并在终端运行一次 claude 完成登录。",
   modelPickerClaudeNotStarted: "Claude 启动后才会显示可选的模型。",
+  modelPickerClaudeDefault: "Claude Code（默认模型）",
   modelPickerEngineNote: "第一条消息选的模型，决定这个对话用 Grok 还是 Claude，之后不能更换。",
   taskEngineName: (engine) => ({ grok: "Grok", claude: "Claude" })[engine],
   taskEngineMarkerTitle: (engine) => ({ grok: "Grok 对话", claude: "Claude Code 对话" })[engine],
@@ -721,7 +725,7 @@ const ZH_CN: GuildMessages = Object.freeze({
   onlineReminderDontRemind: "在此工作区不再提醒",
   onlineReminderSwitch: "切换",
   privacyOnlineReminder: "发给在线模型前先提醒我",
-  privacyOnlineReminderHelp: "在此工作区的对话里第一次使用在线模型时，先确认一次。本地模型和 Claude 订阅模型不会提醒。",
+  privacyOnlineReminderHelp: "在此工作区的每个对话里，第一次使用某个在线服务商的模型时，先确认一次；换到另一个服务商会再确认。本地模型和 Claude 订阅模型不会提醒。",
   privacyOnlineReminderNoWorkspace: "打开一个对话后，才能修改它所在工作区的这项设置。",
   privacyOnlineReminderFailed: "这项设置没有保存，请重试。",
   settingsEngines: "引擎",
@@ -768,9 +772,11 @@ const ZH_CN: GuildMessages = Object.freeze({
   sourcesModelCount: (count) => `${count} 个模型`,
   sourcesConfirm: "确认",
   sourcesConfirming: "等待你在系统窗口中确认…",
-  sourcesConfirmHelp: (host, variable) => variable === null
+  sourcesConfirmHelp: (host, variable, kind) => variable === null
     ? `Guild 会弹出系统窗口，请你确认可以向 ${host} 发送请求。`
-    : `Guild 会弹出系统窗口，请你确认变量 ${variable} 里的密钥可以发送到 ${host}。`,
+    : kind === "online"
+      ? `Guild 会弹出系统窗口，请你确认变量 ${variable} 里的密钥和 Claude 任务的对话可以发送到 ${host}。`
+      : `Guild 会弹出系统窗口，请你确认变量 ${variable} 里的密钥可以发送到 ${host}。`,
   sourcesConfirmedNotice: "已确认。",
   sourcesConfirmCancelled: "没有确认，这个模型源暂时不能使用。",
   sourcesConfirmFailed: "确认没有完成，请重试。",
@@ -797,6 +803,16 @@ const ZH_CN: GuildMessages = Object.freeze({
   sourcesEnabled: "启用",
   sourcesSaving: "正在保存…",
   sourcesSaveFailed: "没有保存成功，请检查各项内容后重试。",
+  sourcesSaveError: (reason, maxSources) => ({
+    invalid: "有些内容没有被接受。请检查各项，看是否含有隐藏字符，或看起来像密钥的文字。",
+    reserved_id: "这个名称是 Claude 自带模型保留的，请换一个名称。",
+    reserved_model: "有模型 ID 被 Claude Code 保留了（以 claude- 开头，或是 default、opus、sonnet、haiku 等名称）。请改用你的接口实际需要的 ID。",
+    duplicate_model: "别的模型源已经提供了这个模型 ID。同一个 ID 只能属于一个模型源。",
+    limit: `模型源最多 ${maxSources} 个。请先删除一个再添加。`,
+    changed: "编辑期间，这个模型源在别处被修改了。列表已刷新，请关闭此表单后重新编辑。",
+    not_found: "这个模型源已经不存在。列表已刷新，请关闭此表单。",
+    rejected: "Guild 没能保存这个模型源。请检查各项内容后重试。",
+  })[reason],
   sourcesInvalid: (problem) => ({
     label: "请填写名称。",
     base_url: "请填写完整的接口地址，例如 https://api.example.com/anthropic。",
@@ -1230,6 +1246,7 @@ const EN_US: GuildMessages = Object.freeze({
   modelPickerClaudeUnavailable: "Claude Code not found or not logged in",
   modelPickerClaudeUnavailableHelp: "Install Claude Code, then run `claude` once in Terminal and log in.",
   modelPickerClaudeNotStarted: "Model choices appear once Claude has started.",
+  modelPickerClaudeDefault: "Claude Code (default model)",
   modelPickerEngineNote: "The model you pick for the first message decides whether this conversation runs on Grok or Claude. It cannot change afterwards.",
   taskEngineName: (engine) => ({ grok: "Grok", claude: "Claude" })[engine],
   taskEngineMarkerTitle: (engine) => ({ grok: "Grok conversation", claude: "Claude Code conversation" })[engine],
@@ -1242,7 +1259,7 @@ const EN_US: GuildMessages = Object.freeze({
   onlineReminderDontRemind: "Don't remind me again in this workspace",
   onlineReminderSwitch: "Switch",
   privacyOnlineReminder: "Remind me before sending to an online model",
-  privacyOnlineReminderHelp: "Asks once, the first time a conversation in this workspace uses an online model. Local models and your Claude subscription never ask.",
+  privacyOnlineReminderHelp: "Asks once per conversation for each online vendor, the first time it uses that vendor's model; switching to another vendor asks again. Local models and your Claude subscription never ask.",
   privacyOnlineReminderNoWorkspace: "Open a conversation to change this for its workspace.",
   privacyOnlineReminderFailed: "That setting was not saved. Try again.",
   settingsEngines: "Engines",
@@ -1289,9 +1306,11 @@ const EN_US: GuildMessages = Object.freeze({
   sourcesModelCount: (count) => `${count} ${count === 1 ? "model" : "models"}`,
   sourcesConfirm: "Confirm",
   sourcesConfirming: "Waiting for your confirmation in the system window…",
-  sourcesConfirmHelp: (host, variable) => variable === null
+  sourcesConfirmHelp: (host, variable, kind) => variable === null
     ? `Guild will open a system window asking you to confirm that requests may be sent to ${host}.`
-    : `Guild will open a system window asking you to confirm that the key in ${variable} may be sent to ${host}.`,
+    : kind === "online"
+      ? `Guild will open a system window asking you to confirm that the key in ${variable} and Claude task conversations may be sent to ${host}.`
+      : `Guild will open a system window asking you to confirm that the key in ${variable} may be sent to ${host}.`,
   sourcesConfirmedNotice: "Confirmed.",
   sourcesConfirmCancelled: "Not confirmed. The source cannot be used yet.",
   sourcesConfirmFailed: "The confirmation did not finish. Try again.",
@@ -1318,6 +1337,16 @@ const EN_US: GuildMessages = Object.freeze({
   sourcesEnabled: "Enabled",
   sourcesSaving: "Saving…",
   sourcesSaveFailed: "It could not be saved. Check the fields and try again.",
+  sourcesSaveError: (reason, maxSources) => ({
+    invalid: "Some values were not accepted. Check each field for hidden characters or text that looks like a key.",
+    reserved_id: "This name is reserved for Claude's own models. Choose a different name.",
+    reserved_model: "A model ID here belongs to Claude Code (one that starts with claude-, or a name such as default, opus, sonnet or haiku). Use the ID your endpoint expects instead.",
+    duplicate_model: "Another model source already offers this model ID. An ID can belong to one source only.",
+    limit: `You can keep up to ${maxSources} model sources. Delete one to add another.`,
+    changed: "This source was changed somewhere else while you were editing. The list has been refreshed. Close this form and edit it again.",
+    not_found: "This source no longer exists. The list has been refreshed. Close this form.",
+    rejected: "Guild could not save this source. Check each field and try again.",
+  })[reason],
   sourcesInvalid: (problem) => ({
     label: "Enter a name.",
     base_url: "Enter a full base URL, for example https://api.example.com/anthropic.",
@@ -1601,6 +1630,11 @@ const CLAUDE_ZH = (base: GuildMessages): Partial<GuildMessages> => ({
     ? "Claude Code 暂时不可用，稍后再试"
     : base.rewindDisabledReason(reason),
   rewindRefused: (reason) => base.rewindRefused(reason).replaceAll("Grok", "Claude Code"),
+  rewindRuntimeRestoreHeading: (count) => base.rewindRuntimeRestoreHeading(count).replaceAll("Grok", "Claude Code"),
+  interjectionReason: (reason) => base.interjectionReason(reason).replaceAll("Grok", "Claude Code"),
+  steerNotice: (kind, reason) => base.steerNotice(kind, reason).replaceAll("Grok", "Claude Code"),
+  // Why a continuous task stopped (runtime_unavailable, empty_runtime_response, transport_interrupted name the runtime).
+  continuousStopReason: (reason) => base.continuousStopReason(reason).replaceAll("Grok", "Claude Code"),
 });
 
 const CLAUDE_EN = (base: GuildMessages): Partial<GuildMessages> => ({
@@ -1641,6 +1675,11 @@ const CLAUDE_EN = (base: GuildMessages): Partial<GuildMessages> => ({
     ? "Claude Code is unavailable right now. Try again in a moment"
     : base.rewindDisabledReason(reason),
   rewindRefused: (reason) => base.rewindRefused(reason).replaceAll("Grok", "Claude Code"),
+  rewindRuntimeRestoreHeading: (count) => base.rewindRuntimeRestoreHeading(count).replaceAll("Grok", "Claude Code"),
+  interjectionReason: (reason) => base.interjectionReason(reason).replaceAll("Grok", "Claude Code"),
+  steerNotice: (kind, reason) => base.steerNotice(kind, reason).replaceAll("Grok", "Claude Code"),
+  // Why a continuous task stopped (runtime_unavailable, empty_runtime_response, transport_interrupted name the runtime).
+  continuousStopReason: (reason) => base.continuousStopReason(reason).replaceAll("Grok", "Claude Code"),
 });
 
 const CLAUDE_LOCALES: Readonly<Record<GuildLocale, GuildMessages>> = Object.freeze({

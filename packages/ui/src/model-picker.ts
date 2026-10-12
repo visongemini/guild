@@ -75,12 +75,14 @@ export function selectionAfterModelChange(
 /**
  * Clicking what the task already pins is a no-op. A selection that is only inherited (global or
  * runtime default) is not a task override yet, so choosing it pins it; clearing an override that
- * does not exist is the no-op there.
+ * does not exist is the no-op there. A change that moves the task to the other engine is never a
+ * no-op, whatever the model says (the engine is part of the selection).
  */
 export function isSameSelection(
   selection: Pick<TaskModelSelectionProjection, "modelId" | "reasoningEffort" | "source">,
   change: ModelSelectionChange,
 ): boolean {
+  if (change.engine !== undefined) return false;
   if (change.model === null) return selection.source !== "task";
   return selection.source === "task" &&
     selection.modelId === change.model &&
@@ -150,6 +152,11 @@ export type ModelRowView = Readonly<{
   group: ModelGroup;
   /** Engine the model belongs to: Grok for the Grok group, Claude for Claude, Online and Local. */
   engine: GuildEngine;
+  /**
+   * The row names no model: it follows Claude Code's own default. Only the Claude group offers it, and only while
+   * Claude lists no model of its own (a first run), so a task can still start on Claude before the list exists.
+   */
+  runtimeDefault?: true;
 }>;
 
 export type EffortChoiceView = Readonly<{
@@ -174,7 +181,7 @@ export type ModelGroupView = Readonly<{
   group: ModelGroup;
   label: string;
   models: readonly ModelRowView[];
-  /** Present exactly when `models` is empty. */
+  /** Present exactly when the group lists no model of the catalog (the Claude group may still hold its default row). */
   empty?: ModelGroupEmptyView;
 }>;
 
@@ -357,7 +364,28 @@ export function modelPickerView(input: {
     (group === "grok" ? catalogs.grok : catalogs.claude).models
       .filter((candidate) => modelGroupOf(candidate) === group)
       .map((candidate) => rowOf(candidate, group));
-  const rawGroups = visible.map((group) => ({ group, rows: rowsOfGroup(group) }));
+  // Claude Code lists its models only once a session has started. Until then (and whenever it lists none) the Claude
+  // group offers "Claude Code (default model)", so a fresh install can still start a Claude task; a missing
+  // installation offers nothing, and an unknown state is not a reason to withhold it.
+  const claudeDefaultOffered = input.claudeState !== "not_found" &&
+    !catalogs.claude.models.some((candidate) => modelGroupOf(candidate) === "claude");
+  const claudeDefaultRow = (): Omit<ModelRowView, "tabStop"> => ({
+    id: "",
+    name: messages.modelPickerClaudeDefault,
+    // Selected while the task follows a default instead of a pinned model.
+    selected: taskEngine === "claude" && selection !== undefined && selection.source !== "task",
+    group: "claude",
+    engine: "claude",
+    runtimeDefault: true,
+  });
+  const rawGroups = visible.map((group) => {
+    const catalogRows = rowsOfGroup(group);
+    return {
+      group,
+      catalogRows: catalogRows.length,
+      rows: group === "claude" && claudeDefaultOffered ? [claudeDefaultRow(), ...catalogRows] : catalogRows,
+    };
+  });
   const allRows = rawGroups.flatMap((entry) => entry.rows);
   // One roving tab stop: the selected row, else the first one.
   const tabStopIndex = Math.max(0, allRows.findIndex((row) => row.selected));
@@ -368,7 +396,7 @@ export function modelPickerView(input: {
       group: entry.group,
       label: messages.modelGroupName(entry.group),
       models: Object.freeze(models),
-      ...(models.length === 0 ? { empty: groupEmptyView(messages, entry.group, claudeAvailable, input.claudeState) } : {}),
+      ...(entry.catalogRows === 0 ? { empty: groupEmptyView(messages, entry.group, claudeAvailable, input.claudeState) } : {}),
     });
   });
   const models = groups.flatMap((entry) => entry.models);
@@ -415,11 +443,14 @@ export function modelPickerView(input: {
  */
 export function selectionForRow(
   catalogs: ModelPickerCatalogs,
-  row: Pick<ModelRowView, "id" | "group" | "engine">,
+  row: Pick<ModelRowView, "id" | "group" | "engine" | "runtimeDefault">,
   currentEffort: string | null,
   taskEngine: GuildEngine,
 ): ModelSelectionChange {
-  const change = selectionAfterModelChange(catalogs[row.engine], row.id, currentEffort);
+  // The default row pins nothing: it clears the task's override so the engine's own default applies.
+  const change = row.runtimeDefault === true
+    ? CLEAR_MODEL_OVERRIDE
+    : selectionAfterModelChange(catalogs[row.engine], row.id, currentEffort);
   return Object.freeze({
     ...change,
     group: row.group,

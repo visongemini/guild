@@ -117,6 +117,7 @@ export function createModelSourcesService(options: ModelSourcesServiceOptions): 
     // The dialog is built from this revision; an edit made while it is open voids the answer.
     const prompt = hostConfirmationPrompt({
       locale: await options.getLocale(),
+      kind: source.kind,
       label: source.label,
       host,
       keyVariable: source.keyVariable,

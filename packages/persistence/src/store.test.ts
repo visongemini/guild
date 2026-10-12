@@ -5052,6 +5052,7 @@ describe("Guild 3.0 dual engine, model sources and preferences (schema v19)", ()
     rejected({ keyVariable: "sk-" }, "keyVariable sk-");
     rejected({ keyVariable: "deepseek_key" }, "lower-case variable");
     rejected({ keyFile: "/Users/owner/keys.env", keyVariable: null }, "a key file without a variable");
+    rejected({ keyVariable: null }, "an Online source without a key variable");
     rejected({ keyFile: "keys.env" }, "relative key file");
     rejected({ keyFile: "/Users/owner/sk-ant-api03-abcdefghijkl.env" }, "a key in the path");
     rejected({ label: "DeepSeek sk-ant-api03-abcdefghijkl" }, "a key in the label");

@@ -125,7 +125,23 @@ test("the key variable is an upper-case name and a key file is an absolute path 
   }
   // A key file without a variable names nothing to read.
   rejects({ keyFile: "/Users/owner/keys.env", keyVariable: null });
+  rejects({ keyFile: "/Users/owner/keys.env", keyVariable: null }, local);
   rejects({ keyVariable: "sk-ant-api03-abcdefghijkl" });
+});
+
+test("an Online source must name its key variable; only a Local source may go without a key (PC-ROUTE-002)", () => {
+  // A keyless Online source would send the conversation to a remote vendor with nothing to confirm.
+  rejects({ keyVariable: null });
+  rejects({ keyVariable: null, keyFile: null });
+  assert.throws(() => parseModelSourceDraft({ ...online, keyVariable: null }), /invalid_model_source_key_variable/u);
+  // The key file stays optional: null is the default key file.
+  assert.equal(parseModelSourceDraft({ ...online, keyFile: null }).keyFile, null);
+  assert.equal(parseModelSourceDraft({ ...online, keyFile: "/Users/owner/keys.env" }).keyVariable, "DEEPSEEK_API_KEY");
+  // A Local source keeps both shapes: keyless, or keyed.
+  assert.equal(parseModelSourceDraft(local).keyVariable, null);
+  assert.equal(parseModelSourceDraft({ ...local, keyVariable: "WORKSTATION_KEY" }).keyVariable, "WORKSTATION_KEY");
+  // The kind decides: the same draft is a valid Local source and an invalid Online one.
+  assert.throws(() => parseModelSourceDraft({ ...local, kind: "online", baseUrl: "https://workstation.example.com" }), TypeError);
 });
 
 test("ids, labels and model lists are bounded and refuse anything that looks like a credential", () => {

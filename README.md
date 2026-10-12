@@ -89,13 +89,14 @@ Guild 1.1.13 只作为黑盒视觉与交互基准；它的渲染器、程序包�
   上的本机路由器转发，该路由器仅回环、单用户、带随机令牌，不对外开放；
 - 不提取凭据来直接调用上游：Guild 不读取 Grok 或 Claude 的登录凭据，也不共享登录；Claude
   订阅的凭据只会被转发到 `api.anthropic.com`；
-- Online 模型会把对话发送给该模型的厂商：首次切换时会先提醒，内容包括 CLAUDE.md、记忆、对话
-  以及对话里的浏览器页面文本和截图，可按工作区选择不再提醒；Local 模型的对话只留在本机或你自己的
-  Tailscale 网络内；
+- Online 模型会把对话发送给该模型的厂商：对话每换到一个新的厂商时会先提醒，内容包括 CLAUDE.md、
+  记忆、对话以及对话里的浏览器页面文本和截图，可按工作区选择不再提醒；Local 模型的请求只留在本机或
+  你自己的 Tailscale 网络内，但 Claude Code 自己的后台请求（例如生成标题和摘要）仍会按你的订阅发往
+  Anthropic；
 - 第三方模型的密钥从你指定的环境变量文件读取，只在内存中使用，不写入数据库、日志或界面；新增来源或
   修改其地址、密钥变量须经原生确认框；
 - 浏览器面板使用独立的存储分区和沙箱，访问不到 Node 或 Guild 自身界面；智能体只能使用固定工具集
-  （没有 eval），每次调用都走权限确认；
+  （没有 eval），每次调用都遵循该引擎当前的权限模式（除非权限模式或你选过「始终允许」，否则会先询问）；
 - 对话、工作区、诊断和账号状态默认只保留在本机；仓库不包含用户数据或密钥；
 - 第三方运行时、依赖和商标仍受各自权利约束；
 - Guild 与 xAI、Anthropic 均没有隶属、背书或赞助关系。
@@ -145,13 +146,16 @@ Public source availability does not imply an Apple-notarized binary release. Gui
 `~/.grok/auth.json` or Claude credentials. Requests of Grok tasks originate from the official
 user-installed Grok process and use official Grok models only; requests of Claude tasks originate
 from the user-installed `claude`, and Online and Local models are reached through a loopback-only,
-single-user router on `127.0.0.1` that is never exposed to the network. The first switch to an Online
-model shows a reminder that CLAUDE.md, memory, the conversation, and browser page text or screenshots
-in the conversation will be sent to that model's vendor; Local models stay on your machine or your own
-Tailscale network. Keys for Online and Local sources are read from an env file you designate, kept in
-memory only and never stored, and adding or changing a source needs a native confirmation. The browser
-pane runs in its own sandboxed partition, and agents reach it only through a fixed tool set with no
-eval and a permission prompt per call. Conversation and account data remain local and are not included
+single-user router on `127.0.0.1` that is never exposed to the network. The first switch of a
+conversation to an Online model of a given vendor shows a reminder that CLAUDE.md, memory, the
+conversation, and browser page text or screenshots in the conversation will be sent to that vendor,
+and a different vendor asks again; requests to Local models stay on your machine or your own
+Tailscale network, while Claude Code's own background requests (titles, summaries) still go to
+Anthropic on your subscription. Keys for Online and Local sources are read from an env file you
+designate, kept in memory only and never stored, and adding or changing a source needs a native
+confirmation. The browser pane runs in its own sandboxed partition, and agents reach it only through a
+fixed tool set with no eval, where every call follows the engine's permission mode (it prompts unless
+the mode or an "always allow" choice permits it). Conversation and account data remain local and are not included
 in this repository. Guild is not affiliated with, endorsed by, or sponsored by xAI or Anthropic.
 Guild-owned source is available under the MIT License; third-party components, and the user-installed
 Grok, Claude Code and adapter, remain under their own terms.

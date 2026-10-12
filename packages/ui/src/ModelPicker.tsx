@@ -68,15 +68,23 @@ function moveFocus(
   items[next]?.focus();
 }
 
-/** Why a group has no model, with the one-line way out. Plain text inside the list; the action is its own option. */
-function EmptyHint({ empty, fallback }: {
+/**
+ * Why a group has no model, with the one-line way out. Inside the listbox it is a disabled option, so a screen reader
+ * reaches it with the arrow keys and announces it like the rows around it (a bare paragraph in a listbox is skipped);
+ * the action under it is its own option. Alone in the popover (no listbox) it is plain text.
+ */
+function EmptyHint({ empty, fallback, inListbox }: {
   readonly empty: ModelGroupEmptyView | undefined;
   readonly fallback: string;
+  readonly inListbox: boolean;
 }) {
-  return <div className="guild-model-hint">
+  const body = <>
     <p>{empty?.text ?? fallback}</p>
     {empty?.help !== undefined && <small>{empty.help}</small>}
-  </div>;
+  </>;
+  return inListbox
+    ? <div className="guild-model-hint" role="option" aria-disabled="true" aria-selected="false" tabIndex={-1}>{body}</div>
+    : <div className="guild-model-hint">{body}</div>;
 }
 
 export function ModelPicker({
@@ -125,7 +133,9 @@ export function ModelPicker({
     if (!panelOpen) return;
     const popover = popoverRef.current;
     if (popover === null) return;
+    // The selected row, else the first row (a hint is an option too, but a row is what the person came to pick).
     const target = popover.querySelector<HTMLElement>('[role="option"][aria-selected="true"]') ??
+      popover.querySelector<HTMLElement>('button[role="option"]') ??
       popover.querySelector<HTMLElement>('[role="option"]') ??
       popover;
     target.focus();
@@ -201,7 +211,7 @@ export function ModelPicker({
       tabIndex={-1}
     >
       {view.catalogEmpty ? (
-        <EmptyHint empty={view.groups[0]?.empty} fallback={messages.modelPickerEmpty} />
+        <EmptyHint empty={view.groups[0]?.empty} fallback={messages.modelPickerEmpty} inListbox={false} />
       ) : (
         <>
           {!view.showGroupHeadings && <div className="guild-model-heading">{messages.model}</div>}
@@ -220,7 +230,7 @@ export function ModelPicker({
                 >{group.label}</div>
                 {group.models.map((row) => (
                   <button
-                    key={`${row.group}:${row.id}`}
+                    key={`${row.group}:${row.runtimeDefault === true ? "(default)" : row.id}`}
                     type="button"
                     role="option"
                     aria-selected={row.selected}
@@ -243,7 +253,7 @@ export function ModelPicker({
                   </button>
                 ))}
                 {group.empty !== undefined && <>
-                  <EmptyHint empty={group.empty} fallback={messages.modelPickerEmpty} />
+                  <EmptyHint empty={group.empty} fallback={messages.modelPickerEmpty} inListbox />
                   {group.empty.action === "open_model_sources" && onOpenModelSources !== undefined && (
                     <button
                       type="button"

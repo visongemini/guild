@@ -228,13 +228,17 @@ product decision and their own parity and release gates.
   to start with a named error.
 - A task's engine is set when its first turn is created and never changes. A new task's model picker
   shows the Grok group next to the Claude, Online and Local groups, and the group chosen for the
-  first turn fixes the engine. One engine process serves each active task.
+  first turn fixes the engine. One engine process serves each active task. Claude Code lists its
+  models only after a session has started, so until it does (a first run) the Claude group offers
+  "Claude Code (default model)", which moves a task that has not run yet to the Claude engine and
+  leaves the model to Claude Code's own default; it is withheld only when Claude Code is not found.
 - Guild never reads Claude credentials and never calls the adapter's authenticate method. When
   `claude` is not logged in Guild shows a named state that asks the user to run `claude` once in
   Terminal and log in.
 - Grok-only capabilities appear as truthful reduced states, never simulated (PC-FALLBACK-001). Steer
-  becomes a queued message, rewind restores files only, and the usage panel shows context usage and
-  says the quota is managed by Claude Code. The Grok control center and the Grok slash snapshot are
+  is injected into the running turn through the adapter's `_session/steering` and becomes a queued
+  message only when the adapter answers `promptRequired`, rewind restores files only, and the usage
+  panel shows context usage and says the quota is managed by Claude Code. The Grok control center and the Grok slash snapshot are
   offered for Grok tasks only, and the phase line shows generic phases only.
 - OpenViking memory is on in Claude tasks and its automatic capture is off in routed sessions
   (PC-OV-001). Grok tasks keep OpenViking out of the session as before.
@@ -245,10 +249,12 @@ product decision and their own parity and release gates.
   (the user's subscription), Online (vendor Anthropic-compatible endpoints such as DeepSeek) and
   Local (llama.cpp or Ollama `/v1/messages`).
 - Online and Local models come from model sources the user configures in Settings. A source names a
-  base URL and the env file and variable that hold its key. Guild reads the key in the main process,
-  keeps it in memory and never stores, shows or logs it. Adding a source or changing its URL or key
-  variable needs a native confirmation that names the variable and the host. Online sources use
-  https; Local sources must resolve to a loopback or Tailscale (100.64.0.0/10) address.
+  base URL and the env file and variable that hold its key. An Online source always names a key
+  variable; only a Local source may have none. Guild reads the key in the main process, keeps it in
+  memory and never stores, shows or logs it. Adding a source or changing its URL or key variable
+  needs a native confirmation that names the variable and the host (for an Online source it also says
+  that Claude task conversations go to that host). Online sources use https; Local sources must
+  resolve to a loopback or Tailscale (100.64.0.0/10) address.
 - The first Online or Local selection in a Claude task moves that task to a routed session through
   Guild's loopback model router, and a routed task stays routed. The router listens on 127.0.0.1
   only, serves only configured and Claude models, forwards the user's Claude credential only to
@@ -271,10 +277,12 @@ product decision and their own parity and release gates.
 
 ### Online-model reminder (Guild 3.0, PC-PRIV-001)
 
-- The first time a session switches to an Online model Guild asks the user to confirm that
-  CLAUDE.md, memory, the conversation, and browser page text or screenshots in the conversation will
-  be sent to the model's vendor. "Don't remind me again in this workspace" persists per workspace.
-  Claude and Local models never trigger the reminder.
+- The first time a conversation switches to an Online model of a vendor (a model source), Guild asks
+  the user to confirm that CLAUDE.md, memory, the conversation, and browser page text or screenshots
+  in the conversation will be sent to that vendor. The agreement is per conversation and per vendor:
+  another model of the same vendor does not ask again, a different vendor does, including Online A,
+  then Claude, then Online B. "Don't remind me again in this workspace" persists per workspace and
+  silences every reminder. Claude and Local models never trigger the reminder.
 
 ### Desktop interaction
 

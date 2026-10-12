@@ -66,6 +66,7 @@ import type {
   RunCheckpointProjection,
   RunId,
   ConversationSearchResult,
+  ModelSourceProjection,
   RuntimeCommand,
   PromptAttachment,
   RunPhaseProjection,
@@ -136,12 +137,19 @@ import {
   useModalOverlayPresent,
   type WorkbenchTab,
 } from "./browser-pane-view.js";
+import { applyModelSelectionChange } from "./apply-model-change.js";
 import { claudeDefaultsView, claudePermissionModeOf, claudeStatusOf, claudeStatusText } from "./claude-engine.js";
 import { ModelPicker } from "./ModelPicker.js";
 import { ModelSourcesSettings } from "./ModelSourcesSettings.js";
 import { OnlineReminderDialog } from "./OnlineReminderDialog.js";
 import { OnlineReminderSetting } from "./OnlineReminderSetting.js";
-import { onlineReminderNeeded, vendorLabelFor } from "./online-reminder.js";
+import {
+  agreedSourcesOf,
+  createOnlineConsentLedger,
+  onlineReminderNeeded,
+  onlineSourceKey,
+  vendorLabelFor,
+} from "./online-reminder.js";
 import { hasMixedEngines, taskEngineFixed, taskEngineOf } from "./task-engine.js";
 import { RewindDialog } from "./RewindDialog.js";
 import { RunChangesCard, type RunCardData } from "./RunChangesCard.js";
@@ -296,10 +304,10 @@ export function GuildApp({ api }: GuildAppProps) {
   const [renameDraft, setRenameDraft] = useState("");
   const [renameError, setRenameError] = useState(false);
   const [contextUsageOpen, setContextUsageOpen] = useState(false);
-  // The Online-model reminder (PC-PRIV-001): the open dialog, the way to answer it, and the tasks already asked in this window.
+  // The Online-model reminder (PC-PRIV-001): the open dialog, the way to answer it, and the vendors each task agreed to in this window.
   const [onlineReminder, setOnlineReminder] = useState<OnlineReminderRequest>();
   const onlineReminderAnswer = useRef<((answer: OnlineReminderAnswer) => void) | undefined>(undefined);
-  const onlineRemindedTaskIds = useRef<Set<string>>(new Set());
+  const onlineConsent = useRef(createOnlineConsentLedger());
   const [claudeSettingsFailed, setClaudeSettingsFailed] = useState(false);
   const [rewindTarget, setRewindTarget] = useState<{ readonly runId: RunId }>();
   const rewindReturnFocus = useRef<HTMLElement | null>(null);
@@ -1538,16 +1546,13 @@ export function GuildApp({ api }: GuildAppProps) {
     // PC-PRIV-001: the first switch to an Online model in this conversation says what goes to the vendor.
     if (change.group === "online" && !(await confirmOnlineSwitch(task, change.model))) return undefined;
     // PC-ENG-001: a task that has not run yet may still choose its engine; the first turn fixes it.
-    if (change.engine !== undefined && change.engine !== taskEngineOf(task.task)) {
-      const moved = await api.setTaskEngine({ taskId, engine: change.engine });
-      setProjection((current) => current === undefined || current.activeTask?.task.taskId !== taskId
-        ? current
-        : withTaskSummary({ ...current, activeTask: moved }, moved.task));
-    }
-    const response = await api.setTaskRuntimeSettings({
+    const response = await applyModelSelectionChange(api, {
       taskId,
-      model: change.model,
-      reasoningEffort: change.reasoningEffort,
+      taskEngine: taskEngineOf(task.task),
+      change,
+      onEngineMoved: (moved) => setProjection((current) => current === undefined || current.activeTask?.task.taskId !== taskId
+        ? current
+        : withTaskSummary({ ...current, activeTask: moved }, moved.task)),
     });
     // A refusal still returns the task with its previous selection, so it is always safe to adopt.
     setProjection((current) => current === undefined || current.activeTask?.task.taskId !== response.task.task.taskId
@@ -1556,37 +1561,42 @@ export function GuildApp({ api }: GuildAppProps) {
     return response;
   }
 
-  /** True when the switch may go ahead: no reminder is due, or the user accepted it (and maybe silenced it). */
+  /**
+   * True when the switch may go ahead: no reminder is due, or the user accepted it (and maybe silenced it). The
+   * agreement is per task and per vendor, so a second vendor in the same conversation asks again (PC-PRIV-001).
+   */
   async function confirmOnlineSwitch(task: TaskViewProjection, modelId: string | null): Promise<boolean> {
     const taskId = task.task.taskId;
     const currentModel = (taskEngineOf(task.task) === "claude" ? modelCatalogs.claude : modelCatalogs.grok)
       .models.find((model) => model.id === task.modelSelection.modelId);
     const target = modelCatalogs.claude.models.find((model) => model.id === modelId);
-    const currentGroup = currentModel === undefined ? undefined : modelGroupOf(currentModel);
-    const handledBefore = onlineRemindedTaskIds.current.has(taskId);
+    let sources: readonly ModelSourceProjection[] = [];
+    try {
+      sources = (await api.listModelSources()).sources;
+    } catch {
+      // Without the list the model itself is the vendor key and its own name stands in for the vendor.
+    }
+    const targetSource = onlineSourceKey(modelId ?? "", sources);
+    const agreedSources = agreedSourcesOf({
+      ledger: onlineConsent.current,
+      taskId,
+      currentModelId: task.modelSelection.modelId,
+      currentGroup: currentModel === undefined ? undefined : modelGroupOf(currentModel),
+      sources,
+    });
     let dismissed = false;
-    if (!handledBefore && currentGroup !== "online") {
+    if (!agreedSources.has(targetSource)) {
       try {
         dismissed = (await api.getWorkspacePrefs({ workspaceId: task.task.workspaceId })).onlineReminderDismissed;
       } catch {
         // Unknown means not silenced: ask.
       }
     }
-    if (!onlineReminderNeeded({
-      targetGroup: "online",
-      currentGroup,
-      alreadyHandledForTask: handledBefore,
-      dismissedForWorkspace: dismissed,
-    })) {
-      onlineRemindedTaskIds.current.add(taskId);
+    if (!onlineReminderNeeded({ targetGroup: "online", targetSource, agreedSources, dismissedForWorkspace: dismissed })) {
+      onlineConsent.current.agree(taskId, targetSource);
       return true;
     }
-    let vendorLabel = target?.name ?? modelId ?? "";
-    try {
-      vendorLabel = vendorLabelFor(modelId ?? "", (await api.listModelSources()).sources, target?.name);
-    } catch {
-      // The model's own name stands in for the vendor.
-    }
+    const vendorLabel = vendorLabelFor(modelId ?? "", sources, target?.name);
     const answer = await new Promise<OnlineReminderAnswer>((resolve) => {
       onlineReminderAnswer.current = resolve;
       setOnlineReminder(Object.freeze({ vendorLabel }));
@@ -1595,7 +1605,7 @@ export function GuildApp({ api }: GuildAppProps) {
     onlineReminderAnswer.current = undefined;
     window.queueMicrotask(() => document.querySelector<HTMLElement>(".guild-model-picker-trigger")?.focus());
     if (!answer.confirmed) return false;
-    onlineRemindedTaskIds.current.add(taskId);
+    onlineConsent.current.agree(taskId, targetSource);
     if (answer.dontRemindAgain) {
       try {
         await api.setWorkspacePrefs({ workspaceId: task.task.workspaceId, onlineReminderDismissed: true });
@@ -2533,6 +2543,7 @@ export function GuildApp({ api }: GuildAppProps) {
               key={activeTask.task.taskId}
               task={activeTask.continuousTask}
               locale={projection.locale}
+              engine={activeEngine}
               running={running}
               busy={busy}
               onAction={(action) => void setContinuousTask(action)}
@@ -4020,6 +4031,7 @@ export const Timeline = memo(function Timeline({ items, pendingUserText, runStat
       highlighted={highlightedSequence === sequence}
       settled={index < settledBefore && entries.every(isSettledTimelineItem)}
       locale={locale}
+      engine={engine}
       handlers={handlers}
       lastTurn={single !== undefined && single.entryId === lastAnswerEntryId}
       turnMeta={single === undefined ? undefined : turnTook.get(single.entryId)}
@@ -4088,6 +4100,7 @@ type TimelineGroupRowProps = {
   readonly highlighted: boolean;
   readonly settled: boolean;
   readonly locale: GuildLocale;
+  readonly engine: GuildEngine;
   readonly handlers: TimelineHandlers;
   /** The newest answer: its footer stays visible instead of waiting for hover. */
   readonly lastTurn: boolean;
@@ -4100,7 +4113,7 @@ type TimelineGroupRowProps = {
   readonly card: RunCardData | undefined;
 };
 
-const TimelineGroupRow = memo(function TimelineGroupRow({ group, sequence, highlighted, settled, locale, handlers, lastTurn, turnMeta, interruptedUser, canRetry, completionTask, card }: TimelineGroupRowProps) {
+const TimelineGroupRow = memo(function TimelineGroupRow({ group, sequence, highlighted, settled, locale, engine, handlers, lastTurn, turnMeta, interruptedUser, canRetry, completionTask, card }: TimelineGroupRowProps) {
   const className = [
     highlighted ? "guild-timeline-group search-highlight" : "guild-timeline-group",
     settled ? "settled" : "",
@@ -4113,12 +4126,13 @@ const TimelineGroupRow = memo(function TimelineGroupRow({ group, sequence, highl
   >
     {group.type === "activity"
       ? <>
-          <ActivityGroupView items={group.items} locale={locale} />
-          {card !== undefined && <div className="guild-turn-slot"><RunCardView card={card} locale={locale} onViewRunDiff={handlers.onViewRunDiff} onRewind={handlers.onRewind} /></div>}
+          <ActivityGroupView items={group.items} locale={locale} engine={engine} />
+          {card !== undefined && <div className="guild-turn-slot"><RunCardView card={card} locale={locale} engine={engine} onViewRunDiff={handlers.onViewRunDiff} onRewind={handlers.onRewind} /></div>}
         </>
       : <TimelineItem
           item={group.item}
           locale={locale}
+          engine={engine}
           onOpenExternal={handlers.onOpenExternal}
           onPermissionDecision={handlers.onPermissionDecision}
           onBranch={handlers.onBranch}
@@ -4139,6 +4153,7 @@ const TimelineGroupRow = memo(function TimelineGroupRow({ group, sequence, highl
   previous.highlighted === next.highlighted &&
   previous.settled === next.settled &&
   previous.locale === next.locale &&
+  previous.engine === next.engine &&
   previous.handlers === next.handlers &&
   previous.lastTurn === next.lastTurn &&
   previous.turnMeta === next.turnMeta &&
@@ -4166,11 +4181,13 @@ type ToolItem = Extract<TimelineItemProjection, { readonly kind: "tool" }>;
 /** At most this many tool kinds get their own count in the summary line; the rest are summed. */
 const ACTIVITY_STAT_LIMIT = 4;
 
-export const ActivityGroupView = memo(function ActivityGroupView({ items, locale }: {
+export const ActivityGroupView = memo(function ActivityGroupView({ items, locale, engine = "grok" }: {
   readonly items: readonly TimelineItemProjection[];
   readonly locale: GuildLocale;
+  /** Engine of the task: the tool output notes name its runtime. Grok when absent. */
+  readonly engine?: GuildEngine;
 }) {
-  const messages = messagesFor(locale);
+  const messages = messagesFor(locale, engine);
   // Collapsed groups hold no thought text or tool output in the DOM; the body mounts on open.
   const [open, setOpen] = useState(false);
   const thoughts = items.filter((item): item is ThoughtItem => item.kind === "thought");
@@ -4226,11 +4243,12 @@ export const ActivityGroupView = memo(function ActivityGroupView({ items, locale
     </summary>
     {open && <div className="guild-activity-body">
       {thoughts.length > 0 && <ThoughtCopy thoughts={thoughts} />}
-      {tools.length > 0 && <div className="guild-tool-list">{tools.map((item) => <ToolRow item={item} locale={locale} key={item.entryId} />)}</div>}
+      {tools.length > 0 && <div className="guild-tool-list">{tools.map((item) => <ToolRow item={item} locale={locale} engine={engine} key={item.entryId} />)}</div>}
     </div>}
   </details>;
 }, (previous, next) =>
   previous.locale === next.locale &&
+  previous.engine === next.engine &&
   previous.items.length === next.items.length &&
   previous.items.every((item, index) => item === next.items[index]));
 
@@ -4339,11 +4357,13 @@ function ToolKindIcon({ kind, size }: { readonly kind: AcpToolKind; readonly siz
   }
 }
 
-export const ToolRow = memo(function ToolRow({ item, locale }: {
+export const ToolRow = memo(function ToolRow({ item, locale, engine = "grok" }: {
   readonly item: Extract<TimelineItemProjection, { readonly kind: "tool" }>;
   readonly locale: GuildLocale;
+  /** Engine of the task: the terminal-output note names its session. Grok when absent. */
+  readonly engine?: GuildEngine;
 }) {
-  const messages = messagesFor(locale);
+  const messages = messagesFor(locale, engine);
   // Tool output can be large; its text is mounted only while the details are open.
   const [detailsOpen, setDetailsOpen] = useState(false);
   const images = item.content.filter(
@@ -4417,9 +4437,11 @@ export const ToolRow = memo(function ToolRow({ item, locale }: {
 });
 
 /** Exported for tests. */
-export const TimelineItem = memo(function TimelineItem({ item, locale, onOpenExternal, onPermissionDecision, onBranch, onRetryToDraft, onOpenRuntimeDiagnostics, interruptedUser, canRetry, lastTurn = false, turnMeta, card, onViewRunDiff, onRewind }: {
+export const TimelineItem = memo(function TimelineItem({ item, locale, engine = "grok", onOpenExternal, onPermissionDecision, onBranch, onRetryToDraft, onOpenRuntimeDiagnostics, interruptedUser, canRetry, lastTurn = false, turnMeta, card, onViewRunDiff, onRewind }: {
   readonly item: TimelineItemProjection;
   readonly locale: GuildLocale;
+  /** Engine of the task: recovery and Steer notices name its runtime. Grok when absent. */
+  readonly engine?: GuildEngine;
   readonly canRetry: boolean;
   readonly lastTurn?: boolean;
   readonly turnMeta?: string;
@@ -4437,7 +4459,7 @@ export const TimelineItem = memo(function TimelineItem({ item, locale, onOpenExt
   readonly onOpenRuntimeDiagnostics: () => void;
   readonly interruptedUser?: TimelineItemProjection;
 }) {
-  const messages = messagesFor(locale);
+  const messages = messagesFor(locale, engine);
   if (item.kind === "permission") {
     return <PermissionCard item={item} messages={messages} onDecision={onPermissionDecision} />;
   }
@@ -4508,7 +4530,7 @@ export const TimelineItem = memo(function TimelineItem({ item, locale, onOpenExt
         lastTurn={lastTurn}
         meta={turnMeta}
         onBranch={onBranch}
-        slot={card === undefined ? undefined : <RunCardView card={card} locale={locale} onViewRunDiff={onViewRunDiff} onRewind={onRewind} />}
+        slot={card === undefined ? undefined : <RunCardView card={card} locale={locale} engine={engine} onViewRunDiff={onViewRunDiff} onRewind={onRewind} />}
       />
     )}
   </article>;
@@ -4541,15 +4563,17 @@ function MessageActions({ item, messages, canRetry, onBranch, onRetryToDraft }: 
 const NO_RUN_DIFF = () => undefined;
 
 /** The changed-files card of a run, wired to the timeline's handlers. */
-function RunCardView({ card, locale, onViewRunDiff, onRewind }: {
+function RunCardView({ card, locale, engine, onViewRunDiff, onRewind }: {
   readonly card: RunCardData;
   readonly locale: GuildLocale;
+  /** Engine of the task: the Rewind note names its runtime. */
+  readonly engine: GuildEngine;
   readonly onViewRunDiff?: ((runId: RunId, path?: string) => void) | undefined;
   readonly onRewind?: ((runId: RunId, trigger: HTMLElement) => void) | undefined;
 }) {
   return <RunChangesCard
     data={card}
-    messages={messagesFor(locale)}
+    messages={messagesFor(locale, engine)}
     onViewDiff={onViewRunDiff ?? NO_RUN_DIFF}
     onRewind={onRewind ?? NO_RUN_DIFF}
   />;

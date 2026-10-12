@@ -160,7 +160,7 @@ test("the popover keys, focus return and pointer handling are wired in the compo
   // The picker never goes through the app-wide busy wrapper or the global error banner.
   const app = await readFile(new URL("../src/App.tsx", import.meta.url), "utf8");
   const applied = app.slice(app.indexOf("async function applyTaskRuntimeSettings"), app.indexOf("async function setSessionConfigOption"));
-  assert.match(applied, /api\.setTaskRuntimeSettings\(/u);
+  assert.match(applied, /applyModelSelectionChange\(api, \{/u);
   assert.doesNotMatch(applied, /run\(|setError|setBusy/u);
   assert.match(applied, /current\.activeTask\?\.task\.taskId !== response\.task\.task\.taskId/u);
   // A new task gets a new picker, so a pending request or notice never leaks across tasks.
@@ -236,12 +236,35 @@ test("an empty Online group shows the hint and a button that opens Model sources
     models: [{ id: "opus", name: "Opus", group: "claude", reasoningEfforts: [], contextWindows: [] }],
   });
   const markup = renderClaude({ catalogs: { grok: REAL_CATALOG, claude: onlyClaude }, claudeState: "ready" });
-  assert.match(markup, /<div class="guild-model-hint"><p>No online models — add one in Settings › Model sources<\/p><\/div>/u);
-  assert.match(markup, /<div class="guild-model-hint"><p>No local models — add one in Settings › Model sources<\/p><\/div>/u);
+  // The hints are disabled options of the listbox, so a screen reader reaches and announces them (PC-MODEL-001).
+  assert.match(markup, /<div class="guild-model-hint" role="option" aria-disabled="true" aria-selected="false" tabindex="-1"><p>No online models — add one in Settings › Model sources<\/p><\/div>/u);
+  assert.match(markup, /<div class="guild-model-hint" role="option" aria-disabled="true" aria-selected="false" tabindex="-1"><p>No local models — add one in Settings › Model sources<\/p><\/div>/u);
   assert.equal(markup.match(/class="guild-model-action"/gu)?.length, 2);
   assert.match(markup, /<button type="button" role="option" aria-selected="false" tabindex="-1" class="guild-model-action">Open Model sources<\/button>/u);
   // Without a way to open settings the hint stays and the button goes.
   assert.doesNotMatch(renderClaude({ catalogs: { grok: REAL_CATALOG, claude: onlyClaude }, onOpenModelSources: undefined as never }), /guild-model-action/u);
+});
+
+test("empty-group hints are disabled options inside the listbox, so a screen reader announces them; a lone hint is plain text", () => {
+  const onlyClaude = freezeModelCatalog("claude", {
+    models: [{ id: "opus", name: "Opus", group: "claude", reasoningEfforts: [], contextWindows: [] }],
+  });
+  const markup = renderClaude({ catalogs: { grok: REAL_CATALOG, claude: onlyClaude }, claudeState: "ready" });
+  const listbox = markup.match(/<div class="guild-model-list" role="listbox"[^>]*>(.*)<\/div><div class="guild-model-heading">/su)?.[1] ?? markup;
+  const hints = listbox.match(/<div class="guild-model-hint"[^>]*>/gu) ?? [];
+  assert.equal(hints.length, 2);
+  for (const hint of hints) assert.equal(hint, '<div class="guild-model-hint" role="option" aria-disabled="true" aria-selected="false" tabindex="-1">');
+  // Nothing in the listbox is a bare paragraph a screen reader would skip.
+  assert.doesNotMatch(listbox, /<div class="guild-model-hint"><p>/u);
+  // Disabled options are never the roving tab stop and never take a click.
+  assert.doesNotMatch(listbox, /<div class="guild-model-hint"[^>]*tabindex="0"/u);
+  // The help line of the Claude hint rides inside the same option.
+  const claude = renderClaude({ catalogs: { grok: REAL_CATALOG, claude: EMPTY_CLAUDE_MODEL_CATALOG }, selection: selection(null, null, "runtime"), claudeState: "not_found" });
+  assert.match(claude, /role="option" aria-disabled="true" aria-selected="false" tabindex="-1"><p>Claude Code not found or not logged in<\/p><small>Install Claude Code/u);
+  // A picker with a single empty group has no listbox: its hint is plain text in the popover.
+  const lone = render({ initialOpen: true, catalogs: grokOnly({ models: [] }), selection: selection(null, null, "runtime") });
+  assert.match(lone, /<div class="guild-model-hint"><p>Model choices appear once Grok has started\.<\/p><\/div>/u);
+  assert.doesNotMatch(lone, /role="listbox"/u);
 });
 
 test("the Claude group says Claude Code is not found or not logged in, with what to do", () => {
@@ -277,4 +300,7 @@ test("the grouped picker keeps arrow-key navigation over every option and opens 
   assert.match(source, /role="group" aria-labelledby=\{headingId\}/u);
   assert.match(source, /setOpen\(false\);\s*onOpenModelSources\(\);/u);
   assert.match(source, /selectionForRow\(catalogs, row, view\.selectedEffortId, taskEngine\)/u);
+  // The popover opens on the selected row, else the first row (a hint is also an option, but not what a person came to pick).
+  assert.match(source, /querySelector<HTMLElement>\('\[role="option"\]\[aria-selected="true"\]'\) \?\?\s*\n\s*popover\.querySelector<HTMLElement>\('button\[role="option"\]'\)/u);
+  assert.match(source, /role="option" aria-disabled="true" aria-selected="false" tabIndex=\{-1\}/u);
 });

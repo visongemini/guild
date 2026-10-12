@@ -25,14 +25,17 @@ function between(source: string, from: string, to: string): string {
   return source.slice(start, end);
 }
 
-test("choosing a model of the other engine moves the task first, then applies the model", () => {
+test("choosing a model of the other engine moves the task first, then applies the model", async () => {
   const apply = between(app, "async function applyTaskRuntimeSettings", "async function confirmOnlineSwitch");
-  assert.match(apply, /change\.engine !== undefined && change\.engine !== taskEngineOf\(task\.task\)/u);
-  const move = apply.indexOf("api.setTaskEngine({ taskId, engine: change.engine })");
-  const settings = apply.indexOf("api.setTaskRuntimeSettings({");
-  assert.ok(move > 0 && settings > move, "setTaskEngine comes before setTaskRuntimeSettings");
+  assert.match(apply, /applyModelSelectionChange\(api, \{\s*\n\s*taskId,\s*\n\s*taskEngine: taskEngineOf\(task\.task\),\s*\n\s*change,/u);
   // The moved task replaces the open one and its sidebar summary follows without waiting for a push.
   assert.match(apply, /withTaskSummary\(\{ \.\.\.current, activeTask: moved \}, moved\.task\)/u);
+  // The order itself lives in one place: setTaskEngine first, only when the engine differs, then the settings.
+  const helper = await readFile(new URL("../src/apply-model-change.ts", import.meta.url), "utf8");
+  assert.match(helper, /change\.engine !== undefined && change\.engine !== input\.taskEngine/u);
+  const move = helper.indexOf("api.setTaskEngine({ taskId, engine: change.engine })");
+  const settings = helper.indexOf("api.setTaskRuntimeSettings({");
+  assert.ok(move > 0 && settings > move, "setTaskEngine comes before setTaskRuntimeSettings");
 });
 
 test("the picker gets the engine catalogs, the task's engine, whether it is fixed, Claude's state and the way to Model sources", () => {

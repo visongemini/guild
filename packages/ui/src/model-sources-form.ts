@@ -13,6 +13,7 @@ export const SOURCE_LIMITS = Object.freeze({
   baseUrlLength: 2_048,
   keyFileLength: 4_096,
   keyVariableLength: 64,
+  maxSources: 32,
   maxModels: 64,
   modelIdLength: 128,
   modelLabelLength: 128,
@@ -242,4 +243,63 @@ export function draftFromForm(form: SourceForm, existingIds: readonly string[]):
     })),
     enabled: form.enabled,
   });
+}
+
+/** The refusals `upsertModelSource` can raise; they reach the renderer as `Error: model_source_<reason>`. */
+export const SOURCE_SAVE_FAILURE_REASONS = Object.freeze([
+  "invalid",
+  "reserved_id",
+  "reserved_model",
+  "duplicate_model",
+  "limit",
+  "changed",
+  "not_found",
+  "rejected",
+] as const);
+export type SourceSaveFailureReason = (typeof SOURCE_SAVE_FAILURE_REASONS)[number];
+
+/**
+ * Where a failed save is explained: beside the Name field, with the model list (under the rows it names, or under
+ * the list when it names none), or at the foot of the form.
+ */
+export type SourceSaveFailure = Readonly<{
+  place: "label" | "models" | "form";
+  /** `unknown` is any failure that is not one of the main process's own refusals (the generic message). */
+  reason: SourceSaveFailureReason | "unknown";
+  /** Model rows (by index) that repeat an ID another source already offers; only for `duplicate_model`. */
+  rows: readonly number[];
+}>;
+
+/**
+ * The reason behind a failed save, read from the error the preload raises (Electron wraps the main process's
+ * message as `Error invoking remote method '...': Error: model_source_<reason>`). Anything else is undefined.
+ */
+export function sourceSaveFailureReason(cause: unknown): SourceSaveFailureReason | undefined {
+  const text = cause instanceof Error ? cause.message : typeof cause === "string" ? cause : "";
+  const reason = /\bmodel_source_([a-z_]{1,48})\b/u.exec(text)?.[1];
+  return (SOURCE_SAVE_FAILURE_REASONS as readonly string[]).includes(reason ?? "")
+    ? reason as SourceSaveFailureReason
+    : undefined;
+}
+
+/**
+ * Places a failed save next to what the person can fix. A repeated model ID is pinned to the rows that repeat one
+ * of the other sources' IDs (the renderer knows them all); a reserved ID or name has no row to point at, so it sits
+ * with the model list or the Name field.
+ */
+export function sourceSaveFailureOf(
+  cause: unknown,
+  form: SourceForm,
+  sources: readonly Pick<ModelSourceProjection, "id" | "models">[],
+): SourceSaveFailure {
+  const reason = sourceSaveFailureReason(cause);
+  if (reason === undefined) return Object.freeze({ place: "form", reason: "unknown", rows: Object.freeze([]) });
+  if (reason === "reserved_id") return Object.freeze({ place: "label", reason, rows: Object.freeze([]) });
+  if (reason === "reserved_model") return Object.freeze({ place: "models", reason, rows: Object.freeze([]) });
+  if (reason === "duplicate_model") {
+    const taken = new Set(sources.filter((source) => source.id !== form.id).flatMap((source) => source.models.map((model) => model.id)));
+    const rows = form.models.flatMap((row, index) => !isBlankRow(row) && taken.has(row.id.trim()) ? [index] : []);
+    return Object.freeze({ place: "models", reason, rows: Object.freeze(rows) });
+  }
+  return Object.freeze({ place: "form", reason, rows: Object.freeze([]) });
 }
