@@ -2716,8 +2716,10 @@ export function GuildApp({ api }: GuildAppProps) {
               <button
                 type="button"
                 className={`guild-context-usage ${contextWindow.available ? "available" : "unavailable"} ${contextWindow.hasSize ? "measured" : "used-only"} ${contextWindow.hasSize && contextWindow.percent >= 80 ? "high" : ""}`}
+                aria-expanded={contextUsageOpen}
                 onPointerDown={(event) => event.stopPropagation()}
                 onClick={() => setContextUsageOpen((open) => !open)}
+                onBlur={() => setContextUsageOpen(false)}
                 title={!contextWindow.available
                   ? messages.contextUsageUnavailable
                   : contextWindow.hasSize

@@ -575,3 +575,19 @@ test("the Files tab names a line only when it says something", async () => {
   assert.equal(messagesFor("en-US").fileLine(42), "line 42");
   assert.equal(messagesFor("zh-CN").fileLineHelp, "最近一次读取或修改的位置");
 });
+
+test("the context ring opens its figures on click, Enter and Space, closes on Escape, an outside press and when focus leaves", async () => {
+  const app = await source("App.tsx");
+  const classAt = app.indexOf('className={`guild-context-usage ');
+  const ring = app.slice(app.lastIndexOf("<button", classAt), app.indexOf("<ModelPicker"));
+  // A real button: Enter and Space activate it like a click, so touch and keyboard users get the same popover as the tooltip.
+  assert.match(ring, /<button\s+type="button"\s+className=\{`guild-context-usage /u);
+  assert.match(ring, /aria-expanded=\{contextUsageOpen\}/u);
+  assert.match(ring, /onClick=\{\(\) => setContextUsageOpen\(\(open\) => !open\)\}/u);
+  assert.match(ring, /onBlur=\{\(\) => setContextUsageOpen\(false\)\}/u);
+  assert.match(ring, /\{contextUsageOpen && <span className="guild-context-usage-detail" role="status">/u);
+  // Escape and a press anywhere else close it.
+  assert.match(app, /const closeOnEscape = \(event: KeyboardEvent\) => \{\s*if \(event\.key === "Escape"\) close\(\);/u);
+  assert.match(app, /window\.addEventListener\("pointerdown", close\);/u);
+  assert.match(app, /setContextUsageOpen\(false\);\s*\};/u);
+});
