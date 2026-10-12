@@ -172,7 +172,7 @@ async function startClaude(
   assert.deepEqual(initialize.params, {
     protocolVersion: 1,
     clientCapabilities: {},
-    clientInfo: { name: "guild", title: "Guild", version: "3.0.1" },
+    clientInfo: { name: "guild", title: "Guild", version: "3.0.2" },
   });
   process.emitMessages({ jsonrpc: "2.0", id: initialize.id, result: initializeResult } as WireMessage);
   await starting;
