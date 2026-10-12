@@ -1,5 +1,6 @@
 import { contextBridge, ipcRenderer } from "electron";
 import type {
+  BrowserPaneProjection,
   DesktopBootstrapProjection,
   DesktopInvokeChannel,
   DesktopRequestByChannel,
@@ -55,8 +56,18 @@ const DESKTOP_IPC_CHANNELS = Object.freeze({
   restoreUserData: "guild:v1:settings:restore-user-data",
   openRuntimeDiagnostics: "guild:v1:diagnostics:open-runtime-log",
   runGrokManagement: "guild:v1:grok:management:run",
+  setTaskEngine: "guild:v1:task:engine:set",
+  setClaudeSettings: "guild:v1:settings:claude",
+  listModelSources: "guild:v1:model-sources:list",
+  upsertModelSource: "guild:v1:model-sources:upsert",
+  deleteModelSource: "guild:v1:model-sources:delete",
+  confirmModelSource: "guild:v1:model-sources:confirm",
+  getWorkspacePrefs: "guild:v1:workspace-prefs:get",
+  setWorkspacePrefs: "guild:v1:workspace-prefs:set",
+  browserCommand: "guild:v1:browser:command",
   projectionChanged: "guild:v1:event:projection-changed",
   streamDelta: "guild:v1:event:stream-delta",
+  browserPaneChanged: "guild:v1:event:browser-pane-changed",
 } as const);
 
 const invoke = <Channel extends DesktopInvokeChannel>(
@@ -123,6 +134,15 @@ const api = {
   backupUserData: () => invoke(DESKTOP_IPC_CHANNELS.backupUserData, {}),
   openRuntimeDiagnostics: () => invoke(DESKTOP_IPC_CHANNELS.openRuntimeDiagnostics, {}),
   runGrokManagement: (request) => invoke(DESKTOP_IPC_CHANNELS.runGrokManagement, request),
+  setTaskEngine: (request) => invoke(DESKTOP_IPC_CHANNELS.setTaskEngine, request),
+  setClaudeSettings: (request) => invoke(DESKTOP_IPC_CHANNELS.setClaudeSettings, request),
+  listModelSources: () => invoke(DESKTOP_IPC_CHANNELS.listModelSources, {}),
+  upsertModelSource: (request) => invoke(DESKTOP_IPC_CHANNELS.upsertModelSource, request),
+  deleteModelSource: (request) => invoke(DESKTOP_IPC_CHANNELS.deleteModelSource, request),
+  confirmModelSource: (request) => invoke(DESKTOP_IPC_CHANNELS.confirmModelSource, request),
+  getWorkspacePrefs: (request) => invoke(DESKTOP_IPC_CHANNELS.getWorkspacePrefs, request),
+  setWorkspacePrefs: (request) => invoke(DESKTOP_IPC_CHANNELS.setWorkspacePrefs, request),
+  browserCommand: (request) => invoke(DESKTOP_IPC_CHANNELS.browserCommand, request),
   onProjectionChanged: (listener) => {
     const wrapped = (_event: Electron.IpcRendererEvent, projection: DesktopBootstrapProjection) => listener(projection);
     ipcRenderer.on(DESKTOP_IPC_CHANNELS.projectionChanged, wrapped);
@@ -132,6 +152,11 @@ const api = {
     const wrapped = (_event: Electron.IpcRendererEvent, delta: StreamDeltaEvent) => listener(delta);
     ipcRenderer.on(DESKTOP_IPC_CHANNELS.streamDelta, wrapped);
     return () => ipcRenderer.removeListener(DESKTOP_IPC_CHANNELS.streamDelta, wrapped);
+  },
+  onBrowserPaneChanged: (listener) => {
+    const wrapped = (_event: Electron.IpcRendererEvent, projection: BrowserPaneProjection) => listener(projection);
+    ipcRenderer.on(DESKTOP_IPC_CHANNELS.browserPaneChanged, wrapped);
+    return () => ipcRenderer.removeListener(DESKTOP_IPC_CHANNELS.browserPaneChanged, wrapped);
   },
 } satisfies GuildRendererApi;
 
