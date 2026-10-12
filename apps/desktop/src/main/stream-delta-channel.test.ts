@@ -114,6 +114,7 @@ test("the preload allow-list mirrors the contract registry and exposes no generi
   // Subscriptions: only registered event channels, with the Electron event object stripped.
   const subscriptions = [...preload.matchAll(/ipcRenderer\.on\(([^,]+),/gu)].map((match) => match[1]!.trim());
   assert.deepEqual(subscriptions.sort(), [
+    "DESKTOP_IPC_CHANNELS.browserPaneChanged",
     "DESKTOP_IPC_CHANNELS.projectionChanged",
     "DESKTOP_IPC_CHANNELS.streamDelta",
   ]);

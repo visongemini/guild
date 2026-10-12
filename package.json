@@ -14,6 +14,7 @@
     "apps/desktop",
     "packages/contracts",
     "packages/domain",
+    "packages/model-router",
     "packages/persistence",
     "packages/runtime-grok",
     "packages/ui"

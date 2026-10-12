@@ -9,7 +9,21 @@
  *  - the D-011 policy predicate that keeps non-xAI models the owner may have configured in the
  *    official CLI out of Guild's selector,
  *  - pure selection helpers shared by main, persistence and the renderer.
+ *
+ * Guild 3.0 (PC-ENG-001, PC-MODEL-001): the same catalog shape now also describes the Claude
+ * engine. A catalog and each of its models carry an `engine` / `group` label, the model id grammar
+ * is chosen per engine (`parseGuildModelId`), and `freezeModelCatalog(engine, ...)` validates either.
+ * The Grok-era names below keep their meaning and behavior for the Grok engine.
  */
+
+import {
+  GUILD_CLAUDE_IDENTIFIER_LIMITS,
+  isClaudeModelId,
+  modelGroupsOfEngine,
+  parseGuildClaudeReasoningEffort,
+  type GuildEngine,
+  type ModelGroup,
+} from "./engines.js";
 
 export const GUILD_GROK_IDENTIFIER_LIMITS = Object.freeze({
   modelIdLength: 64,
@@ -46,6 +60,40 @@ export function parseGuildGrokReasoningEffort(value: unknown): GuildGrokReasonin
   return value;
 }
 
+/**
+ * Model id of a task or default on `engine`. Grok ids must also pass the D-011 official-model
+ * policy; Claude ids follow the Claude grammar and may name an Online / Local model.
+ */
+export function parseGuildModelId(engine: GuildEngine, value: unknown): string {
+  if (engine === "grok") return parseGuildGrokModel(value);
+  if (typeof value !== "string" || !isClaudeModelId(value)) {
+    throw new TypeError("invalid_claude_model");
+  }
+  return value;
+}
+
+/**
+ * Boundary check for a request that names a task but not its engine (`setTaskRuntimeSettings`): the
+ * wider Claude grammar applies, because every Grok id is also a valid Claude id. The rule of the
+ * task's own engine is enforced where the engine is known: `parseGuildModelId` in main and the store.
+ */
+export function parseGuildModelIdOfAnyEngine(value: unknown): string {
+  if (typeof value !== "string" || !isClaudeModelId(value)) {
+    throw new TypeError("invalid_model_id");
+  }
+  return value;
+}
+
+export function isModelIdOfEngine(engine: GuildEngine, id: string): boolean {
+  return engine === "grok" ? isOfficialGrokModelId(id) : isClaudeModelId(id);
+}
+
+export function parseGuildReasoningEffort(engine: GuildEngine, value: unknown): string {
+  return engine === "grok"
+    ? parseGuildGrokReasoningEffort(value)
+    : parseGuildClaudeReasoningEffort(value);
+}
+
 export function parseGuildGrokContextWindow(value: unknown): number {
   if (
     typeof value !== "number" ||
@@ -75,28 +123,55 @@ export type GrokReasoningEffortDescriptor = Readonly<{
   isDefault: boolean;
 }>;
 
-export type GrokModelDescriptor = Readonly<{
+export type ModelDescriptor = Readonly<{
   id: GuildGrokModel;
   /** Official display name, for example "Grok 4.7 Fast". */
   name: string;
   /** Official description, for example "Fast variant. 2x the price." */
   description?: string;
   agentType?: string;
+  /**
+   * Picker group (PC-MODEL-001). Always present in a Claude catalog; absent in a Grok catalog (the
+   * Grok-era shape), where it means `"grok"`.
+   */
+  group?: ModelGroup;
   /** Empty when the model does not accept a reasoning effort. */
   reasoningEfforts: readonly GrokReasoningEffortDescriptor[];
   contextWindows: readonly number[];
   defaultContextWindow?: number;
 }>;
 
-export type GrokModelCatalog = Readonly<{
-  models: readonly GrokModelDescriptor[];
-  /** The official model the runtime itself had selected when the list was captured. */
+export type ModelCatalog = Readonly<{
+  /**
+   * Engine the models belong to. Always present in a Claude catalog; absent in a Grok catalog (the
+   * Grok-era shape), where it means `"grok"`.
+   */
+  engine?: GuildEngine;
+  models: readonly ModelDescriptor[];
+  /** The model the engine itself had selected when the list was captured. */
   runtimeDefaultModelId?: GuildGrokModel;
 }>;
+
+/** Grok-era names: the same shapes, kept so existing code compiles unchanged. */
+export type GrokModelDescriptor = ModelDescriptor;
+export type GrokModelCatalog = ModelCatalog;
 
 export const EMPTY_GROK_MODEL_CATALOG: GrokModelCatalog = Object.freeze({
   models: Object.freeze([]),
 });
+
+export const EMPTY_CLAUDE_MODEL_CATALOG: ModelCatalog = Object.freeze({
+  engine: "claude",
+  models: Object.freeze([]),
+});
+
+export function modelCatalogEngineOf(catalog: ModelCatalog): GuildEngine {
+  return catalog.engine ?? "grok";
+}
+
+export function modelGroupOf(model: ModelDescriptor): ModelGroup {
+  return model.group ?? "grok";
+}
 
 export function grokModelById(
   catalog: GrokModelCatalog | undefined,
@@ -167,8 +242,12 @@ export function resolveEffectiveSelection(input: {
   });
 }
 
-function fail(code: string, path: string): never {
-  throw new TypeError(`grok_model_catalog_${code}:${path}`);
+type CatalogFail = (code: string, path: string) => never;
+
+function catalogFailure(engine: GuildEngine): CatalogFail {
+  return (code, path) => {
+    throw new TypeError(`${engine}_model_catalog_${code}:${path}`);
+  };
 }
 
 function exactKeys(
@@ -176,6 +255,7 @@ function exactKeys(
   required: readonly string[],
   optional: readonly string[],
   path: string,
+  fail: CatalogFail,
 ): Record<string, unknown> {
   if (value === null || typeof value !== "object" || Array.isArray(value)) fail("not_object", path);
   const prototype = Object.getPrototypeOf(value) as unknown;
@@ -191,12 +271,12 @@ function exactKeys(
   return record;
 }
 
-function boundedString(value: unknown, max: number, path: string): string {
+function boundedString(value: unknown, max: number, path: string, fail: CatalogFail): string {
   if (typeof value !== "string" || value.length === 0 || value.length > max) fail("invalid_string", path);
   return value;
 }
 
-function contextWindow(value: unknown, path: string): number {
+function contextWindow(value: unknown, path: string, fail: CatalogFail): number {
   try {
     return parseGuildGrokContextWindow(value);
   } catch {
@@ -204,30 +284,60 @@ function contextWindow(value: unknown, path: string): number {
   }
 }
 
-/**
- * Strictly validates, copies and deep-freezes a catalog. Used for the value the ACP codec builds
- * and for the copy read back from the local cache, so a corrupted cache is rejected rather than
- * trusted.
- */
-export function freezeGrokModelCatalog(input: unknown): GrokModelCatalog {
+function catalogLimits(engine: GuildEngine) {
   const limits = GUILD_GROK_IDENTIFIER_LIMITS;
-  const root = exactKeys(input, ["models"], ["runtimeDefaultModelId"], "$");
+  return engine === "grok"
+    ? limits
+    : {
+        ...limits,
+        modelIdLength: GUILD_CLAUDE_IDENTIFIER_LIMITS.modelIdLength,
+        maxModels: GUILD_CLAUDE_IDENTIFIER_LIMITS.maxModels,
+      };
+}
+
+/**
+ * Strictly validates, copies and deep-freezes the catalog of `engine`. Used for the value a codec
+ * builds and for the copy read back from the local cache, so a corrupted cache is rejected rather
+ * than trusted. A root `engine` and a per-model `group` are optional in the input (a cache written
+ * before Guild 3.0 has neither) and must agree with the engine when present. Grok-engine ids must
+ * pass the D-011 official-model policy.
+ *
+ * A Claude catalog always carries `engine: "claude"` and a `group` on every model. A Grok catalog
+ * keeps its Grok-era shape, byte for byte: no labels, so every existing consumer and cached value is
+ * unchanged, and an absent label means grok (`modelCatalogEngineOf`, `modelGroupOf`).
+ */
+export function freezeModelCatalog(engine: GuildEngine, input: unknown): ModelCatalog {
+  const fail = catalogFailure(engine);
+  const limits = catalogLimits(engine);
+  const groups = modelGroupsOfEngine(engine);
+  const root = exactKeys(input, ["models"], ["runtimeDefaultModelId", "engine"], "$", fail);
+  if (root["engine"] !== undefined && root["engine"] !== engine) fail("engine_mismatch", "$.engine");
   if (!Array.isArray(root["models"]) || root["models"].length > limits.maxModels) {
     fail("invalid_models", "$.models");
   }
   const seen = new Set<string>();
-  const models = (root["models"] as unknown[]).map((entry, index): GrokModelDescriptor => {
+  const models = (root["models"] as unknown[]).map((entry, index): ModelDescriptor => {
     const path = `$.models[${index}]`;
     const record = exactKeys(
       entry,
       ["id", "name", "reasoningEfforts", "contextWindows"],
-      ["description", "agentType", "defaultContextWindow"],
+      ["description", "agentType", "defaultContextWindow", "group"],
       path,
+      fail,
     );
-    const id = boundedString(record["id"], limits.modelIdLength, `${path}.id`);
-    if (!isOfficialGrokModelId(id)) fail("unofficial_model", `${path}.id`);
+    const id = boundedString(record["id"], limits.modelIdLength, `${path}.id`, fail);
+    if (!isModelIdOfEngine(engine, id)) {
+      fail(engine === "grok" ? "unofficial_model" : "invalid_model", `${path}.id`);
+    }
     if (seen.has(id)) fail("duplicate_model", `${path}.id`);
     seen.add(id);
+    let group: ModelGroup = groups[0]!;
+    if (record["group"] !== undefined) {
+      if (typeof record["group"] !== "string" || !(groups as readonly string[]).includes(record["group"])) {
+        fail("invalid_group", `${path}.group`);
+      }
+      group = record["group"] as ModelGroup;
+    }
     const efforts = record["reasoningEfforts"];
     if (!Array.isArray(efforts) || efforts.length > limits.maxEffortsPerModel) {
       fail("invalid_efforts", `${path}.reasoningEfforts`);
@@ -235,10 +345,10 @@ export function freezeGrokModelCatalog(input: unknown): GrokModelCatalog {
     const effortIds = new Set<string>();
     const reasoningEfforts = (efforts as unknown[]).map((effort, effortIndex) => {
       const effortPath = `${path}.reasoningEfforts[${effortIndex}]`;
-      const item = exactKeys(effort, ["id", "label", "isDefault"], ["description"], effortPath);
+      const item = exactKeys(effort, ["id", "label", "isDefault"], ["description"], effortPath, fail);
       let effortId: string;
       try {
-        effortId = parseGuildGrokReasoningEffort(item["id"]);
+        effortId = parseGuildReasoningEffort(engine, item["id"]);
       } catch {
         return fail("invalid_effort_id", `${effortPath}.id`);
       }
@@ -247,7 +357,7 @@ export function freezeGrokModelCatalog(input: unknown): GrokModelCatalog {
       if (typeof item["isDefault"] !== "boolean") fail("invalid_boolean", `${effortPath}.isDefault`);
       return Object.freeze({
         id: effortId,
-        label: boundedString(item["label"], limits.maxEffortLabelLength, `${effortPath}.label`),
+        label: boundedString(item["label"], limits.maxEffortLabelLength, `${effortPath}.label`, fail),
         ...(item["description"] === undefined
           ? {}
           : {
@@ -255,6 +365,7 @@ export function freezeGrokModelCatalog(input: unknown): GrokModelCatalog {
                 item["description"],
                 limits.maxEffortDescriptionLength,
                 `${effortPath}.description`,
+                fail,
               ),
             }),
         isDefault: item["isDefault"] as boolean,
@@ -268,10 +379,10 @@ export function freezeGrokModelCatalog(input: unknown): GrokModelCatalog {
       fail("invalid_context_windows", `${path}.contextWindows`);
     }
     const contextWindows = (windows as unknown[]).map((window, windowIndex) =>
-      contextWindow(window, `${path}.contextWindows[${windowIndex}]`));
+      contextWindow(window, `${path}.contextWindows[${windowIndex}]`, fail));
     return Object.freeze({
       id,
-      name: boundedString(record["name"], limits.maxNameLength, `${path}.name`),
+      name: boundedString(record["name"], limits.maxNameLength, `${path}.name`, fail),
       ...(record["description"] === undefined
         ? {}
         : {
@@ -279,16 +390,24 @@ export function freezeGrokModelCatalog(input: unknown): GrokModelCatalog {
               record["description"],
               limits.maxDescriptionLength,
               `${path}.description`,
+              fail,
             ),
           }),
       ...(record["agentType"] === undefined
         ? {}
-        : { agentType: boundedString(record["agentType"], 64, `${path}.agentType`) }),
+        : { agentType: boundedString(record["agentType"], 64, `${path}.agentType`, fail) }),
+      ...(engine === "grok" ? {} : { group }),
       reasoningEfforts: Object.freeze(reasoningEfforts),
       contextWindows: Object.freeze(contextWindows),
       ...(record["defaultContextWindow"] === undefined
         ? {}
-        : { defaultContextWindow: contextWindow(record["defaultContextWindow"], `${path}.defaultContextWindow`) }),
+        : {
+            defaultContextWindow: contextWindow(
+              record["defaultContextWindow"],
+              `${path}.defaultContextWindow`,
+              fail,
+            ),
+          }),
     });
   });
   let runtimeDefaultModelId: string | undefined;
@@ -297,13 +416,20 @@ export function freezeGrokModelCatalog(input: unknown): GrokModelCatalog {
       root["runtimeDefaultModelId"],
       limits.modelIdLength,
       "$.runtimeDefaultModelId",
+      fail,
     );
     if (!seen.has(runtimeDefaultModelId)) fail("unknown_default_model", "$.runtimeDefaultModelId");
   }
   return Object.freeze({
+    ...(engine === "grok" ? {} : { engine }),
     models: Object.freeze(models),
     ...(runtimeDefaultModelId === undefined ? {} : { runtimeDefaultModelId }),
   });
+}
+
+/** The Grok engine's catalog (D-011: only `grok-*` models). */
+export function freezeGrokModelCatalog(input: unknown): GrokModelCatalog {
+  return freezeModelCatalog("grok", input);
 }
 
 /** Model and effort the session reports as selected, read from its official config options. */

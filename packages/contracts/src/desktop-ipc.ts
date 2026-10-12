@@ -13,14 +13,42 @@ import {
 } from "./ids.js";
 import type { RunState } from "./run-events.js";
 import {
+  GUILD_CLAUDE_PERMISSION_MODES,
+  parseGuildClaudeModel,
+  parseGuildClaudePermissionMode,
+  parseGuildClaudeReasoningEffort,
+  parseGuildEngine,
+  type GuildClaudePermissionMode,
+  type GuildEngine,
+} from "./engines.js";
+import {
   parseGuildGrokContextWindow,
   parseGuildGrokModel,
   parseGuildGrokReasoningEffort,
+  parseGuildModelIdOfAnyEngine,
   type GrokModelCatalog,
   type GuildGrokModel,
   type GuildGrokReasoningEffort,
   type GuildModelSelectionSource,
+  type ModelCatalog,
 } from "./grok-models.js";
+import {
+  parseBrowserCommand,
+  type BrowserCommand,
+  type BrowserPaneProjection,
+} from "./browser-pane.js";
+import {
+  parseModelSourceDraft,
+  parseModelSourceIdRequest,
+  type ConfirmModelSourceRequest,
+  type ConfirmModelSourceResponse,
+  type DeleteModelSourceRequest,
+  type ListModelSourcesRequest,
+  type ListModelSourcesResponse,
+  type UpsertModelSourceRequest,
+  type UpsertModelSourceResponse,
+} from "./model-sources.js";
+import { boundedText, exactRecord } from "./request-record.js";
 import type { RunPhaseProjection } from "./run-phase.js";
 import {
   GUILD_TASK_ISOLATIONS,
@@ -149,14 +177,25 @@ export const DESKTOP_IPC_CHANNELS = Object.freeze({
   restoreUserData: "guild:v1:settings:restore-user-data",
   openRuntimeDiagnostics: "guild:v1:diagnostics:open-runtime-log",
   runGrokManagement: "guild:v1:grok:management:run",
+  setTaskEngine: "guild:v1:task:engine:set",
+  setClaudeSettings: "guild:v1:settings:claude",
+  listModelSources: "guild:v1:model-sources:list",
+  upsertModelSource: "guild:v1:model-sources:upsert",
+  deleteModelSource: "guild:v1:model-sources:delete",
+  confirmModelSource: "guild:v1:model-sources:confirm",
+  getWorkspacePrefs: "guild:v1:workspace-prefs:get",
+  setWorkspacePrefs: "guild:v1:workspace-prefs:set",
+  browserCommand: "guild:v1:browser:command",
   projectionChanged: "guild:v1:event:projection-changed",
   streamDelta: "guild:v1:event:stream-delta",
+  browserPaneChanged: "guild:v1:event:browser-pane-changed",
 } as const);
 
 /** Main-to-renderer push channels. Every other registered channel is renderer-initiated invoke. */
 export const DESKTOP_EVENT_CHANNELS = Object.freeze([
   DESKTOP_IPC_CHANNELS.projectionChanged,
   DESKTOP_IPC_CHANNELS.streamDelta,
+  DESKTOP_IPC_CHANNELS.browserPaneChanged,
 ] as const);
 export type DesktopEventChannel = (typeof DESKTOP_EVENT_CHANNELS)[number];
 
@@ -221,6 +260,11 @@ export type TaskSummaryProjection = {
   readonly activeActivity?: GuildTaskActivity;
   /** Present when the task works in its own git worktree (F3); the sidebar shows a branch glyph. */
   readonly worktreeStatus?: GuildWorktreeStatus;
+  /**
+   * Engine the task runs on (PC-ENG-001). Absent means `"grok"`; the task view carries it through
+   * its `task`. It is fixed at the task's first turn (`setTaskEngine` works only before any Run).
+   */
+  readonly engine?: GuildEngine;
 };
 
 export type TimelineItemStatus =
@@ -443,6 +487,24 @@ export type RuntimeSettingsProjection = {
   readonly availablePermissionModes: typeof GUILD_GROK_PERMISSION_MODES;
   readonly startup: GuildGrokStartupSettings;
   readonly canChange: boolean;
+  /** Claude-engine defaults (PC-SET-002). Absent until the main process supplies them. */
+  readonly claude?: ClaudeEngineSettingsProjection;
+  /**
+   * Last model list each engine advertised (PC-MODEL-001). `modelCatalog` above stays the Grok
+   * catalog for the existing UI; `modelCatalogs.grok` is the same value. The Claude catalog also
+   * carries the enabled Online / Local models, labelled by `group`.
+   */
+  readonly modelCatalogs?: Readonly<Record<GuildEngine, ModelCatalog>>;
+};
+
+/** Defaults a new Claude-engine task starts from. Same rules as the Grok defaults, Claude grammar. */
+export type ClaudeEngineSettingsProjection = {
+  /** Default model id; null follows the adapter's own default. */
+  readonly model: string | null;
+  /** Default effort (`default`, `low`, `medium`, `high`, `xhigh`, `max`); null follows the adapter. */
+  readonly reasoningEffort: string | null;
+  readonly permissionMode: GuildClaudePermissionMode;
+  readonly availablePermissionModes: typeof GUILD_CLAUDE_PERMISSION_MODES;
 };
 
 /** Model and effort one task will use for its next turn, with where the choice comes from. */
@@ -526,7 +588,11 @@ export type CreateTaskRequest = {
   readonly workspaceId: WorkspaceId;
   /** `"worktree"` makes the task work in its own git worktree on its own branch (F3). */
   readonly isolation?: GuildTaskIsolation;
+  /** Engine for the new task (PC-ENG-001); absent means `"grok"`. */
+  readonly engine?: GuildEngine;
 };
+/** Changes a task's engine. The main process allows it only while the task has no Run. */
+export type SetTaskEngineRequest = { readonly taskId: TaskId; readonly engine: GuildEngine };
 export type OpenTaskRequest = { readonly taskId: TaskId; readonly sequence?: number };
 export type UpdateWorkspaceRequest = {
   readonly workspaceId: WorkspaceId;
@@ -581,6 +647,22 @@ export type SetRuntimeSettingsRequest = {
   readonly reasoningEffort: GuildGrokReasoningEffort | null;
   readonly permissionMode: GuildGrokPermissionMode;
   readonly startup: GuildGrokStartupSettings;
+};
+export type SetClaudeSettingsRequest = {
+  readonly model: string | null;
+  readonly reasoningEffort: string | null;
+  readonly permissionMode: GuildClaudePermissionMode;
+};
+/** Per-workspace privacy preferences (PC-PRIV-001). */
+export type WorkspacePrefsProjection = {
+  readonly workspaceId: WorkspaceId;
+  /** "Don't remind me again in this workspace" for the Online-model reminder. */
+  readonly onlineReminderDismissed: boolean;
+};
+export type GetWorkspacePrefsRequest = { readonly workspaceId: WorkspaceId };
+export type SetWorkspacePrefsRequest = {
+  readonly workspaceId: WorkspaceId;
+  readonly onlineReminderDismissed: boolean;
 };
 export type SetSidebarWidthRequest = { readonly width: number };
 export type ChooseAvatarRequest = Readonly<Record<string, never>>;
@@ -767,6 +849,15 @@ export type DesktopRequestByChannel = {
   readonly [DESKTOP_IPC_CHANNELS.restoreUserData]: Readonly<Record<string, never>>;
   readonly [DESKTOP_IPC_CHANNELS.openRuntimeDiagnostics]: OpenRuntimeDiagnosticsRequest;
   readonly [DESKTOP_IPC_CHANNELS.runGrokManagement]: RunGrokManagementRequest;
+  readonly [DESKTOP_IPC_CHANNELS.setTaskEngine]: SetTaskEngineRequest;
+  readonly [DESKTOP_IPC_CHANNELS.setClaudeSettings]: SetClaudeSettingsRequest;
+  readonly [DESKTOP_IPC_CHANNELS.listModelSources]: ListModelSourcesRequest;
+  readonly [DESKTOP_IPC_CHANNELS.upsertModelSource]: UpsertModelSourceRequest;
+  readonly [DESKTOP_IPC_CHANNELS.deleteModelSource]: DeleteModelSourceRequest;
+  readonly [DESKTOP_IPC_CHANNELS.confirmModelSource]: ConfirmModelSourceRequest;
+  readonly [DESKTOP_IPC_CHANNELS.getWorkspacePrefs]: GetWorkspacePrefsRequest;
+  readonly [DESKTOP_IPC_CHANNELS.setWorkspacePrefs]: SetWorkspacePrefsRequest;
+  readonly [DESKTOP_IPC_CHANNELS.browserCommand]: BrowserCommand;
 };
 
 export type DesktopResponseByChannel = {
@@ -816,6 +907,15 @@ export type DesktopResponseByChannel = {
   readonly [DESKTOP_IPC_CHANNELS.restoreUserData]: { readonly status: "cancelled" | "restarting" };
   readonly [DESKTOP_IPC_CHANNELS.openRuntimeDiagnostics]: EmptyDesktopResponse;
   readonly [DESKTOP_IPC_CHANNELS.runGrokManagement]: RunGrokManagementResponse;
+  readonly [DESKTOP_IPC_CHANNELS.setTaskEngine]: TaskViewProjection;
+  readonly [DESKTOP_IPC_CHANNELS.setClaudeSettings]: DesktopBootstrapProjection;
+  readonly [DESKTOP_IPC_CHANNELS.listModelSources]: ListModelSourcesResponse;
+  readonly [DESKTOP_IPC_CHANNELS.upsertModelSource]: UpsertModelSourceResponse;
+  readonly [DESKTOP_IPC_CHANNELS.deleteModelSource]: EmptyDesktopResponse;
+  readonly [DESKTOP_IPC_CHANNELS.confirmModelSource]: ConfirmModelSourceResponse;
+  readonly [DESKTOP_IPC_CHANNELS.getWorkspacePrefs]: WorkspacePrefsProjection;
+  readonly [DESKTOP_IPC_CHANNELS.setWorkspacePrefs]: WorkspacePrefsProjection;
+  readonly [DESKTOP_IPC_CHANNELS.browserCommand]: BrowserPaneProjection;
 };
 
 export type DesktopInvokeChannel = keyof DesktopRequestByChannel;
@@ -926,11 +1026,35 @@ export type GuildRendererApi = Readonly<{
   readonly runGrokManagement: (
     request: RunGrokManagementRequest,
   ) => Promise<RunGrokManagementResponse>;
+  readonly setTaskEngine: (request: SetTaskEngineRequest) => Promise<TaskViewProjection>;
+  readonly setClaudeSettings: (
+    request: SetClaudeSettingsRequest,
+  ) => Promise<DesktopBootstrapProjection>;
+  readonly listModelSources: () => Promise<ListModelSourcesResponse>;
+  readonly upsertModelSource: (
+    request: UpsertModelSourceRequest,
+  ) => Promise<UpsertModelSourceResponse>;
+  readonly deleteModelSource: (
+    request: DeleteModelSourceRequest,
+  ) => Promise<EmptyDesktopResponse>;
+  readonly confirmModelSource: (
+    request: ConfirmModelSourceRequest,
+  ) => Promise<ConfirmModelSourceResponse>;
+  readonly getWorkspacePrefs: (
+    request: GetWorkspacePrefsRequest,
+  ) => Promise<WorkspacePrefsProjection>;
+  readonly setWorkspacePrefs: (
+    request: SetWorkspacePrefsRequest,
+  ) => Promise<WorkspacePrefsProjection>;
+  readonly browserCommand: (request: BrowserCommand) => Promise<BrowserPaneProjection>;
   readonly onProjectionChanged: (
     listener: (projection: DesktopBootstrapProjection) => void,
   ) => () => void;
   readonly onStreamDelta: (
     listener: (event: StreamDeltaEvent) => void,
+  ) => () => void;
+  readonly onBrowserPaneChanged: (
+    listener: (projection: BrowserPaneProjection) => void,
   ) => () => void;
 }>;
 
@@ -1098,20 +1222,56 @@ export function parseDesktopRequest<Channel extends DesktopInvokeChannel>(
     case DESKTOP_IPC_CHANNELS.restoreUserData:
     case DESKTOP_IPC_CHANNELS.backupUserData:
     case DESKTOP_IPC_CHANNELS.openRuntimeDiagnostics:
+    case DESKTOP_IPC_CHANNELS.listModelSources:
       return exactRecord(input, []) as DesktopRequestByChannel[Channel];
     case DESKTOP_IPC_CHANNELS.createTask: {
-      const record = exactRecord(input, ["workspaceId"], ["isolation"]);
+      const record = exactRecord(input, ["workspaceId"], ["isolation", "engine"]);
       const parsed = parseWorkspaceId(record["workspaceId"]);
       const isolation = record["isolation"];
       if (!parsed.ok) throw new TypeError("invalid_workspace_id");
       if (isolation !== undefined && !(GUILD_TASK_ISOLATIONS as readonly unknown[]).includes(isolation)) {
         throw new TypeError("invalid_task_isolation");
       }
+      const engine = record["engine"] === undefined ? undefined : parseGuildEngine(record["engine"]);
       return Object.freeze({
         workspaceId: boundedId(parsed.value),
         ...(isolation === undefined ? {} : { isolation: isolation as GuildTaskIsolation }),
+        ...(engine === undefined ? {} : { engine }),
       }) as DesktopRequestByChannel[Channel];
     }
+    case DESKTOP_IPC_CHANNELS.setTaskEngine: {
+      const record = exactRecord(input, ["taskId", "engine"]);
+      const parsed = parseTaskId(record["taskId"]);
+      if (!parsed.ok) throw new TypeError("invalid_task_id");
+      return Object.freeze({
+        taskId: boundedId(parsed.value),
+        engine: parseGuildEngine(record["engine"]),
+      }) as DesktopRequestByChannel[Channel];
+    }
+    case DESKTOP_IPC_CHANNELS.upsertModelSource:
+      return parseModelSourceDraft(input) as DesktopRequestByChannel[Channel];
+    case DESKTOP_IPC_CHANNELS.deleteModelSource:
+    case DESKTOP_IPC_CHANNELS.confirmModelSource:
+      return parseModelSourceIdRequest(input) as DesktopRequestByChannel[Channel];
+    case DESKTOP_IPC_CHANNELS.getWorkspacePrefs: {
+      const record = exactRecord(input, ["workspaceId"]);
+      const parsed = parseWorkspaceId(record["workspaceId"]);
+      if (!parsed.ok) throw new TypeError("invalid_workspace_id");
+      return Object.freeze({ workspaceId: boundedId(parsed.value) }) as DesktopRequestByChannel[Channel];
+    }
+    case DESKTOP_IPC_CHANNELS.setWorkspacePrefs: {
+      const record = exactRecord(input, ["workspaceId", "onlineReminderDismissed"]);
+      const parsed = parseWorkspaceId(record["workspaceId"]);
+      if (!parsed.ok || typeof record["onlineReminderDismissed"] !== "boolean") {
+        throw new TypeError("invalid_workspace_prefs");
+      }
+      return Object.freeze({
+        workspaceId: boundedId(parsed.value),
+        onlineReminderDismissed: record["onlineReminderDismissed"],
+      }) as DesktopRequestByChannel[Channel];
+    }
+    case DESKTOP_IPC_CHANNELS.browserCommand:
+      return parseBrowserCommand(input) as DesktopRequestByChannel[Channel];
     case DESKTOP_IPC_CHANNELS.choosePromptFiles: {
       const record = exactRecord(input, ["taskId"]);
       const parsed = parseTaskId(record["taskId"]);
@@ -1199,7 +1359,9 @@ export function parseDesktopRequest<Channel extends DesktopInvokeChannel>(
       const record = exactRecord(input, ["taskId", "model", "reasoningEffort"], ["contextWindow"]);
       const parsed = parseTaskId(record["taskId"]);
       if (!parsed.ok) throw new TypeError("invalid_task_runtime_settings");
-      const model = record["model"] === null ? null : parseGuildGrokModel(record["model"]);
+      // The request names a task, not its engine: the wider grammar applies here, the task's own
+      // engine rule (Grok: official grok-* only) is enforced by main and the store.
+      const model = record["model"] === null ? null : parseGuildModelIdOfAnyEngine(record["model"]);
       const reasoningEffort = record["reasoningEffort"] === null
         ? null
         : parseGuildGrokReasoningEffort(record["reasoningEffort"]);
@@ -1462,6 +1624,15 @@ export function parseDesktopRequest<Channel extends DesktopInvokeChannel>(
       const startup = parseGuildGrokStartupSettings(record["startup"]);
       return Object.freeze({ model, reasoningEffort, permissionMode, startup }) as DesktopRequestByChannel[Channel];
     }
+    case DESKTOP_IPC_CHANNELS.setClaudeSettings: {
+      const record = exactRecord(input, ["model", "reasoningEffort", "permissionMode"]);
+      const model = record["model"] === null ? null : parseGuildClaudeModel(record["model"]);
+      const reasoningEffort = record["reasoningEffort"] === null
+        ? null
+        : parseGuildClaudeReasoningEffort(record["reasoningEffort"]);
+      const permissionMode = parseGuildClaudePermissionMode(record["permissionMode"]);
+      return Object.freeze({ model, reasoningEffort, permissionMode }) as DesktopRequestByChannel[Channel];
+    }
     case DESKTOP_IPC_CHANNELS.setSidebarWidth: {
       const record = exactRecord(input, ["width"]);
       const width = record["width"];
@@ -1550,40 +1721,6 @@ function parseSaveProfileAvatar(value: unknown): SaveProfileAvatar {
   return Object.freeze({
     previewToken: parseAvatarPreviewToken(record["previewToken"]),
   });
-}
-
-function exactRecord(
-  input: unknown,
-  required: readonly string[],
-  optional: readonly string[] = [],
-): Record<string, unknown> {
-  if (input === null || typeof input !== "object" || Array.isArray(input)) {
-    throw new TypeError("invalid_request");
-  }
-  const prototype = Object.getPrototypeOf(input) as unknown;
-  if (prototype !== Object.prototype && prototype !== null) {
-    throw new TypeError("invalid_request");
-  }
-  const allowed = new Set([...required, ...optional]);
-  const keys = Reflect.ownKeys(input);
-  if (
-    keys.some((key) => typeof key !== "string" || !allowed.has(key)) ||
-    required.some((key) => !Object.hasOwn(input, key))
-  ) {
-    throw new TypeError("invalid_request");
-  }
-  const copied: Record<string, unknown> = {};
-  for (const key of [...required, ...optional]) {
-    if (Object.hasOwn(input, key)) copied[key] = Reflect.get(input, key);
-  }
-  return copied;
-}
-
-function boundedText(value: unknown, maxLength: number): string {
-  if (typeof value !== "string" || value.length === 0 || value.length > maxLength || value.includes("\0")) {
-    throw new TypeError("invalid_text");
-  }
-  return value;
 }
 
 function boundedId<T extends string>(value: T): T {

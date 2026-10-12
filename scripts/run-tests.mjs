@@ -24,6 +24,11 @@ const PACKAGES = [
     src: join(repoRoot, "packages/domain/src"),
   },
   {
+    name: "@guild/model-router",
+    dist: join(repoRoot, "packages/model-router/dist"),
+    src: join(repoRoot, "packages/model-router/src"),
+  },
+  {
     name: "@guild/persistence",
     dist: join(repoRoot, "packages/persistence/dist"),
     src: join(repoRoot, "packages/persistence/src"),
@@ -60,6 +65,14 @@ const REQUIRED_TEST_BASENAMES = {
     "session-binding.test.js",
     "permission-machine.test.js",
     "event-admission.test.js",
+  ],
+  "@guild/model-router": [
+    "compat.test.js",
+    "env-file.test.js",
+    "network-policy.test.js",
+    "provenance.test.js",
+    "router.test.js",
+    "sse.test.js",
   ],
   "@guild/persistence": ["lease.test.js", "store.test.js"],
   "@guild/runtime-grok": [

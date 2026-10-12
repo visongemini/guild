@@ -1,6 +1,6 @@
 schema_version: 1
 document_id: GUILD2-REQUIREMENTS
-product_version: 2.0.27
+product_version: 3.0.0
 baseline_ui: Guild 1.1.13
 status: implementation
 
@@ -10,6 +10,13 @@ id_policy:
   rule: >-
     Published requirement IDs are never renamed or reused. Superseded requirements remain
     present with a disposition and replacement ID.
+  disposition:
+    superseded: >-
+      The whole requirement is replaced. superseded_by lists the replacement IDs and the entry
+      stays in the file unchanged.
+    superseded_in_part: >-
+      Only the clauses named in disposition_note are replaced. superseded_by lists the replacement
+      IDs and the remaining text stays normative.
 
 traceability_policy:
   pre_implementation: implementation_commits may be empty only while no production code implements the requirement.
@@ -84,6 +91,25 @@ acceptance_stories:
     summary: >-
       Package consecutive local Guild releases under one certificate-backed designated requirement
       so macOS recognizes updates without reverting to a per-build ad-hoc identity.
+  AS-011:
+    source: docs/01-PRODUCT-CONTRACT.md#acceptance-stories
+    summary: >-
+      Run a task on the Claude engine with the user's own subscription login, write and read a file
+      through a permission card, quit, reopen and resume, then switch the same task from Claude to an
+      Online model and back with tools, see the Online reminder once, run a Local model turn without
+      duplicated reply text, and show that OAuth credentials reach only api.anthropic.com.
+  AS-012:
+    source: docs/01-PRODUCT-CONTRACT.md#acceptance-stories
+    summary: >-
+      Log in manually in the browser pane and keep the login across restart, let an agent navigate a
+      local dev server, take a screenshot and click, see the operating badge, take over and resume,
+      and confirm the pane cannot reach Node or the Guild UI.
+  AS-013:
+    source: docs/01-PRODUCT-CONTRACT.md#acceptance-stories
+    summary: >-
+      Observe OpenViking recall in Claude tasks, no capture in routed Claude sessions and nothing in
+      Grok tasks, and see every reduced-capability state render truthfully with no blank area or
+      stuck spinner.
 
 acceptance_tests:
   CT-TRACE-001:
@@ -294,6 +320,79 @@ acceptance_tests:
     phase: 4
     status: planned
     proves: Neutral import dry-run, atomic commit, idempotent re-import, conflict handling and snapshot restore pass.
+  AT-ENGINE-001:
+    layer: packaged-acceptance
+    phase: 3
+    status: planned
+    proves: >-
+      A new task's picker offers the Grok group and the first turn fixes the engine, a Claude task on
+      the user's subscription completes a file write and read behind a permission card, survives quit
+      and resume, shows no gateway in /status, and renders each reduced-capability state truthfully.
+  AT-ROUTER-001:
+    layer: packaged-integration
+    phase: 3
+    status: planned
+    proves: >-
+      The router refuses a non-loopback bind at startup, answers a wrong token with 404, answers an
+      unknown model with a 404 JSON error without any default upstream, never follows a redirect and
+      lists only configured Online and Local models.
+  AT-ROUTER-002:
+    layer: packaged-integration
+    phase: 3
+    status: planned
+    proves: >-
+      OAuth credentials are forwarded only to api.anthropic.com over https with the header allowlist,
+      Online and Local requests carry only their own source key, keys come from the user env file
+      into memory only, a source change needs a native confirmation naming variable and host, and no
+      secret appears in SQLite, IPC payloads, logs or the package.
+  AT-ROUTER-003:
+    layer: packaged-acceptance
+    phase: 3
+    status: planned
+    proves: >-
+      Against fake upstreams including a recorded llama.cpp stream, the compat layer, thinking
+      provenance filter and local SSE normalizer hold; the same task moves Opus to an Online model
+      and back with tools, and a Local turn shows no duplicated text.
+  AT-BROWSER-001:
+    layer: packaged-acceptance
+    phase: 3
+    status: planned
+    proves: >-
+      The browser pane uses partition persist:guild-browser with sandbox, context isolation, no node
+      integration and no preload, enforces the navigation, permission, download and window.open
+      policy, keeps a manual login across restart, cannot reach Node or the Guild UI, and leaves
+      Guild's own renderer guards unchanged.
+  AT-BROWSER-002:
+    layer: packaged-acceptance
+    phase: 3
+    status: planned
+    proves: >-
+      The browser MCP server answers only its listed methods on a loopback token URL, offers no eval
+      tool, raises a permission card for each tool call, and the operating badge, Take over and
+      Resume agent behave as specified while an agent navigates a local dev server.
+  AT-PRIV-001:
+    layer: packaged-acceptance
+    phase: 3
+    status: planned
+    proves: >-
+      The first switch to an Online model shows the reminder naming CLAUDE.md, memory, conversation
+      and browser content, the per-workspace opt-out persists, and Claude and Local models never
+      show it.
+  AT-OV-001:
+    layer: packaged-acceptance
+    phase: 3
+    status: planned
+    proves: >-
+      OpenViking recall works in Claude tasks, automatic capture is off in routed Claude sessions,
+      and Grok tasks still receive the kill-switch environment block.
+  AT-SET-002:
+    layer: packaged-acceptance
+    phase: 3
+    status: planned
+    proves: >-
+      Settings show General, Engines, Model sources, Privacy and About, persist the settings of each,
+      never display or store a key value, and apply a source change only after the native
+      confirmation.
   EV-RELEASE-001:
     layer: release-evidence
     phase: 5
@@ -376,6 +475,13 @@ requirements:
     acceptance_tests: [EV-ACP-001, IT-SEC-001, EV-RELEASE-001]
     implementation_commits: [effe75f69f28b8ca025027ee9ceb9d85f8c695b2, c67b33be224c9372bbb93848e8d1fec340b79a2d, ec1f1e59b58d91cca2650d4a83f7f2b14294c721]
     sources: [AGENTS.md, docs/01-PRODUCT-CONTRACT.md, docs/02-ARCHITECTURE.md]
+    disposition: superseded_in_part
+    superseded_by: [PC-ROUTE-001, PC-ROUTE-002]
+    disposition_note: >-
+      Unchanged for every Grok upstream request. The clauses that Guild exposes no gateway and never
+      sends the upstream request itself are replaced for routed Claude sessions by a loopback-only,
+      token-guarded, single-user router that forwards requests (D-058). A shared or externally
+      reachable gateway stays prohibited.
 
   - id: PC-SEC-002
     title: No unsolicited startup access
@@ -778,6 +884,11 @@ requirements:
     acceptance_tests: [AT-SET-001, AT-I18N-001, AT-ATTENTION-001]
     implementation_commits: []
     sources: [docs/01-PRODUCT-CONTRACT.md, docs/04-DECISION-LOG.md]
+    disposition: superseded
+    superseded_by: [PC-SET-002]
+    disposition_note: >-
+      Replaced by the tab set General, Engines, Model sources, Privacy and About (D-057, D-058). Its
+      persistence rules carry over into PC-SET-002.
 
   - id: PC-ACC-001
     title: Official account and runtime facts only
@@ -794,6 +905,12 @@ requirements:
     acceptance_tests: [EV-ACP-003, AT-ACCOUNT-001]
     implementation_commits: [3c2c0e2ca6154fdca04a6892b2ea2e43a18e5b81, 1ea41c787cf577db621033278d55091ae0a7e670, c67b33be224c9372bbb93848e8d1fec340b79a2d, ec1f1e59b58d91cca2650d4a83f7f2b14294c721, 5711a51ef82ae71494816e7fb25c914586fef308]
     sources: [docs/01-PRODUCT-CONTRACT.md, docs/02-ARCHITECTURE.md]
+    disposition: superseded_in_part
+    superseded_by: [PC-MODEL-001]
+    disposition_note: >-
+      The clause that no third-party model adapter, provider route or selector containing external
+      models exists is replaced. It now holds for the Grok engine only (D-057, D-058). The rest
+      stays normative for the Grok engine.
 
   - id: PC-GROK-001
     title: Complete typed official Grok feature center
@@ -813,6 +930,12 @@ requirements:
     acceptance_tests: [AT-GROK-001, AT-I18N-001, IT-SEC-001]
     implementation_commits: []
     sources: [docs/01-PRODUCT-CONTRACT.md, docs/02-ARCHITECTURE.md, docs/17-GROK-BUILD-1.0.13-GUI-SURFACE.md]
+    disposition: superseded_in_part
+    superseded_by: [PC-ENG-001, PC-MODEL-001]
+    disposition_note: >-
+      The clause that external models remain impossible now applies to the Grok engine and its
+      feature center only. Online and Local models exist only in Claude tasks, through the router
+      (D-057, D-058).
 
   - id: PC-SIGN-001
     title: Stable local macOS update identity
@@ -863,3 +986,171 @@ requirements:
     acceptance_tests: [EV-RELEASE-001]
     implementation_commits: []
     sources: [docs/00-PROVENANCE-CHARTER.md, docs/03-ROADMAP-AND-GATES.md]
+
+  - id: PC-ENG-001
+    title: Two engines with a per-task engine binding
+    statement: >-
+      Guild runs a task on one of two engines, the official Grok process or the user-installed
+      Claude Code adapter. The task's engine is set when its first turn is created and never changes;
+      the model group chosen for that turn fixes it. One engine process serves each active task. A
+      capability an engine lacks is shown as a named reduced state in Chinese and English and is never
+      simulated.
+    severity: P0
+    phase: 3
+    acceptance_stories: [AS-001, AS-011, AS-013]
+    acceptance_tests: [AT-ENGINE-001, AT-I18N-001, EV-RELEASE-001]
+    implementation_commits: []
+    sources: [docs/20-GUILD3-DUAL-ENGINE.md, docs/04-DECISION-LOG.md, docs/01-PRODUCT-CONTRACT.md]
+
+  - id: PC-ENG-002
+    title: Pinned user-installed Claude engine without credential access
+    statement: >-
+      The Claude engine runs the user-installed ACP adapter under the user's node and the
+      user-installed claude binary; Guild distributes neither. The adapter is pinned by a version
+      range and a SHA-256 over its installed package.json and dist tree, and a mismatch refuses to
+      start with a named error. The child environment is an allowlist with every inherited ANTHROPIC_
+      and CLAUDE_CODE_ variable stripped. Guild never reads Claude credentials and never calls the
+      adapter's authenticate method; a missing login is shown as a named reduced state.
+    severity: P0
+    phase: 3
+    acceptance_stories: [AS-011]
+    acceptance_tests: [AT-ENGINE-001, IT-SEC-001, EV-RELEASE-001]
+    implementation_commits: []
+    sources: [docs/20-GUILD3-DUAL-ENGINE.md, docs/04-DECISION-LOG.md]
+
+  - id: PC-MODEL-001
+    title: Grouped model picker limited to reported or configured models
+    statement: >-
+      The model picker groups models as Grok, Claude, Online and Local. A Grok task lists only models
+      the official Grok process reports. A Claude task lists the models its adapter reports plus the
+      enabled Online and Local models of sources the user configured and confirmed. Nothing from any
+      other origin is selectable. Inside a Claude task the model can change between turns.
+    severity: P1
+    phase: 3
+    acceptance_stories: [AS-007, AS-011]
+    acceptance_tests: [AT-ENGINE-001, AT-ROUTER-003, AT-I18N-001]
+    implementation_commits: []
+    sources: [docs/20-GUILD3-DUAL-ENGINE.md, docs/04-DECISION-LOG.md, docs/01-PRODUCT-CONTRACT.md]
+
+  - id: PC-ROUTE-001
+    title: Loopback-only token-guarded router with an exact model registry
+    statement: >-
+      Guild's model router listens on 127.0.0.1 only, on a random port, under a random path token. A
+      wrong token is answered with 404 and binding to a non-loopback address fails at startup. Only
+      models in its exact registry are served; an unknown model is a 404 JSON error and never reaches
+      a default upstream. Redirects are never followed. The router is single-user and is never a
+      shared or externally reachable gateway.
+    severity: P0
+    phase: 3
+    acceptance_stories: [AS-011]
+    acceptance_tests: [AT-ROUTER-001, IT-SEC-001, EV-RELEASE-001]
+    implementation_commits: []
+    sources: [docs/20-GUILD3-DUAL-ENGINE.md, docs/04-DECISION-LOG.md, docs/02-ARCHITECTURE.md]
+
+  - id: PC-ROUTE-002
+    title: Credentials reach only their own host
+    statement: >-
+      OAuth and Authorization values from Claude Code are forwarded only to api.anthropic.com over
+      https with a request-header allowlist. Online and Local sources receive their own key and never
+      Anthropic credentials. Third-party keys are read in main from a user-designated env file, kept in
+      memory only, and never written to SQLite, IPC payloads, the renderer or logs. Adding a source or
+      changing its base URL or key variable needs a native confirmation naming the variable and the
+      host, and a key is sent only to the host it was confirmed for. Online sources are https only and
+      Local sources must resolve to loopback or 100.64.0.0/10. Logs carry model, source id, status and
+      booleans, never credential or header values.
+    severity: P0
+    phase: 3
+    acceptance_stories: [AS-011]
+    acceptance_tests: [AT-ROUTER-002, IT-SEC-001, EV-SCAN-001, EV-RELEASE-001]
+    implementation_commits: []
+    sources: [docs/20-GUILD3-DUAL-ENGINE.md, docs/04-DECISION-LOG.md, docs/09-ELECTRON-SECURITY-PROFILE.md]
+
+  - id: PC-ROUTE-003
+    title: Compat layer, thinking provenance and local stream normalization
+    statement: >-
+      For Online and Local sources the router normalizes the request shapes that plain
+      Anthropic-compatible backends reject, drops thinking blocks the target source did not produce
+      according to recorded signature provenance, and re-sequences local content-block events so a
+      reply is never duplicated. Anthropic receives the original body. The router speaks the Anthropic
+      Messages protocol only and performs no OpenAI-protocol translation.
+    severity: P1
+    phase: 3
+    acceptance_stories: [AS-011]
+    acceptance_tests: [AT-ROUTER-003]
+    implementation_commits: []
+    sources: [docs/20-GUILD3-DUAL-ENGINE.md, docs/04-DECISION-LOG.md]
+
+  - id: PC-BROWSER-001
+    title: Isolated browser pane
+    statement: >-
+      The browser pane runs in session partition persist:guild-browser with sandbox and context
+      isolation on, node integration off and no preload. Only web contents created by the browser
+      module may navigate http, https or about:blank; Guild's own renderer keeps every existing
+      navigation, window and IPC guard unchanged, and the guards key on a web-contents id registry,
+      not on URL heuristics. Permission requests are denied, downloads need a native save dialog,
+      window.open opens a pane tab (at most 5) or is denied, and no external login state is copied.
+    severity: P0
+    phase: 3
+    acceptance_stories: [AS-005, AS-012]
+    acceptance_tests: [AT-BROWSER-001, IT-SEC-001, EV-RELEASE-001]
+    implementation_commits: []
+    sources: [docs/20-GUILD3-DUAL-ENGINE.md, docs/04-DECISION-LOG.md, docs/09-ELECTRON-SECURITY-PROFILE.md]
+
+  - id: PC-BROWSER-002
+    title: Browser MCP server without eval, with permission cards and user takeover
+    statement: >-
+      Agents control the browser pane through a loopback MCP server in the main process, on a random
+      port under a random token, that answers only initialize, notifications/initialized, ping,
+      tools/list and tools/call. Its fixed tool set contains no eval or script-execution tool. Each
+      tool call goes through the engine's normal permission flow. An agent-operating badge is shown
+      while an agent controls the pane, and Take over makes the tools answer paused by user until the
+      user resumes the agent.
+    severity: P0
+    phase: 3
+    acceptance_stories: [AS-012]
+    acceptance_tests: [AT-BROWSER-002, IT-SEC-001, EV-RELEASE-001]
+    implementation_commits: []
+    sources: [docs/20-GUILD3-DUAL-ENGINE.md, docs/04-DECISION-LOG.md, docs/09-ELECTRON-SECURITY-PROFILE.md]
+
+  - id: PC-PRIV-001
+    title: Online-model reminder with per-workspace opt-out
+    statement: >-
+      The first time a session switches to an Online model, Guild asks for confirmation stating that
+      CLAUDE.md, memory, the conversation, and browser page text or screenshots in the conversation
+      will be sent to the vendor. The user can choose not to be reminded again in that workspace, and
+      the choice persists per workspace. Claude and Local models never trigger the reminder.
+    severity: P0
+    phase: 3
+    acceptance_stories: [AS-011]
+    acceptance_tests: [AT-PRIV-001, AT-I18N-001]
+    implementation_commits: []
+    sources: [docs/20-GUILD3-DUAL-ENGINE.md, docs/04-DECISION-LOG.md, docs/01-PRODUCT-CONTRACT.md]
+
+  - id: PC-OV-001
+    title: OpenViking policy per engine and routed state
+    statement: >-
+      On the Claude engine OpenViking memory is on. In a routed Claude session automatic capture is off
+      while recall stays. On the Grok engine the Guild-owned environment block that keeps OpenViking
+      out of the session is unchanged.
+    severity: P1
+    phase: 3
+    acceptance_stories: [AS-013]
+    acceptance_tests: [AT-OV-001]
+    implementation_commits: []
+    sources: [docs/20-GUILD3-DUAL-ENGINE.md, docs/04-DECISION-LOG.md]
+
+  - id: PC-SET-002
+    title: Settings tabs General, Engines, Model sources, Privacy and About
+    statement: >-
+      Settings open as an independent dialog with General, Engines, Model sources, Privacy and About.
+      Language, restore-last-task, new-task workspace mode and background-task notification policy
+      persist. Engines shows each engine's status and settings; the official Grok model, reasoning
+      effort and tool authorization are sent to the official process. Model sources holds the Online
+      and Local sources, whose key values are never displayed or stored by Guild and whose changes
+      need a native confirmation. Browser login sync stays off and unavailable.
+    severity: P1
+    phase: 3
+    acceptance_stories: [AS-005, AS-007, AS-011]
+    acceptance_tests: [AT-SET-002, AT-SET-001, AT-I18N-001, AT-ATTENTION-001]
+    implementation_commits: []
+    sources: [docs/20-GUILD3-DUAL-ENGINE.md, docs/01-PRODUCT-CONTRACT.md, docs/04-DECISION-LOG.md]

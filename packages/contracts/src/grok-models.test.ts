@@ -1,11 +1,15 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  EMPTY_CLAUDE_MODEL_CATALOG,
   EMPTY_GROK_MODEL_CATALOG,
   defaultReasoningEffortOf,
   freezeGrokModelCatalog,
+  freezeModelCatalog,
   grokModelById,
   isOfficialGrokModelId,
+  modelCatalogEngineOf,
+  modelGroupOf,
   modelSupportsReasoningEffort,
   parseGuildGrokContextWindow,
   parseGuildGrokModel,
@@ -147,4 +151,98 @@ test("the session's own official options give its model and effort", () => {
   assert.equal(selectionOptionsOf(options).effort?.id, "reasoning_effort");
   assert.deepEqual(sessionSelectionOf([]), {});
   assert.deepEqual(sessionSelectionOf([{ id: "model", category: "model", type: "boolean", currentValue: true }]), {});
+});
+
+const claudeRaw = {
+  runtimeDefaultModelId: "default",
+  models: [
+    { id: "default", name: "Default", reasoningEfforts: [effort("high", true), effort("low")], contextWindows: [] },
+    { id: "opus", name: "Opus", group: "claude", reasoningEfforts: [effort("max"), effort("high", true)], contextWindows: [200_000, 1_000_000] },
+    { id: "claude-fable-5-1[1m]", name: "Fable 5.1 (1M)", group: "claude", reasoningEfforts: [], contextWindows: [1_000_000] },
+    { id: "deepseek-v4-flash", name: "DeepSeek V4 Flash", group: "online", reasoningEfforts: [], contextWindows: [128_000] },
+    { id: "local-27b-model", name: "Local 27B", group: "local", reasoningEfforts: [], contextWindows: [] },
+  ],
+};
+
+test("a Grok catalog keeps its Grok-era shape: no labels, and an absent label means grok (PC-MODEL-001)", () => {
+  const catalog = freezeGrokModelCatalog(rawCatalog);
+  assert.equal(Object.hasOwn(catalog, "engine"), false);
+  assert.equal(catalog.models.some((model) => Object.hasOwn(model, "group")), false);
+  assert.equal(modelCatalogEngineOf(catalog), "grok");
+  assert.deepEqual(catalog.models.map((model) => modelGroupOf(model)), ["grok", "grok", "grok", "grok"]);
+  assert.deepEqual(freezeModelCatalog("grok", rawCatalog), catalog, "the generic entry point agrees");
+  assert.deepEqual(EMPTY_GROK_MODEL_CATALOG, { models: [] });
+  // A cache written after labelling, or by hand, normalizes to the same value.
+  const labelled = {
+    ...rawCatalog,
+    engine: "grok",
+    models: rawCatalog.models.map((model) => ({ ...model, group: "grok" })),
+  };
+  assert.deepEqual(freezeGrokModelCatalog(labelled), catalog);
+  assert.throws(() => freezeGrokModelCatalog({ ...rawCatalog, engine: "claude" }), /grok_model_catalog_engine_mismatch/u);
+  const withGroup = (group: unknown) => ({
+    models: [{ ...rawCatalog.models[3]!, group }],
+  });
+  for (const group of ["claude", "online", "local", "", 1, null]) {
+    assert.throws(() => freezeGrokModelCatalog(withGroup(group)), /grok_model_catalog_invalid_group/u, String(group));
+  }
+  // Hand-built values keep their Grok-era meaning too.
+  assert.equal(modelCatalogEngineOf({ models: [] }), "grok");
+  assert.equal(modelGroupOf({ id: "grok-4.7", name: "n", reasoningEfforts: [], contextWindows: [] }), "grok");
+  assert.equal(modelGroupOf({ id: "opus", name: "n", group: "claude", reasoningEfforts: [], contextWindows: [] }), "claude");
+});
+
+test("a Claude catalog follows the Claude id grammar and carries claude, online and local groups", () => {
+  const catalog = freezeModelCatalog("claude", claudeRaw);
+  assert.equal(catalog.engine, "claude");
+  assert.equal(Object.isFrozen(catalog), true);
+  assert.equal(Object.isFrozen(catalog.models[1]), true);
+  assert.deepEqual(catalog.models.map((model) => [model.id, model.group]), [
+    ["default", "claude"],
+    ["opus", "claude"],
+    ["claude-fable-5-1[1m]", "claude"],
+    ["deepseek-v4-flash", "online"],
+    ["local-27b-model", "local"],
+  ]);
+  assert.equal(runtimeDefaultModelOf(catalog)?.id, "default");
+  assert.equal(defaultReasoningEffortOf(grokModelById(catalog, "opus")), "high");
+  assert.deepEqual(freezeModelCatalog("claude", JSON.parse(JSON.stringify(catalog))), catalog, "round trips through the JSON cache");
+  assert.deepEqual(freezeModelCatalog("claude", { models: [] }), EMPTY_CLAUDE_MODEL_CATALOG);
+  assert.equal(EMPTY_CLAUDE_MODEL_CATALOG.engine, "claude");
+
+  const mutate = (change: (copy: typeof claudeRaw) => void): unknown => {
+    const copy = JSON.parse(JSON.stringify(claudeRaw)) as typeof claudeRaw;
+    change(copy);
+    return copy;
+  };
+  const rejected: Array<[string, RegExp, unknown]> = [
+    ["a space in an id", /claude_model_catalog_invalid_model/u, mutate((c) => { c.models[1]!.id = "claude opus"; })],
+    ["a slash in an id", /claude_model_catalog_invalid_model/u, mutate((c) => { c.models[1]!.id = "claude/opus"; })],
+    ["a 129 character id", /claude_model_catalog_invalid_string/u, mutate((c) => { c.models[1]!.id = "x".repeat(129); })],
+    ["the grok group", /claude_model_catalog_invalid_group/u, mutate((c) => { (c.models[1] as Record<string, unknown>)["group"] = "grok"; })],
+    ["an unknown group", /claude_model_catalog_invalid_group/u, mutate((c) => { (c.models[1] as Record<string, unknown>)["group"] = "remote"; })],
+    ["a duplicate id", /claude_model_catalog_duplicate_model/u, mutate((c) => { c.models[2]!.id = "opus"; })],
+    ["a default not in the list", /claude_model_catalog_unknown_default_model/u, { ...claudeRaw, runtimeDefaultModelId: "sonnet" }],
+    ["a grok engine label", /claude_model_catalog_engine_mismatch/u, { ...claudeRaw, engine: "grok" }],
+    ["an extra root key", /claude_model_catalog_unexpected_key/u, { ...claudeRaw, extra: 1 }],
+    ["a bad effort id", /claude_model_catalog_invalid_effort_id/u, mutate((c) => { c.models[0]!.reasoningEfforts[0]!.id = "High"; })],
+  ];
+  for (const [label, pattern, value] of rejected) {
+    assert.throws(() => freezeModelCatalog("claude", value), pattern, label);
+  }
+  // The same data is not a Grok catalog: Claude ids do not pass the D-011 policy.
+  assert.throws(() => freezeModelCatalog("grok", claudeRaw), /grok_model_catalog_unofficial_model/u);
+  assert.throws(() => freezeGrokModelCatalog(claudeRaw), /grok_model_catalog_/u);
+});
+
+test("a Claude catalog may hold native models plus the models of every source, a Grok catalog stays at 32", () => {
+  const many = (count: number, prefix: string) => ({
+    models: Array.from({ length: count }, (_, i) => ({
+      id: `${prefix}${i}`, name: "n", reasoningEfforts: [], contextWindows: [],
+    })),
+  });
+  assert.equal(freezeModelCatalog("claude", many(256, "model-")).models.length, 256);
+  assert.throws(() => freezeModelCatalog("claude", many(257, "model-")), /claude_model_catalog_invalid_models/u);
+  assert.equal(freezeModelCatalog("grok", many(32, "grok-")).models.length, 32);
+  assert.throws(() => freezeModelCatalog("grok", many(33, "grok-")), /grok_model_catalog_invalid_models/u);
 });

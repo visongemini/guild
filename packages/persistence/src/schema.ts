@@ -1,7 +1,7 @@
 import type { DatabaseSync } from "node:sqlite";
 import { persistenceError } from "./errors.js";
 
-export const SCHEMA_VERSION = 18;
+export const SCHEMA_VERSION = 19;
 
 const MIGRATION_V1 = String.raw`
 CREATE TABLE schema_migrations (
@@ -1226,6 +1226,197 @@ INSERT INTO schema_migrations(version, name, applied_at_ms)
 VALUES(18, 'task_worktrees', CAST(unixepoch('subsec') * 1000 AS INTEGER));
 `;
 
+// V19 (Guild 3.0 dual engine: PC-ENG-001, PC-MODEL-001, PC-ROUTE-002, PC-PRIV-001). Forward-only;
+// no historical conversation, run or permission row is read or rewritten.
+// 1. task_metadata.engine ('grok' | 'claude', every existing task is 'grok') is fixed once the task
+//    has a Run (trigger); routed_at_ms marks the first switch to an Online / Local model, is only
+//    legal on a Claude task and never changes or clears once set (trigger).
+// 2. app_settings gains the Claude-engine defaults. Their model and effort accept the empty string
+//    ("follow the adapter's default") or a Claude-grammar identifier. The Grok columns and their
+//    grok-* CHECK are untouched.
+// 3. task_runtime_settings.model_id accepts either engine's grammar (the store validates it against
+//    the task's engine). A trigger keeps the old guarantee for Grok tasks: their override is still
+//    a bounded official grok-* id, even through raw SQL.
+// 4. runtime_model_catalog holds one cached model list per engine; the existing row becomes 'grok'.
+// 5. model_sources holds Online / Local endpoints. There is NO secret column: a key is only named
+//    (key_file + key_variable) and read by the main process from the user's env file. The URL CHECK
+//    refuses user info, query and fragment so a key cannot ride along in the address, and
+//    confirmed_host (written only after the native confirmation) must be part of the base URL.
+// 6. workspace_prefs keeps per-workspace privacy choices; thinking_provenance maps the hash of a
+//    thinking signature to the source that produced it (the store prunes it to a bounded size).
+const MIGRATION_V19 = String.raw`
+CREATE TABLE guild_meta_next (
+  singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+  schema_version INTEGER NOT NULL CHECK(schema_version = 19),
+  clean_shutdown INTEGER NOT NULL CHECK(clean_shutdown IN (0, 1)),
+  last_integrity_at_ms INTEGER CHECK(last_integrity_at_ms IS NULL OR last_integrity_at_ms >= 0)
+) STRICT;
+
+INSERT INTO guild_meta_next(singleton, schema_version, clean_shutdown, last_integrity_at_ms)
+SELECT singleton, 19, clean_shutdown, last_integrity_at_ms FROM guild_meta;
+
+DROP TABLE guild_meta;
+ALTER TABLE guild_meta_next RENAME TO guild_meta;
+
+ALTER TABLE task_metadata
+ADD COLUMN engine TEXT NOT NULL DEFAULT 'grok'
+CHECK(engine IN ('grok', 'claude'));
+
+ALTER TABLE task_metadata
+ADD COLUMN routed_at_ms INTEGER
+CHECK(routed_at_ms IS NULL OR (routed_at_ms >= 0 AND engine = 'claude'));
+
+CREATE TRIGGER task_engine_is_fixed_after_first_run
+BEFORE UPDATE OF engine ON task_metadata
+WHEN NEW.engine IS NOT OLD.engine
+  AND EXISTS (SELECT 1 FROM runs WHERE task_id = OLD.task_id)
+BEGIN
+  SELECT RAISE(ABORT, 'task_engine_fixed_after_first_run');
+END;
+
+CREATE TRIGGER task_routed_marker_is_sticky
+BEFORE UPDATE OF routed_at_ms ON task_metadata
+WHEN OLD.routed_at_ms IS NOT NULL AND NEW.routed_at_ms IS NOT OLD.routed_at_ms
+BEGIN
+  SELECT RAISE(ABORT, 'task_routed_marker_immutable');
+END;
+
+ALTER TABLE app_settings
+ADD COLUMN claude_model TEXT NOT NULL DEFAULT ''
+CHECK(claude_model = '' OR (
+  length(claude_model) BETWEEN 1 AND 128
+  AND claude_model GLOB '[A-Za-z0-9]*'
+  AND claude_model NOT GLOB '*[^]A-Za-z0-9._:[-]*'
+));
+
+ALTER TABLE app_settings
+ADD COLUMN claude_effort TEXT NOT NULL DEFAULT ''
+CHECK(claude_effort = '' OR (
+  length(claude_effort) BETWEEN 1 AND 32
+  AND claude_effort GLOB '[a-z]*'
+  AND claude_effort NOT GLOB '*[^a-z0-9_-]*'
+));
+
+ALTER TABLE app_settings
+ADD COLUMN claude_permission_mode TEXT NOT NULL DEFAULT 'default'
+CHECK(claude_permission_mode IN ('default', 'acceptEdits', 'plan', 'auto', 'bypassPermissions'));
+
+CREATE TABLE task_runtime_settings_next (
+  task_id TEXT PRIMARY KEY REFERENCES tasks(task_id) ON DELETE RESTRICT,
+  model_id TEXT CHECK(model_id IS NULL OR (
+    length(model_id) BETWEEN 1 AND 128
+    AND model_id GLOB '[A-Za-z0-9]*'
+    AND model_id NOT GLOB '*[^]A-Za-z0-9._:[-]*'
+  )),
+  reasoning_effort TEXT CHECK(reasoning_effort IS NULL OR (
+    length(reasoning_effort) BETWEEN 1 AND 32
+    AND reasoning_effort GLOB '[a-z]*'
+    AND reasoning_effort NOT GLOB '*[^a-z0-9_-]*'
+  )),
+  context_window INTEGER CHECK(context_window IS NULL OR context_window BETWEEN 1 AND 100000000),
+  revision INTEGER NOT NULL CHECK(revision >= 1),
+  updated_at_ms INTEGER NOT NULL CHECK(updated_at_ms >= 0)
+) STRICT;
+
+INSERT INTO task_runtime_settings_next(
+  task_id, model_id, reasoning_effort, context_window, revision, updated_at_ms
+)
+SELECT task_id, model_id, reasoning_effort, context_window, revision, updated_at_ms
+FROM task_runtime_settings;
+
+DROP TABLE task_runtime_settings;
+ALTER TABLE task_runtime_settings_next RENAME TO task_runtime_settings;
+
+CREATE TRIGGER task_runtime_model_follows_engine_on_insert
+BEFORE INSERT ON task_runtime_settings
+WHEN NEW.model_id IS NOT NULL
+  AND (SELECT engine FROM task_metadata WHERE task_id = NEW.task_id) IS NOT 'claude'
+  AND NOT (
+    length(NEW.model_id) BETWEEN 1 AND 64
+    AND NEW.model_id GLOB 'grok-*'
+    AND NEW.model_id NOT GLOB '*[^A-Za-z0-9._:-]*'
+  )
+BEGIN
+  SELECT RAISE(ABORT, 'task_runtime_model_engine_mismatch');
+END;
+
+CREATE TRIGGER task_runtime_model_follows_engine_on_update
+BEFORE UPDATE OF model_id ON task_runtime_settings
+WHEN NEW.model_id IS NOT NULL
+  AND (SELECT engine FROM task_metadata WHERE task_id = NEW.task_id) IS NOT 'claude'
+  AND NOT (
+    length(NEW.model_id) BETWEEN 1 AND 64
+    AND NEW.model_id GLOB 'grok-*'
+    AND NEW.model_id NOT GLOB '*[^A-Za-z0-9._:-]*'
+  )
+BEGIN
+  SELECT RAISE(ABORT, 'task_runtime_model_engine_mismatch');
+END;
+
+CREATE TABLE runtime_model_catalog_next (
+  engine TEXT PRIMARY KEY CHECK(engine IN ('grok', 'claude')),
+  catalog_json TEXT NOT NULL CHECK(length(catalog_json) BETWEEN 2 AND 262144),
+  runtime_version TEXT CHECK(runtime_version IS NULL OR length(runtime_version) BETWEEN 1 AND 128),
+  updated_at_ms INTEGER NOT NULL CHECK(updated_at_ms >= 0)
+) STRICT;
+
+INSERT INTO runtime_model_catalog_next(engine, catalog_json, runtime_version, updated_at_ms)
+SELECT 'grok', catalog_json, runtime_version, updated_at_ms FROM runtime_model_catalog;
+
+DROP TABLE runtime_model_catalog;
+ALTER TABLE runtime_model_catalog_next RENAME TO runtime_model_catalog;
+
+CREATE TABLE model_sources (
+  source_id TEXT PRIMARY KEY CHECK(
+    length(source_id) BETWEEN 1 AND 64
+    AND source_id GLOB '[A-Za-z0-9]*'
+    AND source_id NOT GLOB '*[^A-Za-z0-9._-]*'
+  ),
+  kind TEXT NOT NULL CHECK(kind IN ('online', 'local')),
+  label TEXT NOT NULL CHECK(length(label) BETWEEN 1 AND 80),
+  base_url TEXT NOT NULL CHECK(
+    length(base_url) BETWEEN 9 AND 2048
+    AND base_url NOT GLOB '*[@?#]*'
+    AND (
+      (kind = 'online' AND base_url GLOB 'https://?*')
+      OR (kind = 'local' AND (base_url GLOB 'https://?*' OR base_url GLOB 'http://?*'))
+    )
+  ),
+  key_file TEXT CHECK(key_file IS NULL OR length(key_file) BETWEEN 1 AND 4096),
+  key_variable TEXT CHECK(key_variable IS NULL OR (
+    length(key_variable) BETWEEN 1 AND 64
+    AND key_variable GLOB '[A-Z_]*'
+    AND key_variable NOT GLOB '*[^A-Z0-9_]*'
+  )),
+  models_json TEXT NOT NULL CHECK(length(models_json) BETWEEN 2 AND 65536),
+  enabled INTEGER NOT NULL CHECK(enabled IN (0, 1)),
+  confirmed_host TEXT CHECK(confirmed_host IS NULL OR (
+    length(confirmed_host) BETWEEN 1 AND 300
+    AND instr(base_url, confirmed_host) > 0
+  )),
+  revision INTEGER NOT NULL CHECK(revision >= 1),
+  created_at_ms INTEGER NOT NULL CHECK(created_at_ms >= 0),
+  updated_at_ms INTEGER NOT NULL CHECK(updated_at_ms >= created_at_ms),
+  CHECK(key_file IS NULL OR key_variable IS NOT NULL)
+) STRICT;
+
+CREATE TABLE workspace_prefs (
+  workspace_id TEXT PRIMARY KEY REFERENCES workspaces(workspace_id) ON DELETE RESTRICT,
+  online_reminder_dismissed INTEGER NOT NULL CHECK(online_reminder_dismissed IN (0, 1))
+) STRICT;
+
+CREATE TABLE thinking_provenance (
+  hash TEXT PRIMARY KEY CHECK(length(hash) BETWEEN 16 AND 64 AND hash NOT GLOB '*[^0-9a-f]*'),
+  source_id TEXT NOT NULL CHECK(length(source_id) BETWEEN 1 AND 64),
+  created_at_ms INTEGER NOT NULL CHECK(created_at_ms >= 0)
+) STRICT;
+
+CREATE INDEX thinking_provenance_by_created ON thinking_provenance(created_at_ms);
+
+INSERT INTO schema_migrations(version, name, applied_at_ms)
+VALUES(19, 'dual_engine_and_model_sources', CAST(unixepoch('subsec') * 1000 AS INTEGER));
+`;
+
 // Only a database created from scratch (user_version 0) runs this, inside the same transaction
 // as MIGRATION_V16, so a new install follows the runtime default instead of the rewritten pair.
 const MIGRATION_V16_FRESH_INSTALL = String.raw`
@@ -1468,6 +1659,18 @@ export function migrateSchema(database: DatabaseSync): void {
       throw persistenceError("schema_integrity_failed", cause);
     }
   }
+  if (version === 18) {
+    database.exec("BEGIN IMMEDIATE");
+    try {
+      database.exec(MIGRATION_V19);
+      database.exec("PRAGMA user_version = 19");
+      database.exec("COMMIT");
+      version = 19;
+    } catch (cause: unknown) {
+      if (database.isTransaction) database.exec("ROLLBACK");
+      throw persistenceError("schema_integrity_failed", cause);
+    }
+  }
   if (version !== SCHEMA_VERSION) {
     throw persistenceError("schema_integrity_failed");
   }
@@ -1478,7 +1681,7 @@ export function migrateSchema(database: DatabaseSync): void {
     .prepare("SELECT schema_version FROM guild_meta WHERE singleton = 1")
     .get();
   if (
-    migrations.length !== 18 ||
+    migrations.length !== 19 ||
     exactInteger(migrations[0], "version") !== 1 ||
     migrations[0]?.["name"] !== "initial_authoritative_aggregates" ||
     exactInteger(migrations[1], "version") !== 2 ||
@@ -1515,6 +1718,8 @@ export function migrateSchema(database: DatabaseSync): void {
     migrations[16]?.["name"] !== "steer_interjections_and_run_checkpoints" ||
     exactInteger(migrations[17], "version") !== 18 ||
     migrations[17]?.["name"] !== "task_worktrees" ||
+    exactInteger(migrations[18], "version") !== 19 ||
+    migrations[18]?.["name"] !== "dual_engine_and_model_sources" ||
     exactInteger(meta, "schema_version") !== SCHEMA_VERSION
   ) {
     throw persistenceError("schema_integrity_failed");

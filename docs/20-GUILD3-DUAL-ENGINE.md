@@ -45,6 +45,8 @@ server.
 | llama.cpp SSE | Not conformant: it opens the text block (index 1) before closing the thinking block (index 0) and sends block 0's `signature_delta` after text started. Claude Code then duplicated the reply text. The router must re-sequence local streams. |
 | Subscription passthrough | With only `ANTHROPIC_BASE_URL` (no token), requests reach the router with `Authorization: Bearer sk-ant-oat...`; forwarded unchanged to api.anthropic.com they succeed on the subscription. |
 | Browser MCP | An HTTP MCP server passed in `mcpServers` (`{type:"http", name, url, headers:[]}`) is used by Claude; each tool call produces a `session/request_permission` (permission card). The client first sends `server/discover` (answer -32601 or a valid result). `webContents.capturePage()` fails with "Current display surface not available" when the window is not visible; CDP `Page.captureScreenshot` works. Attach `webContents.debugger` only after the first page load; `sendCommand` before that hangs. |
+| Steering | `initialize` result `_meta.steering.supported: true`; method `_session/steering {sessionId, prompt, _meta:{steering:{idleBehavior:"promptRequired"}}}` -> `{outcome:"injected"}` / `{outcome:"promptRequired", reason:"noRunningTurn"}` / `{outcome:"startedNewTurn"}`. Guild's Steer maps to it for the Claude engine. |
+| Account | `_auth/status_update {authStatus:{kind:"account", label:"Claude Max", account:{plan, email, organization}}}`. Guild may show the label/plan; never store, log or display the email. |
 | Local latency | A trivial turn on the 27B local model took 48 s (large system prompt prefill). Expected; not a bug. |
 
 ## 3. Architecture decisions
@@ -163,7 +165,7 @@ Option "Don't remind me again in this workspace" persists in `workspace_prefs`. 
 models never remind.
 
 ### 3.8 Grok-only features under the Claude engine (truthful reduced capability, PC-FALLBACK-001)
-Steer -> queue (existing -32601 fallback). Conversation rewind -> files only (existing fallback).
+Steer -> `_session/steering` (queue when `promptRequired`). Conversation rewind -> files only (existing fallback).
 Usage panel -> context usage from `usage_update`; quota "Managed by Claude Code". Grok control
 center and Grok slash snapshot -> Grok engine only. Phase line -> generic phases only.
 

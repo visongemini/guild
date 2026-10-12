@@ -580,7 +580,8 @@ test("per-task runtime settings parse a pinned pair, a full clear, and nothing i
   for (const rejected of [
     { taskId, model: null, reasoningEffort: "low" },
     { taskId, model: null, reasoningEffort: null, contextWindow: 256_000 },
-    { taskId, model: "MiniMax-M3", reasoningEffort: null },
+    { taskId, model: "Mini Max/M3", reasoningEffort: null },
+    { taskId, model: "x".repeat(129), reasoningEffort: null },
     { taskId, model: "grok-4.7", reasoningEffort: "Low Effort" },
     { taskId, model: "grok-4.7", reasoningEffort: null, contextWindow: 0 },
     { taskId, model: "grok-4.7", reasoningEffort: null, contextWindow: 1.5 },
@@ -590,6 +591,31 @@ test("per-task runtime settings parse a pinned pair, a full clear, and nothing i
   ]) {
     assert.throws(() => parseDesktopRequest(DESKTOP_IPC_CHANNELS.setTaskRuntimeSettings, rejected));
   }
+});
+
+test("a per-task model request takes the wider id grammar; the task's own engine decides at main and the store [PC-MODEL-001]", () => {
+  const taskId = "task-1";
+  assert.deepEqual(
+    parseDesktopRequest(DESKTOP_IPC_CHANNELS.setTaskRuntimeSettings, {
+      taskId, model: "claude-fable-5-1[1m]", reasoningEffort: "max",
+    }),
+    { taskId, model: "claude-fable-5-1[1m]", reasoningEffort: "max" },
+  );
+  for (const model of ["opus", "deepseek-v4-flash", "local-27b-model", "grok-4.7"]) {
+    assert.equal(
+      (parseDesktopRequest(DESKTOP_IPC_CHANNELS.setTaskRuntimeSettings, { taskId, model, reasoningEffort: null }) as { model: string }).model,
+      model,
+    );
+  }
+  for (const model of ["", "a b", "a/b", "-opus", "x".repeat(129), 4]) {
+    assert.throws(
+      () => parseDesktopRequest(DESKTOP_IPC_CHANNELS.setTaskRuntimeSettings, { taskId, model, reasoningEffort: null }),
+      TypeError,
+      String(model),
+    );
+  }
+  // The global Grok defaults stay Grok-only.
+  assert.throws(() => parseGuildGrokModel("claude-opus-5-5"), /invalid_grok_model/u);
 });
 
 test("Steer, rewind and run diff requests accept only their exact shape [F4, F2]", () => {
@@ -758,4 +784,185 @@ test("the worktree channels are registered invoke channels, not events [F3]", ()
     () => parseDesktopRequest("guild:v1:worktree:merge-anything" as never, { taskId: "task-1" }),
     /unregistered_channel/u,
   );
+});
+
+test("createTask accepts an optional engine and nothing else new (PC-ENG-001)", () => {
+  const workspaceId = "workspace-1";
+  assert.deepEqual(
+    parseDesktopRequest(DESKTOP_IPC_CHANNELS.createTask, { workspaceId, engine: "claude" }),
+    { workspaceId, engine: "claude" },
+  );
+  assert.deepEqual(
+    parseDesktopRequest(DESKTOP_IPC_CHANNELS.createTask, { workspaceId, engine: "grok", isolation: "worktree" }),
+    { workspaceId, isolation: "worktree", engine: "grok" },
+  );
+  assert.deepEqual(parseDesktopRequest(DESKTOP_IPC_CHANNELS.createTask, { workspaceId }), { workspaceId });
+  for (const rejected of [
+    { workspaceId, engine: "codex" },
+    { workspaceId, engine: "Claude" },
+    { workspaceId, engine: "" },
+    { workspaceId, engine: null },
+    { workspaceId, engine: 1 },
+    { workspaceId, engine: "claude", model: "opus" },
+  ]) {
+    assert.throws(() => parseDesktopRequest(DESKTOP_IPC_CHANNELS.createTask, rejected), TypeError, JSON.stringify(rejected));
+  }
+});
+
+test("setTaskEngine takes a task id and an engine; the routed marker has no channel [PC-ENG-001, PC-ROUTE-002]", () => {
+  assert.deepEqual(
+    parseDesktopRequest(DESKTOP_IPC_CHANNELS.setTaskEngine, { taskId: "task-1", engine: "claude" }),
+    { taskId: "task-1", engine: "claude" },
+  );
+  for (const rejected of [
+    {},
+    { taskId: "task-1" },
+    { engine: "claude" },
+    { taskId: "task-1", engine: "gemini" },
+    { taskId: "", engine: "claude" },
+    { taskId: "task-1", engine: "claude", routed: true },
+    { taskId: "task-1", engine: "claude", expectedRevision: 1 },
+  ]) {
+    assert.throws(() => parseDesktopRequest(DESKTOP_IPC_CHANNELS.setTaskEngine, rejected), TypeError, JSON.stringify(rejected));
+  }
+  // markTaskRouted is main-internal: no registered channel carries it.
+  assert.equal(Object.keys(DESKTOP_IPC_CHANNELS).some((name) => /routed/iu.test(name)), false);
+  assert.equal(Object.values(DESKTOP_IPC_CHANNELS).some((channel) => /routed/iu.test(channel)), false);
+});
+
+test("Claude-engine defaults are validated with the Claude grammar and the five Claude modes [PC-SET-002]", () => {
+  assert.deepEqual(
+    parseDesktopRequest(DESKTOP_IPC_CHANNELS.setClaudeSettings, {
+      model: "claude-fable-5-1[1m]", reasoningEffort: "xhigh", permissionMode: "acceptEdits",
+    }),
+    { model: "claude-fable-5-1[1m]", reasoningEffort: "xhigh", permissionMode: "acceptEdits" },
+  );
+  assert.deepEqual(
+    parseDesktopRequest(DESKTOP_IPC_CHANNELS.setClaudeSettings, {
+      model: null, reasoningEffort: null, permissionMode: "default",
+    }),
+    { model: null, reasoningEffort: null, permissionMode: "default" },
+    "null follows the adapter default",
+  );
+  assert.deepEqual(
+    parseDesktopRequest(DESKTOP_IPC_CHANNELS.setClaudeSettings, {
+      model: null, reasoningEffort: "high", permissionMode: "plan",
+    }),
+    { model: null, reasoningEffort: "high", permissionMode: "plan" },
+    "an effort does not need a pinned model on the Claude engine",
+  );
+  for (const rejected of [
+    { model: "claude opus", reasoningEffort: null, permissionMode: "default" },
+    { model: "a/b", reasoningEffort: null, permissionMode: "default" },
+    { model: "", reasoningEffort: null, permissionMode: "default" },
+    { model: "x".repeat(129), reasoningEffort: null, permissionMode: "default" },
+    { model: "opus", reasoningEffort: "High", permissionMode: "default" },
+    { model: "opus", reasoningEffort: null, permissionMode: "dontAsk" },
+    { model: "opus", reasoningEffort: null, permissionMode: "allow-all" },
+    { model: "opus", reasoningEffort: null },
+    { model: "opus", permissionMode: "default" },
+    { model: "opus", reasoningEffort: null, permissionMode: "default", startup: {} },
+  ]) {
+    assert.throws(() => parseDesktopRequest(DESKTOP_IPC_CHANNELS.setClaudeSettings, rejected), TypeError, JSON.stringify(rejected));
+  }
+  // The Grok defaults still reject Claude-only values.
+  assert.throws(() => parseDesktopRequest(DESKTOP_IPC_CHANNELS.setRuntimeSettings, {
+    model: "opus", reasoningEffort: null, permissionMode: "default",
+    startup: { webSearchEnabled: true, planEnabled: true, subagentsEnabled: true, maxTurns: null },
+  }), /invalid_grok_model/u);
+});
+
+test("model source requests carry no secret and no confirmation a renderer could forge [PC-ROUTE-002]", () => {
+  const draft = {
+    id: "deepseek",
+    kind: "online",
+    label: "DeepSeek",
+    baseUrl: "https://api.deepseek.com/anthropic",
+    keyFile: null,
+    keyVariable: "DEEPSEEK_API_KEY",
+    models: [{ id: "deepseek-v4-flash", label: "DeepSeek V4 Flash" }],
+    enabled: true,
+  };
+  assert.deepEqual(parseDesktopRequest(DESKTOP_IPC_CHANNELS.listModelSources, {}), {});
+  assert.throws(() => parseDesktopRequest(DESKTOP_IPC_CHANNELS.listModelSources, { id: "deepseek" }), TypeError);
+  assert.deepEqual(parseDesktopRequest(DESKTOP_IPC_CHANNELS.upsertModelSource, draft), draft);
+  assert.throws(() => parseDesktopRequest(DESKTOP_IPC_CHANNELS.upsertModelSource, { ...draft, apiKey: "secret" }), TypeError);
+  assert.throws(() => parseDesktopRequest(DESKTOP_IPC_CHANNELS.upsertModelSource, { ...draft, confirmedHost: "api.deepseek.com" }), TypeError);
+  assert.throws(() => parseDesktopRequest(DESKTOP_IPC_CHANNELS.upsertModelSource, { ...draft, baseUrl: "http://api.deepseek.com" }), TypeError);
+  assert.throws(() => parseDesktopRequest(DESKTOP_IPC_CHANNELS.upsertModelSource, { ...draft, keyVariable: "sk-ant-api03-abcdefghijkl" }), TypeError);
+  for (const channel of [DESKTOP_IPC_CHANNELS.deleteModelSource, DESKTOP_IPC_CHANNELS.confirmModelSource]) {
+    assert.deepEqual(parseDesktopRequest(channel, { id: "deepseek" }), { id: "deepseek" });
+    for (const rejected of [
+      {}, { id: "" }, { id: "a b" }, { id: 1 },
+      { id: "deepseek", confirmedHost: "api.deepseek.com" },
+      { id: "deepseek", host: "evil.example" },
+      { id: "deepseek", expectedRevision: 1 },
+    ]) {
+      assert.throws(() => parseDesktopRequest(channel, rejected), TypeError, `${channel} ${JSON.stringify(rejected)}`);
+    }
+  }
+});
+
+test("workspace prefs requests name a workspace and one boolean [PC-PRIV-001]", () => {
+  assert.deepEqual(
+    parseDesktopRequest(DESKTOP_IPC_CHANNELS.getWorkspacePrefs, { workspaceId: "workspace-1" }),
+    { workspaceId: "workspace-1" },
+  );
+  assert.deepEqual(
+    parseDesktopRequest(DESKTOP_IPC_CHANNELS.setWorkspacePrefs, { workspaceId: "workspace-1", onlineReminderDismissed: true }),
+    { workspaceId: "workspace-1", onlineReminderDismissed: true },
+  );
+  for (const rejected of [
+    {}, { workspaceId: "" }, { workspaceId: 1 },
+    { workspaceId: "workspace-1", onlineReminderDismissed: true },
+  ]) {
+    assert.throws(() => parseDesktopRequest(DESKTOP_IPC_CHANNELS.getWorkspacePrefs, rejected), TypeError, JSON.stringify(rejected));
+  }
+  for (const rejected of [
+    { workspaceId: "workspace-1" },
+    { workspaceId: "workspace-1", onlineReminderDismissed: "yes" },
+    { workspaceId: "workspace-1", onlineReminderDismissed: 1 },
+    { onlineReminderDismissed: true },
+    { workspaceId: "workspace-1", onlineReminderDismissed: true, localReminder: false },
+  ]) {
+    assert.throws(() => parseDesktopRequest(DESKTOP_IPC_CHANNELS.setWorkspacePrefs, rejected), TypeError, JSON.stringify(rejected));
+  }
+});
+
+test("the browser command channel validates the closed command union; the pane projection is a push event [PC-BROWSER-001]", () => {
+  assert.deepEqual(
+    parseDesktopRequest(DESKTOP_IPC_CHANNELS.browserCommand, { kind: "navigate", url: "https://example.com" }),
+    { kind: "navigate", url: "https://example.com/" },
+  );
+  assert.deepEqual(parseDesktopRequest(DESKTOP_IPC_CHANNELS.browserCommand, { kind: "takeOver" }), { kind: "takeOver" });
+  for (const rejected of [
+    {}, { kind: "eval", script: "1" }, { kind: "navigate", url: "file:///etc/passwd" }, { kind: "navigate" },
+  ]) {
+    assert.throws(() => parseDesktopRequest(DESKTOP_IPC_CHANNELS.browserCommand, rejected), TypeError, JSON.stringify(rejected));
+  }
+  assert.equal(DESKTOP_IPC_CHANNELS.browserPaneChanged, "guild:v1:event:browser-pane-changed");
+  assert.ok(DESKTOP_EVENT_CHANNELS.includes(DESKTOP_IPC_CHANNELS.browserPaneChanged));
+  assert.equal((DESKTOP_EVENT_CHANNELS as readonly string[]).includes(DESKTOP_IPC_CHANNELS.browserCommand), false);
+  assert.throws(() => parseDesktopRequest(DESKTOP_IPC_CHANNELS.browserPaneChanged as never, { kind: "back" }), /unregistered_channel/u);
+  assert.equal(new Set(DESKTOP_EVENT_CHANNELS).size, DESKTOP_EVENT_CHANNELS.length);
+});
+
+test("the Guild 3.0 channels are registered, unique invoke channels in the closed table", () => {
+  const added = [
+    DESKTOP_IPC_CHANNELS.setTaskEngine,
+    DESKTOP_IPC_CHANNELS.setClaudeSettings,
+    DESKTOP_IPC_CHANNELS.listModelSources,
+    DESKTOP_IPC_CHANNELS.upsertModelSource,
+    DESKTOP_IPC_CHANNELS.deleteModelSource,
+    DESKTOP_IPC_CHANNELS.confirmModelSource,
+    DESKTOP_IPC_CHANNELS.getWorkspacePrefs,
+    DESKTOP_IPC_CHANNELS.setWorkspacePrefs,
+    DESKTOP_IPC_CHANNELS.browserCommand,
+  ];
+  assert.equal(new Set(added).size, added.length);
+  for (const channel of added) {
+    assert.match(channel, /^guild:v1:[a-z-]+(?::[a-z-]+)*$/u);
+    assert.equal((DESKTOP_EVENT_CHANNELS as readonly string[]).includes(channel), false, channel);
+  }
+  assert.throws(() => parseDesktopRequest("guild:v1:model-sources:reveal-key" as never, { id: "deepseek" }), /unregistered_channel/u);
 });

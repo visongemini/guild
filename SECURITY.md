@@ -1,8 +1,10 @@
 # Security Policy
 
 Guild is a local desktop client. It must not become a shared gateway, extract
-Grok credentials, or send model requests outside the official user-installed
-`grok` process.
+Grok credentials, or read Claude credentials. Grok model requests come only from the
+official user-installed `grok` process. Claude task requests come from the
+user-installed `claude`; Online and Local models are reached only through a
+loopback-only, single-user router on `127.0.0.1`.
 
 Please report a suspected vulnerability through this repository's private
 security-advisory flow when available. Do not include passwords, tokens,

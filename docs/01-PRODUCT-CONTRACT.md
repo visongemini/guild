@@ -4,23 +4,38 @@ Stable requirement IDs, severities, owning phases, acceptance stories, and evide
 normative in `requirements/requirements.yml`. This prose explains product intent; code and release
 evidence cite the immutable IDs.
 
+Guild 3.0 (D-057 to D-060, `docs/20-GUILD3-DUAL-ENGINE.md`) adds a second engine, model sources and a
+browser pane. Passages that changed for 3.0 say so; where an older passage says "official Grok only",
+it now describes the Grok engine.
+
 ## Product definition
 
 Guild is a bilingual, local-first desktop workspace for running coding and knowledge
-tasks through the official Grok process. It is designed for one local user and one
-machine profile at a time. Guild 2.0.0 targets macOS; other platforms require a later
+tasks through one of two engines: the official Grok process, or Claude Code through a
+user-installed ACP adapter. A task keeps the engine it was started on. Inside a Claude task the
+user can also use Online and Local models through a loopback router, and an isolated browser pane
+lets the user and the agent work with web pages. It is designed for one local user and one
+machine profile at a time. Guild 2.0.0 and 3.0.0 target macOS; other platforms require a later
 product decision and their own parity and release gates.
 
 ## Non-negotiable boundaries
 
 1. No shared API gateway, multi-user credential sharing, or externally reachable
-   OpenAI-compatible service.
-2. No direct upstream requests made with credentials extracted from Grok files.
-3. The product name is Guild. It must state that it is independent from xAI.
-4. Interactive permissions should use official Grok ACP over stdio. Reduced fallback
-   behavior must be visibly disclosed rather than simulated.
+   OpenAI-compatible or Anthropic-compatible service.
+2. No direct upstream requests made with credentials extracted from Grok files. Grok upstream
+   requests come only from the official Grok process.
+3. The product name is Guild. It must state that it is independent from xAI and from Anthropic.
+4. Interactive permissions use ACP over stdio with the task's engine (official Grok ACP, or the
+   Claude adapter). Reduced fallback behavior must be visibly disclosed rather than simulated.
 5. Starting Guild must not request browser, Keychain, or Grok login access unless the
    user initiates the corresponding feature.
+6. Claude credentials are never read by Guild. The user's `claude` binary uses its own login. In a
+   routed session Guild's router forwards the Authorization header of `claude`'s own requests
+   unchanged, only to `api.anthropic.com`, and never logs or stores it.
+7. The model router is loopback-only and single-user (D-058). Keys for Online and Local sources come
+   from a user-designated env file, live in memory only and are never stored, shown or logged.
+8. The browser pane and its MCP server are isolated and loopback-only (D-059); Guild's own renderer
+   never gains network navigation.
 
 ## Required product behaviors
 
@@ -160,11 +175,13 @@ product decision and their own parity and release gates.
   are unavailable, the panel says so and never estimates them. It opens as a non-modal popover
   anchored immediately above the avatar in the lower-left sidebar, resizes with that sidebar,
   and never relocates to the center of the application window.
-- Settings open in an independent dialog with General, Grok, Privacy, and About tabs. General
+- Settings open in an independent dialog with General, Engines, Model sources, Privacy, and About
+  tabs (PC-SET-002; Guild 2 had a Grok tab where 3.0 has Engines and Model sources). General
   covers language, restore-last-task, new-task workspace behavior, and persistent background-task
   notifications. Notifications are emitted only for a newly observed permission wait, completion,
   failure, or interruption while Guild is not focused. Delivery never activates Guild; clicking
-  the notification is an explicit user action that opens the exact task. Grok model,
+  the notification is an explicit user action that opens the exact task. Engines shows each
+  engine's status; for the Grok engine its model,
   reasoning effort, and tool authorization are sent to the official process. Tool authorization
   defaults to per-request approval; the local user may explicitly choose full access, which maps
   only to the official process's `bypassPermissions` mode and persists until changed. It never
@@ -191,13 +208,73 @@ product decision and their own parity and release gates.
   Terminal-rendering,
   headless serialization, relay/server, debug, and shell-integration flags stay excluded because
   they are transport or developer surfaces rather than missing desktop settings.
-- Guild uses the official Grok Build runtime only. It has no MiniMax, Ornith, third-party model
-  adapter, OpenAI-compatible provider route, or selector containing external models. The settings
-  surface may select only official Grok models and reasoning efforts supported by the runtime.
-- Any model or reasoning information shown by Guild reflects only the official Grok process.
+- The Grok engine uses the official Grok Build runtime only. Grok tasks have no MiniMax, Ornith,
+  third-party model adapter, OpenAI-compatible provider route, or selector containing external
+  models. The Grok settings may select only official Grok models and reasoning efforts supported by
+  the runtime (D-011 as amended by D-057).
+- Any model or reasoning information shown for a Grok task reflects only the official Grok process.
+  For a Claude task it reflects only what the adapter reports or what the user configured as a
+  model source.
 - A reduced official-CLI fallback names its missing capabilities in Chinese and English;
   it never displays interactive permission UI when permissions cannot round-trip.
 - Guild remains useful when optional browser synchronization is disabled.
+
+### Claude engine (Guild 3.0, D-057)
+
+- A task can run on Claude Code through the user-installed ACP adapter
+  `@agentclientprotocol/claude-agent-acp`, which drives the user-installed `claude` binary. Guild
+  distributes neither. The user installs Node 22 or newer, the adapter and `claude`. The adapter
+  version is limited to a supported range and verified by hash before it starts; a mismatch refuses
+  to start with a named error.
+- A task's engine is set when its first turn is created and never changes. A new task's model picker
+  shows the Grok group next to the Claude, Online and Local groups, and the group chosen for the
+  first turn fixes the engine. One engine process serves each active task.
+- Guild never reads Claude credentials and never calls the adapter's authenticate method. When
+  `claude` is not logged in Guild shows a named state that asks the user to run `claude` once in
+  Terminal and log in.
+- Grok-only capabilities appear as truthful reduced states, never simulated (PC-FALLBACK-001). Steer
+  becomes a queued message, rewind restores files only, and the usage panel shows context usage and
+  says the quota is managed by Claude Code. The Grok control center and the Grok slash snapshot are
+  offered for Grok tasks only, and the phase line shows generic phases only.
+- OpenViking memory is on in Claude tasks and its automatic capture is off in routed sessions
+  (PC-OV-001). Grok tasks keep OpenViking out of the session as before.
+
+### Model sources and the router (Guild 3.0, D-058)
+
+- Inside a Claude task the user switches the model between turns among three groups: Claude
+  (the user's subscription), Online (vendor Anthropic-compatible endpoints such as DeepSeek) and
+  Local (llama.cpp or Ollama `/v1/messages`).
+- Online and Local models come from model sources the user configures in Settings. A source names a
+  base URL and the env file and variable that hold its key. Guild reads the key in the main process,
+  keeps it in memory and never stores, shows or logs it. Adding a source or changing its URL or key
+  variable needs a native confirmation that names the variable and the host. Online sources use
+  https; Local sources must resolve to a loopback or Tailscale (100.64.0.0/10) address.
+- The first Online or Local selection in a Claude task moves that task to a routed session through
+  Guild's loopback model router, and a routed task stays routed. The router listens on 127.0.0.1
+  only, serves only configured and Claude models, forwards the user's Claude credential only to
+  `api.anthropic.com`, and does not translate to the OpenAI protocol.
+
+### Browser pane (Guild 3.0, D-059)
+
+- The task workbench has a Browser tab with an isolated web view that has its own storage partition
+  and no access to Node or to Guild's own interface. It has an address bar, back, forward, reload and
+  up to 5 tabs. The user can log in manually and the login persists across restart. Guild never
+  copies login state from another browser or the Keychain.
+- Navigation is limited to http, https and about:blank. Camera, microphone, geolocation,
+  notifications and clipboard read are denied, and a download needs a native save dialog.
+- Agents operate the pane through a loopback MCP server with a fixed tool set: navigate, back,
+  forward, reload, screenshot, page reading, find, click, type, key, scroll, console and network
+  inspection, and tab control. No tool runs arbitrary script. Every tool call follows the engine's
+  normal permission flow. While an agent controls the pane a badge says so, and Take over pauses
+  agent control until the user chooses Resume agent.
+- The security profile is in `docs/09-ELECTRON-SECURITY-PROFILE.md`.
+
+### Online-model reminder (Guild 3.0, PC-PRIV-001)
+
+- The first time a session switches to an Online model Guild asks the user to confirm that
+  CLAUDE.md, memory, the conversation, and browser page text or screenshots in the conversation will
+  be sent to the model's vendor. "Don't remind me again in this workspace" persists per workspace.
+  Claude and Local models never trigger the reminder.
 
 ### Desktop interaction
 
@@ -259,14 +336,15 @@ product decision and their own parity and release gates.
 - A reliability fix may introduce only a named, reviewed recovery-state exception; it must not
   preserve a permanent-thinking defect merely to satisfy a screenshot comparison.
 
-## Explicit non-goals for 2.0.0
+## Explicit non-goals (2.0.0, amended for 3.0)
 
 - Hosting an inference gateway or team server.
-- Reimplementing or bundling the Grok model/runtime.
-- Routing prompts to third-party or OpenAI-compatible model providers.
+- Reimplementing or bundling the Grok runtime, Claude Code or the Claude adapter.
+- Translating between model protocols (the 3.0 router forwards the Anthropic Messages protocol only)
+  or sharing a router with anyone but the local user.
 - Cloning another product pixel-for-pixel or using its protected assets.
 - Redesigning the accepted Guild 1.1.13 interface during the internal rewrite.
-- A general-purpose browser or IDE replacement.
+- An IDE replacement.
 - Cloud task synchronization owned by Guild.
 - Plugin abstractions without a verified 2.0 product requirement.
 
@@ -294,6 +372,15 @@ product decision and their own parity and release gates.
    exact typed fields and a second confirmation.
 9. Install two consecutive local Guild releases and verify their designated requirements are
    certificate-stable rather than pinned to each package hash.
+10. (Guild 3.0, AS-011) Start a task on the Claude engine with the user's own login, write and read a
+    file through a permission card, quit, reopen and resume. Switch the same task from Claude to an
+    Online model and back with tools, see the Online reminder once, run a Local model turn without
+    duplicated reply text, and confirm that OAuth credentials reach only `api.anthropic.com`.
+11. (Guild 3.0, AS-012) Log in manually in the browser pane and keep the login across restart. Let an
+    agent navigate a local dev server, take a screenshot and click. See the operating badge, take over
+    and resume, and confirm the pane cannot reach Node or the Guild interface.
+12. (Guild 3.0, AS-013) Observe OpenViking recall in Claude tasks, no capture in routed Claude
+    sessions and nothing in Grok tasks, and see every reduced-capability state render truthfully.
 
 
 ## Guild 2.1 frontend redesign (2026-09-12, D-046)
