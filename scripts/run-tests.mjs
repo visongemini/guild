@@ -66,7 +66,13 @@ const REQUIRED_TEST_BASENAMES = {
     "permission-machine.test.js",
     "event-admission.test.js",
   ],
-  "@guild/model-router": ["compat.test.js", "provenance.test.js", "sse.test.js"],
+  "@guild/model-router": [
+    "compat.test.js",
+    "env-file.test.js",
+    "network-policy.test.js",
+    "provenance.test.js",
+    "sse.test.js",
+  ],
   "@guild/persistence": ["lease.test.js", "store.test.js"],
   "@guild/runtime-grok": [
     "acp-adapter.test.js",
