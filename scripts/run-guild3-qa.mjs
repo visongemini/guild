@@ -13,8 +13,10 @@
  * Guild reads the key file itself. This script reads the two key values only to prove that no copy
  * of them landed in the data directory or the logs (in memory, booleans and counts only).
  *
- * Checks: A Grok queued turns, B Claude file task + restart/resume, C Opus -> DeepSeek -> Opus,
- * D Local model, E browser pane + agent tools + take over, F settings tabs, G reduced capability
+ * Checks: A Grok queued turns, B Claude file task + restart/resume, C Opus -> DeepSeek, one way (the
+ * Claude rows are disabled afterwards, the router refuses claude-* models and never sees a Claude
+ * credential), D Local model, E browser pane + agent tools + take over (on a fresh native Claude task,
+ * the checked one has left the subscription for good), F settings tabs, G reduced capability
  * (usage popover), H permission card lifecycle after a UI approval.
  * Environment: GUILD_QA_STAMP (reuse a run), GUILD_QA_ONLY=A,B (subset), GUILD_QA_KEEP_APP=1.
  *
@@ -117,6 +119,12 @@ function processEnvHas(pid, name) {
 function processEnvValueIs(pid, name, value) {
   const result = spawnSync("/bin/ps", ["-E", "-ww", "-o", "command=", "-p", String(pid)], { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 });
   return (result.stdout ?? "").includes(` ${name}=${value}`);
+}
+
+/** Whether a variable of the process environment starts with `prefix`. Only a boolean leaves this function. */
+function processEnvValueStartsWith(pid, name, prefix) {
+  const result = spawnSync("/bin/ps", ["-E", "-ww", "-o", "command=", "-p", String(pid)], { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 });
+  return (result.stdout ?? "").includes(` ${name}=${prefix}`);
 }
 
 function freePort() {
@@ -625,8 +633,10 @@ async function checkB(record) {
   await shot("B", "claude-file-task");
   const adapter = adapterProcess();
   details.nativeNoGateway = adapter !== undefined && !processEnvHas(adapter.pid, "ANTHROPIC_BASE_URL");
+  details.nativeNoRouterToken = adapter !== undefined && !processEnvHas(adapter.pid, "ANTHROPIC_AUTH_TOKEN");
   details.captureOffHookInEnv = adapter !== undefined && processEnvValueIs(adapter.pid, "OPENVIKING_AUTO_CAPTURE", "false");
   if (!details.nativeNoGateway) throw new Error("native Claude session has ANTHROPIC_BASE_URL (or adapter not found)");
+  if (!details.nativeNoRouterToken) throw new Error("native Claude session has an ANTHROPIC_AUTH_TOKEN");
   const engineStatus = turn.view.engineStatus ?? {};
   details.accountLabelPresent = typeof engineStatus.accountLabel === "string" && engineStatus.accountLabel.length > 0;
   details.routedFlag = engineStatus.routed === true;
@@ -674,21 +684,35 @@ async function checkC() {
   const details = {};
   const picked = await pickModel("C", "^\\s*DeepSeek V4 Flash");
   details.pickerGroups = picked.groups;
-  const dialog = await until("online reminder dialog", async () => (await domExists(".guild-online-reminder")) ? true : undefined, { timeout: 15_000 });
+  const dialog = await until("one-way and online reminder dialog", async () => (await domExists(".guild-online-reminder")) ? true : undefined, { timeout: 15_000 });
   void dialog;
+  // The task has run on the subscription, so the first switch carries both messages in ONE dialog (D-061, PC-PRIV-001).
   details.reminderTitle = safeText(await domText(".guild-online-reminder .guild-dialog-header"), 160);
-  details.reminderBody = safeText(await domText(".guild-online-reminder-body"), 400);
-  await shot("C", "online-reminder-dialog");
-  if (!/DeepSeek/u.test(details.reminderTitle)) throw new Error("reminder does not name the vendor");
+  details.reminderBody = safeText(await domText(".guild-online-reminder-body"), 600);
+  details.dialogCount = await cdp.evaluate(`document.querySelectorAll(".guild-online-reminder").length`);
+  await shot("C", "one-way-and-online-reminder-dialog");
+  if (details.dialogCount !== 1) throw new Error(`expected one dialog, found ${details.dialogCount}`);
+  if (!/switch back to a Claude subscription/iu.test(details.reminderTitle)) throw new Error("the dialog does not say the switch is one way");
+  if (!/local relay/iu.test(details.reminderBody) || !/DeepSeek/u.test(details.reminderBody)) throw new Error("the dialog lacks the one-way text or the vendor");
   await clickDom(".guild-online-reminder .guild-dialog-footer button.primary");
   const routedView = await waitSelection(taskId, "deepseek-v4-flash", { timeout: 180_000 });
   details.routedFlag = routedView.engineStatus?.routed === true;
   const adapter = adapterProcess();
   details.routedEnv = adapter === undefined ? "adapter missing" : {
     baseUrlSet: processEnvHas(adapter.pid, "ANTHROPIC_BASE_URL"),
+    // Claude Code sends this throwaway token to the router, never its subscription token (D-061).
+    authTokenIsRouterToken: processEnvValueStartsWith(adapter.pid, "ANTHROPIC_AUTH_TOKEN", "guild-router-"),
+    noApiKey: !processEnvHas(adapter.pid, "ANTHROPIC_API_KEY"),
+    nonessentialTrafficOff: processEnvValueIs(adapter.pid, "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1"),
+    subagentOnRoutedModel: processEnvValueIs(adapter.pid, "CLAUDE_CODE_SUBAGENT_MODEL", "deepseek-v4-flash"),
+    smallFastOnRoutedModel: processEnvValueIs(adapter.pid, "ANTHROPIC_SMALL_FAST_MODEL", "deepseek-v4-flash"),
     toolSearch: processEnvValueIs(adapter.pid, "ENABLE_TOOL_SEARCH", "true"),
     captureOff: processEnvValueIs(adapter.pid, "OPENVIKING_AUTO_CAPTURE", "false"),
   };
+  const env = details.routedEnv;
+  if (typeof env === "string" || !env.baseUrlSet || !env.authTokenIsRouterToken || !env.noApiKey || !env.nonessentialTrafficOff || !env.subagentOnRoutedModel || !env.smallFastOnRoutedModel) {
+    throw new Error(`the routed process environment is wrong: ${JSON.stringify(env)}`);
+  }
   await shot("C", "deepseek-selected");
   const turn = await sendAndWait("C", taskId, "List the files in the workspace with a tool and reply DONE", { timeout: 420_000 });
   const reply = assistantTextOf(turn.view, turn.runId);
@@ -701,48 +725,54 @@ async function checkC() {
   if (!/DONE/u.test(reply)) throw new Error("DeepSeek reply lacks DONE");
   if (tools.length === 0 || !tools.some((item) => item.toolStatus === "completed")) throw new Error("DeepSeek turn used no completed tool");
 
-  // The reminder is shown once: choosing DeepSeek again later in the same task must not ask again.
-  await pickModel("C", "^\\s*Opus");
-  await waitSelection(taskId, "opus", { timeout: 180_000 });
-  await shot("C", "back-on-opus");
-  const opus = await sendAndWait("C", taskId, "Without using any tools: what does hello.txt contain? Answer in one short sentence.", { timeout: 360_000 });
-  const opusReply = assistantTextOf(opus.view, opus.runId);
-  details.opusReplyTail = safeText(opusReply.slice(-200), 200);
-  if (!/\bhi\b/iu.test(opusReply)) throw new Error("Opus did not recall hello.txt after the DeepSeek turn");
-  await pickModel("C", "^\\s*DeepSeek V4 Flash");
+  // One way: the Claude rows are shown disabled with the note, a click on one changes nothing, and the main process refuses the choice.
+  await clickDom(".guild-model-picker-trigger");
+  await until("model popover", () => domExists(".guild-model-popover"), { timeout: 10_000 });
+  await sleep(300);
+  details.lockedClaudeRows = await cdp.evaluate(`document.querySelectorAll(".guild-model-row.locked[aria-disabled='true']").length`);
+  details.lockedClaudeNote = safeText(await domText(".guild-model-group-note"), 200);
+  await shot("C", "claude-rows-disabled-after-routing");
+  if (details.lockedClaudeRows === 0 || !/cannot go back to a Claude subscription/iu.test(details.lockedClaudeNote)) throw new Error("the Claude rows of a routed task are not disabled with the note");
+  await clickDom(".guild-model-row.locked");
   await sleep(1500);
-  details.reminderShownAgain = await domExists(".guild-online-reminder");
-  if (details.reminderShownAgain) {
-    await shot("C", "reminder-shown-again");
-    await clickDom(".guild-online-reminder .guild-dialog-footer button", "^Cancel$");
-    throw new Error("reminder was shown a second time in the same task");
-  }
-  await waitSelection(taskId, "deepseek-v4-flash", { timeout: 180_000 });
-  await pickModel("C", "^\\s*Opus");
-  await waitSelection(taskId, "opus", { timeout: 180_000 });
+  const stillRouted = await call("openTask", { taskId });
+  details.selectionAfterClickOnLockedRow = stillRouted.modelSelection.modelId;
+  if (stillRouted.modelSelection.modelId !== "deepseek-v4-flash") throw new Error("a click on a disabled Claude row changed the selection");
+  await cdp.evaluate(`document.querySelector(".guild-model-picker")?.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }))`);
+  const refused = await call("setTaskRuntimeSettings", { taskId, model: "opus", reasoningEffort: null });
+  details.mainRefusal = { status: refused.status, reason: refused.reason ?? null };
+  if (refused.status !== "refused" || refused.reason !== "claude_locked") throw new Error(`main did not refuse a Claude model for a routed task: ${JSON.stringify(details.mainRefusal)}`);
 
-  // Router log proof.
+  // The conversation continues on the third-party model, with what the Claude turns said before the switch.
+  const recall = await sendAndWait("C", taskId, "Without using any tools: what does hello.txt contain? Answer in one short sentence.", { timeout: 360_000 });
+  const recallReply = assistantTextOf(recall.view, recall.runId);
+  details.recallReplyTail = safeText(recallReply.slice(-200), 200);
+  if (!/\bhi\b/iu.test(recallReply)) throw new Error("DeepSeek did not recall hello.txt from the Claude turns");
+
+  // Router log proof: only third-party sources; nothing went to Anthropic and no Claude credential ever reached the router.
   const events = routerEvents().filter((entry) => entry.event === "router.request");
   const byModel = (pattern) => events.filter((entry) => pattern.test(String(entry.fields.model ?? "")));
   const deepseek = byModel(/deepseek/iu);
-  const anthropic = events.filter((entry) => entry.fields.source === "anthropic");
+  const claudeModels = byModel(/^claude-/iu);
   details.router = {
     requests: events.length,
     deepseekRequests: deepseek.length,
     deepseekAuthInAndReplaced: deepseek.filter((entry) => entry.fields.authIn === true && entry.fields.authReplaced === true).length,
     deepseekFromOtherSource: deepseek.filter((entry) => entry.fields.source !== "deepseek").length,
     deepseekOk: deepseek.filter((entry) => entry.fields.status === 200).length,
-    anthropicRequests: anthropic.length,
-    anthropicForwardedOk: anthropic.filter((entry) => entry.fields.status === 200).length,
-    anthropicAuthReplaced: anthropic.filter((entry) => entry.fields.authReplaced === true).length,
-    thirdPartyWithoutKeyReplacement: events.filter((entry) => entry.fields.source !== "anthropic" && entry.fields.source !== "none" && entry.fields.authReplaced !== true && entry.fields.route === "messages").length,
+    anthropicSourceRequests: events.filter((entry) => entry.fields.source === "anthropic").length,
+    claudeModelRequests: claudeModels.length,
+    claudeModelRequestsAnswered2xx: claudeModels.filter((entry) => entry.fields.status >= 200 && entry.fields.status < 300).length,
+    anthropicCredentialRejections: events.filter((entry) => entry.fields.outcome === "anthropic_credential_rejected").length,
+    thirdPartyWithoutKeyReplacement: events.filter((entry) => entry.fields.source !== "none" && entry.fields.authReplaced !== true && entry.fields.route === "messages").length,
     unknownModelRejections: events.filter((entry) => entry.fields.outcome === "unknown_model").length,
   };
   const r = details.router;
   if (r.deepseekRequests === 0 || r.deepseekAuthInAndReplaced !== r.deepseekRequests) throw new Error(`DeepSeek requests lack authIn/authReplaced: ${JSON.stringify(r)}`);
   if (r.deepseekFromOtherSource !== 0) throw new Error("a DeepSeek model id was routed to another source");
-  if (r.anthropicRequests === 0 || r.anthropicForwardedOk === 0) throw new Error(`no forwarded Anthropic request: ${JSON.stringify(r)}`);
-  if (r.anthropicAuthReplaced !== 0) throw new Error("an Anthropic request had its credential replaced");
+  if (r.anthropicSourceRequests !== 0) throw new Error(`a request was served by Anthropic: ${JSON.stringify(r)}`);
+  if (r.claudeModelRequestsAnswered2xx !== 0) throw new Error(`a claude-* model request was served: ${JSON.stringify(r)}`);
+  if (r.anthropicCredentialRejections !== 0) throw new Error(`a Claude credential reached the router: ${JSON.stringify(r)}`);
   if (r.thirdPartyWithoutKeyReplacement !== 0) throw new Error("a third-party request went out without key replacement");
   return details;
 }
@@ -776,12 +806,14 @@ async function checkD() {
 }
 
 async function checkE() {
-  const taskId = state.claudeTaskId;
+  // The browser tools belong to the Claude engine, not to routing. The task checked above has left the Claude
+  // subscription for good (D-061), so the agent drives the pane from a fresh native Claude task on Opus.
+  const created = await call("createTask", { workspaceId, engine: "claude" });
+  const taskId = created.task.taskId;
   await call("openTask", { taskId });
-  const details = {};
-  // Back on a capable model for tool use.
-  await pickModel("E", "^\\s*Opus");
-  await waitSelection(taskId, "opus", { timeout: 180_000 });
+  const details = { taskId };
+  const chosen = await call("setTaskRuntimeSettings", { taskId, model: "opus", reasoningEffort: null });
+  if (chosen.status === "refused") throw new Error(`could not choose Opus for the browser task: ${chosen.reason}`);
 
   // Open the workbench, the Browser tab, and navigate through the address bar.
   const expanded = await cdp.evaluate(`document.querySelector(".guild-workbench-trigger")?.getAttribute("aria-expanded")`);
@@ -1068,12 +1100,12 @@ async function main() {
   await runCheck("A", "Grok: two queued turns in one session", checkA);
   await runCheck("B", "Claude: file task, permission card, restart and resume", checkB);
   if (state.claudeTaskId === undefined || results.find((entry) => entry.id === "B")?.status !== "pass") {
-    for (const [id, title] of [["C", "Opus -> DeepSeek -> Opus"], ["D", "Local model"], ["E", "Browser pane"]]) {
+    for (const [id, title] of [["C", "Opus -> DeepSeek, one way"], ["D", "Local model"], ["E", "Browser pane"]]) {
       skip(id, title, "blocked: check B did not pass");
     }
   } else {
     await runCheck("G1", "Reduced capability: usage popover (native session)", () => checkG("G1", "native"));
-    await runCheck("C", "Opus -> DeepSeek -> Opus with tools; reminder; router proof", checkC);
+    await runCheck("C", "Opus -> DeepSeek, one way: dialog, env, disabled Claude rows, router proof", checkC);
     await runCheck("D", "Local Model 27B, no duplicated text", checkD);
     await runCheck("E", "Browser pane: navigate, agent tools, take over, resume", checkE);
   }

@@ -30,8 +30,9 @@ product decision and their own parity and release gates.
 5. Starting Guild must not request browser, Keychain, or Grok login access unless the
    user initiates the corresponding feature.
 6. Claude credentials are never read by Guild. The user's `claude` binary uses its own login. In a
-   routed session Guild's router forwards the Authorization header of `claude`'s own requests
-   unchanged, only to `api.anthropic.com`, and never logs or stores it.
+   routed session `claude` carries a throwaway auth token that Guild generated, so its subscription
+   login never reaches Guild's router; the router never connects to Anthropic and rejects any request
+   that carries an Anthropic credential (D-061).
 7. The model router is loopback-only and single-user (D-058). Keys for Online and Local sources come
    from a user-designated env file, live in memory only and are never stored, shown or logged.
 8. The browser pane and its MCP server are isolated and loopback-only (D-059); Guild's own renderer
@@ -256,9 +257,14 @@ product decision and their own parity and release gates.
   that Claude task conversations go to that host). Online sources use https; Local sources must
   resolve to a loopback or Tailscale (100.64.0.0/10) address.
 - The first Online or Local selection in a Claude task moves that task to a routed session through
-  Guild's loopback model router, and a routed task stays routed. The router listens on 127.0.0.1
-  only, serves only configured and Claude models, forwards the user's Claude credential only to
-  `api.anthropic.com`, and does not translate to the OpenAI protocol.
+  Guild's loopback model router, and a routed task stays routed: it can no longer use a Claude
+  subscription model, its Claude rows in the picker are disabled, and the user starts a new task to use
+  Claude again. A Claude task that has already run turns confirms before that first switch, in the same
+  dialog as the Online reminder when one is due. The router listens on 127.0.0.1 only, serves only
+  configured Online and Local models, never forwards a Claude credential or anything else to Anthropic,
+  and does not translate to the OpenAI protocol.
+- The Claude group of the picker shows the Default row and the newest model of each family; the other
+  Claude models are one collapsed "Older models" row (D-061, `docs/20-GUILD3-DUAL-ENGINE.md` 3.9).
 
 ### Browser pane (Guild 3.0, D-059)
 
@@ -382,8 +388,9 @@ product decision and their own parity and release gates.
    certificate-stable rather than pinned to each package hash.
 10. (Guild 3.0, AS-011) Start a task on the Claude engine with the user's own login, write and read a
     file through a permission card, quit, reopen and resume. Switch the same task from Claude to an
-    Online model and back with tools, see the Online reminder once, run a Local model turn without
-    duplicated reply text, and confirm that OAuth credentials reach only `api.anthropic.com`.
+    Online model with tools through one dialog that carries the one-way notice and the Online reminder,
+    see the Claude rows disabled afterwards, run a Local model turn without duplicated reply text, and
+    confirm that no Claude credential reached the router and nothing went to `api.anthropic.com`.
 11. (Guild 3.0, AS-012) Log in manually in the browser pane and keep the login across restart. Let an
     agent navigate a local dev server, take a screenshot and click. See the operating badge, take over
     and resume, and confirm the pane cannot reach Node or the Guild interface.

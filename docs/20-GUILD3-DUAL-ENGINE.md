@@ -1,10 +1,11 @@
 # Guild 3.0 — Claude Code engine, model sources, browser pane
 
-Date: 2026-10-12. Owner decision recorded as D-057..D-060 in `docs/04-DECISION-LOG.md`.
+Date: 2026-10-12. Owner decision recorded as D-057..D-061 in `docs/04-DECISION-LOG.md`.
 This document is the implementation brief for every work package (WP). Read it fully before
 changing code. Facts marked **[spike]** were verified on this machine on 2026-10-12 with
-`@agentclientprotocol/claude-agent-acp` 0.89.1 (Agent SDK 0.3.293) and `claude` 2.1.291; the spike
-scripts live outside the repository.
+`@agentclientprotocol/claude-agent-acp` 0.89.1 (Agent SDK 0.3.293) and `claude` 2.1.291 (the
+subscription-token row was re-verified with `claude` 2.1.296); the spike scripts live outside the
+repository.
 
 ## 1. Goal
 
@@ -17,9 +18,10 @@ One Guild window, two engines:
 
 Inside a Claude task the model picker switches, between turns and inside the same conversation,
 among three groups: **Claude (subscription)**, **Online** (vendor Anthropic-compatible endpoints such
-as DeepSeek) and **Local** (llama.cpp / Ollama `/v1/messages`). A new task's picker also shows the
-**Grok** group; the group chosen for the first turn fixes the task's engine (PC-TASK-001: no silent
-rebinding).
+as DeepSeek) and **Local** (llama.cpp / Ollama `/v1/messages`). The switch from Claude to Online or Local
+is one-way: a task that goes through the model router can never use a Claude subscription model again
+(3.3, D-061). A new task's picker also shows the **Grok** group; the group chosen for the first turn
+fixes the task's engine (PC-TASK-001: no silent rebinding).
 
 Plus an isolated **browser pane** in the workbench, controllable by the agent through a loopback MCP
 server.
@@ -43,7 +45,7 @@ server.
 | Tool results | DeepSeek enforces "tool_result immediately after tool_use": any text injected into a user message must come after its `tool_result` blocks. |
 | Thinking | Cross-vendor thinking blocks: dropping blocks whose signature was not produced by the target vendor kept every request at 200. Local llama.cpp returns thinking with an empty signature. |
 | llama.cpp SSE | Not conformant: it opens the text block (index 1) before closing the thinking block (index 0) and sends block 0's `signature_delta` after text started. Claude Code then duplicated the reply text. The router must re-sequence local streams. |
-| Subscription passthrough | With only `ANTHROPIC_BASE_URL` (no token), requests reach the router with `Authorization: Bearer sk-ant-oat...`; forwarded unchanged to api.anthropic.com they succeed on the subscription. |
+| Subscription token | With only `ANTHROPIC_BASE_URL` (no token), requests reach the router with `Authorization: Bearer sk-ant-oat...`, Claude Code's own subscription token. With `ANTHROPIC_AUTH_TOKEN=<dummy>` also set (`claude` 2.1.296, clean environment) Claude Code sends only `Authorization: Bearer <dummy>` and the subscription token never leaves it. Anthropic's rules forbid intermediating the token, so Guild never lets it reach the router (D-061, section 3.3). |
 | Browser MCP | An HTTP MCP server passed in `mcpServers` (`{type:"http", name, url, headers:[]}`) is used by Claude; each tool call produces a `session/request_permission` (permission card). The client first sends `server/discover` (answer -32601 or a valid result). `webContents.capturePage()` fails with "Current display surface not available" when the window is not visible; CDP `Page.captureScreenshot` works. Attach `webContents.debugger` only after the first page load; `sendCommand` before that hangs. |
 | Steering | `initialize` result `_meta.steering.supported: true`; method `_session/steering {sessionId, prompt, _meta:{steering:{idleBehavior:"promptRequired"}}}` -> `{outcome:"injected"}` / `{outcome:"promptRequired", reason:"noRunningTurn"}` / `{outcome:"startedNewTurn"}`. Guild's Steer maps to it for the Claude engine. |
 | Account | `_auth/status_update {authStatus:{kind:"account", label:"Claude Max", account:{plan, email, organization}}}`. Guild may show the label/plan; never store, log or display the email. |
@@ -115,10 +117,10 @@ created and never changes. Process topology stays one engine process per task (D
   fails with auth required, show "Run `claude` once in Terminal and log in" (named reduced state).
 
 ### 3.3 Native vs routed sessions
-- A Claude session starts **native**: no `ANTHROPIC_BASE_URL`, the model list is the adapter's own.
+- A Claude session starts **native**: no `ANTHROPIC_BASE_URL`, no `ANTHROPIC_AUTH_TOKEN`, the model list is
+  the adapter's own.
 - The first time the user picks an Online or Local model, Guild (between turns, as one serialized start
-  operation that concurrent callers join): restarts the task's adapter with
-  `ANTHROPIC_BASE_URL=<router url>`, `ENABLE_TOOL_SEARCH=true`, `OPENVIKING_AUTO_CAPTURE=false`,
+  operation that concurrent callers join): restarts the task's adapter with the routed environment below,
   resumes the same session with `_meta.claudeCode.options.settings.modelPicker` listing every
   enabled Online/Local model, sets the model, and only after the model is confirmed applied (and the start's projection
   published) records `task_metadata.routed_at` as the last step that can fail (review fix 2026-10-12); a projection
@@ -127,8 +129,36 @@ created and never changes. Process topology stays one engine process per task (D
   closed, the switch is deferred without marking; any failure leaves the task unmarked and surfaces
   `model_router_unavailable` / `model_selection_failed`. For the Claude engine a model that cannot be
   applied refuses the prompt (`model_selection_failed`) instead of running on another model.
-- Once routed, always routed (every later process start for that task uses the routed env, also
-  after Guild restarts). Claude models pass through the router to Anthropic.
+- **Routed environment (D-061).** Every start of a routed process (the switch, a crash recovery, a Guild
+  restart) adds exactly these per-spawn variables, each validated by the Claude profile:
+  `ANTHROPIC_BASE_URL=<router url>`; `ANTHROPIC_AUTH_TOKEN=guild-router-<32 random hex>`, new for each
+  launch, never logged, redacted from diagnostics (with a base URL alone Claude Code would send its
+  subscription token to the router; with this token set it sends only the throwaway value);
+  `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`; `ENABLE_TOOL_SEARCH=true`; `OPENVIKING_AUTO_CAPTURE=false`;
+  and the routed model applied at that start (the task's selected Online/Local model; no variable when it
+  selects none) as `ANTHROPIC_DEFAULT_HAIKU_MODEL`, `ANTHROPIC_DEFAULT_SONNET_MODEL`,
+  `ANTHROPIC_DEFAULT_OPUS_MODEL`, `ANTHROPIC_SMALL_FAST_MODEL` and `CLAUDE_CODE_SUBAGENT_MODEL`, so
+  background requests (titles, summaries, compaction) and subagents stay on the third-party source.
+  `ANTHROPIC_API_KEY` is never set (inherited `ANTHROPIC_*` stays stripped). The model variables follow the
+  last (re)start: a switch between routed models of a live session is a plain `set_config_option`, so they
+  keep naming the earlier source until the next start.
+- **One way (D-061).** Once routed, always routed (every later process start for that task uses the routed
+  env, also after Guild restarts), and a routed task can no longer use a Claude subscription model:
+  - the picker shows the Claude group's rows disabled under one line ("This task has used an online or
+    local model and cannot go back to a Claude subscription. Start a new task to use Claude."), with no
+    selection, roving tab stop or "Use default" for it;
+  - the main process refuses a selection of any non-routed model, and clearing the choice, for a routed
+    task (`claude_locked`, surfaced like other selection refusals);
+  - a Claude choice a task stored before it was routed, and the Claude global default, are ignored when its
+    selection is resolved; a turn that would start with no routed model selected (a task an earlier build
+    routed and took back to Claude) ends with `model_selection_failed` before the prompt is sent, and
+    choosing a routed model fixes it;
+  - a Claude task that has already run turns on a native session confirms before its first switch to an
+    Online or Local model (title "You can't switch back to a Claude subscription"): after the switch the
+    task runs through Guild's local relay and can no longer use Claude subscription models, the Claude login
+    never passes through the relay, and a new task is the way to keep using Claude. When the Online reminder
+    (3.7) is also due, one dialog carries both messages and its button reads "Continue". A new task with
+    no turn yet picks freely; routing is decided at its first run.
 - Switching among models of a routed session is a plain `set_config_option` (no restart).
 - Selection before Claude has started: the runtime default of a Claude task is Claude's own pick (the
   adapter-reported list, group `claude`) or nothing, which the picker shows as "Claude Code (default model)";
@@ -142,16 +172,21 @@ created and never changes. Process topology stays one engine process per task (D
 ### 3.4 Model router (`packages/model-router`, runs in the Electron main process)
 - Listens on `127.0.0.1` only, random port, URL `http://127.0.0.1:<port>/<token>/` with a 32-hex
   random token; wrong token -> 404. Binding to any non-loopback address throws at startup (test).
-- **Exact registry.** Anthropic ids are the Claude model ids the adapter reported in native sessions
-  plus `claude-*` ids the CLI sends for background work (titles, summaries); Online/Local ids are the
-  configured ones. Unknown model -> 404 JSON error, never a default upstream.
-- **Credential rules (tests):** OAuth/Authorization is forwarded only to the fixed host
-  `api.anthropic.com` over https, with an allowlist of request headers (`authorization`,
-  `x-api-key` if present, `anthropic-version`, `anthropic-beta`, `content-type`, `accept`,
-  `user-agent`, `x-app`, `x-stainless-*`, `anthropic-dangerous-direct-browser-access`, `x-claude-code-*`).
-  Requests to Online/Local sources drop `authorization`, `x-api-key`, `anthropic-beta`, then set the
-  source key (`x-api-key` and `Authorization: Bearer`). Redirects are never followed. Credential and
-  header values are never logged; logs carry model, source id, status, booleans.
+- **Exact registry.** The registry holds the configured Online/Local models of enabled, confirmed
+  sources and nothing else. There is no Anthropic upstream and no Anthropic id: the router never opens a
+  connection to `api.anthropic.com` (D-061). Any other model gets a JSON error and no upstream, never a
+  default: a `claude-*` model -> 400 `invalid_request_error`, "Claude subscription models are not
+  available in a task that uses online or local models"; any other unknown model -> 404. A model id a
+  source lists is served by that source only.
+- **Credential rules (tests):** a request whose `authorization` or `x-api-key` value, after an optional
+  `Bearer `, starts with `sk-ant-` (an Anthropic API key or a subscription token) is rejected with 400
+  `invalid_request_error` before the body is read or anything is forwarded; the router logs the fixed code
+  `anthropic_credential_rejected` (and `console.warn` a fixed string) and never the value. Requests to
+  Online/Local sources forward only an allowlist of request headers (`anthropic-version`, `content-type`,
+  `accept`, `user-agent`, `x-app`, `x-stainless-*`, `anthropic-dangerous-direct-browser-access`,
+  `x-claude-code-*`); `authorization`, `x-api-key` and `anthropic-beta` are never among them. The
+  source key is then set (`x-api-key` and `Authorization: Bearer`). Redirects are never followed.
+  Credential and header values are never logged; logs carry model, source id, status, booleans.
 - **Keys** come from a user-designated env file (path + variable name per source, default file
   `~/.config/guild/keys.env` on this machine), read in main when the router starts or when a
   source is confirmed; kept in memory only; never in SQLite, IPC payloads, renderer or logs.
@@ -168,7 +203,7 @@ created and never changes. Process topology stays one engine process per task (D
 - **Transport selection.** The router calls `fetchImpl(url, init, { sourceKind })` with the kind of the
   source it chose for that request. The Electron host uses the direct (no proxy) session for `local`
   and the proxied session otherwise, from that argument only, never from the URL or the live registry.
-- **Compat layer** (Online/Local only; Anthropic gets the original body):
+- **Compat layer** (every request the router serves):
   1. `role:"system"` messages are removed; their text is queued and inserted as one
      `<system-reminder>` text block into the next user message **after** its `tool_result` blocks
      (or appended as a trailing user message if none follows).
@@ -182,10 +217,11 @@ created and never changes. Process topology stays one engine process per task (D
 - **Thinking provenance.** The router records `sha256(signature)[:32] -> source id` for every non-empty
   thinking signature it sees in responses (SSE `signature_delta`, `content_block_start`, or JSON).
   Persistence goes through an injected store (Guild: SQLite table `thinking_provenance`).
-  Before forwarding to source X, `thinking`/`redacted_thinking` blocks not produced by X are dropped.
-  Unknown provenance: drop for Online/Local; for Anthropic keep only if the signature is a long
-  (> 100 chars) base64 string. An empty (or missing) signature is never recorded and such unsigned
-  thinking blocks are dropped for every target, Local included.
+  Before forwarding to source X, `thinking`/`redacted_thinking` blocks not produced by X are dropped,
+  and so are blocks of unknown provenance, whatever the signature looks like (Claude turns made before
+  a task was routed were never seen by the router). Rows that Guild 3.0.0 recorded under the id
+  `anthropic` prove nothing for any source; the id stays reserved. An empty (or missing) signature is
+  never recorded and such unsigned thinking blocks are dropped for every target, Local included.
 - **SSE normalizer** for Local sources: re-sequence content blocks so a block's events (deltas,
   `signature_delta`, `content_block_stop`) are emitted before any event of a higher index; buffer the
   higher block until the lower one stops.
@@ -240,17 +276,42 @@ Claude engine: OpenViking on (no kill-switch env). Routed Claude sessions: `OPEN
 Whenever a task switches to an Online model of a vendor (model source) not yet agreed to in that task, a confirmation states that CLAUDE.md, memory,
 the conversation, and browser page text/screenshots in the conversation will be sent to <vendor>.
 Option "Don't remind me again in this workspace" persists in `workspace_prefs`. Local and Claude
-models never remind.
+models never remind. When the task is a Claude task that has already run turns on a native session,
+the first switch also needs the one-way confirmation of 3.3; the same dialog then carries both
+messages (the one-way notice first, then the vendor list and the checkbox), so the user never gets
+two dialogs back to back. A switch to a Local model from such a task shows the one-way notice alone.
 
 ### 3.8 Grok-only features under the Claude engine (truthful reduced capability, PC-FALLBACK-001)
 Steer -> `_session/steering` (queue when `promptRequired`). Conversation rewind -> files only (existing fallback).
 Usage panel -> context usage from `usage_update`; quota "Managed by Claude Code". Grok control
 center and Grok slash snapshot -> Grok engine only. Phase line -> generic phases only. Content the adapter emits after a prompt response (rare: v1 holds a turn open while its background work runs) is dropped and reported as `late_update_dropped` (known 3.0 limitation); `async_task_*` session updates are ignored extensions.
 
+### 3.9 Claude group layout in the model picker (PC-MODEL-001)
+The adapter lists every model Claude Code knows; the picker reads that list and shows less of it. These
+rules apply to the Claude group only (Grok, Online and Local rows are unchanged) and read names and ids the
+adapter reported, never a hard-coded list of models:
+- **Rows shown.** The Default row, and the newest model of each known family (Opus, Sonnet, Haiku, Fable):
+  family and version are parsed from the display name ("Opus 5.5"), else from the id; a tie at the newest
+  version keeps every row; a model whose family is not recognized is always shown. Every other Claude model
+  sits in a collapsed row at the end of the group, "Older models (N)", which opens
+  inline and starts open when the selected model is one of them. The row is a keyboard-reachable option of the
+  listbox; collapsed models are not in the keyboard order or the tab stop.
+- **Default row.** Named "Default (Opus 5.5)" where the part in parentheses is
+  the adapter's description of the Default row when that reads like a model name, else just "Default"; the
+  trigger shows the same real model name ("Opus 5.5 · Default").
+- **Descriptions.** zh-CN replaces the adapter's English text with a description of the family (Opus:
+  complex and everyday work, Sonnet: speed and ability in balance, Haiku: fastest, for simple quick tasks,
+  Fable: the hardest and longest tasks); a family it does not know keeps the adapter text, and so does
+  every row in English.
+- **Efforts.** The Claude effort segment reads Default, Low, Medium, High, Extra high, Max. All wording
+  is localized in `packages/ui/src/locales.ts`.
+
 ## 4. New identifiers
 
 Decisions: **D-057** dual engine and per-task binding; **D-058** model router; **D-059** browser pane
-and browser MCP; **D-060** OpenViking amendment (supersedes the D-052 amendment for the Claude engine).
+and browser MCP; **D-060** OpenViking amendment (supersedes the D-052 amendment for the Claude engine);
+**D-061** subscription credentials never traverse the router and the Claude-to-routed switch is one-way
+(amends D-058).
 
 Requirements (new; old ones remain with disposition `superseded_by`):
 
@@ -258,9 +319,9 @@ Requirements (new; old ones remain with disposition `superseded_by`):
 |---|---|---|
 | PC-ENG-001 | Two engines; engine fixed per task at the first turn; truthful reduced capability per engine | — |
 | PC-ENG-002 | Claude engine runs the user-installed adapter and claude binary, pinned; Guild never reads Claude credentials | — |
-| PC-MODEL-001 | Grouped model picker (Grok / Claude / Online / Local); only models reported by the engine or configured sources | PC-ACC-001 (model clauses) |
-| PC-ROUTE-001 | Router loopback-only, random token, exact registry, unknown model 404, no redirects | PC-SEC-001 (gateway clause, extended) |
-| PC-ROUTE-002 | Credential rules: OAuth only to api.anthropic.com; third-party keys from a user env file, host-bound by native confirmation, never persisted or logged | — |
+| PC-MODEL-001 | Grouped model picker (Grok / Claude / Online / Local); only models reported by the engine or configured sources; a routed task cannot go back to a Claude subscription model | PC-ACC-001 (model clauses) |
+| PC-ROUTE-001 | Router loopback-only, random token, exact registry of Online/Local models, unknown model 404 (Claude model 400), no redirects | PC-SEC-001 (gateway clause, extended) |
+| PC-ROUTE-002 | Credential rules: no Claude credential ever reaches the router (throwaway auth token, Anthropic-looking credentials rejected), no Anthropic upstream; third-party keys from a user env file, host-bound by native confirmation, never persisted or logged | — |
 | PC-ROUTE-003 | Compat layer, thinking provenance, local SSE normalization | — |
 | PC-BROWSER-001 | Isolated browser pane (partition, sandbox, navigation and permission policy, security-profile split) | — |
 | PC-BROWSER-002 | Browser MCP loopback server, tool set without eval, permission cards, user takeover | — |
@@ -277,7 +338,7 @@ File ownership avoids conflicts; anything outside the listed paths needs a note 
 
 | WP | Scope | Owns |
 |---|---|---|
-| WP0 | Governance text: decisions D-057..D-060, requirement entries and dispositions, README (zh/en boundary list), PROVENANCE.yml, NOTICE / THIRD-PARTY-NOTICES (independence from xAI and Anthropic), docs/01 contract, docs/09 security profile split, docs/15, docs/02/12 notes | `docs/`, `requirements/`, `README.md`, `PROVENANCE.yml`, `NOTICE`, `THIRD-PARTY-NOTICES` |
+| WP0 | Governance text: decisions D-057..D-060 (D-061 followed), requirement entries and dispositions, README (zh/en boundary list), PROVENANCE.yml, NOTICE / THIRD-PARTY-NOTICES (independence from xAI and Anthropic), docs/01 contract, docs/09 security profile split, docs/15, docs/02/12 notes | `docs/`, `requirements/`, `README.md`, `PROVENANCE.yml`, `NOTICE`, `THIRD-PARTY-NOTICES` |
 | WP-B | Contracts + persistence: `GuildEngine`, per-engine model id grammar, per-engine catalogs and defaults, IPC channels/validators for task engine, model sources (no secrets), workspace prefs, browser pane commands; schema v19 (`task_metadata.engine`, `routed_at`, `model_sources`, `workspace_prefs`, `thinking_provenance`, per-engine defaults, catalog keyed by engine, relaxed CHECKs) with migration tests | `packages/contracts`, `packages/persistence` |
 | WP-C | `packages/model-router` (new workspace package, registered in root `workspaces`, `tsconfig`, `scripts/run-tests.mjs`): everything in 3.4 with unit tests against fake upstream servers (including recorded llama.cpp SSE) | `packages/model-router`, root registration lines |
 | WP-D | Browser: main-process `browser-pane.ts`, `browser-mcp.ts`, security guard split in `window-security.ts`, `BrowserPane.tsx` UI component (standalone, wired later by WP-E), tests | `apps/desktop/src/main/browser-*.ts`, `window-security.ts`, `packages/ui/src/BrowserPane*` |
@@ -291,7 +352,10 @@ Order: WP0, WP-B, WP-C, WP-D in parallel -> WP-A (needs WP-B contracts) -> WP-E 
 
 1. All existing tests pass; real Grok two-turn queued task passes.
 2. Claude subscription task: file write/read, permission card, restart + resume; `/status` shows no gateway.
-3. Same task Opus -> DeepSeek -> Opus with tools; reminder shown once; router log proves OAuth only to Anthropic.
+3. Same task Opus -> DeepSeek with tools: one dialog carries the one-way notice and the reminder; afterwards
+   the Claude rows are disabled and the main process refuses a Claude model; the routed process has the
+   throwaway token and no API key; the router log shows no request served by Anthropic, no `claude-*`
+   request answered and no rejected Anthropic credential.
 4. Local model turn through the router; no duplicated text.
 5. Browser: manual login persists across restart; agent navigates a local dev server, screenshots,
    clicks; badge + takeover work; pane cannot reach Node or Guild UI.
