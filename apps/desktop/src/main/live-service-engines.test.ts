@@ -777,6 +777,7 @@ class EngineFake implements RuntimeAdapterPort {
   session: AcpV1AdapterSession | undefined;
   private options: readonly RuntimeConfigOption[] = [];
   private held: (() => void) | undefined;
+  private releaseRequested = false;
   private promptSequence = 0;
 
   constructor(
@@ -939,7 +940,12 @@ class EngineFake implements RuntimeAdapterPort {
           payload: { type: "agent_thought_chunk", sessionId: session.sessionId, text: "thinking", received: received() },
         },
       });
-      await new Promise<void>((resolve) => { this.held = resolve; });
+      // A release that arrives before the turn started waiting is not lost.
+      await new Promise<void>((resolve) => {
+        if (this.releaseRequested) resolve();
+        else this.held = resolve;
+      });
+      this.releaseRequested = false;
     }
     await this.sink.commitUpdate({
       identity: { adapterEpoch: this.adapterEpoch, sessionId: session.sessionId },
@@ -962,6 +968,7 @@ class EngineFake implements RuntimeAdapterPort {
   }
 
   release(): void {
+    this.releaseRequested = true;
     this.held?.();
     this.held = undefined;
   }
