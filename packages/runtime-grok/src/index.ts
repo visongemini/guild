@@ -2,6 +2,7 @@ export * from "./acp-adapter.js";
 export * from "./acp-v1-codec.js";
 export * from "./acp-v1-methods.js";
 export * from "./adapter-pin.js";
+export * from "./claude-dialect.js";
 export {
   CLAUDE_ENGINE_PROFILE,
   CLAUDE_ENVIRONMENT_POLICY,
