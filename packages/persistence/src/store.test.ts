@@ -4617,6 +4617,54 @@ describe("Guild 3.0 dual engine, model sources and preferences (schema v19)", ()
     });
   });
 
+  it("starts a Run-less task's session over when its engine changes after a session opened [PC-ENG-001]", (t) => {
+    const path = temporaryDatabase(t);
+    const store = conversationStore(path);
+    const attemptId = must(parseSessionAttemptId("attempt-engine-switch"));
+    assert.equal(store.applySessionBinding({
+      taskId,
+      event: { type: "start_session", attemptId, idempotencyKey: key("engine-switch-start") },
+    }).ok, true);
+    assert.equal(store.applySessionBinding({
+      taskId,
+      event: {
+        type: "session_new_succeeded", sessionId, adapterEpoch: epoch, attemptId,
+        idempotencyKey: key("engine-switch-established"),
+      },
+    }).ok, true);
+    store.commitAdapterEpoch({ taskId, sessionId, adapterEpoch: epoch, expectedRevision: 0, status: "alive" });
+    assert.equal(store.loadSessionBinding(taskId).state, "healthy");
+
+    const before = store.loadTaskMetadata(taskId);
+    const changed = store.setTaskEngine({ taskId, expectedRevision: before.revision, engine: "claude" });
+    assert.equal(changed.engine, "claude");
+    const binding = store.loadSessionBinding(taskId);
+    assert.equal(binding.state, "unbound", "the other engine's empty session does not follow the task");
+    assert.equal(binding.sessionId, undefined);
+    assert.equal(store.loadCurrentAdapterEpoch(taskId), undefined);
+    store.close();
+
+    withRaw(path, (raw) => {
+      assert.equal(raw.prepare("SELECT COUNT(*) AS n FROM adapter_epochs WHERE task_id = ?").get(taskId)?.["n"], 0);
+    });
+    // The task can open a session again from epoch 1 without colliding with the dropped one.
+    const reopened = openGuildPersistence({ path });
+    const nextAttempt = must(parseSessionAttemptId("attempt-engine-switch-2"));
+    assert.equal(reopened.applySessionBinding({
+      taskId,
+      event: { type: "start_session", attemptId: nextAttempt, idempotencyKey: key("engine-switch-start-2") },
+    }).ok, true);
+    assert.equal(reopened.applySessionBinding({
+      taskId,
+      event: {
+        type: "session_new_succeeded", sessionId, adapterEpoch: epoch, attemptId: nextAttempt,
+        idempotencyKey: key("engine-switch-established-2"),
+      },
+    }).ok, true);
+    reopened.commitAdapterEpoch({ taskId, sessionId, adapterEpoch: epoch, expectedRevision: 0, status: "alive" });
+    reopened.close();
+  });
+
   it("refuses to change the engine of an archived task", (t) => {
     const path = temporaryDatabase(t);
     const store = conversationStore(path);

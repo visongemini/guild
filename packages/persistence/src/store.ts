@@ -2449,6 +2449,24 @@ class SqliteGuildPersistence implements GuildPersistence {
       }
       // A model override was written for the other engine and means nothing on this one.
       this.#database.prepare("DELETE FROM task_runtime_settings WHERE task_id = ?").run(taskId);
+      // So does a session the other engine opened before the first turn (a slash-command menu starts
+      // one): with no Run there is nothing in it to keep, and the next turn starts a fresh session.
+      // Its adapter epochs go too, so the new binding can count from epoch 1 again.
+      const staleBinding = this.#selectSession(taskId);
+      if (staleBinding !== undefined && staleBinding.value.state !== "unbound") {
+        const unbound = encodeSessionBinding(createUnboundBinding(taskId));
+        this.#database.prepare("DELETE FROM adapter_epochs WHERE task_id = ?").run(taskId);
+        const reset = this.#database
+          .prepare(`
+            UPDATE session_bindings
+            SET snapshot_json = ?, snapshot_sha256 = ?, revision = revision + 1, updated_at_ms = ?
+            WHERE task_id = ? AND revision = ?
+          `)
+          .run(unbound.json, unbound.sha256, exactNow(), taskId, staleBinding.revision);
+        if (changes(reset.changes) !== 1) {
+          throw persistenceError("persistence_cas_conflict");
+        }
+      }
       const updated = this.#database
         .prepare(`
           UPDATE task_metadata

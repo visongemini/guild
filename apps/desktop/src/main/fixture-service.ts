@@ -1,12 +1,16 @@
 import {
   GUILD_API_VERSION,
+  GUILD_CLAUDE_PERMISSION_MODES,
   GUILD_GROK_PERMISSION_MODES,
   GUILD_DEFAULT_GROK_STARTUP_SETTINGS,
   GUILD_MODEL_SWITCH_REFUSAL_REASONS,
   GUILD_RUN_PHASES,
   freezeGrokModelCatalog,
+  freezeModelCatalog,
   resolveEffectiveSelection,
   type DesktopBootstrapProjection,
+  type GuildClaudePermissionMode,
+  type GuildEngine,
   type GuildLocale,
   type GuildGrokModel,
   type GuildGrokPermissionMode,
@@ -97,6 +101,36 @@ const FIXTURE_MODEL_CATALOG = freezeGrokModelCatalog({
   runtimeDefaultModelId: "grok-4.7",
 });
 
+/**
+ * What the Claude picker offers (PC-MODEL-001): the adapter's own models plus the router's Online
+ * and Local ones. Efforts are only known for the model that is selected.
+ */
+const FIXTURE_CLAUDE_CATALOG = freezeModelCatalog("claude", {
+  engine: "claude",
+  runtimeDefaultModelId: "default",
+  models: [
+    {
+      id: "default", name: "Default (recommended)", group: "claude",
+      reasoningEfforts: [
+        { id: "medium", label: "Medium", isDefault: true },
+        { id: "high", label: "High", isDefault: false },
+      ],
+      contextWindows: [],
+    },
+    { id: "opus", name: "Opus", group: "claude", reasoningEfforts: [], contextWindows: [] },
+    { id: "sonnet", name: "Sonnet", group: "claude", reasoningEfforts: [], contextWindows: [] },
+    { id: "haiku", name: "Haiku", group: "claude", reasoningEfforts: [], contextWindows: [] },
+    {
+      id: "deepseek-v4-flash", name: "DeepSeek V4 Flash", description: "DeepSeek", group: "online",
+      reasoningEfforts: [], contextWindows: [128000],
+    },
+    {
+      id: "local-27b-model", name: "Local 27B", description: "Local llama.cpp", group: "local",
+      reasoningEfforts: [], contextWindows: [],
+    },
+  ],
+});
+
 export function createFixtureDesktopService(): DesktopApplicationService {
   const listeners = new Set<(projection: DesktopBootstrapProjection) => void>();
   let locale: GuildLocale = "zh-CN";
@@ -105,6 +139,10 @@ export function createFixtureDesktopService(): DesktopApplicationService {
   let reasoningEffort: GuildGrokReasoningEffort | null = null;
   const taskOverrides = new Map<string, { model: GuildGrokModel; reasoningEffort: GuildGrokReasoningEffort | null }>();
   let permissionMode: GuildGrokPermissionMode = "default";
+  let claudeModel: string | null = null;
+  let claudeEffort: string | null = null;
+  let claudePermissionMode: GuildClaudePermissionMode = "default";
+  const taskEngines = new Map<string, GuildEngine>();
   let startup: GuildGrokStartupSettings = GUILD_DEFAULT_GROK_STARTUP_SETTINGS;
   let sidebarWidth = 280;
   let nickname = "BDV";
@@ -144,12 +182,15 @@ export function createFixtureDesktopService(): DesktopApplicationService {
   /** What the task will use for its next turn: its own override, then the global default, then the runtime's. */
   function withModelSelection(task: Omit<TaskViewProjection, "modelSelection">): TaskViewProjection {
     const override = taskOverrides.get(task.task.taskId);
+    const claude = taskEngines.get(task.task.taskId) === "claude";
     const resolved = resolveEffectiveSelection({
       ...(override === undefined
         ? {}
         : { task: { modelId: override.model, reasoningEffort: override.reasoningEffort } }),
-      global: { modelId: grokModel, reasoningEffort },
-      catalog: FIXTURE_MODEL_CATALOG,
+      global: claude
+        ? { modelId: claudeModel, reasoningEffort: claudeEffort }
+        : { modelId: grokModel, reasoningEffort },
+      catalog: claude ? FIXTURE_CLAUDE_CATALOG : FIXTURE_MODEL_CATALOG,
     });
     const state = task.task.activeRunState;
     const turnLive = state !== undefined &&
@@ -185,6 +226,13 @@ export function createFixtureDesktopService(): DesktopApplicationService {
         startup,
         availablePermissionModes: GUILD_GROK_PERMISSION_MODES,
         canChange: true,
+        claude: Object.freeze({
+          model: claudeModel,
+          reasoningEffort: claudeEffort,
+          permissionMode: claudePermissionMode,
+          availablePermissionModes: GUILD_CLAUDE_PERMISSION_MODES,
+        }),
+        modelCatalogs: Object.freeze({ grok: FIXTURE_MODEL_CATALOG, claude: FIXTURE_CLAUDE_CATALOG }),
       }),
       generalSettings: Object.freeze({
         restoreLastTask,
@@ -281,7 +329,7 @@ export function createFixtureDesktopService(): DesktopApplicationService {
     bootstrap: async () => projection,
     chooseWorkspace: async () => projection,
     choosePromptFiles: async () => Object.freeze({ status: "cancelled" as const }),
-    createTask: async (workspaceId, isolation) => {
+    createTask: async (workspaceId, isolation, engine) => {
       if (isolation === "worktree" && (worktrees === undefined || workspaceId !== WORKTREE_REPO_WORKSPACE)) {
         throw new Error("worktree_not_a_git_repo");
       }
@@ -300,6 +348,7 @@ export function createFixtureDesktopService(): DesktopApplicationService {
         });
         await worktrees.refresh(taskId, { force: true });
       }
+      taskEngines.set(taskId, engine ?? "grok");
       activeTask = withModelSelection({
         task: Object.freeze({
           taskId,
@@ -308,7 +357,11 @@ export function createFixtureDesktopService(): DesktopApplicationService {
           pinned: false,
           archived: false,
           updatedAtMs: Date.now(),
+          engine: engine ?? "grok",
         }),
+        ...(engine === "claude"
+          ? { engineStatus: Object.freeze({ accountLabel: "Claude Max" }) }
+          : {}),
         timeline: Object.freeze([]),
         hasEarlierTimeline: false,
         queuedTurns: Object.freeze([]),
@@ -479,6 +532,28 @@ export function createFixtureDesktopService(): DesktopApplicationService {
       reasoningEffort = nextReasoningEffort;
       permissionMode = nextPermissionMode;
       startup = nextStartup;
+      activeTask = withModelSelection(activeTask);
+      publish();
+      return projection;
+    },
+    setTaskEngine: async (taskId, engine) => {
+      if (taskId !== activeTask.task.taskId) throw new Error("fixture_task_not_found");
+      if (activeTask.timeline.length > 0) throw new Error("task_engine_locked");
+      taskEngines.set(taskId, engine);
+      taskOverrides.delete(taskId);
+      const { engineStatus: _status, ...rest } = activeTask;
+      activeTask = withModelSelection({
+        ...rest,
+        task: Object.freeze({ ...activeTask.task, engine }),
+        ...(engine === "claude" ? { engineStatus: Object.freeze({ accountLabel: "Claude Max" }) } : {}),
+      });
+      publish();
+      return currentTask();
+    },
+    setClaudeSettings: async (nextModel, nextEffort, nextPermissionMode) => {
+      claudeModel = nextModel;
+      claudeEffort = nextEffort;
+      claudePermissionMode = nextPermissionMode;
       activeTask = withModelSelection(activeTask);
       publish();
       return projection;

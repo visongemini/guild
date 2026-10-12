@@ -19,6 +19,7 @@ import type {
   XaiSignal,
 } from "@guild/contracts";
 import {
+  GUILD_CLAUDE_PERMISSION_MODES,
   GUILD_GROK_PERMISSION_MODES,
   freezeGrokModelCatalog,
   parseAdapterEpoch,
@@ -38,6 +39,7 @@ import {
   type AcpV1DecodedUpdate,
   type AcpV1InitializeResult,
   type AcpV1PreparedPermissionResponse,
+  type AcpV1SteerResult,
   type JsonRpcInboundResponseWriteReceipt,
   type JsonRpcWriteReceipt,
   type JsonValue,
@@ -929,6 +931,13 @@ describe("live desktop service", () => {
       availablePermissionModes: GUILD_GROK_PERMISSION_MODES,
       startup,
       canChange: true,
+      claude: {
+        model: null,
+        reasoningEffort: null,
+        permissionMode: "default",
+        availablePermissionModes: GUILD_CLAUDE_PERMISSION_MODES,
+      },
+      modelCatalogs: { grok: { models: [] }, claude: { engine: "claude", models: [] } },
     }, "a new install follows the runtime default and has no model list yet");
 
     // No list yet: any official-looking pair is accepted; the runtime validates it per session.
@@ -1838,7 +1847,8 @@ describe("live desktop service", () => {
       stagingRoot: join(root, "staging"),
       chooseWorkspace: async () => workspace,
       runtimeFactory: fakeRuntimeFactory([], (adapter) => adapters.push(adapter)),
-      promptSilenceMs: 25,
+      // Long enough that a CPU-starved machine does not read the retried turn as silent too.
+      promptSilenceMs: 250,
     });
     services.push(service);
 
@@ -5120,7 +5130,7 @@ describe("live desktop service", () => {
       stagingRoot: join(root, "staging"),
       chooseWorkspace: async () => workspace,
       runtimeFactory: fakeRuntimeFactory(),
-      promptSilenceMs: 25,
+      promptSilenceMs: 250,
     });
     services.push(service);
 
@@ -5128,7 +5138,7 @@ describe("live desktop service", () => {
     const task = await service.createTask(bootstrapped.workspaces[0]!.workspaceId);
     const sent = await service.sendMessage(task.task.taskId, "permission");
     const pending = await waitForPermission(service);
-    await new Promise((resolve) => setTimeout(resolve, 75));
+    await new Promise((resolve) => setTimeout(resolve, 750));
     const stillWaiting = await service.bootstrap();
     assert.equal(stillWaiting.activeTask?.task.activeRunState, "awaiting_permission");
     assert.equal(
@@ -6962,6 +6972,10 @@ function fakeRuntimeFactory(
 
 class FakeAdapter implements RuntimeAdapterPort {
   state = "created";
+  readonly engine = "grok" as const;
+  readonly features = Object.freeze({
+    billing: true, steer: true, conversationRewind: true, xaiSignals: true, agentInitiatedTurns: true,
+  });
   toolCallOnPrompt = false;
   newSessionCalls = 0;
   billingCalls = 0;
@@ -7096,6 +7110,14 @@ class FakeAdapter implements RuntimeAdapterPort {
   }
 
   async authenticate(): Promise<void> {}
+
+  async steer(): Promise<AcpV1SteerResult> {
+    return Object.freeze({ status: "unsupported" as const, reason: "engine" as const });
+  }
+
+  async setPermissionMode(): Promise<readonly RuntimeConfigOption[]> {
+    throw new AcpV1AdapterError("unsupported_for_engine");
+  }
 
   async sendExtensionRequest(
     method: string,

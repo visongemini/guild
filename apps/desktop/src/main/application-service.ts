@@ -8,6 +8,8 @@ import type {
   ExecuteRewindRequest,
   ExecuteRewindResponse,
   ExportTaskResponse,
+  GuildClaudePermissionMode,
+  GuildEngine,
   GuildGrokModel,
   GuildGrokPermissionMode,
   GuildGrokReasoningEffort,
@@ -41,7 +43,17 @@ export interface DesktopApplicationService {
   chooseWorkspace(): Promise<DesktopBootstrapProjection>;
   choosePromptFiles(taskId: TaskId): Promise<ChoosePromptFilesResponse>;
   /** `isolation: "worktree"` (F3) gives the task its own git worktree; refusals throw `worktree_<reason>`. */
-  createTask(workspaceId: WorkspaceId, isolation?: GuildTaskIsolation): Promise<TaskViewProjection>;
+  createTask(
+    workspaceId: WorkspaceId,
+    isolation?: GuildTaskIsolation,
+    /** Engine of the new task (PC-ENG-001); absent means Grok. */
+    engine?: GuildEngine,
+  ): Promise<TaskViewProjection>;
+  /**
+   * Changes the engine of a task before its first turn. Refused with `task_engine_locked` once the
+   * task has a Run, a queued turn or a started turn, or has switched to a router model (PC-TASK-001).
+   */
+  setTaskEngine(taskId: TaskId, engine: GuildEngine): Promise<TaskViewProjection>;
   openTask(taskId: TaskId, sequence?: number): Promise<TaskViewProjection>;
   loadEarlierTimeline(taskId: TaskId): Promise<TaskViewProjection>;
   loadSlashCommands(taskId: TaskId): Promise<TaskViewProjection>;
@@ -118,6 +130,12 @@ export interface DesktopApplicationService {
     reasoningEffort: GuildGrokReasoningEffort | null,
     permissionMode: GuildGrokPermissionMode,
     startup: GuildGrokStartupSettings,
+  ): Promise<DesktopBootstrapProjection>;
+  /** Defaults a new Claude-engine task starts from (PC-SET-002); applied to sessions between turns. */
+  setClaudeSettings(
+    model: string | null,
+    reasoningEffort: string | null,
+    permissionMode: GuildClaudePermissionMode,
   ): Promise<DesktopBootstrapProjection>;
   setSidebarWidth(width: number): Promise<void>;
   chooseAvatar(): Promise<ChooseAvatarResponse>;

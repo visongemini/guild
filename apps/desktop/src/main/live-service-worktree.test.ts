@@ -19,6 +19,7 @@ import type {
   AcpV1AdapterSink,
   AcpV1DecodedUpdate,
   AcpV1InitializeResult,
+  AcpV1SteerResult,
   JsonRpcWriteReceipt,
   JsonValue,
   XaiExtensionOutcome,
@@ -482,6 +483,10 @@ function scriptedRuntimeFactory(
 
 class ScriptedAdapter implements RuntimeAdapterPort {
   state = "created";
+  readonly engine = "grok" as const;
+  readonly features = Object.freeze({
+    billing: true, steer: true, conversationRewind: true, xaiSignals: true, agentInitiatedTurns: true,
+  });
   readonly sessionFolders: string[] = [];
   private promptSequence = 0;
   private readonly sessionId = "scripted-session";
@@ -493,6 +498,14 @@ class ScriptedAdapter implements RuntimeAdapterPort {
     private readonly gate: Promise<void>,
     private readonly cwd: string,
   ) {}
+
+  async steer(): Promise<AcpV1SteerResult> {
+    return Object.freeze({ status: "unsupported" as const, reason: "engine" as const });
+  }
+
+  async setPermissionMode(): Promise<readonly RuntimeConfigOption[]> {
+    throw new Error("unsupported_for_engine");
+  }
 
   async start(): Promise<AcpV1InitializeResult> {
     this.state = "ready";

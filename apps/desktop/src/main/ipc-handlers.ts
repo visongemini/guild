@@ -54,7 +54,7 @@ export function registerDesktopIpc(
   handle(DESKTOP_IPC_CHANNELS.choosePromptFiles, async (request) =>
     service.choosePromptFiles(request.taskId));
   handle(DESKTOP_IPC_CHANNELS.createTask, async (request) =>
-    service.createTask(request.workspaceId, request.isolation));
+    service.createTask(request.workspaceId, request.isolation, request.engine));
   handle(DESKTOP_IPC_CHANNELS.openTask, async (request) =>
     service.openTask(request.taskId, request.sequence));
   handle(DESKTOP_IPC_CHANNELS.loadEarlierTimeline, async (request) =>
@@ -164,6 +164,10 @@ export function registerDesktopIpc(
   });
   handle(DESKTOP_IPC_CHANNELS.runGrokManagement, async (request) =>
     service.runGrokManagement(request));
+  handle(DESKTOP_IPC_CHANNELS.setTaskEngine, async (request) =>
+    service.setTaskEngine(request.taskId, request.engine));
+  handle(DESKTOP_IPC_CHANNELS.setClaudeSettings, async (request) =>
+    service.setClaudeSettings(request.model, request.reasoningEffort, request.permissionMode));
 
   const modelSources = extras.modelSources;
   if (modelSources !== undefined) {
