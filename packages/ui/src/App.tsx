@@ -65,6 +65,7 @@ import type {
   RewindAvailabilityProjection,
   RunCheckpointProjection,
   RunId,
+  RunModelProjection,
   ConversationSearchResult,
   ModelSourceProjection,
   RuntimeCommand,
@@ -157,6 +158,7 @@ import { cardAnchors, latestChangedRun, resultSummaryRepeatsChangeCard } from ".
 import { composerEnterAction, steerButtonState } from "./steer.js";
 import { noTaskComposerPlaceholder } from "./welcome.js";
 import {
+  MODEL_PICKER_SEPARATOR,
   globalDefaultView,
   modelCatalogsOf,
   modelPickerView,
@@ -2413,6 +2415,7 @@ export function GuildApp({ api }: GuildAppProps) {
               recentResult={activeTask.recentResult}
               continuousTask={activeTask.continuousTask}
               runCheckpoints={activeTask.runCheckpoints}
+              runModels={activeTask.runModels}
               rewind={activeTask.rewind}
               running={running}
               highlightedSequence={searchNavigation?.results[searchNavigation.index]?.taskId === activeTask.task.taskId
@@ -3883,6 +3886,8 @@ type TimelineProps = {
   /** Changed-file summaries of the runs in the loaded window; each finished run with changes gets a card. */
   readonly runCheckpoints?: readonly RunCheckpointProjection[];
   readonly rewind?: RewindAvailabilityProjection;
+  /** The model each run of the window started on, by display name; a run without a record is absent. */
+  readonly runModels?: readonly RunModelProjection[];
   readonly highlightedSequence?: number;
   /** A run is live: its turn is not finished, so it shows no duration yet. */
   readonly running: boolean;
@@ -3891,7 +3896,7 @@ type TimelineProps = {
 /** The newest groups always render fully so growth and scrolling at the bottom stay exact. */
 const LIVE_TAIL_GROUPS = 3;
 
-export const Timeline = memo(function Timeline({ items, pendingUserText, runStatus, runPhase, locale, engine = "grok", recentResult, continuousTask, runCheckpoints, rewind, highlightedSequence, running, onOpenExternal, onPermissionDecision, onBranch, onRetryToDraft, onOpenRuntimeDiagnostics, onViewRunDiff, onRewind }: TimelineProps) {
+export const Timeline = memo(function Timeline({ items, pendingUserText, runStatus, runPhase, locale, engine = "grok", recentResult, continuousTask, runCheckpoints, rewind, runModels, highlightedSequence, running, onOpenExternal, onPermissionDecision, onBranch, onRetryToDraft, onOpenRuntimeDiagnostics, onViewRunDiff, onRewind }: TimelineProps) {
   const messages = messagesFor(locale, engine);
   const groups = useMemo(() => groupTimeline(items), [items]);
   const handlers = useMemo(() => Object.freeze({
@@ -3939,6 +3944,20 @@ export const Timeline = memo(function Timeline({ items, pendingUserText, runStat
     }
     return labels;
   }, [items, messages, running]);
+  // The model that answered goes in the same footer, for a finished turn only (the live one is still being answered).
+  const modelOfRun = useMemo(() => new Map((runModels ?? []).map((entry) => [entry.runId as string, entry.label])), [runModels]);
+  const turnModel = useMemo(() => {
+    const lastAnswerOfRun = new Map<string, string>();
+    for (const item of items) {
+      if (item.kind === "assistant" && item.runId !== undefined) lastAnswerOfRun.set(item.runId, item.entryId);
+    }
+    const labels = new Map<string, string>();
+    for (const [runId, entryId] of lastAnswerOfRun) {
+      const label = runId === liveRunId ? undefined : modelOfRun.get(runId);
+      if (label !== undefined) labels.set(entryId, label);
+    }
+    return labels;
+  }, [items, modelOfRun, liveRunId]);
   const lastAnswerEntryId = useMemo(() => items.findLast((item) => item.kind === "assistant")?.entryId, [items]);
   const segments = useMemo(() => segmentTimeline(groups), [groups]);
   const renderRow = ({ group, index }: TimelineRow) => {
@@ -3957,6 +3976,7 @@ export const Timeline = memo(function Timeline({ items, pendingUserText, runStat
       handlers={handlers}
       lastTurn={single !== undefined && single.entryId === lastAnswerEntryId}
       turnMeta={single === undefined ? undefined : turnTook.get(single.entryId)}
+      turnModel={single === undefined ? undefined : turnModel.get(single.entryId)}
       interruptedUser={single?.kind === "notice" && single.noticeType === "session_restored"
         ? [...items].reverse().find((item) =>
             item.sequence < single.sequence && item.kind === "user" && item.status === "interrupted")
@@ -3997,6 +4017,7 @@ export const Timeline = memo(function Timeline({ items, pendingUserText, runStat
   previous.continuousTask === next.continuousTask &&
   previous.runCheckpoints === next.runCheckpoints &&
   previous.rewind === next.rewind &&
+  previous.runModels === next.runModels &&
   previous.highlightedSequence === next.highlightedSequence &&
   previous.running === next.running &&
   previous.onOpenExternal === next.onOpenExternal &&
@@ -4028,6 +4049,8 @@ type TimelineGroupRowProps = {
   readonly lastTurn: boolean;
   /** Right-aligned footer text for the last answer of a finished turn, such as "Took 4 min 12 s". */
   readonly turnMeta: string | undefined;
+  /** Display name of the model that answered that turn, shown before the time. */
+  readonly turnModel: string | undefined;
   readonly interruptedUser: TimelineItemProjection | undefined;
   readonly canRetry: boolean;
   readonly completionTask: TaskViewProjection["continuousTask"];
@@ -4035,7 +4058,7 @@ type TimelineGroupRowProps = {
   readonly card: RunCardData | undefined;
 };
 
-const TimelineGroupRow = memo(function TimelineGroupRow({ group, sequence, highlighted, settled, locale, engine, handlers, lastTurn, turnMeta, interruptedUser, canRetry, completionTask, card }: TimelineGroupRowProps) {
+const TimelineGroupRow = memo(function TimelineGroupRow({ group, sequence, highlighted, settled, locale, engine, handlers, lastTurn, turnMeta, turnModel, interruptedUser, canRetry, completionTask, card }: TimelineGroupRowProps) {
   const className = [
     highlighted ? "guild-timeline-group search-highlight" : "guild-timeline-group",
     settled ? "settled" : "",
@@ -4064,6 +4087,7 @@ const TimelineGroupRow = memo(function TimelineGroupRow({ group, sequence, highl
           canRetry={canRetry}
           lastTurn={lastTurn}
           turnMeta={turnMeta}
+          turnModel={turnModel}
           card={card}
           onViewRunDiff={handlers.onViewRunDiff}
           onRewind={handlers.onRewind}
@@ -4079,6 +4103,7 @@ const TimelineGroupRow = memo(function TimelineGroupRow({ group, sequence, highl
   previous.handlers === next.handlers &&
   previous.lastTurn === next.lastTurn &&
   previous.turnMeta === next.turnMeta &&
+  previous.turnModel === next.turnModel &&
   previous.interruptedUser === next.interruptedUser &&
   previous.canRetry === next.canRetry &&
   previous.completionTask === next.completionTask &&
@@ -4359,7 +4384,7 @@ export const ToolRow = memo(function ToolRow({ item, locale, engine = "grok" }: 
 });
 
 /** Exported for tests. */
-export const TimelineItem = memo(function TimelineItem({ item, locale, engine = "grok", onOpenExternal, onPermissionDecision, onBranch, onRetryToDraft, onOpenRuntimeDiagnostics, interruptedUser, canRetry, lastTurn = false, turnMeta, card, onViewRunDiff, onRewind }: {
+export const TimelineItem = memo(function TimelineItem({ item, locale, engine = "grok", onOpenExternal, onPermissionDecision, onBranch, onRetryToDraft, onOpenRuntimeDiagnostics, interruptedUser, canRetry, lastTurn = false, turnMeta, turnModel, card, onViewRunDiff, onRewind }: {
   readonly item: TimelineItemProjection;
   readonly locale: GuildLocale;
   /** Engine of the task: recovery and Steer notices name its runtime. Grok when absent. */
@@ -4367,6 +4392,8 @@ export const TimelineItem = memo(function TimelineItem({ item, locale, engine = 
   readonly canRetry: boolean;
   readonly lastTurn?: boolean;
   readonly turnMeta?: string;
+  /** The model that answered this turn (display name), shown in its footer before the time. */
+  readonly turnModel?: string;
   /** The changed-files card to show in this answer's footer when it is its run's last answer (F2). */
   readonly card?: RunCardData;
   readonly onViewRunDiff?: (runId: RunId, path?: string) => void;
@@ -4451,6 +4478,7 @@ export const TimelineItem = memo(function TimelineItem({ item, locale, engine = 
         messages={messages}
         lastTurn={lastTurn}
         meta={turnMeta}
+        model={turnModel}
         onBranch={onBranch}
         slot={card === undefined ? undefined : <RunCardView card={card} locale={locale} engine={engine} onViewRunDiff={onViewRunDiff} onRewind={onRewind} />}
       />
@@ -4507,11 +4535,13 @@ function RunCardView({ card, locale, engine, onViewRunDiff, onRewind }: {
  * per-turn changed-files card (with "rewind to before this turn"); nothing renders there for a
  * turn without file changes, so no placeholder is shown.
  */
-function TurnFooter({ item, messages, lastTurn, meta, onBranch, slot }: {
+function TurnFooter({ item, messages, lastTurn, meta, model, onBranch, slot }: {
   readonly item: TimelineItemProjection;
   readonly messages: ReturnType<typeof messagesFor>;
   readonly lastTurn: boolean;
   readonly meta?: string | undefined;
+  /** Display name of the model that answered; one muted line with the time, truncated before the time is. */
+  readonly model?: string | undefined;
   readonly onBranch: (item: TimelineItemProjection) => Promise<void>;
   readonly slot?: ReactNode;
 }) {
@@ -4527,7 +4557,12 @@ function TurnFooter({ item, messages, lastTurn, meta, onBranch, slot }: {
         }).catch(() => undefined);
       }}>{copied ? <Check size={14} /> : <Copy size={14} />}{copied ? messages.copiedShort : messages.copyShort}</button>
       <button type="button" className="guild-ghost-button" title={messages.branchMessageHelp} onClick={() => void onBranch(item)}><GitFork size={14} />{messages.branchShort}</button>
-      {meta !== undefined && <span className="guild-turn-meta">{meta}</span>}
+      {model === undefined
+        ? meta !== undefined && <span className="guild-turn-meta">{meta}</span>
+        : <span className="guild-turn-meta">
+            <span className="guild-turn-model" title={model}>{model}</span>
+            {meta !== undefined && <span className="guild-turn-took">{`${MODEL_PICKER_SEPARATOR}${meta}`}</span>}
+          </span>}
     </div>
   </div>;
 }

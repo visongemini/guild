@@ -33,12 +33,14 @@ import {
   parseGuildNewTaskWorkspaceMode,
   parseContinuousFooter,
   defaultReasoningEffortOf,
+  CLAUDE_DEFAULT_MODEL_ID,
   freezeModelCatalog,
   grokModelById,
   isClaudeModelId,
   isOfficialGrokModelId,
   modelCatalogEngineOf,
   modelGroupOf,
+  modelNameFromDescription,
   modelSupportsReasoningEffort,
   parseGuildClaudePermissionMode,
   parseGuildClaudeReasoningEffort,
@@ -119,6 +121,7 @@ import {
   type PreviewRewindResponse,
   type RewindAvailabilityProjection,
   type RunCheckpointProjection,
+  type RunModelProjection,
   type SteerAvailabilityProjection,
   type SteerMessageResponse,
   type TimelineInterjectionProjection,
@@ -1130,10 +1133,14 @@ export function createLiveDesktopService(
     }
   }
 
-  function modelSelectionProjection(
+  /**
+   * What the task runs on: the stored selection, or the session's own model and effort when nothing is pinned or the
+   * session refused the stored one.
+   */
+  function appliedSelection(
     taskId: TaskId,
     controller: RuntimeController | undefined,
-  ): TaskModelSelectionProjection {
+  ): Omit<TaskModelSelectionProjection, "canChange"> {
     const { selection } = desiredSelection(taskId);
     const live = controller?.session === undefined
       ? undefined
@@ -1143,8 +1150,54 @@ export function createLiveDesktopService(
       modelId: (showLive ? live.modelId : undefined) ?? selection.modelId,
       reasoningEffort: (showLive ? live.reasoningEffort : undefined) ?? selection.reasoningEffort,
       source: selection.source,
+    });
+  }
+
+  function modelSelectionProjection(
+    taskId: TaskId,
+    controller: RuntimeController | undefined,
+  ): TaskModelSelectionProjection {
+    return Object.freeze({
+      ...appliedSelection(taskId, controller),
       canChange: taskSelectionCanChange(taskId),
     });
+  }
+
+  /**
+   * The name the picker shows for the model a Run is about to start on: the catalog's display name, which for an
+   * Online or Local model is its source's label. The Claude Default row stands for a model and takes that model's
+   * name when the adapter says it; when it does not, the Run gets no label rather than a vague one.
+   */
+  function appliedModelLabel(taskId: TaskId, controller: RuntimeController): string | undefined {
+    const modelId = appliedSelection(taskId, controller).modelId;
+    if (modelId === null) return undefined;
+    const model = catalogOfEngine(controller.engine).models.find((candidate) => candidate.id === modelId);
+    if (model === undefined) return undefined;
+    const name = model.id === CLAUDE_DEFAULT_MODEL_ID && modelGroupOf(model) === "claude"
+      ? modelNameFromDescription(model.description)
+      : model.name;
+    const label = name?.trim();
+    return label === undefined || label.length === 0 ? undefined : label.slice(0, 128);
+  }
+
+  /** Writes the Run's model label once its selection is applied and before its prompt goes out. Never blocks the turn. */
+  function recordRunModel(taskId: TaskId, controller: RuntimeController, runId: RunId): void {
+    try {
+      const label = appliedModelLabel(taskId, controller);
+      if (label !== undefined) store.recordRunModelLabel({ taskId, runId, label });
+    } catch {
+      logRuntime({ category: "runtime", event: "run_model_label_failed", taskId, runId });
+    }
+  }
+
+  function runModelProjections(
+    taskId: TaskId,
+    entries: readonly ConversationEntryRecord[],
+  ): readonly RunModelProjection[] {
+    const runIds = [...new Set(entries.flatMap((entry) => entry.runId === undefined ? [] : [entry.runId]))];
+    if (runIds.length === 0) return Object.freeze([]);
+    return Object.freeze(store.listRunModelLabels(taskId, runIds).map((row) =>
+      Object.freeze({ runId: row.runId, label: row.label })));
   }
 
   /**
@@ -3577,6 +3630,7 @@ export function createLiveDesktopService(
     const runPhase = runPhaseProjection(controller, summary.activeRunState);
     const engineStatus = engineStatusProjection(metadata);
     const windowCheckpoints = runCheckpointProjections(taskId, entries);
+    const windowRunModels = runModelProjections(taskId, entries);
     const worktreeProjection = worktreeManager.projectionOf(taskId);
     // Opening a task with a worktree refreshes its numbers in the background (bounded, at most
     // once in a while); the projection that carries them follows.
@@ -3624,6 +3678,7 @@ export function createLiveDesktopService(
       ...(runPhase === undefined ? {} : { runPhase }),
       steer: steerAvailability(taskId, controller),
       ...(windowCheckpoints.length === 0 ? {} : { runCheckpoints: windowCheckpoints }),
+      ...(windowRunModels.length === 0 ? {} : { runModels: windowRunModels }),
       rewind: rewindAvailability(taskId, controller),
       ...(worktreeProjection === undefined ? {} : { worktree: worktreeProjection }),
       ...(latestAuxiliary === undefined
@@ -6630,6 +6685,8 @@ export function createLiveDesktopService(
       });
       // A Claude session never runs a turn looser than the setting says; a refusal ends the turn here.
       await reconcileClaudePermissionMode(taskId, controller, adapter, session);
+      // Which model answers is known now: the selection has been applied and nothing has been sent yet.
+      recordRunModel(taskId, controller, runId);
       notePhase(controller, { type: "prompt_sent" });
       await adapter.prompt(session, text, resources);
     } catch (cause: unknown) {

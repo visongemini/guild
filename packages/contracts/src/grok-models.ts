@@ -206,6 +206,21 @@ export function runtimeDefaultModelOf(
   return grokModelById(catalog, catalog.runtimeDefaultModelId) ?? catalog.models[0];
 }
 
+/** The Claude adapter's own alias for "whatever Claude Code picks": the Default row of the Claude list. */
+export const CLAUDE_DEFAULT_MODEL_ID = "default";
+
+/** What a model name looks like as a plain description: capitalized words, a version, maybe a short note. */
+const MODEL_NAME_TEXT = /^[A-Z][A-Za-z-]*(?: [A-Z][A-Za-z-]*){0,2} \d+(?:\.\d+)*(?: \([^()]{1,32}\))?$/u;
+
+/**
+ * The adapter's description of the Claude Default row when it reads like a model name ("Opus 5.5"), else
+ * undefined. The picker names the row after it, and so does the record of which model answered a turn.
+ */
+export function modelNameFromDescription(description: string | undefined): string | undefined {
+  const text = description?.trim();
+  return text !== undefined && text.length <= 48 && MODEL_NAME_TEXT.test(text) ? text : undefined;
+}
+
 export type GuildModelSelectionSource = "task" | "global" | "runtime";
 
 export type GuildModelSelection = Readonly<{

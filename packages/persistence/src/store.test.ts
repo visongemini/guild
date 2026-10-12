@@ -42,9 +42,15 @@ import * as packageRoot from "./index.js";
 /**
  * Takes a freshly created (schema v19) database back to what a v18 install looks like: none of the
  * Guild 3.0 tables, columns, triggers or migration row. The downgrade fixtures below run it first, so
- * their old-schema databases migrate forward through V19 again.
+ * their old-schema databases migrate forward through V19 and V20 again.
  */
+const REMOVE_V20_SQL = `
+  DROP TABLE IF EXISTS run_model_labels;
+  DELETE FROM schema_migrations WHERE version = 20;
+`;
+
 const REMOVE_V19_SQL = `
+  ${REMOVE_V20_SQL}
   DROP TRIGGER IF EXISTS task_engine_is_fixed_after_first_run;
   DROP TRIGGER IF EXISTS task_routed_marker_is_sticky;
   DROP TRIGGER IF EXISTS task_runtime_model_follows_engine_on_insert;
@@ -398,7 +404,7 @@ describe("main-only SQLite persistence", () => {
     store.close();
     const raw = new DatabaseSync(path);
     assert.equal(raw.prepare("PRAGMA journal_mode").get()?.["journal_mode"], "wal");
-    assert.equal(raw.prepare("PRAGMA user_version").get()?.["user_version"], 19);
+    assert.equal(raw.prepare("PRAGMA user_version").get()?.["user_version"], 20);
     const strictByTable = new Map(
       raw
         .prepare("PRAGMA table_list")
@@ -1115,7 +1121,7 @@ describe("main-only SQLite persistence", () => {
     const reopened = openGuildPersistence({ path });
     assert.equal(reopened.loadRun(taskId, runId).state, "completed");
     assert.equal(reopened.loadConversationEntry(taskId, "live-assistant-1").text, "Hello");
-    assert.equal(reopened.verifyIntegrity().schemaVersion, 19);
+    assert.equal(reopened.verifyIntegrity().schemaVersion, 20);
     reopened.close();
   });
 
@@ -1162,7 +1168,7 @@ describe("main-only SQLite persistence", () => {
     const next = store.commitLiveRuntimeEvent({ event: eventAt(257), mutation });
     assert.equal(next.ok, true);
     assert.equal(next.record?.text, "x".repeat(257));
-    assert.equal(store.verifyIntegrity().schemaVersion, 19);
+    assert.equal(store.verifyIntegrity().schemaVersion, 20);
     store.close();
   });
 
@@ -1221,7 +1227,7 @@ describe("main-only SQLite persistence", () => {
     raw.close();
 
     const migrated = openGuildPersistence({ path });
-    assert.equal(migrated.verifyIntegrity().schemaVersion, 19);
+    assert.equal(migrated.verifyIntegrity().schemaVersion, 20);
     assert.equal(migrated.loadRun(taskId, runId).state, "queued");
     assert.throws(
       () => migrated.loadTaskMetadata(taskId),
@@ -1366,7 +1372,7 @@ describe("main-only SQLite persistence", () => {
     });
     assert.equal(secondDispatch.run.runId, secondQueuedRunId);
     assert.equal(store.listQueuedTurns(taskId).length, 0);
-    assert.equal(store.verifyIntegrity().schemaVersion, 19);
+    assert.equal(store.verifyIntegrity().schemaVersion, 20);
     store.close();
   });
 
@@ -2864,7 +2870,7 @@ describe("main-only SQLite persistence", () => {
       assert.equal(merged.payload.text, texts.slice(1).join(""));
 
       const reopened = openGuildPersistence({ path });
-      assert.equal(reopened.verifyIntegrity().schemaVersion, 19);
+      assert.equal(reopened.verifyIntegrity().schemaVersion, 20);
       // Admission continues from the last covered sequence, so the stream resumes gaplessly.
       const next = reopened.commitLiveRuntimeEvent({
         event: textChunk(lastSequence + 1, "!"),
@@ -3218,12 +3224,12 @@ describe("main-only SQLite persistence", () => {
       downgrade.close();
 
       const migrated = openGuildPersistence({ path });
-      assert.equal(migrated.verifyIntegrity().schemaVersion, 19);
+      assert.equal(migrated.verifyIntegrity().schemaVersion, 20);
       migrated.close();
       assert.equal(snapshot(), before, "migration must not read-modify historical rows");
 
       const raw = new DatabaseSync(path);
-      assert.equal(raw.prepare("PRAGMA user_version").get()?.["user_version"], 19);
+      assert.equal(raw.prepare("PRAGMA user_version").get()?.["user_version"], 20);
       assert.match(
         String(raw.prepare("SELECT sql FROM sqlite_schema WHERE name = 'conversation_entry_is_append_only'").get()?.["sql"]),
         /octet_length/u,
@@ -3373,7 +3379,7 @@ describe("main-only SQLite persistence", () => {
 
       const reopened = openGuildPersistence({ path });
       assert.equal(reopened.loadLatestContextTokensUsed(taskId), 9_000);
-      assert.equal(reopened.verifyIntegrity().schemaVersion, 19);
+      assert.equal(reopened.verifyIntegrity().schemaVersion, 20);
       reopened.close();
     });
 
@@ -3554,7 +3560,7 @@ describe("main-only SQLite persistence", () => {
       const older = seedV15(t, "grok-4.5", "medium");
 
       const migrated = openGuildPersistence({ path: owner });
-      assert.equal(migrated.verifyIntegrity().schemaVersion, 19);
+      assert.equal(migrated.verifyIntegrity().schemaVersion, 20);
       const settings = migrated.loadAppSettings();
       assert.equal(settings.grokModel, "grok-4.7");
       assert.equal(settings.reasoningEffort, "high");
@@ -3585,7 +3591,7 @@ describe("main-only SQLite persistence", () => {
       }
 
       withRaw(owner, (raw) => {
-        assert.equal(raw.prepare("PRAGMA user_version").get()?.["user_version"], 19);
+        assert.equal(raw.prepare("PRAGMA user_version").get()?.["user_version"], 20);
         assert.deepEqual(
           raw.prepare("SELECT version, name FROM schema_migrations WHERE version >= 15 ORDER BY version")
             .all().map((row) => ({ ...row })),
@@ -3595,6 +3601,7 @@ describe("main-only SQLite persistence", () => {
             { version: 17, name: "steer_interjections_and_run_checkpoints" },
             { version: 18, name: "task_worktrees" },
             { version: 19, name: "dual_engine_and_model_sources" },
+            { version: 20, name: "run_model_labels" },
           ],
         );
         assert.deepEqual(
@@ -3776,7 +3783,7 @@ describe("main-only SQLite persistence", () => {
       const reopened = openGuildPersistence({ path });
       assert.equal(reopened.loadAppSettings().grokModel, "grok-4.6");
       assert.equal(reopened.loadAppSettings().reasoningEffort, null);
-      assert.equal(reopened.verifyIntegrity().schemaVersion, 19);
+      assert.equal(reopened.verifyIntegrity().schemaVersion, 20);
       reopened.close();
     });
 
@@ -3878,7 +3885,7 @@ describe("main-only SQLite persistence", () => {
 
       store = openGuildPersistence({ path });
       assert.deepEqual(store.loadTaskRuntimeSettings(taskId), updated);
-      assert.equal(store.verifyIntegrity().schemaVersion, 19);
+      assert.equal(store.verifyIntegrity().schemaVersion, 20);
       assert.throws(
         () => store.clearTaskRuntimeSettings({ taskId, expectedRevision: 1 }),
         failure("persistence_cas_conflict"),
@@ -3940,7 +3947,7 @@ describe("main-only SQLite persistence", () => {
       });
       store = openGuildPersistence({ path });
       assert.deepEqual(store.loadModelCatalogCache()?.catalog, catalog);
-      assert.equal(store.verifyIntegrity().schemaVersion, 19);
+      assert.equal(store.verifyIntegrity().schemaVersion, 20);
 
       // An identical list (even built with another key order) is not rewritten; a changed list
       // or runtime version is.
@@ -3992,7 +3999,7 @@ describe("main-only SQLite persistence", () => {
         });
         const reopened = openGuildPersistence({ path });
         assert.equal(reopened.loadModelCatalogCache(), undefined, damaged);
-        assert.equal(reopened.verifyIntegrity().schemaVersion, 19);
+        assert.equal(reopened.verifyIntegrity().schemaVersion, 20);
         reopened.saveModelCatalogCache({ catalog });
         assert.deepEqual(reopened.loadModelCatalogCache()?.catalog, catalog);
         reopened.close();
@@ -4065,7 +4072,7 @@ describe("Steer interjections and run checkpoints (schema v17)", () => {
 
     const reopened = openGuildPersistence({ path });
     assert.equal(reopened.loadInterjection(taskId, "interject-1")?.state, "delivered");
-    assert.equal(reopened.verifyIntegrity().schemaVersion, 19);
+    assert.equal(reopened.verifyIntegrity().schemaVersion, 20);
     reopened.close();
   });
 
@@ -4304,7 +4311,7 @@ describe("Steer interjections and run checkpoints (schema v17)", () => {
       `);
     });
     const migrated = openGuildPersistence({ path });
-    assert.equal(migrated.verifyIntegrity().schemaVersion, 19);
+    assert.equal(migrated.verifyIntegrity().schemaVersion, 20);
     assert.equal(migrated.loadConversationEntry(taskId, "history-1").text, "old");
     assert.deepEqual(migrated.listInterjections(taskId), []);
     assert.deepEqual(migrated.listRunCheckpoints(taskId), []);
@@ -4449,7 +4456,7 @@ describe("Task worktrees (schema v18)", () => {
       `);
     });
     const migrated = openGuildPersistence({ path });
-    assert.equal(migrated.verifyIntegrity().schemaVersion, 19);
+    assert.equal(migrated.verifyIntegrity().schemaVersion, 20);
     assert.equal(migrated.loadConversationEntry(taskId, "history-1").text, "old");
     assert.deepEqual(migrated.listTaskWorktrees(), []);
     assert.equal(migrated.createTaskWorktree(input).status, "active");
@@ -4561,7 +4568,7 @@ describe("Guild 3.0 dual engine, model sources and preferences (schema v19)", ()
 
     const reopened = openGuildPersistence({ path });
     assert.equal(reopened.loadTaskMetadata(claudeTaskId).engine, "claude");
-    assert.equal(reopened.verifyIntegrity().schemaVersion, 19);
+    assert.equal(reopened.verifyIntegrity().schemaVersion, 20);
     reopened.close();
   });
 
@@ -4701,7 +4708,7 @@ describe("Guild 3.0 dual engine, model sources and preferences (schema v19)", ()
 
     const reopened = openGuildPersistence({ path });
     assert.equal(reopened.loadTaskMetadata(claudeTaskId).routedAtMs, routed.routedAtMs);
-    assert.equal(reopened.verifyIntegrity().schemaVersion, 19);
+    assert.equal(reopened.verifyIntegrity().schemaVersion, 20);
     reopened.close();
 
     withRaw(path, (raw) => {
@@ -4823,7 +4830,7 @@ describe("Guild 3.0 dual engine, model sources and preferences (schema v19)", ()
     });
     assert.equal(updated.modelId, "local-27b-model");
     assert.equal(updated.contextWindow, 32_000);
-    assert.equal(store.verifyIntegrity().schemaVersion, 19);
+    assert.equal(store.verifyIntegrity().schemaVersion, 20);
     store.close();
 
     const reopened = openGuildPersistence({ path });
@@ -4933,7 +4940,7 @@ describe("Guild 3.0 dual engine, model sources and preferences (schema v19)", ()
     store = openGuildPersistence({ path });
     assert.equal(store.loadModelCatalogCache("claude"), undefined);
     assert.deepEqual(store.loadModelCatalogCache()?.catalog, grok);
-    assert.equal(store.verifyIntegrity().schemaVersion, 19);
+    assert.equal(store.verifyIntegrity().schemaVersion, 20);
     store.close();
   });
 
@@ -5130,7 +5137,7 @@ describe("Guild 3.0 dual engine, model sources and preferences (schema v19)", ()
     const reopened = openGuildPersistence({ path });
     assert.deepEqual(reopened.listModelSources().map((source) => source.id), ["workstation", "other"]);
     assert.equal(reopened.loadModelSource("workstation")?.confirmedHost, "127.0.0.1:8081");
-    assert.equal(reopened.verifyIntegrity().schemaVersion, 19);
+    assert.equal(reopened.verifyIntegrity().schemaVersion, 20);
     reopened.close();
   });
 
@@ -5198,7 +5205,7 @@ describe("Guild 3.0 dual engine, model sources and preferences (schema v19)", ()
 
     const reopened = openGuildPersistence({ path });
     assert.equal(reopened.loadWorkspacePrefs(workspaceId).onlineReminderDismissed, true);
-    assert.equal(reopened.verifyIntegrity().schemaVersion, 19);
+    assert.equal(reopened.verifyIntegrity().schemaVersion, 20);
     reopened.close();
     withRaw(path, (raw) => {
       assert.throws(
@@ -5344,7 +5351,7 @@ describe("Guild 3.0 dual engine, model sources and preferences (schema v19)", ()
     });
 
     const migrated = openGuildPersistence({ path });
-    assert.equal(migrated.verifyIntegrity().schemaVersion, 19);
+    assert.equal(migrated.verifyIntegrity().schemaVersion, 20);
     // Tasks: same rows, all on the Grok engine, none routed.
     const taskAfter = migrated.loadTaskMetadata(taskId);
     assert.deepEqual({ ...taskAfter, engine: undefined, routedAtMs: undefined }, { ...taskBefore, engine: undefined, routedAtMs: undefined });
@@ -5389,12 +5396,13 @@ describe("Guild 3.0 dual engine, model sources and preferences (schema v19)", ()
           { version: 17, name: "steer_interjections_and_run_checkpoints" },
           { version: 18, name: "task_worktrees" },
           { version: 19, name: "dual_engine_and_model_sources" },
+          { version: 20, name: "run_model_labels" },
         ],
       );
-      assert.equal(raw.prepare("PRAGMA user_version").get()?.["user_version"], 19);
+      assert.equal(raw.prepare("PRAGMA user_version").get()?.["user_version"], 20);
       assert.deepEqual(
         raw.prepare("SELECT schema_version FROM guild_meta").all().map((row) => row["schema_version"]),
-        [19],
+        [20],
       );
       assert.deepEqual(
         raw.prepare("SELECT engine FROM runtime_model_catalog").all().map((row) => row["engine"]),
@@ -5416,14 +5424,103 @@ describe("Guild 3.0 dual engine, model sources and preferences (schema v19)", ()
     assert.equal(migrated.loadModelCatalogCache(), undefined);
     assert.equal(migrated.loadTaskRuntimeSettings(taskId), undefined);
     assert.equal(migrated.loadTaskEngine(taskId), "grok");
-    assert.equal(migrated.verifyIntegrity().schemaVersion, 19);
+    assert.equal(migrated.verifyIntegrity().schemaVersion, 20);
     migrated.close();
   });
 
   it("refuses a database from a newer schema", (t) => {
     const path = temporaryDatabase(t);
     conversationStore(path).close();
-    withRaw(path, (raw) => raw.exec("PRAGMA user_version = 20"));
+    withRaw(path, (raw) => raw.exec("PRAGMA user_version = 21"));
     assert.throws(() => openGuildPersistence({ path }), failure("schema_version_unsupported"));
+  });
+});
+
+describe("Per-Run model labels (schema v20)", () => {
+  const failure = (code: string) => (error: unknown) => error instanceof PersistenceError && error.code === code;
+  function withRaw<T>(path: string, operation: (raw: DatabaseSync) => T): T {
+    const raw = new DatabaseSync(path);
+    try {
+      return operation(raw);
+    } finally {
+      raw.close();
+    }
+  }
+
+  it("records the first label of a Run, keeps it, and gives it back after a reopen", (t) => {
+    const path = temporaryDatabase(t);
+    const store = liveReadyStore(path);
+    const second = must(parseRunId("run-2"));
+    store.recordRunModelLabel({ taskId, runId, label: "Haiku 5.5" });
+    // A Run has one label: the engine applied it once, and a later call changes nothing.
+    store.recordRunModelLabel({ taskId, runId, label: "DeepSeek V4 Flash" });
+    store.applyRun({ taskId, runId, event: { type: "application_quit", idempotencyKey: key("quit-labels") } });
+    store.createRun({ taskId, runId: second });
+    store.recordRunModelLabel({ taskId, runId: second, label: "  Grok 4.7  " });
+    assert.deepEqual(store.listRunModelLabels(taskId).map((entry) => [entry.runId, entry.label]), [["run-1", "Haiku 5.5"], ["run-2", "Grok 4.7"]]);
+    store.close();
+
+    const reopened = openGuildPersistence({ path });
+    assert.deepEqual(reopened.listRunModelLabels(taskId, [second]).map((entry) => entry.label), ["Grok 4.7"]);
+    assert.deepEqual(reopened.listRunModelLabels(taskId, [must(parseRunId("run-never"))]), [], "a Run without a label is absent");
+    assert.deepEqual(reopened.listRunModelLabels(taskId, []), []);
+    reopened.close();
+  });
+
+  it("refuses a label that is empty, too long or carries control characters, and a Run that does not exist", (t) => {
+    const store = conversationStore(temporaryDatabase(t));
+    store.createRun({ taskId, runId });
+    for (const label of ["", "   ", "x".repeat(129), "a\nb", "a\u0000b", "tab\there"]) {
+      assert.throws(() => store.recordRunModelLabel({ taskId, runId, label }), failure("domain_operation_rejected"), JSON.stringify(label));
+    }
+    assert.throws(() => store.recordRunModelLabel({ taskId, runId: must(parseRunId("run-ghost")), label: "Opus" }), (error) => error instanceof PersistenceError);
+    assert.deepEqual(store.listRunModelLabels(taskId), []);
+    store.recordRunModelLabel({ taskId, runId, label: "x".repeat(128) });
+    assert.equal(store.listRunModelLabels(taskId)[0]?.label.length, 128);
+    store.close();
+  });
+
+  it("migrates a v19 database forward without touching an existing row, and old Runs simply have no label", (t) => {
+    const path = temporaryDatabase(t);
+    const legacy = conversationStore(path);
+    legacy.createRun({ taskId, runId });
+    legacy.createConversationEntry({ taskId, entryId: "history-1", kind: "user", runId, text: "old", status: "complete" });
+    legacy.close();
+    withRaw(path, (raw) => raw.exec(`
+      PRAGMA foreign_keys = OFF;
+      ${REMOVE_V20_SQL}
+      CREATE TABLE guild_meta_v19 (
+        singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+        schema_version INTEGER NOT NULL CHECK(schema_version = 19),
+        clean_shutdown INTEGER NOT NULL CHECK(clean_shutdown IN (0, 1)),
+        last_integrity_at_ms INTEGER CHECK(last_integrity_at_ms IS NULL OR last_integrity_at_ms >= 0)
+      ) STRICT;
+      INSERT INTO guild_meta_v19(singleton, schema_version, clean_shutdown, last_integrity_at_ms)
+      SELECT singleton, 19, clean_shutdown, last_integrity_at_ms FROM guild_meta;
+      DROP TABLE guild_meta;
+      ALTER TABLE guild_meta_v19 RENAME TO guild_meta;
+      PRAGMA user_version = 19;
+    `));
+    withRaw(path, (raw) => {
+      assert.equal(raw.prepare("PRAGMA user_version").get()?.["user_version"], 19);
+      assert.equal(raw.prepare("SELECT count(*) AS n FROM sqlite_schema WHERE name = 'run_model_labels'").get()?.["n"], 0);
+    });
+    const migrated = openGuildPersistence({ path });
+    assert.equal(migrated.verifyIntegrity().schemaVersion, 20);
+    assert.equal(migrated.listConversationEntries({ taskId, limit: 10 }).find((entry) => entry.entryId === "history-1")?.text, "old");
+    assert.deepEqual(migrated.listRunModelLabels(taskId), []);
+    migrated.recordRunModelLabel({ taskId, runId, label: "Opus 5.5" });
+    migrated.close();
+    withRaw(path, (raw) => {
+      assert.equal(raw.prepare("PRAGMA user_version").get()?.["user_version"], 20);
+      assert.deepEqual(
+        raw.prepare("SELECT version, name FROM schema_migrations WHERE version >= 19 ORDER BY version").all().map((row) => ({ ...row })),
+        [{ version: 19, name: "dual_engine_and_model_sources" }, { version: 20, name: "run_model_labels" }],
+      );
+      assert.equal(
+        raw.prepare("SELECT strict FROM pragma_table_list WHERE name = 'run_model_labels'").get()?.["strict"],
+        1,
+      );
+    });
   });
 });

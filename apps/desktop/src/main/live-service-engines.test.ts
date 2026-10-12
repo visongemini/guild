@@ -1664,6 +1664,8 @@ type EngineSpec = {
   readonly restoreTranscriptModel?: boolean;
   /** A resume waits for this promise, so a test can hold a mode switch half way. */
   resumeGate?: Promise<void>;
+  /** Claude: the Default row describes no model (the real adapter does, but a version of it may not). */
+  readonly vagueDefault?: boolean;
 };
 
 type World = {
@@ -1974,7 +1976,7 @@ class EngineFake implements RuntimeAdapterPort {
       const picker = (startOptions?.claudeCodeOptions as
         { settings?: { modelPicker?: { options?: Array<{ model: string }> } } } | undefined)
         ?.settings?.modelPicker?.options?.map((entry) => entry.model) ?? [];
-      this.options = claudeOptions([...NATIVE_MODELS, ...picker], this.options);
+      this.options = claudeOptions([...NATIVE_MODELS, ...picker], this.options, this.spec.vagueDefault === true);
       const lastModel = establishedBy === "resume" && this.spec.restoreTranscriptModel === true
         ? transcriptModels.get(this.spec)?.get(sessionId)
         : undefined;
@@ -2113,14 +2115,15 @@ const lapsedResumes = new WeakMap<EngineSpec, number>();
 /** The error codes the next resumes of a spec fail with, in order (consumed one per resume). */
 const resumeFailureCodes = new WeakMap<EngineSpec, AcpV1AdapterError["code"][]>();
 
-function claudeOptions(models: readonly string[], previous: readonly RuntimeConfigOption[]): readonly RuntimeConfigOption[] {
+function claudeOptions(models: readonly string[], previous: readonly RuntimeConfigOption[], vagueDefault = false): readonly RuntimeConfigOption[] {
   const current = (id: string, fallback: string): string => {
     const option = previous.find((candidate) => candidate.id === id);
     return option?.type === "select" ? option.currentValue : fallback;
   };
   const flat = (values: readonly string[]) => ({
     form: "flat" as const,
-    options: values.map((value) => ({ value, name: value })),
+    // The adapter's Default row says which model it stands for, like the real adapter does.
+    options: values.map((value) => ({ value, name: value, ...(value === "default" && !vagueDefault ? { description: "Opus 5.5" } : {}) })),
   });
   return Object.freeze([
     {
@@ -2202,3 +2205,60 @@ function writeReceipt(): JsonRpcWriteReceipt {
     remoteAcceptance: "not_evidenced",
   });
 }
+
+describe("which model answered each turn [PC-CONV-001, PC-MODEL-001]", () => {
+  const labels = async (h: Awaited<ReturnType<typeof harness>>, taskId: TaskId): Promise<Array<[string, string | undefined]>> => {
+    const view = await h.service.openTask(taskId);
+    const byRun = new Map((view.runModels ?? []).map((entry) => [entry.runId, entry.label]));
+    const runs = [...new Set(view.timeline.filter((item) => item.kind === "user").map((item) => item.runId!))];
+    return runs.map((runId, index) => [`turn ${index + 1}`, byRun.get(runId)]);
+  };
+
+  it("names the model each Run started on, a source's label for a routed model, and keeps it across a restart", async () => {
+    const router = new FakeRouterHost([DEEPSEEK, LOCAL_MODEL]);
+    const h = await harness({ modelRouterHost: router });
+    const task = await h.service.createTask(h.workspaceId, undefined, "claude");
+    const taskId = task.task.taskId;
+
+    // The Default row stands for the model the adapter says (here its description), so that is the name.
+    await h.send(taskId, "first");
+    await h.completed();
+    await h.idle();
+    assert.deepEqual(await labels(h, taskId), [["turn 1", "Opus 5.5"]]);
+
+    // A pinned Claude model is named as the picker names it; the selection of that turn, not the next one.
+    assert.equal((await h.service.setTaskRuntimeSettings({ taskId, model: "sonnet", reasoningEffort: null, contextWindow: null })).status, "applied");
+    await h.send(taskId, "second");
+    await h.completed(2);
+    await h.idle();
+    assert.deepEqual(await labels(h, taskId), [["turn 1", "Opus 5.5"], ["turn 2", "sonnet"]]);
+
+    // A routed model is named by its source's label.
+    assert.equal((await h.service.setTaskRuntimeSettings({ taskId, model: "deepseek-v4-flash", reasoningEffort: null, contextWindow: null })).status, "applied");
+    await h.send(taskId, "third");
+    await h.completed(3);
+    await h.idle();
+    const expected: Array<[string, string | undefined]> = [["turn 1", "Opus 5.5"], ["turn 2", "sonnet"], ["turn 3", "DeepSeek V4 Flash"]];
+    assert.deepEqual(await labels(h, taskId), expected);
+
+    // The record is persistent data, not session state: it is there after quitting and starting again.
+    await h.restart({ modelRouterHost: router });
+    assert.deepEqual(await labels(h, taskId), expected);
+  });
+
+  it("leaves a Run unlabeled when the Default row does not say which model it stands for, and never blocks the turn", async () => {
+    const h = await harness({}, { claude: { vagueDefault: true } });
+    const task = await h.service.createTask(h.workspaceId, undefined, "claude");
+    const taskId = task.task.taskId;
+    await h.send(taskId, "first");
+    await h.completed();
+    await h.idle();
+    assert.deepEqual(h.world.adapters[0]!.prompts, ["first"], "the turn went out without a label");
+    assert.deepEqual(await labels(h, taskId), [["turn 1", undefined]]);
+    // A pinned model is named again, and the older Run stays as it was.
+    await h.service.setTaskRuntimeSettings({ taskId, model: "haiku", reasoningEffort: null, contextWindow: null });
+    await h.send(taskId, "second");
+    await h.completed(2);
+    assert.deepEqual(await labels(h, taskId), [["turn 1", undefined], ["turn 2", "haiku"]]);
+  });
+});

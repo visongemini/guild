@@ -76,6 +76,7 @@ import {
   type PreviewRewindResponse,
   type RewindAvailabilityProjection,
   type RunCheckpointProjection,
+  type RunModelProjection,
   type SteerAvailabilityProjection,
   type SteerMessageRequest,
   type SteerMessageResponse,
@@ -368,6 +369,8 @@ export type TaskViewProjection = {
   readonly steer?: SteerAvailabilityProjection;
   /** Checkpoint and changed-file summary of the Runs in the loaded timeline window (F2). */
   readonly runCheckpoints?: readonly RunCheckpointProjection[];
+  /** The model each Run of the loaded timeline window started on (answer footers); Runs without a record are absent. */
+  readonly runModels?: readonly RunModelProjection[];
   /** Whether a rewind could be offered right now (F2). */
   readonly rewind?: RewindAvailabilityProjection;
   /** Branch, ahead / behind and uncommitted count of the task's isolated worktree (F3). */

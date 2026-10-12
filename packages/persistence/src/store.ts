@@ -1056,6 +1056,14 @@ export interface GuildPersistence {
   /** Cheap: the next checkpoint ordinal and the number of rows, without decoding any file summary. */
   nextRunCheckpointOrdinal(taskId: TaskId): number;
   countRunCheckpoints(taskId: TaskId): number;
+  // Per-Run model attribution.
+  /**
+   * Remembers the display name of the model a Run started on. A Run has one label: the first one recorded stays
+   * and a later call is a no-op. The Run must exist.
+   */
+  recordRunModelLabel(input: { readonly taskId: TaskId; readonly runId: RunId; readonly label: string }): void;
+  /** Labels of the given Runs of a task (all of its Runs without `runIds`); a Run without a label is absent. */
+  listRunModelLabels(taskId: TaskId, runIds?: readonly RunId[]): readonly { readonly runId: RunId; readonly label: string }[];
   // F3 task worktrees.
   /** Records the worktree of a task. A task has at most one; a second call is rejected. */
   createTaskWorktree(input: {
@@ -5046,6 +5054,50 @@ class SqliteGuildPersistence implements GuildPersistence {
       .get(parsedTaskId(taskIdInput));
     if (row === undefined) throw persistenceError("aggregate_integrity_failed");
     return exactInteger(row, "count");
+  }
+
+  recordRunModelLabel(input: { readonly taskId: TaskId; readonly runId: RunId; readonly label: string }): void {
+    const taskId = parsedTaskId(input.taskId);
+    const runId = parsedRunId(input.runId);
+    const label = boundedString(input.label.trim(), 128);
+    if (/[\u0000-\u001F\u007F]/u.test(label)) throw persistenceError("domain_operation_rejected");
+    this.#immediate(() => {
+      this.#requiredRun(taskId, runId);
+      this.#database
+        .prepare("INSERT OR IGNORE INTO run_model_labels(task_id, run_id, label, created_at_ms) VALUES(?, ?, ?, ?)")
+        .run(taskId, runId, label, exactNow());
+    });
+  }
+
+  listRunModelLabels(
+    taskIdInput: TaskId,
+    runIds?: readonly RunId[],
+  ): readonly { readonly runId: RunId; readonly label: string }[] {
+    this.#assertOpen();
+    const taskId = parsedTaskId(taskIdInput);
+    const decode = (row: Record<string, unknown>) => Object.freeze({
+      runId: parsedRunId(exactText(row, "run_id") as RunId),
+      label: exactText(row, "label"),
+    });
+    if (runIds === undefined) {
+      return Object.freeze(
+        this.#database
+          .prepare("SELECT run_id, label FROM run_model_labels WHERE task_id = ? ORDER BY rowid")
+          .all(taskId)
+          .map(decode),
+      );
+    }
+    // Chunks the SQL parameter limit allows, like the checkpoint list.
+    const wanted = [...new Set(runIds.map(parsedRunId))];
+    const rows: { readonly runId: RunId; readonly label: string }[] = [];
+    for (let offset = 0; offset < wanted.length; offset += 200) {
+      const chunk = wanted.slice(offset, offset + 200);
+      rows.push(...this.#database
+        .prepare(`SELECT run_id, label FROM run_model_labels WHERE task_id = ? AND run_id IN (${chunk.map(() => "?").join(",")}) ORDER BY rowid`)
+        .all(taskId, ...chunk)
+        .map(decode));
+    }
+    return Object.freeze(rows);
   }
 
   createTaskWorktree(input: {

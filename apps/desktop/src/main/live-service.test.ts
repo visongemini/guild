@@ -5524,6 +5524,22 @@ describe("live desktop service model selection and phase indicator [F1]", () => 
     assert.deepEqual(setup.adapters[0]?.callLog, ["prompt:hello"]);
   });
 
+  it("names the model each Grok turn started on and keeps it for turns that ran before a model change [PC-CONV-001]", async () => {
+    const setup = await f1Task();
+    const { service, taskId } = setup;
+    await completedFirstTurn(setup);
+    const labelsOf = async () => {
+      const view = await service.openTask(taskId);
+      const byRun = new Map((view.runModels ?? []).map((entry) => [entry.runId, entry.label]));
+      return [...new Set(view.timeline.filter((item) => item.kind === "user").map((item) => item.runId!))].map((runId) => byRun.get(runId));
+    };
+    assert.deepEqual(await labelsOf(), ["Grok 4.7"], "the runtime's own default model, named as the picker names it");
+    await service.setTaskRuntimeSettings({ taskId, model: "grok-4.5", reasoningEffort: "low" });
+    await service.sendMessage(taskId, "second");
+    await waitForCompleted(service, 2);
+    assert.deepEqual(await labelsOf(), ["Grok 4.7", "Grok 4.5"]);
+  });
+
   it("applies a per-task model and effort to the live session between turns, model first, without a restart", async () => {
     const setup = await f1Task();
     const { service, adapters, taskId } = setup;

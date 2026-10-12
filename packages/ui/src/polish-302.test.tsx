@@ -4,7 +4,7 @@ import test from "node:test";
 import type { ModelCatalog, TaskModelSelectionProjection, TimelineItemProjection } from "@guild/contracts";
 import { freezeModelCatalog } from "@guild/contracts/grok-models";
 import { renderToStaticMarkup } from "react-dom/server";
-import { TimelineItem } from "./App.js";
+import { Timeline, TimelineItem } from "./App.js";
 import { claudeDefaultsView } from "./claude-engine.js";
 import { GuildHero } from "./GuildHero.js";
 import { messagesFor } from "./locales.js";
@@ -238,4 +238,55 @@ test("the hero renders the mascot, the five letters and the helper line it is gi
   assert.equal("welcomeTitle" in zh, false);
   assert.equal("noWorkspaceTitle" in zh, false);
   assert.match(messagesFor("zh-CN").welcomeBody, /新建/u);
+});
+
+// ---- which model answered
+
+const answerItem = (runId: string, createdAtMs: number, updatedAtMs: number, patch: Record<string, unknown> = {}) => ({
+  entryId: `a-${runId}`, taskId: "t", runId, sequence: 2, createdAtMs, updatedAtMs, status: "completed", kind: "assistant", text: "ok", ...patch,
+}) as unknown as TimelineItemProjection;
+const userItem = (runId: string, at: number) => ({
+  entryId: `u-${runId}`, taskId: "t", runId, sequence: 1, createdAtMs: at, updatedAtMs: at, status: "completed", kind: "user", text: "hi",
+}) as unknown as TimelineItemProjection;
+
+function turnFooter(extra: { turnMeta?: string; turnModel?: string; lastTurn?: boolean }): string {
+  return renderToStaticMarkup(
+    <TimelineItem item={answerItem("r1", 0, 8_000)} locale="zh-CN" canRetry={false} onOpenExternal={noop}
+      onPermissionDecision={async () => undefined} onBranch={async () => undefined} onRetryToDraft={noop} onOpenRuntimeDiagnostics={noop}
+      {...(extra.lastTurn === undefined ? {} : { lastTurn: extra.lastTurn })}
+      {...(extra.turnMeta === undefined ? {} : { turnMeta: extra.turnMeta })}
+      {...(extra.turnModel === undefined ? {} : { turnModel: extra.turnModel })} />,
+  );
+}
+
+test("the footer names the model before the time on one muted line, and shows only the time for an older turn", () => {
+  const both = turnFooter({ turnMeta: "用时 8 秒", turnModel: "Haiku 5.5", lastTurn: true });
+  assert.match(both, /<span class="guild-turn-meta"><span class="guild-turn-model" title="Haiku 5.5">Haiku 5.5<\/span><span class="guild-turn-took"> · 用时 8 秒<\/span><\/span>/u);
+  const modelOnly = turnFooter({ turnModel: "DeepSeek V4 Flash" });
+  assert.match(modelOnly, /<span class="guild-turn-meta"><span class="guild-turn-model" title="DeepSeek V4 Flash">DeepSeek V4 Flash<\/span><\/span>/u);
+  assert.doesNotMatch(modelOnly, /guild-turn-took/u);
+  // A turn that ran before the model was recorded: the footer is what it always was.
+  assert.match(turnFooter({ turnMeta: "用时 8 秒" }), /<span class="guild-turn-meta">用时 8 秒<\/span>/u);
+  assert.doesNotMatch(turnFooter({}), /guild-turn-meta/u);
+});
+
+test("the timeline labels a finished turn with its recorded model, never the live one, and tolerates a missing record", () => {
+  const items = [userItem("r1", 0), answerItem("r1", 1_000, 62_000), userItem("r2", 70_000), answerItem("r2", 80_000, 90_000), userItem("r3", 100_000), answerItem("r3", 101_000, 110_000)];
+  const render = (running: boolean) => renderToStaticMarkup(
+    <Timeline items={items} locale="zh-CN" running={running} runModels={[{ runId: "r1" as never, label: "Grok 4.7" }, { runId: "r3" as never, label: "DeepSeek V4 Flash" }]}
+      onOpenExternal={noop} onPermissionDecision={async () => undefined} onBranch={async () => undefined} onRetryToDraft={noop} onOpenRuntimeDiagnostics={noop} />,
+  );
+  const finished = render(false);
+  assert.deepEqual([...finished.matchAll(/class="guild-turn-model" title="([^"]+)"/gu)].map((match) => match[1]), ["Grok 4.7", "DeepSeek V4 Flash"], "r2 has no record");
+  assert.match(finished, /Grok 4\.7<\/span><span class="guild-turn-took"> · 用时 1 分 02 秒/u);
+  const live = render(true);
+  assert.deepEqual([...live.matchAll(/class="guild-turn-model" title="([^"]+)"/gu)].map((match) => match[1]), ["Grok 4.7"], "the live turn (r3) says nothing yet");
+});
+
+test("the footer's model name truncates before the time does, and the app hands the projection's records to the timeline", async () => {
+  const css = await source("styles.css");
+  assert.match(css, /\.guild-turn-meta \{[^}]*min-width: 0;[^}]*display: flex;[^}]*white-space: nowrap;/u);
+  assert.match(css, /\.guild-turn-model \{ min-width: 0; overflow: hidden; text-overflow: ellipsis; \}/u);
+  assert.match(css, /\.guild-turn-took \{ flex: none;/u);
+  assert.match(await source("App.tsx"), /runModels=\{activeTask\.runModels\}/u);
 });

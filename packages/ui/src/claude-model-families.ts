@@ -7,7 +7,7 @@
  */
 
 /** The adapter's own alias for "whatever Claude Code picks": the Default row of the Claude group. */
-export const CLAUDE_DEFAULT_ROW_ID = "default";
+export { CLAUDE_DEFAULT_MODEL_ID as CLAUDE_DEFAULT_ROW_ID } from "@guild/contracts/grok-models";
 
 const KNOWN_FAMILY = /^(?:opus|sonnet|haiku|fable)$/u;
 /** "Opus 5.5", "Haiku 4.5 (1M context)": a family name, then a version. */
@@ -15,8 +15,6 @@ const NAME_WITH_VERSION = /^\s*([A-Za-z][A-Za-z-]*)\s+v?(\d+(?:\.\d+)*)(?![\d.])
 const NAME_ONLY = /^\s*([A-Za-z][A-Za-z-]*)\s*$/u;
 /** An id such as claude-<family>-5-5, claude-<family>-5-1[1m] or claude-<family>-4-5-<date>: family, major, then an optional minor. */
 const ID_WITH_VERSION = /(?:^|-)([a-z]+)-(\d+)(?:-(\d{1,2}))?(?=$|[-[])/u;
-/** What a model name looks like as a plain description: capitalized words, a version, maybe a short note. */
-const MODEL_NAME_TEXT = /^[A-Z][A-Za-z-]*(?: [A-Z][A-Za-z-]*){0,2} \d+(?:\.\d+)*(?: \([^()]{1,32}\))?$/u;
 
 export type ClaudeModelIdentity = Readonly<{
   /** Lower-case family when it is one of the known ones; undefined for anything else (always shown). */
@@ -84,11 +82,7 @@ export function splitOlderClaudeModels<T extends Readonly<{ id: string; name: st
   return Object.freeze({ shown: Object.freeze(shown), older: Object.freeze(older) });
 }
 
-/** The adapter's description of the Default row when it reads like a model name ("Opus 5.5"), else undefined. */
-export function modelNameFromDescription(description: string | undefined): string | undefined {
-  const text = description?.trim();
-  return text !== undefined && text.length <= 48 && MODEL_NAME_TEXT.test(text) ? text : undefined;
-}
+export { modelNameFromDescription } from "@guild/contracts/grok-models";
 
 const ZH_FAMILY_DESCRIPTION: Readonly<Record<string, string>> = Object.freeze({
   opus: "复杂任务和日常主力",

@@ -145,6 +145,15 @@ export type RunCheckpointProjection = {
   readonly filesTruncated: boolean;
 };
 
+/**
+ * The model a Run started on, by the display name the picker showed (for example "Haiku 5.5"). Recorded once the
+ * engine applied the task's selection and before the prompt went out; a Run from before it was recorded has none.
+ */
+export type RunModelProjection = {
+  readonly runId: RunId;
+  readonly label: string;
+};
+
 /** Whether a rewind could be offered for the task right now (per-Run detail comes from the preview). */
 export type RewindAvailabilityProjection =
   | { readonly available: true }

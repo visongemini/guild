@@ -1,7 +1,7 @@
 import type { DatabaseSync } from "node:sqlite";
 import { persistenceError } from "./errors.js";
 
-export const SCHEMA_VERSION = 19;
+export const SCHEMA_VERSION = 20;
 
 const MIGRATION_V1 = String.raw`
 CREATE TABLE schema_migrations (
@@ -1423,6 +1423,38 @@ const MIGRATION_V16_FRESH_INSTALL = String.raw`
 UPDATE app_settings SET grok_model = '', reasoning_effort = '';
 `;
 
+// V20 (Guild 3.0.2 UI polish: PC-CONV-001, PC-MODEL-001). Purely additive: one new table, no historical row is read
+// or rewritten. run_model_labels holds, per Run, the display name of the model the Run started on (the name the
+// picker showed: "Haiku 5.5", "DeepSeek V4 Flash"), written once after the engine applied the task's model selection
+// and before the prompt went out, so the answer's footer can say which model answered and still can after a restart.
+// A Run that started before this table existed has no row; its footer shows only the time.
+const MIGRATION_V20 = String.raw`
+CREATE TABLE guild_meta_next (
+  singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+  schema_version INTEGER NOT NULL CHECK(schema_version = 20),
+  clean_shutdown INTEGER NOT NULL CHECK(clean_shutdown IN (0, 1)),
+  last_integrity_at_ms INTEGER CHECK(last_integrity_at_ms IS NULL OR last_integrity_at_ms >= 0)
+) STRICT;
+
+INSERT INTO guild_meta_next(singleton, schema_version, clean_shutdown, last_integrity_at_ms)
+SELECT singleton, 20, clean_shutdown, last_integrity_at_ms FROM guild_meta;
+
+DROP TABLE guild_meta;
+ALTER TABLE guild_meta_next RENAME TO guild_meta;
+
+CREATE TABLE run_model_labels (
+  task_id TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE RESTRICT,
+  run_id TEXT NOT NULL CHECK(length(run_id) BETWEEN 1 AND 512),
+  label TEXT NOT NULL CHECK(length(label) BETWEEN 1 AND 128),
+  created_at_ms INTEGER NOT NULL CHECK(created_at_ms >= 0),
+  PRIMARY KEY(task_id, run_id),
+  FOREIGN KEY(task_id, run_id) REFERENCES runs(task_id, run_id) ON DELETE RESTRICT
+) STRICT;
+
+INSERT INTO schema_migrations(version, name, applied_at_ms)
+VALUES(20, 'run_model_labels', CAST(unixepoch('subsec') * 1000 AS INTEGER));
+`;
+
 type IntegerRow = Record<string, unknown>;
 
 function exactInteger(row: IntegerRow | undefined, key: string): number {
@@ -1671,6 +1703,18 @@ export function migrateSchema(database: DatabaseSync): void {
       throw persistenceError("schema_integrity_failed", cause);
     }
   }
+  if (version === 19) {
+    database.exec("BEGIN IMMEDIATE");
+    try {
+      database.exec(MIGRATION_V20);
+      database.exec("PRAGMA user_version = 20");
+      database.exec("COMMIT");
+      version = 20;
+    } catch (cause: unknown) {
+      if (database.isTransaction) database.exec("ROLLBACK");
+      throw persistenceError("schema_integrity_failed", cause);
+    }
+  }
   if (version !== SCHEMA_VERSION) {
     throw persistenceError("schema_integrity_failed");
   }
@@ -1681,7 +1725,7 @@ export function migrateSchema(database: DatabaseSync): void {
     .prepare("SELECT schema_version FROM guild_meta WHERE singleton = 1")
     .get();
   if (
-    migrations.length !== 19 ||
+    migrations.length !== 20 ||
     exactInteger(migrations[0], "version") !== 1 ||
     migrations[0]?.["name"] !== "initial_authoritative_aggregates" ||
     exactInteger(migrations[1], "version") !== 2 ||
@@ -1720,6 +1764,8 @@ export function migrateSchema(database: DatabaseSync): void {
     migrations[17]?.["name"] !== "task_worktrees" ||
     exactInteger(migrations[18], "version") !== 19 ||
     migrations[18]?.["name"] !== "dual_engine_and_model_sources" ||
+    exactInteger(migrations[19], "version") !== 20 ||
+    migrations[19]?.["name"] !== "run_model_labels" ||
     exactInteger(meta, "schema_version") !== SCHEMA_VERSION
   ) {
     throw persistenceError("schema_integrity_failed");
