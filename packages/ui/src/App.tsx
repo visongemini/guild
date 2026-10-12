@@ -130,6 +130,7 @@ import {
   useModalOverlayPresent,
   type WorkbenchTab,
 } from "./browser-pane-view.js";
+import { useModalLayer } from "./modal-layer.js";
 import { applyModelSelectionChange } from "./apply-model-change.js";
 import { claudeDefaultModelOptions, claudeDefaultSelectValue, claudeDefaultsView, claudePermissionModeOf, claudeStatusOf, claudeStatusText } from "./claude-engine.js";
 import { CLAUDE_DEFAULT_ROW_ID } from "./claude-model-families.js";
@@ -847,6 +848,9 @@ export function GuildApp({ api }: GuildAppProps) {
   const domOverlayOpen = useModalOverlayPresent(
     workbenchOpen && projection?.activeTask !== undefined && workbenchTab === "browser",
   );
+
+  // Behind a modal dialog the sidebar, the timeline and the workbench are inert (D-064).
+  const modalOpen = useModalLayer();
 
   if (projection === undefined) {
     const loadingMessages = messagesFor(
@@ -2054,7 +2058,7 @@ export function GuildApp({ api }: GuildAppProps) {
         "--workbench-width": `${effectiveWorkbenchWidth}px`,
       } as React.CSSProperties}
     >
-      <aside className="guild-sidebar" aria-label={messages.projects} inert={workbenchOpen && viewport.width <= 1000}>
+      <aside className="guild-sidebar" aria-label={messages.projects} inert={modalOpen || (workbenchOpen && viewport.width <= 1000)}>
         <div className="guild-sidebar-drag" />
         <div className="guild-wordmark">
           <span className="guild-wordmark-name">{messages.appName}</span>
@@ -2287,7 +2291,7 @@ export function GuildApp({ api }: GuildAppProps) {
         }}
       />
 
-      <main className="guild-main" inert={workbenchOpen && viewport.width <= 1000}>
+      <main className="guild-main" inert={modalOpen || (workbenchOpen && viewport.width <= 1000)}>
         <header className="guild-topbar">
           <div className="guild-task-heading">
             <span className="guild-task-heading-title">{activeTask?.task.title ?? messages.newTask}</span>
@@ -2791,7 +2795,7 @@ export function GuildApp({ api }: GuildAppProps) {
       </main>
 
       {workbenchOpen && activeTask !== undefined && (
-        <aside ref={workbenchPanel} className="guild-workbench" aria-label={messages.workbench}
+        <aside ref={workbenchPanel} className="guild-workbench" aria-label={messages.workbench} inert={modalOpen}
           role={viewport.width <= 1000 ? "dialog" : undefined} aria-modal={viewport.width <= 1000 || undefined}
           onKeyDown={(event) => {
             if (viewport.width <= 1000) handleDialogKeyDown(event, () => {

@@ -4,7 +4,9 @@ import test from "node:test";
 import type { TimelineItemProjection } from "@guild/contracts";
 import { renderToStaticMarkup } from "react-dom/server";
 import { Timeline } from "./App.js";
+import { BROWSER_OVERLAY_SELECTOR } from "./browser-pane-view.js";
 import { messagesFor } from "./locales.js";
+import { FOCUS_HISTORY_LIMIT, MODAL_SELECTOR, focusIsLost, focusReturnTarget, modalPresent, rememberFocus } from "./modal-layer.js";
 import { newTaskWorkspace, noTaskWorkspaceChip } from "./welcome.js";
 
 /*
@@ -113,4 +115,57 @@ test("the create action and the composer chip read the same decision, and the ch
   assert.match(app, /const decidedNewTaskWorkspace = newTaskWorkspace\(\s*projection\?\.generalSettings\.newTaskWorkspaceMode,\s*projection\?\.generalSettings\.lastWorkspaceId,\s*activeWorkspaces,\s*\);/u);
   assert.match(app, /if \(decidedNewTaskWorkspace\.kind === "ask"\) \{\s*setWorkspacePickerOpen\(true\);\s*return;\s*\}/u);
   assert.match(app, /<span className="guild-pill guild-workspace-pill">\s*<FolderSimple size=\{14\} aria-hidden="true" \/>\s*<span>\{activeTask === undefined \? noTaskWorkspaceChip\(messages, decidedNewTaskWorkspace, activeWorkspaces\) : workspaceName\(/u);
+});
+
+// ---- a modal dialog makes the page behind it inert and gives focus back
+
+test("a modal is any aria-modal element but the workbench panel, and the browser pane's overlay selector still contains it", () => {
+  assert.equal(MODAL_SELECTOR, '[aria-modal="true"]:not(.guild-workbench)');
+  assert.ok(BROWSER_OVERLAY_SELECTOR.startsWith(MODAL_SELECTOR), "the native browser view hides under the same dialogs");
+  const seen: string[] = [];
+  assert.equal(modalPresent({ querySelector: (selector: string) => { seen.push(selector); return null; } } as never), false);
+  assert.equal(modalPresent({ querySelector: () => ({}) } as never), true);
+  assert.deepEqual(seen, [MODAL_SELECTOR]);
+});
+
+test("the focus history is newest first, has no repeats and is bounded", () => {
+  assert.deepEqual(rememberFocus(["b", "a"], "c"), ["c", "b", "a"]);
+  assert.deepEqual(rememberFocus(["c", "b", "a"], "a"), ["a", "c", "b"], "focusing an element again moves it to the front");
+  let history: readonly number[] = [];
+  for (let element = 0; element < FOCUS_HISTORY_LIMIT + 5; element += 1) history = rememberFocus(history, element);
+  assert.equal(history.length, FOCUS_HISTORY_LIMIT);
+  assert.equal(history[0], FOCUS_HISTORY_LIMIT + 4);
+});
+
+test("focus goes back to the newest remembered element that can take it, and only when nothing holds focus", () => {
+  // The menu item that opened the dialog is gone with its popover; the popover's button before it is not.
+  const usable = new Set(["account-button", "composer"]);
+  assert.equal(focusReturnTarget(["menu-item", "popover", "account-button", "composer"], (element) => usable.has(element)), "account-button");
+  assert.equal(focusReturnTarget(["menu-item"], (element) => usable.has(element)), undefined, "nothing usable: focus is left alone");
+  assert.equal(focusReturnTarget([], () => true), undefined);
+  const body = { tag: "body" } as unknown as Element;
+  assert.equal(focusIsLost(null, body), true);
+  assert.equal(focusIsLost(body, body), true, "the removed dialog left focus on the body");
+  assert.equal(focusIsLost({ tag: "composer" } as unknown as Element, body), false, "an element that took focus on purpose keeps it");
+});
+
+test("the sidebar, the timeline and the workbench are inert behind a modal, and the dialogs are not inside them", async () => {
+  const app = await source("App.tsx");
+  assert.match(app, /const modalOpen = useModalLayer\(\);\s*\n\s*if \(projection === undefined\) \{/u, "called before the early return, so the hook order never changes");
+  assert.match(app, /<aside className="guild-sidebar" aria-label=\{messages\.projects\} inert=\{modalOpen \|\| \(workbenchOpen && viewport\.width <= 1000\)\}>/u);
+  assert.match(app, /<main className="guild-main" inert=\{modalOpen \|\| \(workbenchOpen && viewport\.width <= 1000\)\}>/u);
+  assert.match(app, /className="guild-workbench" aria-label=\{messages\.workbench\} inert=\{modalOpen\}/u);
+  // The dialogs are siblings of the three regions, after the last of them: inert on a region never reaches a dialog.
+  const afterMain = app.slice(app.indexOf("</main>"));
+  for (const dialog of ["{commandPaletteOpen && (", "{grokControlOpen && (", "{settingsOpen && (", "{profileOpen && (", "{onlineReminder !== undefined && (", "{rewindTarget !== undefined && activeTask !== undefined && (", "{discardConfirm && (", "worktreeUi.renderOverlays("]) {
+    assert.ok(afterMain.includes(dialog), dialog);
+  }
+  // Every aria-modal dialog of the UI sits in a file whose dialog is rendered at the root of the window or in the body.
+  const modalFiles: string[] = [];
+  for (const file of ["App.tsx", "GrokControlCenter.tsx", "OnlineReminderDialog.tsx", "RewindDialog.tsx", "Worktree.tsx", "BrowserPane.tsx", "ModelPicker.tsx", "ModelSourcesSettings.tsx", "RunChangesCard.tsx"]) {
+    if ((await source(file)).includes('aria-modal="true"')) modalFiles.push(file);
+  }
+  assert.deepEqual(modalFiles, ["App.tsx", "GrokControlCenter.tsx", "OnlineReminderDialog.tsx", "RewindDialog.tsx", "Worktree.tsx"]);
+  // The model picker is a popover, not a modal: it stays reachable and out of the selector.
+  assert.doesNotMatch(await source("ModelPicker.tsx"), /aria-modal/u);
 });
