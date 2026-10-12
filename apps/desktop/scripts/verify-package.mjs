@@ -141,13 +141,29 @@ assert(applicationRequirement.includes("certificate root = H\""), "application r
 assert(!applicationRequirement.includes("cdhash H\""), "application requirement is pinned to one build hash");
 
 const archiveEntries = run(asarCli, ["list", appAsar]).split("\n").filter(Boolean);
-assert(archiveEntries.length < 100, "unexpectedly large app.asar file set");
+// `asar list` counts directories too. Measured for 3.0.0: 123 entries = 41 under dist/main, 2
+// preload, 6 renderer, 72 under node_modules/@guild (five workspace packages), /dist and
+// /package.json. The cap leaves about 25 percent growth for new main modules and still trips on a
+// leaked source tree, a test directory or a third-party node_modules (each adds hundreds of
+// entries). The loop below also names the exact things that must never ship.
+assert(archiveEntries.length < 155, "unexpectedly large app.asar file set");
+for (const required of ["/dist/main/index.js", "/dist/main/dev-hooks.js", "/dist/preload/index.cjs", "/dist/renderer/index.html"]) {
+  assert(archiveEntries.includes(required), `app.asar lacks ${required}`);
+}
 for (const entry of archiveEntries) {
   assert(!entry.includes("/dist/mac-"), "nested packaged application detected");
   assert(!entry.endsWith(".map"), "source map packaged");
   assert(!entry.endsWith(".test.js"), "test file packaged");
   assert(!entry.endsWith("-testing.js"), "test seam packaged");
   assert(!entry.endsWith("/dist/main/fixture-service.js"), "UI fixture packaged");
+  assert(!entry.endsWith("/dist/main/fixture-model-sources.js"), "model sources fixture packaged");
+  assert(!entry.endsWith("/dist/main/fixture-browser-pane.js"), "browser pane fixture packaged");
+  assert(!entry.includes("/dist/fixtures"), "recorded test fixture packaged");
+  assert(
+    entry === "/node_modules" || entry === "/node_modules/@guild" || !entry.startsWith("/node_modules/") ||
+      entry.startsWith("/node_modules/@guild/"),
+    "third-party runtime dependency packaged",
+  );
   assert(!entry.includes("/node_modules/@guild/ui/"), "renderer-only UI dependency packaged");
   assert(!entry.includes("/node_modules/@guild/") || !entry.includes("/src/"), "workspace source packaged");
 }
