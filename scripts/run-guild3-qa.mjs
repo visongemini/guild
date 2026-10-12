@@ -843,7 +843,8 @@ async function checkC() {
   details.dialogCount = await cdp.evaluate(`document.querySelectorAll(".guild-online-reminder").length`);
   await shot("C", "online-reminder-dialog");
   if (details.dialogCount !== 1) throw new Error(`expected one dialog, found ${details.dialogCount}`);
-  if (!/DeepSeek/u.test(details.reminderTitle) || !/CLAUDE\.md/u.test(details.reminderBody)) throw new Error("the dialog is not the Online reminder for DeepSeek");
+  // D-063: the title is generic ("confirm before sending to an online model"); the vendor is named in the body.
+  if (!/online model|在线模型/iu.test(details.reminderTitle) || !/DeepSeek/u.test(details.reminderBody) || !/CLAUDE\.md/u.test(details.reminderBody)) throw new Error("the dialog is not the Online reminder for DeepSeek");
   if (/switch back to a Claude subscription|local relay|cannot go back|不能再切回/iu.test(`${details.reminderTitle} ${details.reminderBody}`)) throw new Error("the dialog still carries the one-way text");
   const nativePid = adapterProcess()?.pid;
   await clickDom(".guild-online-reminder .guild-dialog-footer button.primary");
