@@ -164,6 +164,7 @@ import {
   type XaiExtensionOutcome,
 } from "@guild/runtime-grok";
 import type { DesktopApplicationService } from "./application-service.js";
+import { ClaudeLocatorError, locateClaudeEngine } from "./claude-locator.js";
 import { createClaudeRuntime } from "./claude-runtime.js";
 import type { BrowserMcpPort, ModelRouterHostPort, RoutedModelInfo } from "./engine-ports.js";
 import {
@@ -253,6 +254,8 @@ const DEFAULT_CHECKPOINT_END_TIMEOUT_MS = 10_000;
 const CHECKPOINT_FILES_JSON_BUDGET = 200_000;
 const REWIND_FILE_LIST_LIMIT = 500;
 const REWIND_REQUEST_TIMEOUT_MS = 10_000;
+/** The Claude installation is looked at again at most this often (the locator itself is cached). */
+const CLAUDE_PROBE_INTERVAL_MS = 30_000;
 
 export type WorkspaceChooser = () => Promise<string | undefined>;
 
@@ -368,6 +371,12 @@ export type LiveDesktopServiceOptions = {
   readonly openWorkspaceTerminal?: (path: string) => Promise<void>;
   readonly openTaskFile?: (path: string) => Promise<void>;
   readonly runtimeFactory?: RuntimeFactory;
+  /**
+   * Looks for the Claude installation (node, ACP adapter, `claude`) and returns the `claude` version;
+   * a `ClaudeLocatorError` means something is missing. Defaults to the real locator, and to nothing
+   * when a `runtimeFactory` is injected (the status is then learned from the sessions it starts).
+   */
+  readonly claudeEngineProbe?: () => Promise<Readonly<{ version: string }>>;
   /** Online / Local models behind the loopback router (docs/20 3.3, 3.4). Absent: Claude tasks stay native. */
   readonly modelRouterHost?: ModelRouterHostPort;
   /** Loopback browser MCP server handed to engines that advertise HTTP MCP (docs/20 3.5). */
@@ -625,6 +634,13 @@ export function createLiveDesktopService(
   let claudeRuntimeVersion: string | undefined;
   // What the Claude engine last said about its login. Account-level: one login serves every Claude task.
   let claudeAuth: Readonly<{ kind: string; label?: string }> | undefined;
+  // What was found of the Claude installation; undefined until something looked.
+  let claudeInstall: Readonly<{ status: "ready" | "not_found" | "unavailable"; version?: string }> | undefined;
+  let claudeProbeAtMs = 0;
+  let claudeProbeOperation: Promise<void> | undefined;
+  const claudeProbe = options.claudeEngineProbe ?? (options.runtimeFactory === undefined
+    ? async () => ({ version: (await locateClaudeEngine()).claude.version })
+    : undefined);
   const modelRouterHost = options.modelRouterHost;
   const browserMcp = options.browserMcp;
   let usageSnapshot: AcpV1OfficialBillingSnapshot | undefined;
@@ -683,6 +699,7 @@ export function createLiveDesktopService(
     void warmOfficialGrokRuntime(options.stagingRoot).catch(() => undefined);
   }
 
+  refreshClaudeInstall();
   // Sources added, confirmed, edited, disabled or deleted change what the Claude picker offers.
   const unsubscribeRouterChanges = modelRouterHost?.onChange(() => schedulePublish());
 
@@ -755,6 +772,47 @@ export function createLiveDesktopService(
         runtimeIncidents.set(incident.incidentId, incident);
       }
     }
+  }
+
+  /** Looks for the Claude installation off the critical path; a change reaches the next projection. */
+  function refreshClaudeInstall(): void {
+    if (claudeProbe === undefined || closed || closing || claudeProbeOperation !== undefined) return;
+    if (Date.now() - claudeProbeAtMs < CLAUDE_PROBE_INTERVAL_MS) return;
+    claudeProbeAtMs = Date.now();
+    claudeProbeOperation = (async () => {
+      let next: NonNullable<typeof claudeInstall>;
+      try {
+        next = Object.freeze({ status: "ready" as const, version: (await claudeProbe()).version });
+      } catch (cause: unknown) {
+        next = Object.freeze({ status: cause instanceof ClaudeLocatorError ? "not_found" as const : "unavailable" as const });
+      }
+      noteClaudeInstall(next);
+    })().finally(() => { claudeProbeOperation = undefined; });
+  }
+
+  function noteClaudeInstall(next: NonNullable<typeof claudeInstall>): void {
+    if (closed || closing || (claudeInstall?.status === next.status && claudeInstall.version === next.version)) return;
+    claudeInstall = next;
+    schedulePhasePublish();
+  }
+
+  /** `status`, `accountLabel` and `version` of `runtimeSettings.claude` (docs/20 3.2, 3.8). */
+  function claudeEngineReport(): Readonly<{
+    status?: "ready" | "not_found" | "not_logged_in" | "unavailable";
+    accountLabel?: string;
+    version?: string;
+  }> {
+    const loginRequired = claudeAuth?.kind === "none";
+    const status = claudeInstall !== undefined && claudeInstall.status !== "ready"
+      ? claudeInstall.status
+      : loginRequired
+        ? "not_logged_in" as const
+        : claudeInstall?.status;
+    return Object.freeze({
+      ...(status === undefined ? {} : { status }),
+      ...(claudeAuth?.label === undefined || loginRequired ? {} : { accountLabel: claudeAuth.label }),
+      ...(claudeInstall?.version === undefined ? {} : { version: claudeInstall.version }),
+    });
   }
 
   function noteModelCatalog(catalog: GrokModelCatalog | undefined): void {
@@ -906,6 +964,32 @@ export function createLiveDesktopService(
     controller.sessionConfigOptions = options;
     if (controller.engine === "claude") {
       noteClaudeNativeCatalog(deriveClaudeModelCatalog(options), controller.pickerModelIds);
+      syncClaudePermissionModes(controller, options);
+    }
+  }
+
+  /**
+   * The permission mode of a Claude session is its `mode` config option; the session's mode list
+   * (`activeTask.sessionModes`) follows it, also when the adapter reported no list of its own.
+   */
+  function syncClaudePermissionModes(controller: RuntimeController, options: readonly RuntimeConfigOption[]): void {
+    const option = options.find((candidate) => candidate.category === "mode");
+    if (option === undefined || option.type !== "select") return;
+    const choices = option.choices.form === "flat"
+      ? option.choices.options
+      : option.choices.groups.flatMap((group) => group.options);
+    const modes = controller.sessionModes;
+    if (modes === null || modes === undefined) {
+      controller.sessionModes = Object.freeze({
+        currentModeId: option.currentValue,
+        availableModes: Object.freeze(choices.map((choice) => Object.freeze({
+          id: choice.value,
+          name: choice.name,
+          ...(choice.description === undefined ? {} : { description: choice.description }),
+        }))),
+      });
+    } else if (modes.currentModeId !== option.currentValue && choices.some((choice) => choice.value === option.currentValue)) {
+      controller.sessionModes = Object.freeze({ ...modes, currentModeId: option.currentValue });
     }
   }
 
@@ -2908,6 +2992,7 @@ export function createLiveDesktopService(
         availablePermissionModes: GUILD_GROK_PERMISSION_MODES,
         canChange: runtimeSettingsCanChange(),
         claude: Object.freeze({
+          ...claudeEngineReport(),
           model: settings.claudeModel,
           reasoningEffort: settings.claudeEffort,
           permissionMode: settings.claudePermissionMode,
@@ -4504,6 +4589,10 @@ export function createLiveDesktopService(
         });
       }
       controller.session = session;
+      if (controller.engine === "claude") {
+        const version = /\d+\.\d+\.\d+/u.exec(created.runtimeVersion ?? "")?.[0];
+        noteClaudeInstall(Object.freeze({ status: "ready" as const, ...(version === undefined ? {} : { version }) }));
+      }
       logRuntime({
         category: "session",
         event: "ready",
@@ -4577,6 +4666,9 @@ export function createLiveDesktopService(
       if (isClaudeAuthRequired(controller, cause)) {
         noteClaudeLoginRequired();
         throw new Error(CLAUDE_LOGIN_REQUIRED);
+      }
+      if (controller.engine === "claude" && cause instanceof ClaudeLocatorError) {
+        noteClaudeInstall(Object.freeze({ status: "not_found" as const }));
       }
       if (cause instanceof Error && cause.message === MODEL_ROUTER_UNAVAILABLE) throw cause;
       throw new Error(`runtime_start_${startStage}:${detail}`);
@@ -6285,6 +6377,8 @@ export function createLiveDesktopService(
       await reconcileRuntimeSelection(taskId, controller, adapter, session).catch(() => {
         logRuntime({ category: "runtime", event: "model_switch_failed", taskId });
       });
+      // A Claude session never runs a turn looser than the setting says; a refusal ends the turn here.
+      await reconcileClaudePermissionMode(taskId, controller, adapter, session);
       notePhase(controller, { type: "prompt_sent" });
       await adapter.prompt(session, text, resources);
     } catch (cause: unknown) {
@@ -6843,6 +6937,7 @@ export function createLiveDesktopService(
   const service: DesktopApplicationService = {
     bootstrap: async () => {
       await diagnosticsHydration;
+      refreshClaudeInstall();
       // PC-CONV-002: renderer reload loses its cache; restore its requested history once.
       // Normal publish() calls keep sending only the bounded live tail.
       const projection = buildBootstrap(true);

@@ -512,8 +512,24 @@ export type RuntimeSettingsProjection = {
   readonly modelCatalogs?: Readonly<Record<GuildEngine, ModelCatalog>>;
 };
 
+/**
+ * Whether Claude Code can run on this machine (PC-ENG-002): `not_found` when node, the ACP adapter
+ * or the `claude` binary is missing or unsupported, `not_logged_in` when the engine reported that
+ * nobody is logged in, `unavailable` when it is installed but could not be checked.
+ */
+export const GUILD_CLAUDE_ENGINE_STATUSES = Object.freeze([
+  "ready", "not_found", "not_logged_in", "unavailable",
+] as const);
+export type GuildClaudeEngineStatus = (typeof GUILD_CLAUDE_ENGINE_STATUSES)[number];
+
 /** Defaults a new Claude-engine task starts from. Same rules as the Grok defaults, Claude grammar. */
 export type ClaudeEngineSettingsProjection = {
+  /** Absent until the main process has looked for the engine. */
+  readonly status?: GuildClaudeEngineStatus;
+  /** Plan label of the logged-in account, for example "Claude Max". Never an e-mail address. */
+  readonly accountLabel?: string;
+  /** Version of the installed `claude` binary. */
+  readonly version?: string;
   /** Default model id; null follows the adapter's own default. */
   readonly model: string | null;
   /** Default effort (`default`, `low`, `medium`, `high`, `xhigh`, `max`); null follows the adapter. */

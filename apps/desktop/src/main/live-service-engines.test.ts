@@ -27,6 +27,7 @@ import {
   type JsonValue,
   type XaiExtensionOutcome,
 } from "@guild/runtime-grok";
+import { ClaudeLocatorError } from "./claude-locator.js";
 import type { BrowserMcpPort, ModelRouterHostPort, RoutedModelInfo } from "./engine-ports.js";
 import { createFixtureDesktopService } from "./fixture-service.js";
 import {
@@ -565,6 +566,75 @@ describe("dual engine orchestration [PC-ENG-001, PC-MODEL-001]", () => {
       false,
       "no replacement session, no recovery capsule",
     );
+  });
+
+  it("reports whether Claude Code can run, which account it is and which version, never an address [PC-ENG-002]", async () => {
+    const ready = await harness({ claudeEngineProbe: async () => ({ version: "2.1.291" }) });
+    const readySettings = await eventuallyValue(async () => {
+      const claude = (await ready.service.bootstrap()).runtimeSettings.claude;
+      return claude?.status === "ready" ? claude : undefined;
+    });
+    assert.equal(readySettings.version, "2.1.291");
+    assert.equal(readySettings.accountLabel, undefined, "no login seen yet");
+    const task = await ready.service.createTask(ready.workspaceId, undefined, "claude");
+    await ready.send(task.task.taskId, "x");
+    await ready.completed();
+    ready.world.adapters[0]!.emitAuthStatus({ kind: "account", label: "Claude Max", plan: "max" });
+    await eventually(async () => (await ready.service.bootstrap()).runtimeSettings.claude?.accountLabel === "Claude Max");
+    // A login the engine reports as gone beats "ready" and drops the label.
+    ready.world.adapters[0]!.emitAuthStatus({ kind: "none" });
+    const loggedOut = await eventuallyValue(async () => {
+      const claude = (await ready.service.bootstrap()).runtimeSettings.claude;
+      return claude?.status === "not_logged_in" ? claude : undefined;
+    });
+    assert.equal(loggedOut.accountLabel, undefined);
+    assert.equal(loggedOut.version, "2.1.291");
+
+    const missing = await harness({
+      claudeEngineProbe: async () => { throw new ClaudeLocatorError("adapter_missing"); },
+    });
+    await eventually(async () => (await missing.service.bootstrap()).runtimeSettings.claude?.status === "not_found");
+    const broken = await harness({ claudeEngineProbe: async () => { throw new Error("EACCES"); } });
+    await eventually(async () => (await broken.service.bootstrap()).runtimeSettings.claude?.status === "unavailable");
+
+    // Without a probe the status is learned from the engine: a missing piece at start, a session that runs.
+    const failing = await harness({
+      runtimeFactory: async () => { throw new ClaudeLocatorError("claude_missing"); },
+    });
+    assert.equal((await failing.service.bootstrap()).runtimeSettings.claude?.status, undefined, "nothing known yet");
+    const failingTask = await failing.service.createTask(failing.workspaceId, undefined, "claude");
+    await assert.rejects(failing.send(failingTask.task.taskId, "x"), /runtime_start_runtime_factory/u);
+    assert.equal((await failing.service.bootstrap()).runtimeSettings.claude?.status, "not_found");
+    const learned = await harness();
+    const learnedTask = await learned.service.createTask(learned.workspaceId, undefined, "claude");
+    await learned.send(learnedTask.task.taskId, "x");
+    await learned.completed();
+    const learnedSettings = (await learned.service.bootstrap()).runtimeSettings.claude;
+    assert.equal(learnedSettings?.status, "ready");
+    assert.equal(learnedSettings?.version, "2.1.291");
+  });
+
+  it("shows the permission mode of a Claude session as its session mode [PC-SET-002]", async () => {
+    const h = await harness();
+    await h.service.setClaudeSettings(null, null, "plan");
+    const task = await h.service.createTask(h.workspaceId, undefined, "claude");
+    assert.equal((await h.service.bootstrap()).activeTask?.sessionModes, null, "no session yet");
+    await h.send(task.task.taskId, "x");
+    await h.completed();
+    await h.idle();
+    const view = (await h.service.bootstrap()).activeTask!;
+    assert.equal(view.sessionModes?.currentModeId, "plan");
+    assert.deepEqual(
+      view.sessionModes?.availableModes.map((mode) => mode.id),
+      ["default", "acceptEdits", "plan", "auto", "bypassPermissions"],
+    );
+    // A later default reaches the idle session at its next turn and moves the shown mode with it.
+    await h.service.setClaudeSettings(null, null, "acceptEdits");
+    await h.send(task.task.taskId, "y");
+    await h.completed(2);
+    assert.equal((await h.service.bootstrap()).activeTask?.sessionModes?.currentModeId, "acceptEdits");
+    // The mode is not a free choice of the generic option channel: the setting decides.
+    await assert.rejects(h.service.setSessionConfigOption(task.task.taskId, "mode", "default"));
   });
 
   it("offers only the files half of a rewind to Claude and sends it no _x.ai request [docs/20 3.8]", async () => {
