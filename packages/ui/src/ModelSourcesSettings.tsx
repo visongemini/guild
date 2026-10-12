@@ -10,12 +10,15 @@ import {
   draftFromForm,
   emptySourceForm,
   formFromSource,
+  SOURCE_LIMITS,
   sourceHost,
+  sourceSaveFailureOf,
   sourceStatus,
   validateSourceForm,
   type ModelRowForm,
   type SourceForm,
   type SourceIssue,
+  type SourceSaveFailure,
 } from "./model-sources-form.js";
 
 type SourcesApi = Pick<
@@ -39,6 +42,7 @@ export type ModelSourcesSettingsProps = Readonly<{
   initialSources?: readonly ModelSourceProjection[];
   initialForm?: SourceForm;
   initialIssues?: readonly SourceIssue[];
+  initialSaveFailure?: SourceSaveFailure;
   initialNotice?: SourcesNotice;
 }>;
 
@@ -63,13 +67,13 @@ function noticeText(messages: GuildMessages, notice: SourcesNotice): string {
  * secret. A new or changed address needs the user's confirmation in a native window owned by the main
  * process; this tab only asks for it and waits for the answer.
  */
-export function ModelSourcesSettings({ messages, api, onChanged, initialSources, initialForm, initialIssues, initialNotice }: ModelSourcesSettingsProps) {
+export function ModelSourcesSettings({ messages, api, onChanged, initialSources, initialForm, initialIssues, initialSaveFailure, initialNotice }: ModelSourcesSettingsProps) {
   const [sources, setSources] = useState<readonly ModelSourceProjection[] | undefined>(initialSources);
   const [loadFailed, setLoadFailed] = useState(false);
   const [form, setForm] = useState<SourceForm | undefined>(initialForm);
   const [issues, setIssues] = useState<readonly SourceIssue[]>(initialIssues ?? []);
   const [saving, setSaving] = useState(false);
-  const [saveFailed, setSaveFailed] = useState(false);
+  const [saveFailure, setSaveFailure] = useState<SourceSaveFailure | undefined>(initialSaveFailure);
   const [notice, setNotice] = useState<SourcesNotice | undefined>(initialNotice);
   const [confirmingId, setConfirmingId] = useState<string>();
   const [deleteTargetId, setDeleteTargetId] = useState<string>();
@@ -99,7 +103,7 @@ export function ModelSourcesSettings({ messages, api, onChanged, initialSources,
     if (form === undefined || saving) return;
     const found = validateSourceForm(form);
     setIssues(found);
-    setSaveFailed(false);
+    setSaveFailure(undefined);
     if (found.length > 0) return;
     setSaving(true);
     try {
@@ -113,8 +117,12 @@ export function ModelSourcesSettings({ messages, api, onChanged, initialSources,
         ? Object.freeze({ kind: "needs_confirmation", label: response.source.label })
         : undefined);
       latestOnChanged.current();
-    } catch {
-      if (alive.current) setSaveFailed(true);
+    } catch (cause) {
+      if (!alive.current) return;
+      const failure = sourceSaveFailureOf(cause, form, sources ?? []);
+      setSaveFailure(failure);
+      // The source changed or went away under the form: show the list as it is now.
+      if (failure.reason === "changed" || failure.reason === "not_found") await load();
     } finally {
       if (alive.current) setSaving(false);
     }
@@ -161,6 +169,10 @@ export function ModelSourcesSettings({ messages, api, onChanged, initialSources,
   const issueFor = (field: SourceIssue["field"], row?: number): SourceIssue | undefined =>
     issues.find((issue) => issue.field === field && issue.row === row);
   const issueText = (issue: SourceIssue | undefined) => issue === undefined ? undefined : messages.sourcesInvalid(issue.problem);
+  /** What the main process refused, in words; any other failure keeps the generic line. */
+  const failureText = (failure: SourceSaveFailure) => failure.reason === "unknown"
+    ? messages.sourcesSaveFailed
+    : messages.sourcesSaveError(failure.reason, SOURCE_LIMITS.maxSources);
 
   if (form !== undefined) {
     const labelIssue = issueFor("label");
@@ -168,6 +180,7 @@ export function ModelSourcesSettings({ messages, api, onChanged, initialSources,
     const fileIssue = issueFor("keyFile");
     const variableIssue = issueFor("keyVariable");
     const modelsIssue = issueFor("models");
+    const labelFailure = saveFailure?.place === "label" ? saveFailure : undefined;
     const errorOf = (id: string, issue: SourceIssue | undefined) => issue === undefined
       ? null
       : <p className="guild-source-error" id={id} role="alert">{issueText(issue)}</p>;
@@ -193,11 +206,13 @@ export function ModelSourcesSettings({ messages, api, onChanged, initialSources,
           value={form.label}
           maxLength={80}
           autoComplete="off"
-          aria-invalid={labelIssue !== undefined || undefined}
-          aria-describedby={labelIssue === undefined ? undefined : `${fieldId}-label-error`}
+          aria-invalid={labelIssue !== undefined || labelFailure !== undefined || undefined}
+          aria-describedby={labelIssue === undefined && labelFailure === undefined ? undefined : `${fieldId}-label-error`}
           onChange={(event) => patchForm({ label: event.currentTarget.value })}
         />
-        {errorOf(`${fieldId}-label-error`, labelIssue)}
+        {labelIssue === undefined && labelFailure !== undefined
+          ? <p className="guild-source-error" id={`${fieldId}-label-error`} role="alert">{failureText(labelFailure)}</p>
+          : errorOf(`${fieldId}-label-error`, labelIssue)}
       </label>
       <label className="guild-setting-field">
         <span className="guild-setting-label">{messages.sourcesFieldBaseUrl}</span>
@@ -259,6 +274,9 @@ export function ModelSourcesSettings({ messages, api, onChanged, initialSources,
           const nameIssue = issueFor("modelLabel", index);
           const contextIssue = issueFor("modelContext", index);
           const rowIssue = idIssue ?? nameIssue ?? contextIssue;
+          // A model ID another source already offers (the main process refused the save for it).
+          const repeated = saveFailure?.reason === "duplicate_model" && saveFailure.rows.includes(index);
+          const rowMessage = rowIssue !== undefined ? issueText(rowIssue) : repeated ? failureText(saveFailure) : undefined;
           return <div className="guild-source-model-entry" key={index}>
             <div className="guild-source-model-row">
               <input
@@ -267,7 +285,7 @@ export function ModelSourcesSettings({ messages, api, onChanged, initialSources,
                 value={row.id}
                 autoComplete="off"
                 aria-label={`${messages.sourcesModelId} ${index + 1}`}
-                aria-invalid={idIssue !== undefined || undefined}
+                aria-invalid={idIssue !== undefined || repeated || undefined}
                 onChange={(event) => patchRow(index, { id: event.currentTarget.value })}
               />
               <input
@@ -303,10 +321,13 @@ export function ModelSourcesSettings({ messages, api, onChanged, initialSources,
                 onClick={() => patchForm({ models: Object.freeze(form.models.filter((_, rowIndex) => rowIndex !== index)) })}
               ><X size={13} /></button>
             </div>
-            {rowIssue !== undefined && <p className="guild-source-error" role="alert">{issueText(rowIssue)}</p>}
+            {rowMessage !== undefined && <p className="guild-source-error" role="alert">{rowMessage}</p>}
           </div>;
         })}
         {modelsIssue !== undefined && <p className="guild-source-error" role="alert">{issueText(modelsIssue)}</p>}
+        {saveFailure?.place === "models" && saveFailure.rows.length === 0 && (
+          <p className="guild-source-error" role="alert">{failureText(saveFailure)}</p>
+        )}
         <button
           type="button"
           className="guild-soft-button guild-source-add-model"
@@ -323,9 +344,9 @@ export function ModelSourcesSettings({ messages, api, onChanged, initialSources,
           onClick={() => patchForm({ enabled: !form.enabled })}
         />
       </label>
-      {saveFailed && <p className="guild-source-error" role="alert">{messages.sourcesSaveFailed}</p>}
+      {saveFailure?.place === "form" && <p className="guild-source-error" role="alert">{failureText(saveFailure)}</p>}
       <div className="guild-sources-actions">
-        <button type="button" className="guild-soft-button" disabled={saving} onClick={() => { setForm(undefined); setIssues([]); setSaveFailed(false); }}>{messages.cancel}</button>
+        <button type="button" className="guild-soft-button" disabled={saving} onClick={() => { setForm(undefined); setIssues([]); setSaveFailure(undefined); }}>{messages.cancel}</button>
         <button type="button" className="guild-soft-button primary" disabled={saving} onClick={() => void save()}>
           {saving ? <><SpinnerGap size={13} className="guild-spin" aria-hidden="true" />{messages.sourcesSaving}</> : messages.save}
         </button>
@@ -360,7 +381,7 @@ export function ModelSourcesSettings({ messages, api, onChanged, initialSources,
               <code title={source.baseUrl}>{host}</code>
               <span>{messages.sourcesModelCount(source.models.length)}</span>
             </div>
-            {status === "needs_confirmation" && <p className="guild-setting-help">{messages.sourcesConfirmHelp(host, source.keyVariable)}</p>}
+            {status === "needs_confirmation" && <p className="guild-setting-help">{messages.sourcesConfirmHelp(host, source.keyVariable, source.kind)}</p>}
             {deleting ? (
               <div className="guild-source-delete" role="alertdialog" aria-label={messages.sourcesDeleteConfirm(source.label)}>
                 <p className="guild-setting-help">{messages.sourcesDeleteConfirm(source.label)}</p>
@@ -382,7 +403,7 @@ export function ModelSourcesSettings({ messages, api, onChanged, initialSources,
                     ? <><SpinnerGap size={13} className="guild-spin" aria-hidden="true" />{messages.sourcesConfirming}</>
                     : messages.sourcesConfirm}</button>
                 )}
-                <button type="button" className="guild-soft-button" onClick={() => { setNotice(undefined); setSaveFailed(false); setIssues([]); setForm(formFromSource(source)); }}>{messages.sourcesEdit}</button>
+                <button type="button" className="guild-soft-button" onClick={() => { setNotice(undefined); setSaveFailure(undefined); setIssues([]); setForm(formFromSource(source)); }}>{messages.sourcesEdit}</button>
                 <button type="button" className="guild-soft-button" onClick={() => { setNotice(undefined); setDeleteTargetId(source.id); }}>{messages.delete}</button>
               </div>
             )}
@@ -390,7 +411,7 @@ export function ModelSourcesSettings({ messages, api, onChanged, initialSources,
         })}
       </ul>
     )}
-    <button type="button" className="guild-soft-button guild-source-add" onClick={() => { setNotice(undefined); setSaveFailed(false); setIssues([]); setForm(emptySourceForm()); }}>
+    <button type="button" className="guild-soft-button guild-source-add" onClick={() => { setNotice(undefined); setSaveFailure(undefined); setIssues([]); setForm(emptySourceForm()); }}>
       <Plus size={13} aria-hidden="true" />{messages.sourcesAdd}
     </button>
   </div>;

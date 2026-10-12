@@ -66,7 +66,7 @@ test("Guild 3.0 strings exist, are non-empty and mention no undefined in both ca
     const texts: string[] = [
       messages.settingsEngines, messages.settingsModelSources, messages.settingsClaude, messages.enginesClaudeIntro,
       messages.modelPickerOpenModelSources, messages.modelPickerClaudeUnavailable, messages.modelPickerClaudeUnavailableHelp,
-      messages.modelPickerClaudeNotStarted, messages.modelPickerEngineNote,
+      messages.modelPickerClaudeNotStarted, messages.modelPickerClaudeDefault, messages.modelPickerEngineNote,
       messages.onlineReminderTitle("V"), messages.onlineReminderLead("V"), messages.onlineReminderItemClaudeMd,
       messages.onlineReminderItemMemory, messages.onlineReminderItemConversation, messages.onlineReminderItemBrowser,
       messages.onlineReminderDontRemind, messages.onlineReminderSwitch,
@@ -78,7 +78,7 @@ test("Guild 3.0 strings exist, are non-empty and mention no undefined in both ca
       messages.sourcesIntro, messages.sourcesKeyNotice, messages.sourcesLoading, messages.sourcesLoadFailed, messages.sourcesEmpty,
       messages.sourcesAdd, messages.sourcesEdit, messages.sourcesEditTitle, messages.sourcesAddTitle,
       messages.sourcesDeleteConfirm("L"), messages.sourcesDeleteFailed, messages.sourcesConfirm, messages.sourcesConfirming,
-      messages.sourcesConfirmHelp("h", "V"), messages.sourcesConfirmHelp("h", null), messages.sourcesConfirmedNotice,
+      messages.sourcesConfirmHelp("h", "V", "online"), messages.sourcesConfirmHelp("h", "V", "local"), messages.sourcesConfirmHelp("h", null, "local"), messages.sourcesConfirmedNotice,
       messages.sourcesConfirmCancelled, messages.sourcesConfirmFailed, messages.sourcesNeedsConfirmationNotice("L"),
       messages.sourcesFieldKind, messages.sourcesFieldLabel, messages.sourcesFieldBaseUrl, messages.sourcesFieldKeyFile,
       messages.sourcesKeyFilePlaceholder, messages.sourcesKeyFileHint, messages.sourcesFieldKeyVariable,
@@ -93,6 +93,9 @@ test("Guild 3.0 strings exist, are non-empty and mention no undefined in both ca
     for (const status of ["confirmed", "needs_confirmation", "disabled"] as const) texts.push(messages.sourcesStatusName(status));
     for (const mode of ["default", "acceptEdits", "plan", "auto", "bypassPermissions"] as const) {
       texts.push(messages.claudePermissionModeName(mode), messages.claudePermissionModeHelp(mode));
+    }
+    for (const reason of ["invalid", "reserved_id", "reserved_model", "duplicate_model", "limit", "changed", "not_found", "rejected"] as const) {
+      texts.push(messages.sourcesSaveError(reason, 32));
     }
     for (const problem of ["label", "base_url", "base_url_https", "key_file", "key_variable", "key_variable_secret", "models", "model_id", "model_duplicate", "model_label", "model_context"] as const) {
       texts.push(messages.sourcesInvalid(problem));
