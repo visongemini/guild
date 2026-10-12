@@ -329,7 +329,7 @@ async function startAdapter(
     clientCapabilities: {
       session: { configOptions: { boolean: {} } },
     },
-    clientInfo: { name: "guild", title: "Guild", version: "3.0.2" },
+    clientInfo: { name: "guild", title: "Guild", version: "3.0.3" },
   });
   process.emitMessages({ jsonrpc: "2.0", id: initialize.id, result: advertisedInitializeResult });
   await starting;

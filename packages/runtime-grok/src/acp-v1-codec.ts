@@ -51,7 +51,7 @@ export const ACP_V1_CODEC_LIMITS = Object.freeze({
 export const ACP_V1_CLIENT_INFO = deepFreeze({
   name: "guild",
   title: "Guild",
-  version: "3.0.2",
+  version: "3.0.3",
 });
 
 export type AcpV1CodecErrorCode =
