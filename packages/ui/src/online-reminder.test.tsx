@@ -4,7 +4,13 @@ import test from "node:test";
 import type { ModelSourceProjection } from "@guild/contracts";
 import { renderToStaticMarkup } from "react-dom/server";
 import { messagesFor } from "./locales.js";
-import { onlineReminderNeeded, vendorLabelFor } from "./online-reminder.js";
+import {
+  agreedSourcesOf,
+  createOnlineConsentLedger,
+  onlineReminderNeeded,
+  onlineSourceKey,
+  vendorLabelFor,
+} from "./online-reminder.js";
 import { OnlineReminderDialog } from "./OnlineReminderDialog.js";
 import { OnlineReminderSetting } from "./OnlineReminderSetting.js";
 
@@ -23,22 +29,74 @@ const source = (label: string, ids: readonly string[]): ModelSourceProjection =>
   confirmedHost: "api.example.com",
 });
 
-const base = { targetGroup: "online", currentGroup: "claude", alreadyHandledForTask: false, dismissedForWorkspace: false } as const;
+const base = {
+  targetGroup: "online",
+  targetSource: "source:deepseek",
+  agreedSources: new Set<string>(),
+  dismissedForWorkspace: false,
+} as const;
 
-test("the reminder is due only for the first Online model of a conversation in a workspace that has not silenced it", () => {
+test("the reminder is due for an Online vendor the task has not agreed to, unless the workspace silenced it", () => {
   assert.equal(onlineReminderNeeded(base), true);
-  assert.equal(onlineReminderNeeded({ ...base, currentGroup: undefined }), true);
-  assert.equal(onlineReminderNeeded({ ...base, currentGroup: "local" }), true);
-  assert.equal(onlineReminderNeeded({ ...base, alreadyHandledForTask: true }), false);
+  assert.equal(onlineReminderNeeded({ ...base, agreedSources: new Set(["source:other"]) }), true);
+  assert.equal(onlineReminderNeeded({ ...base, agreedSources: new Set(["source:deepseek"]) }), false);
   assert.equal(onlineReminderNeeded({ ...base, dismissedForWorkspace: true }), false);
-  // Already on an Online model: the person was asked (or chose not to be) when they got there.
-  assert.equal(onlineReminderNeeded({ ...base, currentGroup: "online" }), false);
 });
 
 test("Claude, Local and Grok models never ask", () => {
   for (const targetGroup of ["claude", "local", "grok", undefined] as const) {
     assert.equal(onlineReminderNeeded({ ...base, targetGroup }), false, String(targetGroup));
   }
+});
+
+test("a model belongs to the source that lists it, else it is its own key", () => {
+  const sources = [source("DeepSeek", ["deepseek-v4-flash", "deepseek-v4-reasoner"]), source("Other", ["other-1"])];
+  assert.equal(onlineSourceKey("deepseek-v4-reasoner", sources), "source:deepseek");
+  assert.equal(onlineSourceKey("other-1", sources), "source:other");
+  assert.equal(onlineSourceKey("ghost", sources), "model:ghost");
+  assert.equal(onlineSourceKey("ghost", []), "model:ghost");
+});
+
+test("consent is per task and per vendor: Online A -> Claude -> Online B asks again for B, not for A", () => {
+  const sources = [source("DeepSeek", ["ds-flash", "ds-reasoner"]), source("Other", ["other-1"])];
+  const ledger = createOnlineConsentLedger();
+  /** Whether switching `taskId` from `current` to `target` must ask, and (when answered yes) records the agreement. */
+  const asks = (taskId: string, target: string, current: [string, "claude" | "online"], dismissed = false): boolean => {
+    const targetSource = onlineSourceKey(target, sources);
+    const due = onlineReminderNeeded({
+      targetGroup: "online",
+      targetSource,
+      agreedSources: agreedSourcesOf({ ledger, taskId, currentModelId: current[0], currentGroup: current[1], sources }),
+      dismissedForWorkspace: dismissed,
+    });
+    if (due) ledger.agree(taskId, targetSource);
+    return due;
+  };
+  assert.equal(asks("t1", "ds-flash", ["opus", "claude"]), true, "the first Online vendor of the task");
+  // Another model of the same vendor, with or without leaving to Claude and back, is the same agreement.
+  assert.equal(asks("t1", "ds-reasoner", ["ds-flash", "online"]), false);
+  assert.equal(asks("t1", "ds-flash", ["opus", "claude"]), false);
+  // A different vendor is a different agreement, straight from Online A or by way of Claude.
+  assert.equal(asks("t1", "other-1", ["ds-flash", "online"]), true, "Online A -> Online B");
+  const viaClaude = createOnlineConsentLedger();
+  viaClaude.agree("t2", onlineSourceKey("ds-flash", sources));
+  const b = { ledger: viaClaude, taskId: "t2", currentModelId: "opus", currentGroup: "claude", sources } as const;
+  assert.equal(onlineReminderNeeded({ ...base, targetSource: onlineSourceKey("other-1", sources), agreedSources: agreedSourcesOf(b) }), true, "Online A -> Claude -> Online B");
+  assert.equal(onlineReminderNeeded({ ...base, targetSource: onlineSourceKey("ds-flash", sources), agreedSources: agreedSourcesOf(b) }), false, "and back to A");
+  // Both vendors are known to t1 now; another task starts from nothing.
+  assert.equal(asks("t1", "other-1", ["opus", "claude"]), false);
+  assert.equal(asks("t3", "ds-flash", ["opus", "claude"]), true);
+  // The vendor a task already runs on counts as agreed even with no entry (a default the person set), and the
+  // workspace opt-out silences every vendor.
+  assert.equal(asks("t4", "ds-reasoner", ["ds-flash", "online"]), false);
+  assert.equal(asks("t5", "other-1", ["opus", "claude"], true), false);
+  assert.equal(asks("t5", "ds-flash", ["opus", "claude"], true), false);
+  // A model no source lists is its own vendor key: asked once, not on every switch.
+  assert.equal(asks("t6", "ghost", ["opus", "claude"]), true);
+  assert.equal(asks("t6", "ghost", ["opus", "claude"]), false);
+  // The ledger hands out a copy: reading it never records anything.
+  agreedSourcesOf({ ledger, taskId: "t7", currentModelId: "ds-flash", currentGroup: "online", sources });
+  assert.equal(ledger.agreedSources("t7").size, 0);
 });
 
 test("the vendor named is the model source that lists the model, else the model's name, else its id", () => {
@@ -112,19 +170,20 @@ test("the reminder flow in the app follows PC-PRIV-001", async () => {
   const flow = app.slice(start, end);
   // The reminder gates only Online models and comes before anything is changed.
   assert.match(flow, /change\.group === "online" && !\(await confirmOnlineSwitch\(task, change\.model\)\)\) return undefined/u);
-  assert.ok(flow.indexOf("confirmOnlineSwitch(task") < flow.indexOf("api.setTaskEngine("));
-  assert.ok(flow.indexOf("confirmOnlineSwitch(task") < flow.indexOf("api.setTaskRuntimeSettings("));
-  // The preference is read whenever the task has not been asked and is not already on an Online model, even when the
-  // current model is not in the catalog (a fresh Claude task may name none).
-  assert.match(app, /const currentGroup = currentModel === undefined \? undefined : modelGroupOf\(currentModel\);/u);
-  assert.match(app, /if \(!handledBefore && currentGroup !== "online"\) \{\s*\n\s*try \{\s*\n\s*dismissed = \(await api\.getWorkspacePrefs/u);
-  // The silenced state comes from the workspace preference; the checkbox writes it back; asked tasks are remembered per task id.
-  assert.match(flow, /api\.getWorkspacePrefs\(\{ workspaceId: task\.task\.workspaceId \}\)/u);
+  assert.ok(flow.indexOf("confirmOnlineSwitch(task") < flow.indexOf("applyModelSelectionChange("));
+  // Agreement is kept per task and per vendor, in the ledger; the vendor is the source that lists the model.
+  assert.match(app, /const onlineConsent = useRef\(createOnlineConsentLedger\(\)\);/u);
+  assert.match(flow, /const targetSource = onlineSourceKey\(modelId \?\? "", sources\);/u);
+  assert.match(flow, /agreedSourcesOf\(\{\s*\n\s*ledger: onlineConsent\.current,\s*\n\s*taskId,\s*\n\s*currentModelId: task\.modelSelection\.modelId,/u);
+  // The workspace preference is read only when this vendor is not agreed yet; the checkbox writes it back.
+  assert.match(flow, /if \(!agreedSources\.has\(targetSource\)\) \{\s*\n\s*try \{\s*\n\s*dismissed = \(await api\.getWorkspacePrefs\(\{ workspaceId: task\.task\.workspaceId \}\)\)\.onlineReminderDismissed;/u);
   assert.match(flow, /api\.setWorkspacePrefs\(\{ workspaceId: task\.task\.workspaceId, onlineReminderDismissed: true \}\)/u);
-  assert.match(flow, /onlineRemindedTaskIds\.current\.add\(taskId\)/u);
-  // The vendor is the model source's label.
-  assert.match(flow, /vendorLabelFor\(modelId \?\? "", \(await api\.listModelSources\(\)\)\.sources/u);
-  // Cancel resolves without switching and never marks the task as asked.
-  assert.match(flow, /if \(!answer\.confirmed\) return false;\s*\n\s*onlineRemindedTaskIds\.current\.add\(taskId\);/u);
+  assert.match(flow, /onlineReminderNeeded\(\{ targetGroup: "online", targetSource, agreedSources, dismissedForWorkspace: dismissed \}\)/u);
+  assert.match(flow, /onlineConsent\.current\.agree\(taskId, targetSource\)/u);
+  // The vendor named is the model source's label.
+  assert.match(flow, /vendorLabelFor\(modelId \?\? "", sources, target\?\.name\)/u);
+  // Cancel resolves without switching and never records an agreement.
+  assert.match(flow, /if \(!answer\.confirmed\) return false;\s*\n\s*onlineConsent\.current\.agree\(taskId, targetSource\);/u);
+  assert.doesNotMatch(app, /onlineRemindedTaskIds/u);
   assert.match(app, /<OnlineReminderDialog\s*\n\s*messages=\{baseMessages\}/u);
 });

@@ -170,6 +170,8 @@ export type GuildMessages = WorkshopMessages & ChangeMessages & {
   readonly modelPickerClaudeUnavailable: string;
   readonly modelPickerClaudeUnavailableHelp: string;
   readonly modelPickerClaudeNotStarted: string;
+  /** The Claude group's one row while Claude Code lists no model yet: the task follows Claude Code's own default. */
+  readonly modelPickerClaudeDefault: string;
   readonly modelPickerEngineNote: string;
   readonly taskEngineName: (engine: GuildEngine) => string;
   readonly taskEngineMarkerTitle: (engine: GuildEngine) => string;
@@ -708,6 +710,7 @@ const ZH_CN: GuildMessages = Object.freeze({
   modelPickerClaudeUnavailable: "未找到 Claude Code，或尚未登录",
   modelPickerClaudeUnavailableHelp: "请先安装 Claude Code，并在终端运行一次 claude 完成登录。",
   modelPickerClaudeNotStarted: "Claude 启动后才会显示可选的模型。",
+  modelPickerClaudeDefault: "Claude Code（默认模型）",
   modelPickerEngineNote: "第一条消息选的模型，决定这个对话用 Grok 还是 Claude，之后不能更换。",
   taskEngineName: (engine) => ({ grok: "Grok", claude: "Claude" })[engine],
   taskEngineMarkerTitle: (engine) => ({ grok: "Grok 对话", claude: "Claude Code 对话" })[engine],
@@ -1228,6 +1231,7 @@ const EN_US: GuildMessages = Object.freeze({
   modelPickerClaudeUnavailable: "Claude Code not found or not logged in",
   modelPickerClaudeUnavailableHelp: "Install Claude Code, then run `claude` once in Terminal and log in.",
   modelPickerClaudeNotStarted: "Model choices appear once Claude has started.",
+  modelPickerClaudeDefault: "Claude Code (default model)",
   modelPickerEngineNote: "The model you pick for the first message decides whether this conversation runs on Grok or Claude. It cannot change afterwards.",
   taskEngineName: (engine) => ({ grok: "Grok", claude: "Claude" })[engine],
   taskEngineMarkerTitle: (engine) => ({ grok: "Grok conversation", claude: "Claude Code conversation" })[engine],

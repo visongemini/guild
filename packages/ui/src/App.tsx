@@ -66,6 +66,7 @@ import type {
   RunCheckpointProjection,
   RunId,
   ConversationSearchResult,
+  ModelSourceProjection,
   RuntimeCommand,
   PromptAttachment,
   RunPhaseProjection,
@@ -136,12 +137,19 @@ import {
   useModalOverlayPresent,
   type WorkbenchTab,
 } from "./browser-pane-view.js";
+import { applyModelSelectionChange } from "./apply-model-change.js";
 import { claudeDefaultsView, claudePermissionModeOf, claudeStatusOf, claudeStatusText } from "./claude-engine.js";
 import { ModelPicker } from "./ModelPicker.js";
 import { ModelSourcesSettings } from "./ModelSourcesSettings.js";
 import { OnlineReminderDialog } from "./OnlineReminderDialog.js";
 import { OnlineReminderSetting } from "./OnlineReminderSetting.js";
-import { onlineReminderNeeded, vendorLabelFor } from "./online-reminder.js";
+import {
+  agreedSourcesOf,
+  createOnlineConsentLedger,
+  onlineReminderNeeded,
+  onlineSourceKey,
+  vendorLabelFor,
+} from "./online-reminder.js";
 import { hasMixedEngines, taskEngineFixed, taskEngineOf } from "./task-engine.js";
 import { RewindDialog } from "./RewindDialog.js";
 import { RunChangesCard, type RunCardData } from "./RunChangesCard.js";
@@ -296,10 +304,10 @@ export function GuildApp({ api }: GuildAppProps) {
   const [renameDraft, setRenameDraft] = useState("");
   const [renameError, setRenameError] = useState(false);
   const [contextUsageOpen, setContextUsageOpen] = useState(false);
-  // The Online-model reminder (PC-PRIV-001): the open dialog, the way to answer it, and the tasks already asked in this window.
+  // The Online-model reminder (PC-PRIV-001): the open dialog, the way to answer it, and the vendors each task agreed to in this window.
   const [onlineReminder, setOnlineReminder] = useState<OnlineReminderRequest>();
   const onlineReminderAnswer = useRef<((answer: OnlineReminderAnswer) => void) | undefined>(undefined);
-  const onlineRemindedTaskIds = useRef<Set<string>>(new Set());
+  const onlineConsent = useRef(createOnlineConsentLedger());
   const [claudeSettingsFailed, setClaudeSettingsFailed] = useState(false);
   const [rewindTarget, setRewindTarget] = useState<{ readonly runId: RunId }>();
   const rewindReturnFocus = useRef<HTMLElement | null>(null);
@@ -1538,16 +1546,13 @@ export function GuildApp({ api }: GuildAppProps) {
     // PC-PRIV-001: the first switch to an Online model in this conversation says what goes to the vendor.
     if (change.group === "online" && !(await confirmOnlineSwitch(task, change.model))) return undefined;
     // PC-ENG-001: a task that has not run yet may still choose its engine; the first turn fixes it.
-    if (change.engine !== undefined && change.engine !== taskEngineOf(task.task)) {
-      const moved = await api.setTaskEngine({ taskId, engine: change.engine });
-      setProjection((current) => current === undefined || current.activeTask?.task.taskId !== taskId
-        ? current
-        : withTaskSummary({ ...current, activeTask: moved }, moved.task));
-    }
-    const response = await api.setTaskRuntimeSettings({
+    const response = await applyModelSelectionChange(api, {
       taskId,
-      model: change.model,
-      reasoningEffort: change.reasoningEffort,
+      taskEngine: taskEngineOf(task.task),
+      change,
+      onEngineMoved: (moved) => setProjection((current) => current === undefined || current.activeTask?.task.taskId !== taskId
+        ? current
+        : withTaskSummary({ ...current, activeTask: moved }, moved.task)),
     });
     // A refusal still returns the task with its previous selection, so it is always safe to adopt.
     setProjection((current) => current === undefined || current.activeTask?.task.taskId !== response.task.task.taskId
@@ -1556,37 +1561,42 @@ export function GuildApp({ api }: GuildAppProps) {
     return response;
   }
 
-  /** True when the switch may go ahead: no reminder is due, or the user accepted it (and maybe silenced it). */
+  /**
+   * True when the switch may go ahead: no reminder is due, or the user accepted it (and maybe silenced it). The
+   * agreement is per task and per vendor, so a second vendor in the same conversation asks again (PC-PRIV-001).
+   */
   async function confirmOnlineSwitch(task: TaskViewProjection, modelId: string | null): Promise<boolean> {
     const taskId = task.task.taskId;
     const currentModel = (taskEngineOf(task.task) === "claude" ? modelCatalogs.claude : modelCatalogs.grok)
       .models.find((model) => model.id === task.modelSelection.modelId);
     const target = modelCatalogs.claude.models.find((model) => model.id === modelId);
-    const currentGroup = currentModel === undefined ? undefined : modelGroupOf(currentModel);
-    const handledBefore = onlineRemindedTaskIds.current.has(taskId);
+    let sources: readonly ModelSourceProjection[] = [];
+    try {
+      sources = (await api.listModelSources()).sources;
+    } catch {
+      // Without the list the model itself is the vendor key and its own name stands in for the vendor.
+    }
+    const targetSource = onlineSourceKey(modelId ?? "", sources);
+    const agreedSources = agreedSourcesOf({
+      ledger: onlineConsent.current,
+      taskId,
+      currentModelId: task.modelSelection.modelId,
+      currentGroup: currentModel === undefined ? undefined : modelGroupOf(currentModel),
+      sources,
+    });
     let dismissed = false;
-    if (!handledBefore && currentGroup !== "online") {
+    if (!agreedSources.has(targetSource)) {
       try {
         dismissed = (await api.getWorkspacePrefs({ workspaceId: task.task.workspaceId })).onlineReminderDismissed;
       } catch {
         // Unknown means not silenced: ask.
       }
     }
-    if (!onlineReminderNeeded({
-      targetGroup: "online",
-      currentGroup,
-      alreadyHandledForTask: handledBefore,
-      dismissedForWorkspace: dismissed,
-    })) {
-      onlineRemindedTaskIds.current.add(taskId);
+    if (!onlineReminderNeeded({ targetGroup: "online", targetSource, agreedSources, dismissedForWorkspace: dismissed })) {
+      onlineConsent.current.agree(taskId, targetSource);
       return true;
     }
-    let vendorLabel = target?.name ?? modelId ?? "";
-    try {
-      vendorLabel = vendorLabelFor(modelId ?? "", (await api.listModelSources()).sources, target?.name);
-    } catch {
-      // The model's own name stands in for the vendor.
-    }
+    const vendorLabel = vendorLabelFor(modelId ?? "", sources, target?.name);
     const answer = await new Promise<OnlineReminderAnswer>((resolve) => {
       onlineReminderAnswer.current = resolve;
       setOnlineReminder(Object.freeze({ vendorLabel }));
@@ -1595,7 +1605,7 @@ export function GuildApp({ api }: GuildAppProps) {
     onlineReminderAnswer.current = undefined;
     window.queueMicrotask(() => document.querySelector<HTMLElement>(".guild-model-picker-trigger")?.focus());
     if (!answer.confirmed) return false;
-    onlineRemindedTaskIds.current.add(taskId);
+    onlineConsent.current.agree(taskId, targetSource);
     if (answer.dontRemindAgain) {
       try {
         await api.setWorkspacePrefs({ workspaceId: task.task.workspaceId, onlineReminderDismissed: true });
