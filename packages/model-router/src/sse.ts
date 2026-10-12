@@ -97,9 +97,11 @@ function blockIndex(event: JsonObject): number | undefined {
  * message_stop and error first flush any buffered blocks so nothing is lost or reordered after
  * the message ends.
  *
- * What is held back is bounded (`MAX_BUFFERED_BYTES`, `MAX_BUFFERED_BLOCKS`). When a limit is hit
- * the sequencer drops everything it holds, reports it through `overflow` and accepts nothing more;
- * the owner must end the client stream and abort the upstream.
+ * What is held back, and how many blocks are tracked, is bounded (`MAX_BUFFERED_BYTES`,
+ * `MAX_BUFFERED_BLOCKS`), and both limits are checked before an event or a block is added: a stream
+ * of ever-lower block starts is counted like any other. When a limit is hit the sequencer drops
+ * everything it holds, reports it through `overflow` and accepts nothing more; the owner must end
+ * the client stream and abort the upstream.
  */
 export class SseBlockSequencer {
   private readonly blocks = new Map<number, BlockQueue>();
@@ -130,6 +132,10 @@ export class SseBlockSequencer {
     return this.flushAll();
   }
 
+  /**
+   * The lowest index among the tracked blocks. The scan is bounded: `acceptBlockEvent` refuses to
+   * track more than `MAX_BUFFERED_BLOCKS + 1` blocks, so this never walks more than that many keys.
+   */
   private lowestOpen(): number | undefined {
     let lowest: number | undefined;
     for (const index of this.blocks.keys()) {
@@ -139,16 +145,22 @@ export class SseBlockSequencer {
   }
 
   private acceptBlockEvent(type: string, index: number, raw: string): string[] {
-    const lowest = this.lowestOpen();
     if (type === "content_block_start" && !this.blocks.has(index)) {
+      // Every tracked block except the lowest waits behind it, and a new lowest block (a smaller index
+      // than every open one) turns the old lowest into a waiting block. The cap therefore applies to
+      // every insertion, the streamed-through one included, and is checked before the block is added.
+      if (this.blocks.size >= MAX_BUFFERED_BLOCKS + 1) {
+        this.trip("blocks");
+        return [];
+      }
+      const lowest = this.lowestOpen();
       const created: BlockQueue = { events: [], bytes: 0, stopped: false };
       this.blocks.set(index, created);
       if (lowest === undefined || index < lowest) return [raw];
       this.hold(created, raw);
-      // The lowest open block streams through; every other block is waiting behind it.
-      if (this.blocks.size - 1 > MAX_BUFFERED_BLOCKS) this.trip("blocks");
       return [];
     }
+    const lowest = this.lowestOpen();
     const block = this.blocks.get(index);
     if (block === undefined) return [raw];
     if (index !== lowest) {
@@ -161,13 +173,16 @@ export class SseBlockSequencer {
     return [raw, ...this.promote()];
   }
 
-  /** Holds a raw event back for a block that must wait for a lower one. */
+  /** Holds a raw event back for a block that must wait for a lower one; over the cap it holds nothing. */
   private hold(block: BlockQueue, raw: string): void {
     const size = Buffer.byteLength(raw);
+    if (this.bufferedBytes + size > MAX_BUFFERED_BYTES) {
+      this.trip("bytes");
+      return;
+    }
     block.events.push(raw);
     block.bytes += size;
     this.bufferedBytes += size;
-    if (this.bufferedBytes > MAX_BUFFERED_BYTES) this.trip("bytes");
   }
 
   private trip(reason: SseOverflow): void {
