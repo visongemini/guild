@@ -74,6 +74,16 @@ created and never changes. Process topology stays one engine process per task (D
 - No `--rules` argv. Guild agent rules (if any) go through `_meta.systemPrompt` only if the adapter
   supports append mode; otherwise none.
 - Permission mode: `set_config_option mode` after session start (not argv, no restart).
+- Start window and lost sessions: `initialize` and `session/new|resume|load` of the Claude adapter wait up to
+  300 s (the adapter brings up the Agent SDK, connectors and plugin hooks; 45-125 s were measured under load;
+  Grok keeps 30 s). A request that gets no answer in time (`request_timeout`), or a process that dies before
+  answering a resume, never marks the session lost: the binding stays `restore_pending` with its retained
+  session id, the send fails with `claude_start_timeout` ("Claude is still starting ... Try again in a
+  moment"), and the next send resumes it again. Only the agent's own "no such session" answer (ACP -32002,
+  `session_not_found`) ends in `restore_failed` (replacement offered; a task without a Run is replaced without
+  asking). Any other failure of a resume keeps the session too and stays a plain failure. `session/load` is not
+  tried after a resume that was advertised (it would only wait a second window); it is the way back only for an
+  agent that does not advertise resume.
 - Auth: never call `authenticate` for Claude. If `authMethods` is non-empty and the first session
   fails with auth required, show "Run `claude` once in Terminal and log in" (named reduced state).
 

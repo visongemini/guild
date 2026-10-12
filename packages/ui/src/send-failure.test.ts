@@ -28,3 +28,14 @@ test("names an overlong composer payload instead of collapsing it to runtime", (
     "message",
   );
 });
+
+test("names a Claude start that is still going on instead of collapsing it to runtime (PC-ENG-002)", () => {
+  assert.equal(
+    classifyComposerSendFailure(new Error(
+      "Error invoking remote method 'guild:v1:run:send': Error: claude_start_timeout",
+    )),
+    "claude_start",
+  );
+  assert.equal(classifyComposerSendFailure("claude_start_timeout"), "claude_start");
+  assert.equal(classifyComposerSendFailure(new Error("guild_operation_failed")), "runtime");
+});

@@ -13,6 +13,12 @@ export const CLAUDE_LOGIN_REQUIRED = "claude_login_required";
  * claude-agent-acp or restart Guild".
  */
 export const ENGINE_INTEGRITY_CHANGED = "engine_integrity_changed";
+/**
+ * PC-ENG-002: Claude did not answer within its start window (the adapter, the claude binary, plugins
+ * and connectors can take minutes under load). Nothing was lost: the task keeps its session id and
+ * the next send resumes it. The wording is `claudeStartTimeout`.
+ */
+export const CLAUDE_START_TIMEOUT = "claude_start_timeout";
 /** PC-ENG-001: the task has a Run or switched to a router model, so its engine can no longer change. */
 export const TASK_ENGINE_LOCKED = "task_engine_locked";
 /** Docs/20 3.3: a routed task needs the model router, which is not available. */
@@ -54,6 +60,7 @@ export function toDesktopIpcFailure(cause: unknown): Error {
     message === SESSION_RECOVERY_CONTEXT_REQUIRED ||
     message === MESSAGE_TOO_LONG ||
     message === CLAUDE_LOGIN_REQUIRED ||
+    message === CLAUDE_START_TIMEOUT ||
     message === TASK_ENGINE_LOCKED ||
     message === MODEL_ROUTER_UNAVAILABLE ||
     message === MODEL_SELECTION_FAILED ||

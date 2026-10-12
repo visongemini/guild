@@ -227,7 +227,7 @@ type ContextMenu =
   | { readonly type: "workspace"; readonly workspace: WorkspaceProjection; readonly x: number; readonly y: number }
   | { readonly type: "task"; readonly task: TaskSummaryProjection; readonly x: number; readonly y: number };
 
-type UiError = "bootstrap" | "message" | "operation" | "recovery" | "runtime" | "workspace";
+type UiError = "bootstrap" | "claude_start" | "message" | "operation" | "recovery" | "runtime" | "workspace";
 type SettingsTab = "general" | "engines" | "sources" | "privacy" | "about";
 const SETTINGS_TABS: readonly SettingsTab[] = Object.freeze(["general", "engines", "sources", "privacy", "about"]);
 type OnlineReminderRequest = Readonly<{ vendorLabel: string }>;
@@ -2513,6 +2513,8 @@ export function GuildApp({ api }: GuildAppProps) {
             <div className="guild-inline-error" role="alert">
               {error === "runtime"
                 ? messages.runtimeUnavailable
+                : error === "claude_start"
+                  ? messages.claudeStartTimeout
                 : error === "recovery"
                   ? messages.sessionRecoveryContextRequired
                 : error === "workspace"

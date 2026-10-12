@@ -274,8 +274,8 @@ describe("Claude dialect: initialize and authentication (PC-ENG-002)", () => {
     const process = new FakeProcess();
     const adapter = await startClaude(process, new RecordingSink(), undefined, { peerFactory: timeoutObserver(claude) });
     await newClaudeSession(adapter, process);
-    assert.equal(claude.get(ACP_V1_METHODS.initialize), 30_000);
-    assert.equal(claude.get(ACP_V1_METHODS.sessionNew), 90_000);
+    assert.equal(claude.get(ACP_V1_METHODS.initialize), 300_000);
+    assert.equal(claude.get(ACP_V1_METHODS.sessionNew), 300_000);
     await adapter.close();
 
     const grok = new Map<string, number | null | undefined>();
@@ -297,6 +297,23 @@ describe("Claude dialect: initialize and authentication (PC-ENG-002)", () => {
     await opening;
     assert.equal(grok.get(ACP_V1_METHODS.sessionNew), 30_000);
     await grokAdapter.close();
+  });
+
+  it("gives resume and load the long Claude window too, and Grok keeps its own", async () => {
+    const claude = new Map<string, number | null | undefined>();
+    const process = new FakeProcess();
+    const adapter = await startClaude(process, new RecordingSink(), undefined, { peerFactory: timeoutObserver(claude) });
+    const resuming = adapter.resumeSession("old-session", FIXTURE_CWD);
+    const resume = await waitForOutbound(process, ACP_V1_METHODS.sessionResume);
+    process.emitMessages({ jsonrpc: "2.0", id: resume.id, result: fixtureSessionResult() } as WireMessage);
+    await resuming;
+    const loading = adapter.loadSession("other-session", FIXTURE_CWD);
+    const load = await waitForOutbound(process, ACP_V1_METHODS.sessionLoad);
+    process.emitMessages({ jsonrpc: "2.0", id: load.id, result: fixtureSessionResult() } as WireMessage);
+    await loading;
+    assert.equal(claude.get(ACP_V1_METHODS.sessionResume), 300_000);
+    assert.equal(claude.get(ACP_V1_METHODS.sessionLoad), 300_000);
+    await adapter.close();
   });
 
   it("accepts and ignores terminal auth methods, never authenticating", async () => {
@@ -330,6 +347,49 @@ describe("Claude dialect: initialize and authentication (PC-ENG-002)", () => {
       reason: "engine",
     });
     assert.equal(process.outbound().some((message) => message.method === "_session/steering"), false);
+    await adapter.close();
+  });
+
+  it("names a start that got no answer in time (request_timeout) instead of reporting a lost transport", async () => {
+    const process = new FakeProcess();
+    const adapter = await startClaude(process, new RecordingSink(), undefined, { timeouts: { sessionMs: 25 } });
+    const resuming = adapter.resumeSession("old-session", FIXTURE_CWD);
+    await waitForOutbound(process, ACP_V1_METHODS.sessionResume);
+    await assert.rejects(resuming, hasAdapterCode("request_timeout"));
+    assert.equal(adapter.state, "ready", "a slow resume does not fault the adapter");
+
+    const loading = adapter.loadSession("old-session", FIXTURE_CWD);
+    await waitForOutbound(process, ACP_V1_METHODS.sessionLoad);
+    await assert.rejects(loading, hasAdapterCode("request_timeout"));
+    assert.equal(adapter.state, "ready");
+
+    const creating = adapter.newSession(FIXTURE_CWD);
+    await waitForOutbound(process, ACP_V1_METHODS.sessionNew);
+    await assert.rejects(creating, hasAdapterCode("request_timeout"));
+    await adapter.close();
+
+    // initialize faults the adapter when it times out, and still reads as a timeout.
+    const startProcess = new FakeProcess();
+    const starting = new AcpV1Adapter({ ...adapterOptions(startProcess, new RecordingSink()), timeouts: { initializeMs: 25 } });
+    const initializing = starting.start();
+    await waitForOutbound(startProcess, ACP_V1_METHODS.initialize);
+    await assert.rejects(initializing, hasAdapterCode("request_timeout"));
+  });
+
+  it("answers the agent's own 'no such session' (ACP -32002) with session_not_found and nothing else", async () => {
+    const process = new FakeProcess();
+    const adapter = await startClaude(process, new RecordingSink());
+    const resuming = adapter.resumeSession("missing-session", FIXTURE_CWD);
+    const resume = await waitForOutbound(process, ACP_V1_METHODS.sessionResume);
+    process.emitMessages({ jsonrpc: "2.0", id: resume.id, error: { code: -32002, message: "Resource not found" } });
+    await assert.rejects(resuming, hasAdapterCode("session_not_found"));
+    assert.equal(adapter.state, "ready");
+
+    // Any other error answer is not a statement about the session.
+    const again = adapter.resumeSession("other-session", FIXTURE_CWD);
+    const second = await waitForOutbound(process, ACP_V1_METHODS.sessionResume, 1);
+    process.emitMessages({ jsonrpc: "2.0", id: second.id, error: { code: -32603, message: "Internal error" } });
+    await assert.rejects(again, hasAdapterCode("operation_failed"));
     await adapter.close();
   });
 

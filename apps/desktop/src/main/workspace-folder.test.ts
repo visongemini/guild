@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import {
+  CLAUDE_START_TIMEOUT,
   ENGINE_INTEGRITY_CHANGED,
   MESSAGE_TOO_LONG,
   WORKSPACE_FOLDER_MISSING,
@@ -38,6 +39,8 @@ describe("workspace folder presence", () => {
     assert.equal(toDesktopIpcFailure(new Error(MESSAGE_TOO_LONG)).message, MESSAGE_TOO_LONG);
     assert.equal(ENGINE_INTEGRITY_CHANGED, "engine_integrity_changed");
     assert.equal(toDesktopIpcFailure(new Error(ENGINE_INTEGRITY_CHANGED)).message, ENGINE_INTEGRITY_CHANGED);
+    assert.equal(CLAUDE_START_TIMEOUT, "claude_start_timeout");
+    assert.equal(toDesktopIpcFailure(new Error(CLAUDE_START_TIMEOUT)).message, CLAUDE_START_TIMEOUT);
     assert.equal(toDesktopIpcFailure(new Error("runtime_start_process_start:preflight")).message, "guild_operation_failed");
     assert.equal(toDesktopIpcFailure("unknown").message, "guild_operation_failed");
   });

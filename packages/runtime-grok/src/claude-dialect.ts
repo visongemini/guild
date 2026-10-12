@@ -14,6 +14,9 @@ export const CLAUDE_STEERING_METHOD = "_session/steering";
 /** ACP's JSON-RPC code for `authRequired`. */
 export const ACP_AUTH_REQUIRED_CODE = -32000;
 
+/** ACP's JSON-RPC code for `resourceNotFound`: the agent has no such session (the resume answer for a missing transcript). */
+export const ACP_RESOURCE_NOT_FOUND_CODE = -32002;
+
 const MAX_KIND_LENGTH = 32;
 const MAX_DISPLAY_LENGTH = 64;
 

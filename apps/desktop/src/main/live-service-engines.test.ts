@@ -548,8 +548,8 @@ describe("dual engine orchestration [PC-ENG-001, PC-MODEL-001]", () => {
   });
 
   it("gives the session/load fallback the routed picker and the browser server a resume gets [docs/20 3.3]", async () => {
-    const spec: EngineSpec = { mcpHttp: true, loadSession: true };
-    failingResumes.set(spec, 1);
+    // Claude's adapter resumes; session/load is the way back only for one that does not advertise resume.
+    const spec: EngineSpec = { mcpHttp: true, loadSession: true, resume: false };
     const router = new FakeRouterHost([DEEPSEEK]);
     const h = await harness({ modelRouterHost: router, browserMcp: new FakeBrowserMcp() }, { claude: spec });
     const task = await h.service.createTask(h.workspaceId, undefined, "claude");
@@ -561,13 +561,12 @@ describe("dual engine orchestration [PC-ENG-001, PC-MODEL-001]", () => {
     await h.world.adapters[0]!.emitTransportInterrupted();
     await eventually(() => h.world.adapters.length === 2 && h.world.adapters[1]!.session !== undefined);
     const calls = h.world.adapters[1]!.startCalls;
-    assert.deepEqual(calls.map((call) => call.kind), ["resume", "load"], "the resume failed and the load took over");
+    assert.deepEqual(calls.map((call) => call.kind), ["load"], "no resume is advertised, so the load is the way back");
     const server = { type: "http", name: "guild-browser", url: BROWSER_URL, headers: [] };
-    assert.deepEqual(calls[1]!.options?.mcpServers, [server]);
-    assert.deepEqual(calls[1]!.options?.claudeCodeOptions, {
+    assert.deepEqual(calls[0]!.options?.mcpServers, [server]);
+    assert.deepEqual(calls[0]!.options?.claudeCodeOptions, {
       settings: { modelPicker: { options: [{ model: "deepseek-v4-flash", label: "DeepSeek V4 Flash" }] } },
     });
-    assert.deepEqual(calls[1]!.options, calls[0]!.options, "the same start options as the resume");
     assert.deepEqual(h.world.inputs[1]!.extraEnvironment?.["ANTHROPIC_BASE_URL"], ROUTER_URL);
   });
 
@@ -803,6 +802,100 @@ describe("dual engine orchestration [PC-ENG-001, PC-MODEL-001]", () => {
     );
   });
 
+  it("keeps the session when a Claude resume times out or loses its process, names the state, and the next send resumes it [PC-ENG-002]", async () => {
+    const spec: EngineSpec = { loadSession: true };
+    // The automatic recovery loses its process before an answer; the send then runs into a timeout.
+    resumeFailureCodes.set(spec, ["transport_lost", "request_timeout"]);
+    const h = await harness({}, { claude: spec });
+    const task = await h.service.createTask(h.workspaceId, undefined, "claude");
+    const taskId = task.task.taskId;
+    await h.send(taskId, "first");
+    await h.completed();
+    // Another task is the active one, so the only starts are the recovery and the sends (no background prewarm).
+    await h.service.createTask(h.workspaceId, undefined, "claude");
+    const resumes = () => h.world.adapters.flatMap((adapter) => adapter.startCalls).filter((call) => call.kind === "resume");
+    await h.world.adapters[0]!.emitTransportInterrupted();
+    await recoveryFailures(h, 1);
+    assert.equal(resumes().length, 1);
+
+    const timedOut = await h.send(taskId, "second").then(() => undefined, (cause: unknown) => cause);
+    assert.match(String(timedOut), /^Error: claude_start_timeout$/u);
+    assert.equal(toDesktopIpcFailure(timedOut).message, "claude_start_timeout", "the code survives the IPC allowlist");
+    const retained = await h.service.openTask(taskId);
+    assert.equal(retained.sessionRecovery, "available", "a lost process or a timeout never asks for a replacement session");
+    assert.equal(retained.canSend, true);
+    assert.equal(retained.timeline.some((item) => item.kind === "user" && item.text === "second"), false, "nothing was sent");
+    assert.equal(h.world.adapters.flatMap((adapter) => adapter.startCalls).some((call) => call.kind === "load"), false,
+      "no session/load is started after a resume that got no answer");
+
+    // The next send retries the resume of the same session and runs.
+    await h.send(taskId, "third");
+    await h.completed(2);
+    assert.ok(resumes().length >= 3);
+    assert.equal(new Set(resumes().map((call) => call.sessionId)).size, 1, "the same session every time");
+    assert.equal(h.world.adapters.at(-1)!.prompts.at(-1), "third");
+    const finished = await h.service.openTask(taskId);
+    assert.equal(finished.sessionRecovery, "available");
+    assert.equal(finished.timeline.some((item) => item.kind === "notice"), false, "no replacement session, no recovery capsule");
+  });
+
+  it("declares a Claude session lost only when the agent answers that it has no such session [PC-ENG-002]", async () => {
+    const spec: EngineSpec = { loadSession: true };
+    resumeFailureCodes.set(spec, ["session_not_found"]);
+    const h = await harness({}, { claude: spec });
+    const task = await h.service.createTask(h.workspaceId, undefined, "claude");
+    const taskId = task.task.taskId;
+    await h.send(taskId, "first");
+    await h.completed();
+    await h.world.adapters[0]!.emitTransportInterrupted();
+    await eventually(async () => (await h.service.bootstrap()).activeTask?.sessionRecovery === "replacement_required");
+    const calls = h.world.adapters.flatMap((adapter) => adapter.startCalls);
+    assert.deepEqual(calls.map((call) => call.kind), ["new", "resume"], "no second window is spent on session/load");
+    await assert.rejects(h.send(taskId, "second"), /session_replacement_requires_user_authorization/u);
+
+    // Any other failure of the resume is not an answer about the session: it stays and is retried.
+    const other: EngineSpec = {};
+    resumeFailureCodes.set(other, ["operation_failed", "operation_failed"]);
+    const o = await harness({}, { claude: other });
+    const kept = await o.service.createTask(o.workspaceId, undefined, "claude");
+    await o.send(kept.task.taskId, "first");
+    await o.completed();
+    await o.service.createTask(o.workspaceId, undefined, "claude");
+    await o.world.adapters[0]!.emitTransportInterrupted();
+    await recoveryFailures(o, 1);
+    const failed = await o.send(kept.task.taskId, "second").then(() => undefined, (cause: unknown) => cause);
+    assert.match(String(failed), /runtime_start_session_resume/u, "a plain failure stays a plain failure, not the start timeout");
+    assert.equal((await o.service.openTask(kept.task.taskId)).sessionRecovery, "available");
+    await o.send(kept.task.taskId, "third");
+    await o.completed(2);
+    assert.equal(o.world.adapters.at(-1)!.prompts.at(-1), "third");
+  });
+
+  it("names a Claude start that got no answer at initialize, and leaves a process that cannot start a plain failure [PC-ENG-002]", async () => {
+    const slow = await harness({}, { claude: { initializeFailure: "request_timeout" } });
+    const task = await slow.service.createTask(slow.workspaceId, undefined, "claude");
+    const timedOut = await slow.send(task.task.taskId, "hi").then(() => undefined, (cause: unknown) => cause);
+    assert.match(String(timedOut), /^Error: claude_start_timeout$/u);
+    assert.equal((await slow.service.openTask(task.task.taskId)).sessionRecovery, "available");
+
+    const dead = await harness({}, { claude: { initializeFailure: "transport_lost" } });
+    const second = await dead.service.createTask(dead.workspaceId, undefined, "claude");
+    const failed = await dead.send(second.task.taskId, "hi").then(() => undefined, (cause: unknown) => cause);
+    assert.match(String(failed), /runtime_start_initialize/u);
+    assert.doesNotMatch(String(failed), /claude_start_timeout/u);
+  });
+
+  it("keeps declaring a Grok session lost when its resume gets no answer [PC-ENG-001]", async () => {
+    const spec: EngineSpec = {};
+    resumeFailureCodes.set(spec, ["request_timeout"]);
+    const h = await harness({}, { grok: spec });
+    const task = await h.service.createTask(h.workspaceId);
+    await h.send(task.task.taskId, "first");
+    await h.completed();
+    await h.world.adapters[0]!.emitTransportInterrupted();
+    await eventually(async () => (await h.service.bootstrap()).activeTask?.sessionRecovery === "replacement_required");
+  });
+
   it("reports whether Claude Code can run, which account it is and which version, never an address [PC-ENG-002]", async () => {
     const ready = await harness({ claudeEngineProbe: async () => ({ version: "2.1.291" }) });
     const readySettings = await eventuallyValue(async () => {
@@ -977,8 +1070,12 @@ type EngineSpec = {
   readonly refuseMode?: boolean;
   /** `set_config_option model=<this>` is refused although the session lists it. */
   readonly refuseModel?: string;
-  /** `initialize` advertises `loadSession`; with `failingResumes` the fallback is exercised. */
+  /** `initialize` advertises `loadSession`, the fallback of an adapter that does not advertise resume. */
   readonly loadSession?: boolean;
+  /** `initialize` advertises `resumeSession`; default true. A Claude adapter without it falls back to `session/load`. */
+  readonly resume?: boolean;
+  /** `initialize` fails with this adapter error code (a start that got no answer in time, for example). */
+  readonly initializeFailure?: AcpV1AdapterError["code"];
 };
 
 type World = {
@@ -1164,12 +1261,16 @@ class EngineFake implements RuntimeAdapterPort {
   readonly log: string[] = [];
 
   async start(): Promise<AcpV1InitializeResult> {
+    if (this.spec.initializeFailure !== undefined) {
+      this.state = "faulted";
+      throw new AcpV1AdapterError(this.spec.initializeFailure);
+    }
     this.state = "ready";
     return Object.freeze({
       protocolVersion: 1,
       agentCapabilities: Object.freeze({
         loadSession: this.spec.loadSession === true,
-        resumeSession: true,
+        resumeSession: this.spec.resume !== false,
         prompt: Object.freeze({ image: false, audio: false, embeddedContext: false }),
       }),
       authMethods: Object.freeze(this.spec.advertiseAuthMethod === true
@@ -1252,9 +1353,11 @@ class EngineFake implements RuntimeAdapterPort {
       lapsedResumes.set(this.spec, lapsedResumes.get(this.spec)! - 1);
       throw new AcpV1AdapterError("auth_required");
     }
-    if (failingResumes.get(this.spec) !== undefined && failingResumes.get(this.spec)! > 0) {
-      failingResumes.set(this.spec, failingResumes.get(this.spec)! - 1);
-      throw new AcpV1AdapterError("operation_failed");
+    const failure = resumeFailureCodes.get(this.spec)?.shift();
+    if (failure !== undefined) {
+      // A process that died before it answered is no longer ready; a timeout or an answer leaves it ready.
+      if (failure === "transport_lost") this.state = "faulted";
+      throw new AcpV1AdapterError(failure);
     }
     return this.open("resume", sessionId, startOptions);
   }
@@ -1402,8 +1505,8 @@ class EngineFake implements RuntimeAdapterPort {
 
 /** Remaining lapsed resumes per spec, shared by every adapter the factory builds from it. */
 const lapsedResumes = new WeakMap<EngineSpec, number>();
-/** Remaining resumes that fail with a plain operation failure, so the load fallback is tried. */
-const failingResumes = new WeakMap<EngineSpec, number>();
+/** The error codes the next resumes of a spec fail with, in order (consumed one per resume). */
+const resumeFailureCodes = new WeakMap<EngineSpec, AcpV1AdapterError["code"][]>();
 
 function claudeOptions(models: readonly string[], previous: readonly RuntimeConfigOption[]): readonly RuntimeConfigOption[] {
   const current = (id: string, fallback: string): string => {
@@ -1428,6 +1531,14 @@ function claudeOptions(models: readonly string[], previous: readonly RuntimeConf
       choices: flat(["low", "medium", "high"]),
     },
   ]) as readonly RuntimeConfigOption[];
+}
+
+/** The automatic recovery after an interruption has failed this many times, as its diagnostic record says. */
+async function recoveryFailures(h: Harness, count: number): Promise<void> {
+  await eventually(async () => {
+    const log = await readFile(join(h.root, "diagnostics", "runtime.jsonl"), "utf8").catch(() => "");
+    return log.split("\n").filter((line) => line.includes("\"category\":\"recovery\"") && line.includes("\"event\":\"failed\"")).length >= count;
+  });
 }
 
 async function runningTurn(h: Harness): Promise<TaskViewProjection> {

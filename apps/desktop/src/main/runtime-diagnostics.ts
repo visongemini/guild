@@ -9,6 +9,7 @@ const MAX_READ_RECORDS = 512;
 const MAX_READ_FILE_BYTES = MAX_LOG_BYTES + 64 * 1024;
 
 const SAFE_DIAGNOSTIC_REASONS = new Set([
+  "initialize", "session_new", "session_resume", "session_load",
   "unbound", "creating", "healthy", "restore_pending", "replay_reconciling",
   "broken", "replacement_pending", "new", "resume", "load", "cancelled",
   "completed", "refused", "truncated", "decoder_fault", "explicit_close",

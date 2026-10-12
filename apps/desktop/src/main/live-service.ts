@@ -188,6 +188,7 @@ import {
 import {
   CLAUDE_DEFAULT_MUST_BE_NATIVE,
   CLAUDE_LOGIN_REQUIRED,
+  CLAUDE_START_TIMEOUT,
   ENGINE_INTEGRITY_CHANGED,
   MODEL_ROUTER_UNAVAILABLE,
   MODEL_SELECTION_FAILED,
@@ -1410,6 +1411,18 @@ export function createLiveDesktopService(
     return controller.engine === "claude" &&
       cause instanceof AcpV1AdapterError &&
       cause.code === "auth_required";
+  }
+
+  /**
+   * A Claude start that got no answer in time, or lost its process before one: the session may well
+   * exist, so nothing is declared lost and the next send resumes it (docs/20 3.2). Transport loss
+   * counts only while a session is being resumed or loaded; during initialize or session/new it is
+   * a process that cannot start, which is a plain failure.
+   */
+  function isClaudeStartInterruption(controller: RuntimeController, startStage: string, cause: unknown): boolean {
+    if (controller.engine !== "claude" || !(cause instanceof AcpV1AdapterError)) return false;
+    if (cause.code === "request_timeout") return true;
+    return cause.code === "transport_lost" && (startStage === "session_resume" || startStage === "session_load");
   }
 
   function noteClaudeLoginRequired(): void {
@@ -4587,13 +4600,21 @@ export function createLiveDesktopService(
               sessionStartOptions,
             );
           } catch (cause: unknown) {
-            if (created.adapter.state !== "ready") throw cause;
-            // A login that lapsed is not a lost session: nothing is replaced, the retry resumes it.
-            if (isClaudeAuthRequired(controller, cause)) throw cause;
+            if (controller.engine === "claude") {
+              // Only the agent's own "no such session" (ACP -32002) says the session is gone. A login
+              // that lapsed, a slow start, a lost process or any other failure keeps the retained
+              // session: the binding stays restore_pending and the next send resumes it again.
+              if (!(cause instanceof AcpV1AdapterError && cause.code === "session_not_found")) throw cause;
+            } else if (created.adapter.state !== "ready") {
+              throw cause;
+            }
             restoreCause = cause;
           }
         }
-        if (session === undefined && initialized.agentCapabilities.loadSession) {
+        // Claude's session/load answers a missing session the same way and, started after a timed-out
+        // resume, would only wait a second window: it is the fallback of an agent without resume.
+        const claudeResumes = controller.engine === "claude" && initialized.agentCapabilities.resumeSession;
+        if (session === undefined && initialized.agentCapabilities.loadSession && !claudeResumes) {
           startStage = "session_load";
           try {
             // The same start options as the resume: a routed task's modelPicker and the browser server.
@@ -4718,6 +4739,8 @@ export function createLiveDesktopService(
         bindingChanged = true;
       } else if (
         startStage === "session_resume" &&
+        // Claude settles a missing session inline; any failure that reaches here keeps the binding.
+        controller.engine !== "claude" &&
         !isClaudeAuthRequired(controller, cause) &&
         failedBinding.state === "restore_pending" &&
         failedBinding.restoreAttemptId === attemptId &&
@@ -4773,6 +4796,10 @@ export function createLiveDesktopService(
       if (controller.engine === "claude" && created?.refusedForIntegrity?.() === true) {
         noteClaudeInstall(Object.freeze({ status: "integrity_changed" as const }));
         throw new Error(ENGINE_INTEGRITY_CHANGED);
+      }
+      if (isClaudeStartInterruption(controller, startStage, cause)) {
+        logRuntime({ category: "runtime", event: "claude_start_timeout", taskId, adapterEpoch, reason: startStage });
+        throw new Error(CLAUDE_START_TIMEOUT);
       }
       if (cause instanceof Error && (cause.message === MODEL_ROUTER_UNAVAILABLE || cause.message === MODEL_SELECTION_FAILED)) {
         throw cause;
