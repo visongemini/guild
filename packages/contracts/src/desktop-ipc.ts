@@ -360,6 +360,8 @@ export type TaskViewProjection = {
   } | null;
   readonly sessionConfigOptions: readonly RuntimeConfigOption[];
   readonly modelSelection: TaskModelSelectionProjection;
+  /** Account summary and reduced states of a Claude-engine task (docs/20 3.8). Absent for a Grok task. */
+  readonly engineStatus?: EngineStatusProjection;
   /** Ephemeral phase of the running turn; absent when no turn is running. */
   readonly runPhase?: RunPhaseProjection;
   /** Whether the composer may Steer the running turn (F4). */
@@ -393,6 +395,19 @@ export type TaskViewProjection = {
     stopReason?: string;
   }>;
 };
+
+/**
+ * What the Claude engine reported about itself, for the usage panel and the composer (PC-ENG-001,
+ * PC-FALLBACK-001). Quota and billing belong to Claude Code, so there is nothing to meter here.
+ */
+export type EngineStatusProjection = Readonly<{
+  /** Plan label of the logged-in account, for example "Claude Max". Never an e-mail address. */
+  accountLabel?: string;
+  /** The engine reported that nobody is logged in: the user must run `claude` once in Terminal. */
+  loginRequired?: true;
+  /** The task switched to an Online / Local model and runs through the model router for good. */
+  routed?: true;
+}>;
 
 export type TaskWorkbenchProjection = {
   readonly files: readonly {
