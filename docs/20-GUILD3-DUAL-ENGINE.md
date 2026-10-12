@@ -117,8 +117,9 @@ created and never changes. Process topology stays one engine process per task (D
   every resolved address must be loopback or in 100.64.0.0/10 (Tailscale), and the request is then
   sent to the first validated address as an IP literal (IPv6 bracketed), never to the hostname, so
   a second DNS answer cannot reach the connection (DNS rebinding). Local https is allowed only when
-  the host is already an IP literal or `localhost` (a certificate name cannot match a rewritten IP);
-  any other https host answers 403 `local_https_requires_ip`. No `Host` header is set.
+  the host is already an IP literal (a certificate name cannot match a rewritten IP, `localhost` included);
+  any other https host, `https://localhost` among them, answers 403 `local_https_requires_ip`.
+  `http://localhost` stays allowed and is rewritten to the loopback address it resolves to. No `Host` header is set.
 - **Transport selection.** The router calls `fetchImpl(url, init, { sourceKind })` with the kind of the
   source it chose for that request. The Electron host uses the direct (no proxy) session for `local`
   and the proxied session otherwise, from that argument only, never from the URL or the live registry.
