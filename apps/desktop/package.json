@@ -1,6 +1,6 @@
 {
   "name": "@guild/desktop",
-  "version": "2.2.1",
+  "version": "3.0.0",
   "author": "BDV",
   "description": "An independent desktop client for the official Grok agent process.",
   "license": "MIT",
