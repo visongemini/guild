@@ -79,11 +79,15 @@ created and never changes. Process topology stays one engine process per task (D
 
 ### 3.3 Native vs routed sessions
 - A Claude session starts **native**: no `ANTHROPIC_BASE_URL`, the model list is the adapter's own.
-- The first time the user picks an Online or Local model, Guild (between turns): records
-  `task_metadata.routed_at`, restarts the task's adapter with
+- The first time the user picks an Online or Local model, Guild (between turns, as one serialized start
+  operation that concurrent callers join): restarts the task's adapter with
   `ANTHROPIC_BASE_URL=<router url>`, `ENABLE_TOOL_SEARCH=true`, `OPENVIKING_AUTO_CAPTURE=false`,
   resumes the same session with `_meta.claudeCode.options.settings.modelPicker` listing every
-  enabled Online/Local model, then sets the model.
+  enabled Online/Local model, sets the model, and only after the model is confirmed applied records
+  `task_metadata.routed_at` (review fix 2026-10-12). If a run became active before the native process
+  closed, the switch is deferred without marking; any failure leaves the task unmarked and surfaces
+  `model_router_unavailable` / `model_selection_failed`. For the Claude engine a model that cannot be
+  applied refuses the prompt (`model_selection_failed`) instead of running on another model.
 - Once routed, always routed (every later process start for that task uses the routed env, also
   after Guild restarts). Claude models pass through the router to Anthropic.
 - Switching among models of a routed session is a plain `set_config_option` (no restart).
@@ -184,7 +188,7 @@ Claude engine: OpenViking on (no kill-switch env). Routed Claude sessions: `OPEN
 (recall stays). Grok engine: unchanged kill-switch block.
 
 ### 3.7 Online-model reminder
-The first time a session switches to an Online model, a confirmation states that CLAUDE.md, memory,
+Whenever a task switches to an Online model of a vendor (model source) not yet agreed to in that task, a confirmation states that CLAUDE.md, memory,
 the conversation, and browser page text/screenshots in the conversation will be sent to <vendor>.
 Option "Don't remind me again in this workspace" persists in `workspace_prefs`. Local and Claude
 models never remind.
