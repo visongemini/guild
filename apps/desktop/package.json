@@ -17,6 +17,7 @@
   "dependencies": {
     "@guild/contracts": "2.0.0",
     "@guild/domain": "2.0.0",
+    "@guild/model-router": "2.0.0",
     "@guild/persistence": "2.0.0",
     "@guild/runtime-grok": "2.0.0"
   },
@@ -62,6 +63,8 @@
       "dist/main/**/*.js",
       "!dist/main/**/*.test.js",
       "!dist/main/fixture-service.js",
+      "!dist/main/fixture-model-sources.js",
+      "!dist/main/fixture-browser-pane.js",
       "dist/preload/index.cjs",
       "dist/renderer/**/*",
       "!**/*.map",

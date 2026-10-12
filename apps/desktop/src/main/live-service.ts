@@ -142,6 +142,7 @@ import {
   type XaiExtensionOutcome,
 } from "@guild/runtime-grok";
 import type { DesktopApplicationService } from "./application-service.js";
+import type { BrowserMcpPort, ModelRouterHostPort } from "./engine-ports.js";
 import {
   GuildAvatarError,
   inspectAvatarBytes,
@@ -335,6 +336,15 @@ export type LiveDesktopServiceOptions = {
   /** Minimum delay before a failed background prewarm of the same task is retried. */
   readonly prewarmRetryMs?: number;
   readonly diagnosticsRoot?: string;
+  /** Guild 3.0 (docs/20 section 3.3): Online and Local models served through the loopback router. */
+  readonly modelRouterHost?: ModelRouterHostPort;
+  /** Guild 3.0 (docs/20 section 3.5): the loopback browser MCP server passed to engines in `mcpServers`. */
+  readonly browserMcp?: BrowserMcpPort;
+  /**
+   * An already opened store shared with the model sources service (the database lease allows one
+   * owner). When present the service uses it instead of opening its own and closes it with itself.
+   */
+  readonly persistence?: GuildPersistence;
 };
 
 type PendingPermission = {
@@ -517,7 +527,7 @@ function buildContinuousPrompt(
 export function createLiveDesktopService(
   options: LiveDesktopServiceOptions,
 ): DesktopApplicationService {
-  const store = openGuildPersistence({
+  const store = options.persistence ?? openGuildPersistence({
     path: options.databasePath,
     initialLocale: options.initialLocale,
   });

@@ -4,14 +4,23 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { isAbsolute, join, normalize } from "node:path";
 import { app, dialog, Notification, powerMonitor, shell, type BrowserWindow } from "electron";
+import type { GuildLocale } from "@guild/contracts";
+import { openGuildPersistence } from "@guild/persistence";
 import {
   installGuildAppProtocol,
   installGuildMediaProtocol,
   registerGuildScheme,
 } from "./app-protocol.js";
 import type { DesktopApplicationService } from "./application-service.js";
+import { createBrowserPaneBridge, type BrowserPaneBridge, type BrowserPaneIpcPort } from "./browser-pane-bridge.js";
+import { configureBrowserPaneProcess } from "./browser-pane.js";
+import { createElectronBrowserPane } from "./browser-pane-electron.js";
+import { createElectronRouterFetches } from "./electron-router-fetch.js";
 import { registerDesktopIpc } from "./ipc-handlers.js";
 import { createLiveDesktopService } from "./live-service.js";
+import { createModelRouterHost, DEFAULT_KEY_FILE_UNDER_HOME, type ModelRouterHost } from "./model-router-host.js";
+import { createModelSourcesService, type ModelSourcesService } from "./model-sources-service.js";
+import { RouterDiagnosticLog } from "./router-diagnostic-log.js";
 import { createGuildWindow } from "./window-security.js";
 import {
   reloadRendererWithoutActivation,
@@ -27,10 +36,16 @@ import {
 
 registerGuildScheme();
 app.enableSandbox();
+configureBrowserPaneProcess(app);
 
 let closeIpc: (() => void) | undefined;
 let closeTaskNotifications: (() => void) | undefined;
 let service: DesktopApplicationService | undefined;
+let modelRouterHost: ModelRouterHost | undefined;
+let modelSources: ModelSourcesService | undefined;
+let browserPane: BrowserPaneIpcPort | undefined;
+let browserBridge: BrowserPaneBridge | undefined;
+let routerLog: RouterDiagnosticLog | undefined;
 let guildWindow: BrowserWindow | undefined;
 let preloadPath = "";
 let shutdownStarted = false;
@@ -86,8 +101,62 @@ app.whenReady().then(async () => {
   if (fixtureRequested) {
     const { createFixtureDesktopService } = await import("./fixture-service.js");
     service = createFixtureDesktopService();
+    const { createFixtureModelSources } = await import("./fixture-model-sources.js");
+    modelSources = createFixtureModelSources();
+    const { createFixtureBrowserPane } = await import("./fixture-browser-pane.js");
+    browserPane = createFixtureBrowserPane();
   } else {
+    // One database owner: the model sources service and the router host share the live service's store.
+    const persistence = openGuildPersistence({
+      path: join(app.getPath("userData"), "guild.sqlite3"),
+      initialLocale: systemLocale(),
+    });
+    const defaultKeyFile = join(app.getPath("home"), DEFAULT_KEY_FILE_UNDER_HOME);
+    const fetches = createElectronRouterFetches();
+    const log = new RouterDiagnosticLog(join(app.getPath("userData"), "diagnostics"));
+    routerLog = log;
+    const routerHost = createModelRouterHost({
+      store: persistence,
+      defaultKeyFile,
+      fetchImpl: fetches.proxied,
+      directFetchImpl: fetches.direct,
+      log: (event, fields) => {
+        void log.append(event, fields).catch(() => undefined);
+      },
+    });
+    modelRouterHost = routerHost;
+    modelSources = createModelSourcesService({
+      store: persistence,
+      defaultKeyFile,
+      getLocale: currentLocale,
+      confirmHost: async (prompt) => {
+        const options = {
+          type: "warning" as const,
+          title: "Guild",
+          message: prompt.message,
+          detail: prompt.detail,
+          buttons: [prompt.cancelLabel, prompt.allowLabel],
+          defaultId: 0,
+          cancelId: 0,
+          noLink: true,
+        };
+        const owner = guildWindow;
+        const answer = owner !== undefined && !owner.isDestroyed()
+          ? await dialog.showMessageBox(owner, options)
+          : await dialog.showMessageBox(options);
+        return answer.response === 1;
+      },
+      onChanged: () => {
+        void routerHost.refresh();
+      },
+    });
+    const bridge = createBrowserPaneBridge();
+    browserBridge = bridge;
+    browserPane = bridge;
     service = createLiveDesktopService({
+        persistence,
+        modelRouterHost: routerHost,
+        browserMcp: bridge.mcp,
         appVersion: app.getVersion(),
         databasePath: join(app.getPath("userData"), "guild.sqlite3"),
         initialLocale: app.getLocale().toLowerCase().startsWith("zh") ? "zh-CN" : "en-US",
@@ -246,6 +315,7 @@ app.whenReady().then(async () => {
       });
   }
 
+  void modelRouterHost?.refresh();
   if (!fixtureRequested) closeTaskNotifications = installTaskNotifications(service);
   if (validatingRestoreBoot) {
     await service.bootstrap();
@@ -311,7 +381,12 @@ async function openWindow(activation: WindowActivation = "user"): Promise<void> 
     fixtureCapturePath === undefined && activation === "user",
   );
   guildWindow = window;
-  closeIpc = registerDesktopIpc(window, service);
+  if (browserBridge !== undefined) {
+    // One pane controller per window; the MCP server and the IPC talk to the current one.
+    const detachPane = browserBridge.attach(createElectronBrowserPane(window));
+    window.once("closed", detachPane);
+  }
+  closeIpc = registerDesktopIpc(window, service, { modelSources, browserPane });
   let rendererRecoveryStarted = false;
   let unresponsiveRecoveryTimer: ReturnType<typeof setTimeout> | undefined;
   const clearUnresponsiveRecovery = () => {
@@ -378,6 +453,14 @@ async function openWindow(activation: WindowActivation = "user"): Promise<void> 
   if (!window.isDestroyed() && !window.isVisible()) {
     if (activation === "user") window.show();
   }
+}
+
+function systemLocale(): GuildLocale {
+  return app.getLocale().toLowerCase().startsWith("zh") ? "zh-CN" : "en-US";
+}
+
+async function currentLocale(): Promise<GuildLocale> {
+  return (await service?.bootstrap().catch(() => undefined))?.locale ?? systemLocale();
 }
 
 function installTaskNotifications(currentService: DesktopApplicationService): () => void {
@@ -713,6 +796,16 @@ async function shutdown(): Promise<boolean> {
   if (currentWindow !== undefined && !currentWindow.isDestroyed()) {
     currentWindow.destroy();
   }
+  // The router's requests write thinking provenance into the store the service is about to close.
+  const currentRouterHost = modelRouterHost;
+  const currentBrowserBridge = browserBridge;
+  modelRouterHost = undefined;
+  modelSources = undefined;
+  browserBridge = undefined;
+  browserPane = undefined;
+  await currentRouterHost?.close().catch(() => undefined);
+  await currentBrowserBridge?.mcp.close().catch(() => undefined);
+  await routerLog?.flush().catch(() => undefined);
   const currentService = service;
   service = undefined;
   if (currentService === undefined) return true;
