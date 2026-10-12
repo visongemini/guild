@@ -13,6 +13,9 @@ not require an empty settings screen or a feature-poor shell.
 The target is therefore not to maximize the number of switches. It is to restore every useful,
 truthful local control while refusing controls Guild cannot actually enforce or verify.
 
+Guild 3.0 note: D-057 to D-059 reopened two items of this matrix, third-party model sources and a
+browser surface. They are recorded in "Restored in 3.0" below; the rest of the matrix is unchanged.
+
 ## Keep and finish in Guild itself
 
 | Capability | Direction | Reason |
@@ -46,14 +49,30 @@ truthful local control while refusing controls Guild cannot actually enforce or 
 
 ## Do not restore
 
-- MiniMax, Ornith or other third-party model/provider adapters.
 - OpenAI-compatible shared endpoints, remote gateways or multi-user account sharing.
 - Direct upstream requests using `~/.grok/auth.json`.
 - Browser-cookie or Keychain harvesting and mandatory startup password prompts.
 - Git or branch controls that cannot complete a safe end-to-end workflow.
 - Decorative settings whose state is not enforced by either Guild or official Grok.
 
+## Restored in 3.0 under D-058/D-059
+
+- **Third-party models** (D-058, PC-ROUTE-001 to PC-ROUTE-003). Not as provider adapters in Grok
+  tasks: MiniMax, Ornith and other entries in the Grok CLI's own configuration are still dropped from
+  the Grok model list (D-011, D-054). They return only as user-configured Online and Local model
+  sources of Claude tasks, behind Guild's loopback-only router. Keys come from a user-designated env
+  file and are never stored. The router forwards the Anthropic Messages protocol and does not
+  translate the OpenAI protocol.
+- **Browser** (D-059, PC-BROWSER-001, PC-BROWSER-002). Guild 2 had no browser surface. Guild 3.0 adds
+  an isolated browser pane and a loopback browser MCP server for agents. The pane copies no login
+  state from another browser, so browser-cookie and Keychain harvesting above stays not restored.
+- Still not restored: OpenAI-compatible shared endpoints, remote gateways and multi-user account
+  sharing (first item of the list above).
+
 ## Proposed settings information architecture
+
+> Guild 3.0 note: PC-SET-002 supersedes the tab list of this proposal with General, Engines,
+> Model sources, Privacy and About. The Grok settings move into Engines.
 
 1. **General** — language, restore last task, new-task workspace, launch behavior, notifications,
    and the explicit "never steal focus for background work" policy.

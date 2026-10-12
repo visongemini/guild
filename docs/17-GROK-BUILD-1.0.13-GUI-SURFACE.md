@@ -4,6 +4,11 @@ Date: 2026-08-29
 Observed binary: `grok 1.0.13 (5e9a58528b76)`
 Guild candidate: 2.0.11
 
+Guild 3.0 note (D-057, 2026-10-12): this inventory describes the Grok engine only. Statements that
+Guild offers no external-model adapter or is an official-Grok-only client hold for Grok tasks; Claude
+tasks, their model sources and the browser pane are specified in `docs/20-GUILD3-DUAL-ENGINE.md`,
+D-057 to D-059 and `docs/01-PRODUCT-CONTRACT.md`.
+
 This inventory is based on the installed official binary's `--help`, subcommand help,
 `inspect --json`, and a live ACP `initialize` + `session/new` negotiation. It describes the
 current machine, not an eternal promise about later Grok releases.

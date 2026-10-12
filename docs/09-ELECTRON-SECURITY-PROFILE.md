@@ -10,9 +10,54 @@ specific threat analysis, a narrower compensating control, tests, and BDV approv
 the decision log. Framework defaults are not evidence of compliance: production code
 sets and tests the security-relevant values explicitly.
 
-Guild renders packaged first-party application code. It does not embed remote websites,
-provide a general browser, or use `<webview>`. Untrusted conversation text, tool output,
+Guild's own renderer renders packaged first-party application code. It does not embed remote
+websites or use `<webview>`. The one exception is the browser pane of Guild 3.0 (D-059), whose
+web contents are created by the browser module and governed by the profile split below; nothing in
+that exception relaxes a guard for Guild's own renderer. Untrusted conversation text, tool output,
 filenames, imported data, and local media metadata are data, never executable content.
+
+## Profile split for the browser pane (Guild 3.0, D-059, PC-BROWSER-001, PC-BROWSER-002)
+
+Every guard in the rest of this document applies unchanged to Guild's own renderer and to every
+web contents Guild creates except the pane contents defined here. Only web contents created by the
+browser module in session partition `persist:guild-browser` are pane contents. The guard functions
+decide by a registry of pane web-contents ids that the browser module fills when it creates a
+view; they do not decide by URL, title or any renderer-supplied claim, and a web contents that is
+not in the registry gets the full unchanged profile.
+
+Pane contents have this profile, and nothing broader:
+
+| Preference or behavior | Pane value |
+|---|---|
+| session partition | `persist:guild-browser`, separate from the Guild session |
+| `sandbox` | `true` |
+| `contextIsolation` | `true` |
+| `nodeIntegration` (and in workers and subframes) | `false` |
+| preload | none |
+| `backgroundThrottling` | `false` |
+| every other row of the fixed web preferences table | unchanged, except that the preload row does not apply |
+| navigation | only `http:`, `https:` and `about:blank`; `file:`, `javascript:`, `data:`, `blob:` and unknown schemes are denied |
+| `window.open` | opens a new pane tab (at most 5) or is denied; never a new BrowserWindow |
+| permission requests and checks | all denied (camera, microphone, geolocation, notifications, clipboard read and the rest) |
+| downloads | only through a native save dialog |
+| login state | none copied from another browser or the Keychain (PC-SEC-002 unchanged) |
+| debugger | `webContents.debugger` is attached only to pane contents, and only after the first page load; it is an in-process Electron API, and the ban on remote debugging and DevTools elsewhere in this profile stands |
+
+Pane contents have no preload and no `guild-app:` origin, so they expose no IPC and no `window.guild`.
+IPC sender validation (see below) continues to reject any sender that is not a registered Guild
+window with the fixed origin, so a pane page cannot call a Guild operation. The production CSP
+applies to `guild-app:` documents; pane pages are third-party documents and receive no Guild CSP,
+so their isolation rests on the partition, sandbox, context isolation and navigation policy above.
+
+The browser MCP server (D-059) is a loopback-only HTTP server in main on `127.0.0.1:<random>/<token>/mcp`
+with a random token and no non-loopback bind. It answers `initialize`, `notifications/initialized`,
+`ping`, `tools/list` and `tools/call`, and any other method with -32601. Its fixed tool set is
+`navigate`, `back`, `forward`, `reload`, `screenshot`, `read_page`, `get_text`, `find`, `click`,
+`type`, `key`, `scroll`, `console_messages`, `network_requests`, `tabs_list` and `tab_select`.
+There is no `eval` or other script-execution tool, and adding one needs a decision-log entry and
+security review. Every tool call goes through the engine's normal permission flow, and "Take over"
+makes the tools answer "paused by user" until the user resumes the agent. The same rules cover the
+model router (D-058): loopback only, random path token, and a startup failure on a non-loopback bind.
 
 ## Threat model
 
@@ -101,7 +146,9 @@ does not request browser, Keychain, media-capture, notification, or Grok login a
 
 ## Navigation, frames, and new windows
 
-The main process installs guards on every created web contents, including future contents:
+The main process installs guards on every created web contents, including future contents. For
+pane contents of the browser pane the rules below are replaced by the profile split above; every
+other web contents keeps them exactly:
 
 - initial application loads go through one main-owned loader that accepts only the fixed
   `guild-app://app/` origin and known entrypoints;
@@ -147,6 +194,8 @@ The logical production allowlist is limited to these capability groups:
 | media | issue/revoke opaque grants and read safe metadata, never paths by URL |
 | platform | validated external link, file/folder picker, power and Git projections |
 | migration | explicit selected-package inspect, preview, confirm, cancel, and rollback |
+| engine / model sources (Guild 3.0) | the task's engine binding and non-secret model-source records; key values never cross IPC |
+| browser pane (Guild 3.0) | address, history, tab, take-over and resume commands for the pane; no script-execution capability |
 
 Adding a capability group or operation requires a contract change and security review.
 There is no generic `invoke(channel, ...args)`, `send`, `on`, SQL, filesystem, shell,
@@ -277,6 +326,16 @@ an unguessable per-process secret, it stays in main/helper memory, is never put 
 renderer payload, environment inherited by unrelated children, log, crash report, or
 fixture, and dies with the process.
 
+Guild 3.0 narrowly approves two such helpers, the model router (D-058) and the browser MCP server
+(D-059). Their random token is part of the loopback URL path, and that URL may be handed only to the
+engine process of the task that uses it (the adapter's `ANTHROPIC_BASE_URL` or an `mcpServers`
+entry). It never enters a renderer payload, log, crash report or fixture, and not an environment
+inherited by an unrelated child. Guild never reads Claude credentials. Third-party model keys come
+from a user-designated env file, are read in main, stay in memory, and never reach SQLite, IPC, the
+renderer or logs; the router logs model, source id, status and booleans, never credential or header
+values. Adding a model source or changing its base URL or key variable needs a native confirmation
+in main that names the variable and the host.
+
 IPC diagnostics record operation ID, outcome, duration, byte counts, and correlation IDs,
 not payload bodies. Protocol logs record grant IDs only after one-way redaction and never
 the mapped path. Secret scanning covers packaged renderer assets, source maps, preload,
@@ -297,7 +356,11 @@ The packaged application, not only source configuration, must pass:
   event-object exposure;
 - local-media tests for traversal and encoding variants, symlink swaps, range edges, MIME
   confusion, revoked/cross-window grants, large files, and disappearance during streaming;
-- production fuse, remote-debugging, DevTools, dependency, source-map, and secret scans.
+- production fuse, remote-debugging, DevTools, dependency, source-map, and secret scans;
+- for Guild 3.0: pane contents cannot reach Node, `window.guild` or Guild's own origin; a web
+  contents outside the pane registry cannot navigate to `http:` or `https:`; the router refuses a
+  non-loopback bind and a wrong token; the browser MCP tool list contains no script-execution tool;
+  and no secret or token appears in logs, SQLite or the package.
 
 The release evidence records the Electron version, security-review date, preference and
 fuse snapshots, generated IPC registry hash, CSP string, protocol test results, and any
