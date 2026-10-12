@@ -165,6 +165,9 @@ created and never changes. Process topology stays one engine process per task (D
   lines `[ref_<backendNodeId>] role "name"`), `get_text`, `find{query}`, `click{ref}|{x,y}`,
   `type{text}` (CDP `Input.insertText`), `key{key}`, `scroll{direction,amount}`,
   `console_messages`, `network_requests`, `tabs_list`, `tab_select`. No `eval`.
+- **Window zoom.** The renderer reports the pane's rectangle in CSS pixels; main multiplies x/y/width/height
+  by the Guild window's `webContents.getZoomFactor()` (rounded) before `setBounds`, and re-applies the last
+  rectangle when the zoom changes (`zoom-changed`, and every later layout pass reads the factor afresh).
 - Passed to engines in `session/new`/`session/resume` `mcpServers` as
   `{type:"http", name:"guild-browser", url, headers:[]}` for Claude, and for Grok only if its
   initialize advertises `mcpCapabilities.http`.

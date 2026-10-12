@@ -55,6 +55,7 @@ function fakeController(initial: BrowserPaneProjection, refuse = false): FakeCon
       return { ok: true };
     },
     dispose: () => undefined,
+    refreshLayout: () => undefined,
     tools: {
       runAgentTool: (run) => run(controller.tools),
       navigate: async (url) => {

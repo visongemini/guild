@@ -245,6 +245,11 @@ export type BrowserPaneController = Readonly<{
   subscribe: (listener: (projection: BrowserPaneProjection) => void) => () => void;
   command: (command: BrowserCommand) => Promise<BrowserPaneCommandResult>;
   tools: BrowserPaneToolSurface;
+  /**
+   * Pushes the last layout to the native views again, for example after the Guild window's zoom
+   * changed (the renderer reports CSS pixels; the native view takes window pixels).
+   */
+  refreshLayout: () => void;
   /** Closes every tab and stops all timers. */
   dispose: () => void;
 }>;
@@ -254,6 +259,11 @@ export type BrowserPaneDeps = Readonly<{
   /** Defaults to the process-wide registry that the app-level guards consult. */
   registry?: BrowserPaneRegistry;
   timers?: PaneTimers;
+  /**
+   * Zoom factor of the Guild window's renderer (`webContents.getZoomFactor()`); 1 when absent. Bounds
+   * arrive in CSS pixels and are multiplied by it before they reach the native view.
+   */
+  zoomFactor?: () => number;
 }>;
 
 // ---------------------------------------------------------------------------------------------
@@ -381,12 +391,29 @@ export function createBrowserPaneController(deps: BrowserPaneDeps): BrowserPaneC
    * the window, or zero-sized) is hidden for Chromium too: it stops answering screenshots and input,
    * which is why the render-dependent tools refuse while `visible` is false.
    */
+  function currentZoomFactor(): number {
+    const factor = deps.zoomFactor?.() ?? 1;
+    return Number.isFinite(factor) && factor > 0 ? factor : 1;
+  }
+
+  /** The renderer reports CSS pixels; with the window zoomed, the native view needs window pixels. */
+  function nativeBounds(): BrowserPaneBounds {
+    const zoom = currentZoomFactor();
+    return {
+      x: Math.round(bounds.x * zoom),
+      y: Math.round(bounds.y * zoom),
+      width: Math.round(bounds.width * zoom),
+      height: Math.round(bounds.height * zoom),
+    };
+  }
+
   function applyLayout(): void {
-    const boundsKey = `${bounds.x},${bounds.y},${bounds.width},${bounds.height}`;
+    const native = nativeBounds();
+    const boundsKey = `${native.x},${native.y},${native.width},${native.height}`;
     for (const tab of tabs) {
       const show = visible && tab.id === activeTabId;
       const before = tab.applied;
-      if (before === undefined || before.bounds !== boundsKey) tab.view.setBounds(bounds);
+      if (before === undefined || before.bounds !== boundsKey) tab.view.setBounds(native);
       if (before === undefined || before.visible !== show) tab.view.setVisible(show);
       tab.applied = { bounds: boundsKey, visible: show };
     }
@@ -967,6 +994,7 @@ export function createBrowserPaneController(deps: BrowserPaneDeps): BrowserPaneC
     },
     command,
     tools,
+    refreshLayout: applyLayout,
     dispose,
   });
 }

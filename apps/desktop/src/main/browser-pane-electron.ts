@@ -6,7 +6,7 @@
  * acceptance in docs/20 section 6 item 5 exercises it for real.
  */
 
-import { session, WebContentsView, type BaseWindow, type WebContents } from "electron";
+import { session, WebContentsView, type BrowserWindow, type WebContents } from "electron";
 import {
   BROWSER_PANE_PARTITION,
   BROWSER_PANE_WEB_PREFERENCES,
@@ -91,7 +91,7 @@ function wrapContents(contents: WebContents): PaneWebContents {
 }
 
 /** Creates the controller for the Guild window and disposes it when the window closes. */
-export function createElectronBrowserPane(window: BaseWindow): BrowserPaneController {
+export function createElectronBrowserPane(window: BrowserWindow): BrowserPaneController {
   const paneSession = session.fromPartition(BROWSER_PANE_PARTITION);
   denyPermissions(paneSession);
 
@@ -165,7 +165,15 @@ export function createElectronBrowserPane(window: BaseWindow): BrowserPaneContro
     },
   };
 
-  const controller = createBrowserPaneController({ host });
+  // The renderer reports the pane's rectangle in CSS pixels; a zoomed Guild window (View > Zoom) needs window pixels.
+  const controller = createBrowserPaneController({
+    host,
+    zoomFactor: () => (window.isDestroyed() ? 1 : window.webContents.getZoomFactor()),
+  });
+  // Electron emits this for wheel and pinch zoom; menu zoom changes the page size, which the renderer reports again.
+  // Every layout pass reads the factor afresh, so a missed event is corrected by the next report or page event.
+  const onZoomChanged = () => controller.refreshLayout();
+  window.webContents.on("zoom-changed", onZoomChanged);
   window.once("closed", () => {
     controller.dispose();
     // The session outlives the window; leave nothing of this controller on it for the next one.
