@@ -2074,7 +2074,6 @@ export function GuildApp({ api }: GuildAppProps) {
       <aside className="guild-sidebar" aria-label={messages.projects} inert={workbenchOpen && viewport.width <= 1000}>
         <div className="guild-sidebar-drag" />
         <div className="guild-wordmark">
-          <img src={BANNY_ASSET_URL} alt="" />
           <span className="guild-wordmark-name">{messages.appName}</span>
           {engineVersionLabel !== undefined && <small title={engineVersionLabel}>{engineVersionLabel}</small>}
         </div>

@@ -131,7 +131,6 @@ span.guild-pill { cursor: default; }
 .guild-sidebar { position: relative; display: flex; min-width: 0; min-height: 0; flex-direction: column; height: 100%; padding: 52px 0 0; border-right: 1px solid var(--guild-line); background: var(--guild-panel); overflow: hidden; font-size: var(--guild-fs-ui); }
 .guild-sidebar-drag { position: absolute; inset: 0 0 auto; height: 52px; -webkit-app-region: drag; }
 .guild-wordmark { height: 28px; margin: var(--guild-s1) var(--guild-s2) var(--guild-s3); padding: 0 var(--guild-s2); display: flex; align-items: center; gap: var(--guild-s2); }
-.guild-wordmark img { width: 22px; height: 22px; flex: none; object-fit: contain; image-rendering: pixelated; }
 .guild-wordmark-name { font-size: 15px; font-weight: 650; letter-spacing: -.01em; }
 .guild-wordmark small { min-width: 0; margin-left: auto; overflow: hidden; color: var(--guild-faint); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
 
