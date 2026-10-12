@@ -59,6 +59,12 @@ created and never changes. Process topology stays one engine process per task (D
 - Executable pin: the user's `node` (Mach-O, existing pin) plus the adapter entry script path as
   `argv[0]`. Pin the adapter by package version (supported range `>=0.89.0 <0.90.0`) and a SHA-256
   over its installed `package.json` and `dist/` tree; mismatch refuses to start with a named error.
+  A failed pin check may be followed by one automatic re-locate, and only an update is accepted:
+  `node --version` differs, the adapter `package.json` version differs, or the `claude` real path
+  now is a new `versions/<ver>` file. The same version with other bytes (node SHA-256, adapter
+  fingerprint) is refused with `engine_integrity_changed`, nothing is executed, and the Claude
+  status reads "Claude engine files changed unexpectedly; reinstall claude-agent-acp or restart
+  Guild". The code is on the IPC failure allowlist; the next session that opens clears the state.
 - Locator: `claude-agent-acp` from `~/.npm-global/bin`, the user's PATH and Homebrew paths;
   `claude` from `~/.local/bin/claude` / PATH (Mach-O). `node` from PATH (>= 22).
 - Env (allowlist + Guild-owned values): PATH, HOME, USER, LOGNAME (claude looks up its Keychain login by account name; without USER it reports "not logged in" [WP-A smoke]), LANG/LC_*, TMPDIR, proxy vars, SSL vars,

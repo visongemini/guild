@@ -73,7 +73,7 @@ test("Guild 3.0 strings exist, are non-empty and mention no undefined in both ca
       messages.privacyOnlineReminder, messages.privacyOnlineReminderHelp, messages.privacyOnlineReminderNoWorkspace, messages.privacyOnlineReminderFailed,
       messages.claudeDefaultModelOption, messages.claudeSettingsHelp, messages.claudeSettingsFailed, messages.claudeStatusLabel,
       messages.claudeStatusReady(undefined), messages.claudeStatusReady("Claude Max"), messages.claudeStatusNotFound,
-      messages.claudeStatusNotLoggedIn, messages.claudeStatusUnavailable, messages.grokToolsGrokOnly,
+      messages.claudeStatusNotLoggedIn, messages.claudeStatusUnavailable, messages.claudeStatusIntegrityChanged, messages.grokToolsGrokOnly,
       messages.usageClaudeHeading, messages.usageClaudeAccountUnknown, messages.usageClaudeQuota,
       messages.sourcesIntro, messages.sourcesKeyNotice, messages.sourcesLoading, messages.sourcesLoadFailed, messages.sourcesEmpty,
       messages.sourcesAdd, messages.sourcesEdit, messages.sourcesEditTitle, messages.sourcesAddTitle,

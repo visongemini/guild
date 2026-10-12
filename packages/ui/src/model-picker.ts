@@ -262,8 +262,11 @@ function groupEmptyView(
   if (group === "claude" && !claudeAvailable) {
     // "Not found or not logged in" is only true when nothing says otherwise; a Claude Code that is
     // installed but cannot run (for example an unsupported adapter) gets the generic wording.
-    return claudeState === "unavailable"
-      ? Object.freeze({ kind: "claude_unavailable", text: messages.claudeStatusUnavailable })
+    return claudeState === "unavailable" || claudeState === "integrity_changed"
+      ? Object.freeze({
+          kind: "claude_unavailable",
+          text: claudeState === "unavailable" ? messages.claudeStatusUnavailable : messages.claudeStatusIntegrityChanged,
+        })
       : Object.freeze({
           kind: "claude_unavailable",
           text: messages.modelPickerClaudeUnavailable,

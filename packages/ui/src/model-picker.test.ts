@@ -434,6 +434,11 @@ test("the Claude group is unavailable when the status says so, or the Claude cat
   const unusable = modelPickerView({ ...input, catalogs: emptyClaude, claudeState: "unavailable" });
   assert.equal(groupView(unusable, "claude").empty?.text, EN.claudeStatusUnavailable);
   assert.equal(groupView(unusable, "claude").empty?.help, undefined);
+  // Changed engine files are named as such, with what to do about it.
+  const refused = modelPickerView({ ...input, catalogs: emptyClaude, claudeState: "integrity_changed" });
+  assert.equal(groupView(refused, "claude").empty?.kind, "claude_unavailable");
+  assert.equal(groupView(refused, "claude").empty?.text, EN.claudeStatusIntegrityChanged);
+  assert.match(groupView(refused, "claude").empty?.text ?? "", /reinstall claude-agent-acp or restart Guild/u);
 });
 
 test("the Grok group of a not-yet-started runtime keeps its own hint, whatever engine the task sits on", () => {

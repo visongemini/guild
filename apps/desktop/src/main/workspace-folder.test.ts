@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import {
+  ENGINE_INTEGRITY_CHANGED,
   MESSAGE_TOO_LONG,
   WORKSPACE_FOLDER_MISSING,
   SESSION_RECOVERY_CONTEXT_REQUIRED,
@@ -35,6 +36,8 @@ describe("workspace folder presence", () => {
       SESSION_RECOVERY_CONTEXT_REQUIRED,
     );
     assert.equal(toDesktopIpcFailure(new Error(MESSAGE_TOO_LONG)).message, MESSAGE_TOO_LONG);
+    assert.equal(ENGINE_INTEGRITY_CHANGED, "engine_integrity_changed");
+    assert.equal(toDesktopIpcFailure(new Error(ENGINE_INTEGRITY_CHANGED)).message, ENGINE_INTEGRITY_CHANGED);
     assert.equal(toDesktopIpcFailure(new Error("runtime_start_process_start:preflight")).message, "guild_operation_failed");
     assert.equal(toDesktopIpcFailure("unknown").message, "guild_operation_failed");
   });

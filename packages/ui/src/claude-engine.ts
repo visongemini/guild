@@ -9,7 +9,7 @@ import { globalDefaultView } from "./model-picker.js";
  * what the main process supplies; Guild never reads a Claude credential.
  */
 
-export type ClaudeStatusState = "ready" | "not_found" | "not_logged_in" | "unavailable";
+export type ClaudeStatusState = "ready" | "not_found" | "not_logged_in" | "unavailable" | "integrity_changed";
 
 export type ClaudeStatusView = Readonly<{
   state: ClaudeStatusState;
@@ -18,7 +18,7 @@ export type ClaudeStatusView = Readonly<{
   version?: string;
 }>;
 
-const STATUS_STATES: readonly string[] = ["ready", "not_found", "not_logged_in", "unavailable"];
+const STATUS_STATES: readonly string[] = ["ready", "not_found", "not_logged_in", "unavailable", "integrity_changed"];
 const MAX_LABEL = 80;
 
 function plainLabel(value: unknown): string | undefined {
@@ -33,7 +33,7 @@ function plainLabel(value: unknown): string | undefined {
 
 /**
  * Reads `runtimeSettings.claude` defensively. The contract lists only the defaults today; the main
- * process adds `status` ("ready" | "not_found" | "not_logged_in" | "unavailable"), `accountLabel`
+ * process adds `status` ("ready" | "not_found" | "not_logged_in" | "unavailable" | "integrity_changed"), `accountLabel`
  * and `version` as optional strings. Anything else, or nothing, yields `undefined` and the UI then
  * falls back to what it can see (an empty Claude catalog).
  */
@@ -107,5 +107,6 @@ export function claudeStatusText(messages: GuildMessages, status: ClaudeStatusVi
     case "not_found": return messages.claudeStatusNotFound;
     case "not_logged_in": return messages.claudeStatusNotLoggedIn;
     case "unavailable": return messages.claudeStatusUnavailable;
+    case "integrity_changed": return messages.claudeStatusIntegrityChanged;
   }
 }
