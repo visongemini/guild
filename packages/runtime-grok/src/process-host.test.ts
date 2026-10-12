@@ -1325,6 +1325,99 @@ describe("GrokProcessHost execution policy and lifecycle (PC-TRN-001/002/003)", 
     }
   });
 
+  it("ends an engine helper that left the process group, and nothing outside the engine's tree [PC-ENG-001]", async () => {
+    const fixture = await prepareFixture();
+    let host: TestHost | undefined;
+    let group: number | undefined;
+    let helper: number | undefined;
+    const bystander = spawn(process.execPath, ["-e", "setInterval(() => undefined, 1000)"], { detached: true, stdio: "ignore" });
+    bystander.unref();
+    try {
+      host = testHost(fixture, ["detached-helper"]);
+      const pidLine = waitForStdout(host, "DETACHED:");
+      group = (await startOwned(host, fixture)).processGroupId;
+      helper = Number(/DETACHED:(\d+)/u.exec(await bounded(pidLine, FIXTURE_STARTUP_TIMEOUT_MS))?.[1]);
+      assert.ok(helper > 0);
+      assert.notEqual(
+        (await processRows()).find((row) => row.pid === helper)?.processGroupId,
+        group,
+        "the helper is outside the engine's group, so the group signal cannot reach it",
+      );
+      const receipt = await bounded(host.stop(), 8_000);
+      assert.equal(receipt.type, "stop_reaped");
+      await eventuallyGone(helper);
+      await eventuallyGone(group, true);
+      assert.doesNotThrow(() => process.kill(bystander.pid!, 0), "a process outside the tree is left alone");
+    } finally {
+      if (helper !== undefined) {
+        try { process.kill(helper, "SIGKILL"); } catch { /* already gone: the point of the test */ }
+      }
+      try { process.kill(bystander.pid!, "SIGKILL"); } catch { /* already gone */ }
+      await cleanup(host, group);
+      await fixture.remove();
+    }
+  });
+
+  it("reads the helpers before the group signal and ends them after the group is gone, in that order [PC-ENG-001]", async () => {
+    const fixture = await prepareFixture();
+    let host: TestHost | undefined;
+    let group: number | undefined;
+    const calls: string[] = [];
+    const record = { pid: 4_194_000, ppid: 1, pgid: 4_194_000, startedAt: "Mon Oct 12 15:08:42 2026" };
+    try {
+      host = testHost(fixture, ["linger"], {}, {
+        snapshotDescendants: async (rootPid, rootGroupId) => {
+          calls.push(`snapshot:${rootPid === rootGroupId ? "leader" : "other"}`);
+          return [record];
+        },
+        terminateDescendants: async (records) => {
+          calls.push(`terminate:${records.map((entry) => entry.pid).join(",")}`);
+          return records.length;
+        },
+        signalGroup: (processGroupId, signal) => {
+          calls.push(`group:${signal}`);
+          try {
+            process.kill(-processGroupId, signal);
+            return { signal, outcome: "sent" };
+          } catch {
+            return { signal, outcome: "already_gone" };
+          }
+        },
+      });
+      const ready = waitForStdout(host, "READY\n");
+      group = (await startOwned(host, fixture)).processGroupId;
+      await bounded(ready, FIXTURE_STARTUP_TIMEOUT_MS);
+      await bounded(host.stop());
+      assert.deepEqual(calls, ["snapshot:leader", "group:SIGTERM", "terminate:4194000"]);
+    } finally {
+      await cleanup(host, group);
+      await fixture.remove();
+    }
+  });
+
+  it("takes no snapshot of an engine that already exited by itself [PC-ENG-001]", async () => {
+    const fixture = await prepareFixture();
+    let host: TestHost | undefined;
+    let group: number | undefined;
+    let snapshots = 0;
+    try {
+      host = testHost(fixture, ["immediate-exit"], {}, {
+        snapshotDescendants: async () => {
+          snapshots += 1;
+          return [];
+        },
+      });
+      const exited = waitForEvent(host, "process_exit");
+      group = (await startOwned(host, fixture)).processGroupId;
+      await bounded(exited);
+      await bounded(host.waitForTermination());
+      assert.equal(snapshots, 0, "after the engine's death nothing links a stray process to it");
+    } finally {
+      await cleanup(host, group);
+      await fixture.remove();
+    }
+  });
+
   it("does not make direct close host termination while a stdio-closed descendant remains", async () => {
     const fixture = await prepareFixture();
     let host: TestHost | undefined;

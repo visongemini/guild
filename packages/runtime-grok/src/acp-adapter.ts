@@ -53,6 +53,7 @@ import {
 import { ACP_V1_METHODS } from "./acp-v1-methods.js";
 import {
   ACP_AUTH_REQUIRED_CODE,
+  ACP_RESOURCE_NOT_FOUND_CODE,
   CLAUDE_AUTH_STATUS_METHOD,
   CLAUDE_STEERING_METHOD,
   decodeClaudeAuthStatus,
@@ -68,6 +69,7 @@ import {
 } from "./engine-profile.js";
 import {
   JsonRpcPeer,
+  JsonRpcPeerError,
   JsonRpcRemoteError,
   type JsonRpcDiagnostic,
   type JsonRpcHandlerReply,
@@ -112,13 +114,16 @@ export const ACP_V1_ADAPTER_DEFAULT_TIMEOUTS = Object.freeze({
 });
 
 /**
- * `session/new` of the Claude adapter initializes the whole Agent SDK and runs the user's session
- * hooks first: 6 to 20 s were measured against claude 2.1.291 (2026-10-12), so the Grok default
- * of 30 s leaves too little headroom for it.
+ * `initialize` and `session/new|resume|load` of the Claude adapter bring up the whole Agent SDK, the
+ * user's claude.ai connectors and the plugin session hooks. 6 to 20 s were measured on an idle
+ * machine and 45 to 125 s for the adapter's initialize under load (claude 2.1.291, 2026-10-12), so
+ * the Grok defaults of 30 s leave no headroom. 300 s is the bound for a start that is merely slow; a
+ * timeout is then a retryable "still starting" (`request_timeout`), never a lost session.
  */
 export const CLAUDE_ACP_ADAPTER_DEFAULT_TIMEOUTS = Object.freeze({
   ...ACP_V1_ADAPTER_DEFAULT_TIMEOUTS,
-  sessionMs: 90_000,
+  initializeMs: 300_000,
+  sessionMs: 300_000,
 });
 
 export type AcpV1AdapterTimeouts = {
@@ -140,6 +145,10 @@ export type AcpV1AdapterErrorCode =
   | "operation_failed"
   | "overlapping_prompt"
   | "protocol_fault"
+  /** Claude only: the request got no answer within its timeout; the process may still be starting. */
+  | "request_timeout"
+  /** Claude only: the agent answered ACP -32002 (resource not found) to the session it was asked for. */
+  | "session_not_found"
   | "sink_commit_failed"
   | "stale_session_identity"
   | "transport_lost"
@@ -2368,6 +2377,16 @@ export class AcpV1Adapter {
       cause.response.code === ACP_AUTH_REQUIRED_CODE
     ) {
       return new AcpV1AdapterError("auth_required");
+    }
+    if (this.profile.dialect === "claude") {
+      // Checked before the state: a timed-out initialize faults the adapter, and a slow start is
+      // not the same thing as a lost transport.
+      if (cause instanceof JsonRpcPeerError && cause.code === "request_timeout") {
+        return new AcpV1AdapterError("request_timeout");
+      }
+      if (cause instanceof JsonRpcRemoteError && cause.response.code === ACP_RESOURCE_NOT_FOUND_CODE) {
+        return new AcpV1AdapterError("session_not_found");
+      }
     }
     if (this.currentState === "faulted") return new AcpV1AdapterError("transport_lost");
     if (this.currentState === "closed") return new AcpV1AdapterError("adapter_closed");

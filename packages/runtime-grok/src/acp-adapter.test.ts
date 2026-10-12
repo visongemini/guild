@@ -2067,6 +2067,20 @@ describe("ACP v1 adapter epoch identity and restore paths", () => {
     await unavailable.close();
   });
 
+  it("keeps Grok's failure codes plain: a timed-out or not-found resume is operation_failed, never a Claude code", async () => {
+    const process = new FakeProcess();
+    const adapter = await startAdapter(process, new RecordingSink(), { timeouts: { sessionMs: 25 } });
+    const timing = adapter.resumeSession("session-slow", "/tmp/project");
+    await waitForOutbound(process, ACP_V1_METHODS.sessionResume);
+    await assert.rejects(timing, hasAdapterCode("operation_failed"));
+
+    const missing = adapter.resumeSession("session-gone", "/tmp/project");
+    const request = await waitForOutbound(process, ACP_V1_METHODS.sessionResume, 1);
+    process.emitMessages({ jsonrpc: "2.0", id: request.id, error: { code: -32002, message: "Resource not found" } });
+    await assert.rejects(missing, hasAdapterCode("operation_failed"));
+    await adapter.close();
+  });
+
   it("never returns a loaded session after process loss during the durable barrier commit", async () => {
     const process = new FakeProcess();
     const sink = new RecordingSink();

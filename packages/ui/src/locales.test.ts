@@ -172,3 +172,11 @@ test("the connecting and starting lines name the engine of the task", () => {
   assert.match(messagesFor("en-US", "claude").rewindRefused("runtime_unavailable"), /Claude Code/u);
   assert.equal(messagesFor("en-US", "claude").rewindDisabledReason("run_active"), messagesFor("en-US").rewindDisabledReason("run_active"));
 });
+
+test("the Claude start-timeout wording is retryable and names Claude in both languages (PC-ENG-002)", () => {
+  assert.equal(
+    messagesFor("en-US", "claude").claudeStartTimeout,
+    "Claude is still starting (plugins and connectors can take a while). Try again in a moment.",
+  );
+  assert.match(messagesFor("zh-CN", "claude").claudeStartTimeout, /Claude 仍在启动.*稍后再试/u);
+});

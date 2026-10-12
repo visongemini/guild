@@ -41,6 +41,18 @@ function leaderWithDescendant(closeStdio) {
   });
 }
 
+// An engine helper that leaves the engine's process group (an MCP server in a session of its own).
+function leaderWithDetachedHelper() {
+  const helper = spawn(node, ["-e", "setInterval(() => undefined, 1000)"], { detached: true, stdio: "ignore" });
+  helper.unref();
+  if (helper.pid === undefined) {
+    process.exit(93);
+  }
+  process.on("SIGTERM", () => process.exit(0));
+  process.stdout.write(`DETACHED:${helper.pid}\n`);
+  setInterval(() => undefined, 1_000);
+}
+
 switch (mode) {
   case "argv":
     writeThenExit(`agent|stdio|${mode}|${process.argv[4]}\n`);
@@ -90,6 +102,9 @@ switch (mode) {
     break;
   case "descendant-close-stdio":
     leaderWithDescendant(true);
+    break;
+  case "detached-helper":
+    leaderWithDetachedHelper();
     break;
   default:
     process.exit(92);

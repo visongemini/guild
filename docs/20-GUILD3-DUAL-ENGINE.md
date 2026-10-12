@@ -86,6 +86,25 @@ created and never changes. Process topology stays one engine process per task (D
 - No `--rules` argv. Guild agent rules (if any) go through `_meta.systemPrompt` only if the adapter
   supports append mode; otherwise none.
 - Permission mode: `set_config_option mode` after session start (not argv, no restart).
+- Start window and lost sessions: `initialize` and `session/new|resume|load` of the Claude adapter wait up to
+  300 s (the adapter brings up the Agent SDK, connectors and plugin hooks; 45-125 s were measured under load;
+  Grok keeps 30 s). A request that gets no answer in time (`request_timeout`), or a process that dies before
+  answering a resume, never marks the session lost: the binding stays `restore_pending` with its retained
+  session id, the send fails with `claude_start_timeout` ("Claude is still starting ... Try again in a
+  moment"), and the next send resumes it again. Only the agent's own "no such session" answer (ACP -32002,
+  `session_not_found`) ends in `restore_failed` (replacement offered; a task without a Run is replaced without
+  asking). Any other failure of a resume keeps the session too and stays a plain failure. `session/load` is not
+  tried after a resume that was advertised (it would only wait a second window); it is the way back only for an
+  agent that does not advertise resume.
+- Shutdown and helpers (both engines): the process host signals the engine's process group (TERM, then KILL).
+  Helpers the engine started that left its group (Grok's MCP servers such as `chrome-devtools-mcp`, Claude's
+  plugin and connector processes in a session of their own) are not reached by that signal and used to
+  survive a graceful quit. At stop time, while the engine is alive, the host reads its descendants outside the
+  group (`ps -axo pid=,ppid=,pgid=,lstart=`, walked from the engine pid, at most 256, 1 s bound); after the
+  group is gone it sends TERM, then KILL, to exactly those processes, and only to a process whose pid, group
+  and start time still match the snapshot. Nothing outside the engine's tree is touched. Limitation: an engine
+  that dies on its own (crash, kill from outside) has already re-parented its helpers, so nothing links them to
+  it and they are not swept.
 - Auth: never call `authenticate` for Claude. If `authMethods` is non-empty and the first session
   fails with auth required, show "Run `claude` once in Terminal and log in" (named reduced state).
 
@@ -95,14 +114,22 @@ created and never changes. Process topology stays one engine process per task (D
   operation that concurrent callers join): restarts the task's adapter with
   `ANTHROPIC_BASE_URL=<router url>`, `ENABLE_TOOL_SEARCH=true`, `OPENVIKING_AUTO_CAPTURE=false`,
   resumes the same session with `_meta.claudeCode.options.settings.modelPicker` listing every
-  enabled Online/Local model, sets the model, and only after the model is confirmed applied records
-  `task_metadata.routed_at` (review fix 2026-10-12). If a run became active before the native process
+  enabled Online/Local model, sets the model, and only after the model is confirmed applied (and the start's projection
+  published) records `task_metadata.routed_at` as the last step that can fail (review fix 2026-10-12); a projection
+  that cannot be built after the marker is logged, not raised. Every prompt launch (send, queued turn, continuous
+  round) first joins a start in flight or due and uses the session it produced. If a run became active before the native process
   closed, the switch is deferred without marking; any failure leaves the task unmarked and surfaces
   `model_router_unavailable` / `model_selection_failed`. For the Claude engine a model that cannot be
   applied refuses the prompt (`model_selection_failed`) instead of running on another model.
 - Once routed, always routed (every later process start for that task uses the routed env, also
   after Guild restarts). Claude models pass through the router to Anthropic.
 - Switching among models of a routed session is a plain `set_config_option` (no restart).
+- Selection before Claude has started: the runtime default of a Claude task is Claude's own pick (the
+  adapter-reported list, group `claude`) or nothing, which the picker shows as "Claude Code (default model)";
+  never a routed model and never a Grok model (a Grok id is refused as a Claude choice unless a router source
+  claims it). While the adapter's list is still unknown, the native aliases `default`, `opus`, `sonnet`,
+  `haiku` and `fable` can be saved as a task choice or as the global default; they are applied when the
+  session starts, and `model_selection_failed` answers if the adapter then does not offer one.
 - Never use the adapter's `providers/set` or gateway `authenticate`: they bypass the Claude login
   (adapter source comment on `GatewayAuthMeta`).
 

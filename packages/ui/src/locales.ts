@@ -311,6 +311,8 @@ export type GuildMessages = WorkshopMessages & ChangeMessages & {
   readonly bannyDragHint: string;
   readonly bannySeated: string;
   readonly runtimeUnavailable: string;
+  /** Claude did not answer within its start window; the task keeps its session and the next send retries (docs/20 3.2). */
+  readonly claudeStartTimeout: string;
   readonly workspaceFolderMissing: string;
   readonly messageTooLong: string;
   readonly sessionReplacementTitle: string;
@@ -901,6 +903,7 @@ const ZH_CN: GuildMessages = Object.freeze({
   bannyDragHint: "把蕉仔拖到对话上让它坐下；拖到窗口中间让它回到主页，也可以放在窗口其他位置。",
   bannySeated: "蕉仔坐在这里",
   runtimeUnavailable: "Grok 运行时暂时不可用",
+  claudeStartTimeout: "Claude 仍在启动（插件和连接器可能需要一些时间）。请稍后再试一次。",
   workspaceFolderMissing: "工作区文件夹已不存在。请重新选择该文件夹，或换一个仍在磁盘上的工作区。",
   messageTooLong: "这条消息太长，请删短后再发送。",
   sessionReplacementTitle: "原 Grok 会话无法继续",
@@ -1428,6 +1431,7 @@ const EN_US: GuildMessages = Object.freeze({
   bannyDragHint: "Drop Banny on a chat to give it a seat, near the window center to send it home, or anywhere else to let it stay there.",
   bannySeated: "Banny is sitting here",
   runtimeUnavailable: "The Grok runtime is temporarily unavailable",
+  claudeStartTimeout: "Claude is still starting (plugins and connectors can take a while). Try again in a moment.",
   workspaceFolderMissing: "The workspace folder is gone. Choose that folder again, or switch to a workspace that still exists.",
   messageTooLong: "That message is too long. Shorten it before sending.",
   sessionReplacementTitle: "The previous Grok session cannot continue",

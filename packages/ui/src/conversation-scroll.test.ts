@@ -52,6 +52,115 @@ test("retained history survives a light live tail and newer logical tool updates
   ]);
 });
 
+type PermissionOption = { readonly optionId: string; readonly name: string; readonly kind: "allow_once" | "allow_always" | "reject_once" | "reject_always" };
+
+function timelineBase(sequence: number, status: "completed" | "waiting" = "completed") {
+  return { taskId: "task-1" as never, createdAtMs: sequence, updatedAtMs: sequence, status, sequence };
+}
+
+function textItem(entryId: string, sequence: number, kind: "user" | "assistant" = "assistant") {
+  return { ...timelineBase(sequence), entryId, kind, text: entryId } as const;
+}
+
+function toolItem(entryId: string, sequence: number, toolStatus: "pending" | "completed") {
+  return {
+    ...timelineBase(sequence),
+    entryId,
+    kind: "tool" as const,
+    toolCallId: "call-write",
+    title: "Write dom.txt",
+    toolKind: "edit" as const,
+    toolStatus,
+    content: [],
+    locations: [],
+  };
+}
+
+function permissionItem(permissionId: string, sequence: number, options: readonly PermissionOption[]) {
+  return {
+    ...timelineBase(sequence, "waiting"),
+    entryId: permissionId,
+    kind: "permission" as const,
+    permissionId,
+    title: "Needs your approval",
+    options,
+  };
+}
+
+const CLAUDE_OPTIONS: readonly PermissionOption[] = [
+  { optionId: "allow", name: "Yes", kind: "allow_once" },
+  { optionId: "allow_always", name: "Yes, and allow similar commands", kind: "allow_always" },
+  { optionId: "reject", name: "No", kind: "reject_once" },
+];
+const GROK_OPTIONS: readonly PermissionOption[] = [
+  { optionId: "allow_once", name: "Allow once", kind: "allow_once" },
+  { optionId: "reject_once", name: "Reject", kind: "reject_once" },
+];
+
+for (const [engine, options] of [["claude", CLAUDE_OPTIONS], ["grok", GROK_OPTIONS]] as const) {
+  test(`${engine} flow: a decided permission card leaves the merged timeline (pending, decided, gone)`, () => {
+    const user = textItem("user-1", 1, "user");
+    const pendingProjection = [user, toolItem("tool-1", 2, "pending"), permissionItem("permission-1", 3, options)];
+    const whilePending = mergeTimelineWindows([], pendingProjection);
+    assert.deepEqual(whilePending.map((item) => item.entryId), ["user-1", "tool-1", "permission-1"]);
+
+    // Approved: main drops the pending request, the tool completes, the answer arrives.
+    const decidedProjection = [user, toolItem("tool-1", 2, "completed"), textItem("assistant-1", 4)];
+    const afterDecision = mergeTimelineWindows(whilePending, decidedProjection);
+    assert.deepEqual(afterDecision.map((item) => item.entryId), ["user-1", "tool-1", "assistant-1"]);
+    assert.equal(afterDecision.some((item) => item.kind === "permission"), false);
+    // The cache keeps the cleaned window, so the next publish cannot bring the card back.
+    assert.equal(mergeTimelineWindows(afterDecision, decidedProjection).some((item) => item.kind === "permission"), false);
+  });
+}
+
+test("a decided card is dropped even when it was cancelled and the run ended without a newer item", () => {
+  const retained = mergeTimelineWindows([], [textItem("user-1", 1, "user"), permissionItem("permission-1", 2, CLAUDE_OPTIONS)]);
+  const afterCancel = mergeTimelineWindows(retained, [textItem("user-1", 1, "user")]);
+  assert.deepEqual(afterCancel.map((item) => item.entryId), ["user-1"]);
+});
+
+test("only the decided card goes when two requests were pending", () => {
+  const first = permissionItem("permission-1", 3, CLAUDE_OPTIONS);
+  const second = permissionItem("permission-2", 4, CLAUDE_OPTIONS);
+  const retained = mergeTimelineWindows([], [textItem("user-1", 1, "user"), first, second]);
+  const merged = mergeTimelineWindows(retained, [textItem("user-1", 1, "user"), second]);
+  assert.deepEqual(merged.map((item) => item.entryId), ["user-1", "permission-2"]);
+});
+
+test("a still-pending card stays, and a paged window never drops items outside its page range", () => {
+  const earlier = [textItem("user-1", 1, "user"), textItem("assistant-1", 2), toolItem("tool-early", 3, "completed")];
+  // The first window was the recent page; the reader then loaded an earlier page that also
+  // carries the pending card (main appends it to every projection).
+  const recentPage = [textItem("user-9", 90, "user"), permissionItem("permission-1", 91, CLAUDE_OPTIONS)];
+  const withEarlier = mergeTimelineWindows(mergeTimelineWindows([], recentPage), [...earlier, ...recentPage]);
+  assert.deepEqual(withEarlier.map((item) => item.entryId), [
+    "user-1", "assistant-1", "tool-early", "user-9", "permission-1",
+  ]);
+  // A later light projection holds only the newest page: the earlier history stays, the card
+  // stays while pending, and it goes once decided.
+  const stillPending = mergeTimelineWindows(withEarlier, recentPage);
+  assert.deepEqual(stillPending.map((item) => item.entryId), [
+    "user-1", "assistant-1", "tool-early", "user-9", "permission-1",
+  ]);
+  const decided = mergeTimelineWindows(stillPending, [textItem("user-9", 90, "user"), textItem("assistant-9", 92)]);
+  assert.deepEqual(decided.map((item) => item.entryId), [
+    "user-1", "assistant-1", "tool-early", "user-9", "assistant-9",
+  ]);
+});
+
+test("a pending card whose sequence is below the incoming page start is kept while pending", () => {
+  // Main orders a pending card by a hint that can fall behind the page start in a long task.
+  const stale = permissionItem("permission-1", 501, CLAUDE_OPTIONS);
+  const page = [textItem("user-900", 900, "user"), stale];
+  assert.equal(mergeTimelineWindows([], page).some((item) => item.kind === "permission"), true);
+  assert.equal(
+    mergeTimelineWindows(mergeTimelineWindows([], page), [textItem("user-900", 900, "user")])
+      .some((item) => item.kind === "permission"),
+    false,
+  );
+});
+
 test("retained task timelines use bounded least-recently-used ordering", () => {
   const first = Object.freeze([]);
   const second = Object.freeze([]);

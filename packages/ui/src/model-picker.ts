@@ -316,7 +316,10 @@ export function modelPickerView(input: {
   const catalog = catalogs[taskEngine];
   const model = catalogModelById(catalog, selection?.modelId);
   const modelId = selection?.modelId ?? null;
-  const modelName = model?.name ?? modelId ?? messages.modelDefaultName;
+  // A Claude task that follows Claude's own default (nothing reported yet, nothing pinned) says so with the
+  // label of the default row, never with another engine's model.
+  const modelName = model?.name ?? modelId ??
+    (taskEngine === "claude" ? messages.modelPickerClaudeDefault : messages.modelDefaultName);
   // An effort the task has not pinned is the model's own default, which is what the engine will use.
   const effortId = selection === undefined
     ? null

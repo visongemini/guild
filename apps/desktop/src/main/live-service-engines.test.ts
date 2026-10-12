@@ -27,7 +27,7 @@ import {
   type JsonValue,
   type XaiExtensionOutcome,
 } from "@guild/runtime-grok";
-import { ClaudeLocatorError } from "./claude-locator.js";
+import { ClaudeEngineIntegrityError, ClaudeLocatorError } from "./claude-locator.js";
 import { toDesktopIpcFailure } from "./workspace-folder.js";
 import type { BrowserMcpPort, ModelRouterHostPort, RoutedModelInfo } from "./engine-ports.js";
 import { openGuildPersistence, type GuildPersistence } from "@guild/persistence";
@@ -451,6 +451,76 @@ describe("dual engine orchestration [PC-ENG-001, PC-MODEL-001]", () => {
     );
   });
 
+  it("marks the task last: a publish failure before the marker leaves it unmarked and the selection rolled back [docs/20 3.3]", async () => {
+    const router = new FakeRouterHost([DEEPSEEK]);
+    let store!: GuildPersistence;
+    const h = await harness({ modelRouterHost: router }, {}, (path) => {
+      store = openGuildPersistence({ path });
+      return store;
+    });
+    const task = await h.service.createTask(h.workspaceId, undefined, "claude");
+    const taskId = task.task.taskId;
+    await h.send(taskId, "native");
+    await h.completed();
+    await h.idle();
+
+    // Publishing fails once after the routed process took the model.
+    let armed = false;
+    h.world.onConfigOption = async (_label, configId, value) => {
+      if (configId === "model" && value === "deepseek-v4-flash") armed = true;
+    };
+    h.service.subscribe(() => {
+      if (armed) { armed = false; throw new Error("projection_failed"); }
+    });
+    const refused = await h.service.setTaskRuntimeSettings({
+      taskId, model: "deepseek-v4-flash", reasoningEffort: null, contextWindow: null,
+    });
+    assert.equal(refused.status, "refused", "the switch failed ...");
+    assert.equal(store.loadTaskMetadata(taskId).routedAtMs, undefined, "... and the task was never marked");
+    assert.equal(refused.task.modelSelection.source, "runtime", "the previous choice is back, consistently");
+    assert.equal(refused.task.engineStatus?.routed, undefined);
+
+    // Native again for the next turn, exactly like any other failed switch.
+    await h.send(taskId, "again");
+    await h.completed(2);
+    assert.deepEqual(h.world.adapters.at(-1)!.prompts, ["again"]);
+    assert.equal(h.world.inputs.at(-1)!.extraEnvironment, undefined);
+  });
+
+  it("does not fail a switch whose routed process is valid when only showing the marker fails [docs/20 3.3]", async () => {
+    const router = new FakeRouterHost([DEEPSEEK]);
+    let store!: GuildPersistence;
+    const h = await harness({ modelRouterHost: router }, {}, (path) => {
+      store = openGuildPersistence({ path });
+      return store;
+    });
+    const task = await h.service.createTask(h.workspaceId, undefined, "claude");
+    const taskId = task.task.taskId;
+    await h.send(taskId, "native");
+    await h.completed();
+    await h.idle();
+
+    // The first two projections after the marker cannot be built.
+    let failures = 2;
+    h.service.subscribe(() => {
+      if (failures > 0 && store.loadTaskMetadata(taskId).routedAtMs !== undefined) {
+        failures -= 1;
+        throw new Error("projection_failed");
+      }
+    });
+    const switched = await h.service.setTaskRuntimeSettings({
+      taskId, model: "deepseek-v4-flash", reasoningEffort: null, contextWindow: null,
+    });
+    assert.equal(switched.status, "applied", "the routed process runs the model, so the selection is reported as applied");
+    assert.equal(switched.task.modelSelection.modelId, "deepseek-v4-flash");
+    assert.notEqual(store.loadTaskMetadata(taskId).routedAtMs, undefined);
+    assert.equal(switched.task.engineStatus?.routed, true);
+    await h.send(taskId, "after");
+    await h.completed(2);
+    assert.deepEqual(h.world.adapters.at(-1)!.prompts, ["after"]);
+    assert.equal(h.world.adapters.length, 2, "no second restart");
+  });
+
   it("restarts a task marked routed that still has a native process at the next idle point, whatever Claude model it selects [docs/20 3.3]", async () => {
     const router = new FakeRouterHost([DEEPSEEK]);
     let store!: GuildPersistence;
@@ -548,8 +618,8 @@ describe("dual engine orchestration [PC-ENG-001, PC-MODEL-001]", () => {
   });
 
   it("gives the session/load fallback the routed picker and the browser server a resume gets [docs/20 3.3]", async () => {
-    const spec: EngineSpec = { mcpHttp: true, loadSession: true };
-    failingResumes.set(spec, 1);
+    // Claude's adapter resumes; session/load is the way back only for one that does not advertise resume.
+    const spec: EngineSpec = { mcpHttp: true, loadSession: true, resume: false };
     const router = new FakeRouterHost([DEEPSEEK]);
     const h = await harness({ modelRouterHost: router, browserMcp: new FakeBrowserMcp() }, { claude: spec });
     const task = await h.service.createTask(h.workspaceId, undefined, "claude");
@@ -561,14 +631,72 @@ describe("dual engine orchestration [PC-ENG-001, PC-MODEL-001]", () => {
     await h.world.adapters[0]!.emitTransportInterrupted();
     await eventually(() => h.world.adapters.length === 2 && h.world.adapters[1]!.session !== undefined);
     const calls = h.world.adapters[1]!.startCalls;
-    assert.deepEqual(calls.map((call) => call.kind), ["resume", "load"], "the resume failed and the load took over");
+    assert.deepEqual(calls.map((call) => call.kind), ["load"], "no resume is advertised, so the load is the way back");
     const server = { type: "http", name: "guild-browser", url: BROWSER_URL, headers: [] };
-    assert.deepEqual(calls[1]!.options?.mcpServers, [server]);
-    assert.deepEqual(calls[1]!.options?.claudeCodeOptions, {
+    assert.deepEqual(calls[0]!.options?.mcpServers, [server]);
+    assert.deepEqual(calls[0]!.options?.claudeCodeOptions, {
       settings: { modelPicker: { options: [{ model: "deepseek-v4-flash", label: "DeepSeek V4 Flash" }] } },
     });
-    assert.deepEqual(calls[1]!.options, calls[0]!.options, "the same start options as the resume");
     assert.deepEqual(h.world.inputs[1]!.extraEnvironment?.["ANTHROPIC_BASE_URL"], ROUTER_URL);
+  });
+
+  it("never defaults a Claude task to a routed or a Grok model before Claude has started, and saves a native alias [PC-MODEL-001]", async () => {
+    const router = new FakeRouterHost([DEEPSEEK, LOCAL_MODEL]);
+    let store!: GuildPersistence;
+    const h = await harness({ modelRouterHost: router }, {}, (path) => {
+      store = openGuildPersistence({ path });
+      return store;
+    });
+    // The Claude catalog is still empty (the adapter has not reported its list) and the router offers two models.
+    const created = await h.service.createTask(h.workspaceId, undefined, "claude");
+    const taskId = created.task.taskId;
+    assert.equal(created.modelSelection.modelId, null, "Claude Code's own default, not DeepSeek or a Grok model");
+    assert.equal(created.modelSelection.source, "runtime");
+    assert.equal((await h.service.openTask(taskId)).modelSelection.modelId, null);
+
+    // A stale Grok default (the Claude grammar accepts any id) never shows on a Claude task.
+    store.updateAppSettings({ expectedRevision: store.loadAppSettings().revision, claudeModel: "grok-4.5" });
+    assert.equal((await h.service.openTask(taskId)).modelSelection.modelId, null);
+    store.updateAppSettings({ expectedRevision: store.loadAppSettings().revision, claudeModel: null });
+
+    // A known native alias can be saved as the task's choice before the first session, a Grok model and an unknown id cannot.
+    const alias = await h.service.setTaskRuntimeSettings({ taskId, model: "opus", reasoningEffort: null, contextWindow: null });
+    assert.equal(alias.status, "saved");
+    assert.equal(alias.task.modelSelection.modelId, "opus");
+    assert.equal(alias.task.modelSelection.source, "task");
+    for (const model of ["grok-4.5", "gpt-nope"]) {
+      const refused = await h.service.setTaskRuntimeSettings({ taskId, model, reasoningEffort: null, contextWindow: null });
+      assert.equal(refused.status, "refused", model);
+    }
+    // The same for the global Claude default.
+    const defaults = await h.service.setClaudeSettings("sonnet", null, "default");
+    assert.equal(defaults.runtimeSettings.claude?.model, "sonnet");
+    await assert.rejects(h.service.setClaudeSettings("grok-4.5", null, "default"), /runtime_settings_change_unavailable/u);
+    await assert.rejects(h.service.setClaudeSettings("deepseek-v4-flash", null, "default"), /claude_default_must_be_native/u);
+    await h.service.setClaudeSettings(null, null, "default");
+
+    // The alias is applied when the session starts.
+    await h.send(taskId, "first");
+    await h.completed();
+    assert.ok(h.world.adapters[0]!.log.includes("config:model=opus"));
+    assert.equal((await h.service.openTask(taskId)).modelSelection.modelId, "opus");
+
+    // Once the adapter reported its list, only what it (or the router) offers can be chosen.
+    await h.idle();
+    const unknown = await h.service.setTaskRuntimeSettings({ taskId, model: "fable", reasoningEffort: null, contextWindow: null });
+    assert.equal(unknown.status, "refused", "fable is an alias, but this adapter did not list it");
+  });
+
+  it("saves a native alias for a task whose adapter list is still unknown and fails by name if it is not offered [PC-MODEL-001]", async () => {
+    const h = await harness({ modelRouterHost: new FakeRouterHost([DEEPSEEK]) });
+    const created = await h.service.createTask(h.workspaceId, undefined, "claude");
+    const saved = await h.service.setTaskRuntimeSettings({
+      taskId: created.task.taskId, model: "fable", reasoningEffort: null, contextWindow: null,
+    });
+    assert.equal(saved.status, "saved");
+    // The fake adapter lists default, opus, sonnet and haiku: fable is not there.
+    await assert.rejects(h.send(created.task.taskId, "hi"), /^Error: model_selection_failed$/u);
+    assert.deepEqual(h.world.adapters.at(-1)!.prompts, [], "no turn runs on another model");
   });
 
   it("keeps a Grok task running when its pinned model is not offered [PC-MODEL-001]", async () => {
@@ -803,6 +931,100 @@ describe("dual engine orchestration [PC-ENG-001, PC-MODEL-001]", () => {
     );
   });
 
+  it("keeps the session when a Claude resume times out or loses its process, names the state, and the next send resumes it [PC-ENG-002]", async () => {
+    const spec: EngineSpec = { loadSession: true };
+    // The automatic recovery loses its process before an answer; the send then runs into a timeout.
+    resumeFailureCodes.set(spec, ["transport_lost", "request_timeout"]);
+    const h = await harness({}, { claude: spec });
+    const task = await h.service.createTask(h.workspaceId, undefined, "claude");
+    const taskId = task.task.taskId;
+    await h.send(taskId, "first");
+    await h.completed();
+    // Another task is the active one, so the only starts are the recovery and the sends (no background prewarm).
+    await h.service.createTask(h.workspaceId, undefined, "claude");
+    const resumes = () => h.world.adapters.flatMap((adapter) => adapter.startCalls).filter((call) => call.kind === "resume");
+    await h.world.adapters[0]!.emitTransportInterrupted();
+    await recoveryFailures(h, 1);
+    assert.equal(resumes().length, 1);
+
+    const timedOut = await h.send(taskId, "second").then(() => undefined, (cause: unknown) => cause);
+    assert.match(String(timedOut), /^Error: claude_start_timeout$/u);
+    assert.equal(toDesktopIpcFailure(timedOut).message, "claude_start_timeout", "the code survives the IPC allowlist");
+    const retained = await h.service.openTask(taskId);
+    assert.equal(retained.sessionRecovery, "available", "a lost process or a timeout never asks for a replacement session");
+    assert.equal(retained.canSend, true);
+    assert.equal(retained.timeline.some((item) => item.kind === "user" && item.text === "second"), false, "nothing was sent");
+    assert.equal(h.world.adapters.flatMap((adapter) => adapter.startCalls).some((call) => call.kind === "load"), false,
+      "no session/load is started after a resume that got no answer");
+
+    // The next send retries the resume of the same session and runs.
+    await h.send(taskId, "third");
+    await h.completed(2);
+    assert.ok(resumes().length >= 3);
+    assert.equal(new Set(resumes().map((call) => call.sessionId)).size, 1, "the same session every time");
+    assert.equal(h.world.adapters.at(-1)!.prompts.at(-1), "third");
+    const finished = await h.service.openTask(taskId);
+    assert.equal(finished.sessionRecovery, "available");
+    assert.equal(finished.timeline.some((item) => item.kind === "notice"), false, "no replacement session, no recovery capsule");
+  });
+
+  it("declares a Claude session lost only when the agent answers that it has no such session [PC-ENG-002]", async () => {
+    const spec: EngineSpec = { loadSession: true };
+    resumeFailureCodes.set(spec, ["session_not_found"]);
+    const h = await harness({}, { claude: spec });
+    const task = await h.service.createTask(h.workspaceId, undefined, "claude");
+    const taskId = task.task.taskId;
+    await h.send(taskId, "first");
+    await h.completed();
+    await h.world.adapters[0]!.emitTransportInterrupted();
+    await eventually(async () => (await h.service.bootstrap()).activeTask?.sessionRecovery === "replacement_required");
+    const calls = h.world.adapters.flatMap((adapter) => adapter.startCalls);
+    assert.deepEqual(calls.map((call) => call.kind), ["new", "resume"], "no second window is spent on session/load");
+    await assert.rejects(h.send(taskId, "second"), /session_replacement_requires_user_authorization/u);
+
+    // Any other failure of the resume is not an answer about the session: it stays and is retried.
+    const other: EngineSpec = {};
+    resumeFailureCodes.set(other, ["operation_failed", "operation_failed"]);
+    const o = await harness({}, { claude: other });
+    const kept = await o.service.createTask(o.workspaceId, undefined, "claude");
+    await o.send(kept.task.taskId, "first");
+    await o.completed();
+    await o.service.createTask(o.workspaceId, undefined, "claude");
+    await o.world.adapters[0]!.emitTransportInterrupted();
+    await recoveryFailures(o, 1);
+    const failed = await o.send(kept.task.taskId, "second").then(() => undefined, (cause: unknown) => cause);
+    assert.match(String(failed), /runtime_start_session_resume/u, "a plain failure stays a plain failure, not the start timeout");
+    assert.equal((await o.service.openTask(kept.task.taskId)).sessionRecovery, "available");
+    await o.send(kept.task.taskId, "third");
+    await o.completed(2);
+    assert.equal(o.world.adapters.at(-1)!.prompts.at(-1), "third");
+  });
+
+  it("names a Claude start that got no answer at initialize, and leaves a process that cannot start a plain failure [PC-ENG-002]", async () => {
+    const slow = await harness({}, { claude: { initializeFailure: "request_timeout" } });
+    const task = await slow.service.createTask(slow.workspaceId, undefined, "claude");
+    const timedOut = await slow.send(task.task.taskId, "hi").then(() => undefined, (cause: unknown) => cause);
+    assert.match(String(timedOut), /^Error: claude_start_timeout$/u);
+    assert.equal((await slow.service.openTask(task.task.taskId)).sessionRecovery, "available");
+
+    const dead = await harness({}, { claude: { initializeFailure: "transport_lost" } });
+    const second = await dead.service.createTask(dead.workspaceId, undefined, "claude");
+    const failed = await dead.send(second.task.taskId, "hi").then(() => undefined, (cause: unknown) => cause);
+    assert.match(String(failed), /runtime_start_initialize/u);
+    assert.doesNotMatch(String(failed), /claude_start_timeout/u);
+  });
+
+  it("keeps declaring a Grok session lost when its resume gets no answer [PC-ENG-001]", async () => {
+    const spec: EngineSpec = {};
+    resumeFailureCodes.set(spec, ["request_timeout"]);
+    const h = await harness({}, { grok: spec });
+    const task = await h.service.createTask(h.workspaceId);
+    await h.send(task.task.taskId, "first");
+    await h.completed();
+    await h.world.adapters[0]!.emitTransportInterrupted();
+    await eventually(async () => (await h.service.bootstrap()).activeTask?.sessionRecovery === "replacement_required");
+  });
+
   it("reports whether Claude Code can run, which account it is and which version, never an address [PC-ENG-002]", async () => {
     const ready = await harness({ claudeEngineProbe: async () => ({ version: "2.1.291" }) });
     const readySettings = await eventuallyValue(async () => {
@@ -831,6 +1053,13 @@ describe("dual engine orchestration [PC-ENG-001, PC-MODEL-001]", () => {
     await eventually(async () => (await missing.service.bootstrap()).runtimeSettings.claude?.status === "not_found");
     const broken = await harness({ claudeEngineProbe: async () => { throw new Error("EACCES"); } });
     await eventually(async () => (await broken.service.bootstrap()).runtimeSettings.claude?.status === "unavailable");
+    // Pinned files that changed without an update are not a missing install: the periodic probe says so by name.
+    for (const component of ["node", "adapter", "claude"] as const) {
+      const changed = await harness({
+        claudeEngineProbe: async () => { throw new ClaudeEngineIntegrityError(component); },
+      });
+      await eventually(async () => (await changed.service.bootstrap()).runtimeSettings.claude?.status === "integrity_changed");
+    }
 
     // Without a probe the status is learned from the engine: a missing piece at start, a session that runs.
     const failing = await harness({
@@ -977,8 +1206,12 @@ type EngineSpec = {
   readonly refuseMode?: boolean;
   /** `set_config_option model=<this>` is refused although the session lists it. */
   readonly refuseModel?: string;
-  /** `initialize` advertises `loadSession`; with `failingResumes` the fallback is exercised. */
+  /** `initialize` advertises `loadSession`, the fallback of an adapter that does not advertise resume. */
   readonly loadSession?: boolean;
+  /** `initialize` advertises `resumeSession`; default true. A Claude adapter without it falls back to `session/load`. */
+  readonly resume?: boolean;
+  /** `initialize` fails with this adapter error code (a start that got no answer in time, for example). */
+  readonly initializeFailure?: AcpV1AdapterError["code"];
 };
 
 type World = {
@@ -1164,12 +1397,16 @@ class EngineFake implements RuntimeAdapterPort {
   readonly log: string[] = [];
 
   async start(): Promise<AcpV1InitializeResult> {
+    if (this.spec.initializeFailure !== undefined) {
+      this.state = "faulted";
+      throw new AcpV1AdapterError(this.spec.initializeFailure);
+    }
     this.state = "ready";
     return Object.freeze({
       protocolVersion: 1,
       agentCapabilities: Object.freeze({
         loadSession: this.spec.loadSession === true,
-        resumeSession: true,
+        resumeSession: this.spec.resume !== false,
         prompt: Object.freeze({ image: false, audio: false, embeddedContext: false }),
       }),
       authMethods: Object.freeze(this.spec.advertiseAuthMethod === true
@@ -1252,9 +1489,11 @@ class EngineFake implements RuntimeAdapterPort {
       lapsedResumes.set(this.spec, lapsedResumes.get(this.spec)! - 1);
       throw new AcpV1AdapterError("auth_required");
     }
-    if (failingResumes.get(this.spec) !== undefined && failingResumes.get(this.spec)! > 0) {
-      failingResumes.set(this.spec, failingResumes.get(this.spec)! - 1);
-      throw new AcpV1AdapterError("operation_failed");
+    const failure = resumeFailureCodes.get(this.spec)?.shift();
+    if (failure !== undefined) {
+      // A process that died before it answered is no longer ready; a timeout or an answer leaves it ready.
+      if (failure === "transport_lost") this.state = "faulted";
+      throw new AcpV1AdapterError(failure);
     }
     return this.open("resume", sessionId, startOptions);
   }
@@ -1402,8 +1641,8 @@ class EngineFake implements RuntimeAdapterPort {
 
 /** Remaining lapsed resumes per spec, shared by every adapter the factory builds from it. */
 const lapsedResumes = new WeakMap<EngineSpec, number>();
-/** Remaining resumes that fail with a plain operation failure, so the load fallback is tried. */
-const failingResumes = new WeakMap<EngineSpec, number>();
+/** The error codes the next resumes of a spec fail with, in order (consumed one per resume). */
+const resumeFailureCodes = new WeakMap<EngineSpec, AcpV1AdapterError["code"][]>();
 
 function claudeOptions(models: readonly string[], previous: readonly RuntimeConfigOption[]): readonly RuntimeConfigOption[] {
   const current = (id: string, fallback: string): string => {
@@ -1428,6 +1667,14 @@ function claudeOptions(models: readonly string[], previous: readonly RuntimeConf
       choices: flat(["low", "medium", "high"]),
     },
   ]) as readonly RuntimeConfigOption[];
+}
+
+/** The automatic recovery after an interruption has failed this many times, as its diagnostic record says. */
+async function recoveryFailures(h: Harness, count: number): Promise<void> {
+  await eventually(async () => {
+    const log = await readFile(join(h.root, "diagnostics", "runtime.jsonl"), "utf8").catch(() => "");
+    return log.split("\n").filter((line) => line.includes("\"category\":\"recovery\"") && line.includes("\"event\":\"failed\"")).length >= count;
+  });
 }
 
 async function runningTurn(h: Harness): Promise<TaskViewProjection> {

@@ -36,7 +36,9 @@ import {
   freezeModelCatalog,
   grokModelById,
   isClaudeModelId,
+  isOfficialGrokModelId,
   modelCatalogEngineOf,
+  modelGroupOf,
   modelSupportsReasoningEffort,
   parseGuildClaudePermissionMode,
   parseGuildClaudeReasoningEffort,
@@ -164,7 +166,7 @@ import {
   type XaiExtensionOutcome,
 } from "@guild/runtime-grok";
 import type { DesktopApplicationService } from "./application-service.js";
-import { ClaudeLocatorError, locateClaudeEngine } from "./claude-locator.js";
+import { ClaudeEngineIntegrityError, ClaudeLocatorError, locateClaudeEngine } from "./claude-locator.js";
 import { createClaudeRuntime } from "./claude-runtime.js";
 import type { BrowserMcpPort, ModelRouterHostPort, RoutedModelInfo } from "./engine-ports.js";
 import {
@@ -188,6 +190,7 @@ import {
 import {
   CLAUDE_DEFAULT_MUST_BE_NATIVE,
   CLAUDE_LOGIN_REQUIRED,
+  CLAUDE_START_TIMEOUT,
   ENGINE_INTEGRITY_CHANGED,
   MODEL_ROUTER_UNAVAILABLE,
   MODEL_SELECTION_FAILED,
@@ -805,7 +808,13 @@ export function createLiveDesktopService(
       try {
         next = Object.freeze({ status: "ready" as const, version: (await claudeProbe()).version });
       } catch (cause: unknown) {
-        next = Object.freeze({ status: cause instanceof ClaudeLocatorError ? "not_found" as const : "unavailable" as const });
+        next = Object.freeze({
+          // Changed pinned files are not a missing install: the picker withholds the default row and Settings
+          // shows the integrity text (PC-ENG-002).
+          status: cause instanceof ClaudeEngineIntegrityError
+            ? "integrity_changed" as const
+            : cause instanceof ClaudeLocatorError ? "not_found" as const : "unavailable" as const,
+        });
       }
       // A refusal to run changed files stays until a Claude session opens again; a probe that only
       // finds the pieces present must not hide it.
@@ -1044,6 +1053,45 @@ export function createLiveDesktopService(
     });
   }
 
+  /** Claude's own aliases: a choice before the adapter has reported its list, validated by the Claude grammar. */
+  const NATIVE_CLAUDE_ALIASES: ReadonlySet<string> = new Set(["default", "opus", "sonnet", "haiku", "fable"]);
+
+  /** The adapter-reported Claude models (group `claude`): never a routed or a Grok model. */
+  function nativeClaudeModels(): ModelCatalog["models"] {
+    return claudeNativeCatalog.models.filter((model) => modelGroupOf(model) === "claude");
+  }
+
+  /** The adapter's own default among its own models, or null while nothing has been reported. */
+  function nativeRuntimeDefaultId(): string | null {
+    const native = nativeClaudeModels();
+    if (native.length === 0) return null;
+    return runtimeDefaultModelOf({ ...claudeNativeCatalog, models: native })?.id ?? null;
+  }
+
+  /** An official Grok model id that no router source claims: it can never be a Claude model. */
+  function isGrokOnlyModelId(modelId: string): boolean {
+    return isOfficialGrokModelId(modelId) && !routedModels().some((model) => model.id === modelId);
+  }
+
+  /** A stored Claude choice, or null for one that cannot belong to a Claude task. */
+  function claudeChoiceOrNull(modelId: string | null | undefined): string | null {
+    return modelId === null || modelId === undefined || isGrokOnlyModelId(modelId) ? null : modelId;
+  }
+
+  /**
+   * Whether a Claude task or default may store this model. The adapter's list and the router's
+   * models are the choices; before the adapter reported its list (a task that has not started),
+   * its own aliases are accepted too: they are applied when the session starts, and the existing
+   * `model_selection_failed` path answers if the adapter then does not offer one.
+   */
+  function claudeModelStorable(modelId: string): boolean {
+    if (isGrokOnlyModelId(modelId)) return false;
+    const offered = claudeCatalogProjection();
+    if (offered.models.some((model) => model.id === modelId)) return true;
+    if (nativeClaudeModels().length === 0 && NATIVE_CLAUDE_ALIASES.has(modelId)) return true;
+    return offered.models.length === 0;
+  }
+
   /**
    * Same order as the Grok resolution. The effort is not reconciled with the catalog: the adapter
    * reports efforts only for the model that is selected, and the effort list of a model a session
@@ -1055,9 +1103,10 @@ export function createLiveDesktopService(
   ): ReturnType<typeof resolveEffectiveSelection> {
     const taskPinned = task !== undefined && (task.modelId !== null || task.reasoningEffort !== null);
     const globalPinned = global.modelId !== null || global.reasoningEffort !== null;
-    const catalog = claudeCatalogProjection();
     return Object.freeze({
-      modelId: task?.modelId ?? global.modelId ?? runtimeDefaultModelOf(catalog)?.id ?? null,
+      // The runtime default of a Claude task is Claude's own pick (the adapter's list) or nothing,
+      // which reads "Claude Code default model": never a routed model, never a Grok one.
+      modelId: claudeChoiceOrNull(task?.modelId) ?? claudeChoiceOrNull(global.modelId) ?? nativeRuntimeDefaultId(),
       reasoningEffort: task?.reasoningEffort ?? global.reasoningEffort ?? null,
       source: taskPinned ? "task" as const : globalPinned ? "global" as const : "runtime" as const,
     });
@@ -1376,6 +1425,15 @@ export function createLiveDesktopService(
   }
 
   /**
+   * A start (the routed switch included) is in flight or due for this task, so the session in hand may
+   * be about to go away: no prompt may launch on it. The caller goes through `ensureSession` instead,
+   * which joins the start and hands out the session it produced (docs/20 3.3).
+   */
+  function sessionStartPending(taskId: TaskId, controller: RuntimeController): boolean {
+    return controller.startOperation !== undefined || routedRestartNeeded(taskId, controller);
+  }
+
+  /**
    * A Claude session that never had a prompt has no transcript, so the adapter cannot resume it,
    * and nothing in it is lost: restore_pending -> broken -> replacement_pending without a question.
    */
@@ -1410,6 +1468,18 @@ export function createLiveDesktopService(
     return controller.engine === "claude" &&
       cause instanceof AcpV1AdapterError &&
       cause.code === "auth_required";
+  }
+
+  /**
+   * A Claude start that got no answer in time, or lost its process before one: the session may well
+   * exist, so nothing is declared lost and the next send resumes it (docs/20 3.2). Transport loss
+   * counts only while a session is being resumed or loaded; during initialize or session/new it is
+   * a process that cannot start, which is a plain failure.
+   */
+  function isClaudeStartInterruption(controller: RuntimeController, startStage: string, cause: unknown): boolean {
+    if (controller.engine !== "claude" || !(cause instanceof AcpV1AdapterError)) return false;
+    if (cause.code === "request_timeout") return true;
+    return cause.code === "transport_lost" && (startStage === "session_resume" || startStage === "session_load");
   }
 
   function noteClaudeLoginRequired(): void {
@@ -4084,6 +4154,16 @@ export function createLiveDesktopService(
       controller.session.adapterEpoch !== session.adapterEpoch ||
       controller.adapter?.state !== "ready"
     ) return;
+    if (sessionStartPending(taskId, controller)) {
+      // Wait for the start (the routed switch), then dispatch again on the session it produced.
+      const again = (): void => {
+        const retry = setTimeout(() => void scheduleContinuousDispatch(taskId), 0);
+        retry.unref?.();
+      };
+      if (controller.startOperation !== undefined) void controller.startOperation.then(again, again);
+      else again();
+      return;
+    }
     const rawPrompt = buildContinuousPrompt(mission, store.loadAppSettings().locale);
     const prompt = prepareRuntimePrompt(taskId, session, rawPrompt);
     const runId = id(parseRunId, "run");
@@ -4282,6 +4362,16 @@ export function createLiveDesktopService(
     ) {
       const retry = setTimeout(() => scheduleQueuedDispatch(taskId), 0);
       retry.unref?.();
+      return;
+    }
+    if (sessionStartPending(taskId, controller)) {
+      // The queued turn waits for the start (the routed switch) and then runs on the session it produced.
+      const again = (): void => {
+        const retry = setTimeout(() => scheduleQueuedDispatch(taskId), 0);
+        retry.unref?.();
+      };
+      if (controller.startOperation !== undefined) void controller.startOperation.then(again, again);
+      else again();
       return;
     }
     let discarded = 0;
@@ -4587,13 +4677,21 @@ export function createLiveDesktopService(
               sessionStartOptions,
             );
           } catch (cause: unknown) {
-            if (created.adapter.state !== "ready") throw cause;
-            // A login that lapsed is not a lost session: nothing is replaced, the retry resumes it.
-            if (isClaudeAuthRequired(controller, cause)) throw cause;
+            if (controller.engine === "claude") {
+              // Only the agent's own "no such session" (ACP -32002) says the session is gone. A login
+              // that lapsed, a slow start, a lost process or any other failure keeps the retained
+              // session: the binding stays restore_pending and the next send resumes it again.
+              if (!(cause instanceof AcpV1AdapterError && cause.code === "session_not_found")) throw cause;
+            } else if (created.adapter.state !== "ready") {
+              throw cause;
+            }
             restoreCause = cause;
           }
         }
-        if (session === undefined && initialized.agentCapabilities.loadSession) {
+        // Claude's session/load answers a missing session the same way and, started after a timed-out
+        // resume, would only wait a second window: it is the fallback of an agent without resume.
+        const claudeResumes = controller.engine === "claude" && initialized.agentCapabilities.resumeSession;
+        if (session === undefined && initialized.agentCapabilities.loadSession && !claudeResumes) {
           startStage = "session_load";
           try {
             // The same start options as the resume: a routed task's modelPicker and the browser server.
@@ -4658,12 +4756,10 @@ export function createLiveDesktopService(
       if (runtimeGeneration !== startGeneration) {
         throw new Error("runtime_start_invalidated_by_resume");
       }
-      if (routed !== undefined) {
-        // The routed process took the selection (or none is pinned): only now is the task marked,
-        // and before any turn can start on this session.
-        if (selectionStatus === "skipped" && selectsRoutedModel(taskId)) throw new Error(MODEL_SELECTION_FAILED);
-        startStage = "routed_marker";
-        commitRoutedMarker(taskId);
+      // The routed process must have taken the selection (or none is pinned); the marker itself is the
+      // last step of the start, below, once nothing that can fail for this switch is left.
+      if (routed !== undefined && selectionStatus === "skipped" && selectsRoutedModel(taskId)) {
+        throw new Error(MODEL_SELECTION_FAILED);
       }
       if (replacingSession) {
         persistedContextTokens.delete(taskId);
@@ -4701,6 +4797,18 @@ export function createLiveDesktopService(
         reason: session.establishedBy,
       });
       await publish();
+      if (routed !== undefined) {
+        // The marker is the last thing that can go wrong for this switch: a failure above leaves the
+        // task unmarked (and the caller rolls the selection back); once written, the routed process is
+        // valid and the session is handed out before any turn can start on it, so a failure to show
+        // the marker is logged, not raised.
+        if (runtimeGeneration !== startGeneration) throw new Error("runtime_start_invalidated_by_resume");
+        startStage = "routed_marker";
+        commitRoutedMarker(taskId);
+        await publish().catch(() => {
+          logRuntime({ category: "runtime", event: "routed_marker_publish_failed", taskId });
+        });
+      }
       return session;
     } catch (cause: unknown) {
       await created?.adapter.close().catch(() => undefined);
@@ -4718,6 +4826,8 @@ export function createLiveDesktopService(
         bindingChanged = true;
       } else if (
         startStage === "session_resume" &&
+        // Claude settles a missing session inline; any failure that reaches here keeps the binding.
+        controller.engine !== "claude" &&
         !isClaudeAuthRequired(controller, cause) &&
         failedBinding.state === "restore_pending" &&
         failedBinding.restoreAttemptId === attemptId &&
@@ -4773,6 +4883,10 @@ export function createLiveDesktopService(
       if (controller.engine === "claude" && created?.refusedForIntegrity?.() === true) {
         noteClaudeInstall(Object.freeze({ status: "integrity_changed" as const }));
         throw new Error(ENGINE_INTEGRITY_CHANGED);
+      }
+      if (isClaudeStartInterruption(controller, startStage, cause)) {
+        logRuntime({ category: "runtime", event: "claude_start_timeout", taskId, adapterEpoch, reason: startStage });
+        throw new Error(CLAUDE_START_TIMEOUT);
       }
       if (cause instanceof Error && (cause.message === MODEL_ROUTER_UNAVAILABLE || cause.message === MODEL_SELECTION_FAILED)) {
         throw cause;
@@ -7535,7 +7649,12 @@ export function createLiveDesktopService(
           assertOpen();
           const controller = controllerFor(taskId);
           const session = controller.session;
-          if (session === undefined || controller.adapter?.state !== "ready") {
+          if (
+            session === undefined ||
+            controller.adapter?.state !== "ready" ||
+            // A routed switch started (or became due) after ensureSession handed this session out.
+            sessionStartPending(taskId, controller)
+          ) {
             return Object.freeze({ status: "retry_session" as const });
           }
           const restored = store.restoreTask(taskId);
@@ -8047,11 +8166,7 @@ export function createLiveDesktopService(
             } catch {
               return refuse("unsupported_value");
             }
-            const offered = claudeCatalogProjection();
-            if (
-              (request.contextWindow ?? null) !== null ||
-              (offered.models.length > 0 && !offered.models.some((model) => model.id === request.model))
-            ) {
+            if ((request.contextWindow ?? null) !== null || !claudeModelStorable(request.model)) {
               return refuse("unsupported_value");
             }
           }
@@ -8168,7 +8283,10 @@ export function createLiveDesktopService(
         }));
       }
       return enqueueCommand(async () => {
-        await publish();
+        // The start succeeded, so the task is routed: a projection that cannot be built now is not a failed switch.
+        await publish().catch(() => {
+          logRuntime({ category: "runtime", event: "routed_switch_publish_failed", taskId });
+        });
         // "Applied" only when the routed process is the one running the model. A session that became
         // busy while the router came up keeps its process: the choice is stored and the switch
         // happens at the next idle point.
@@ -8226,7 +8344,7 @@ export function createLiveDesktopService(
       // The stored default must be something the engine or the router offers. The effort of a model
       // the session has not switched to is only known after the switch, so only its form is checked.
       const catalog = claudeCatalogProjection();
-      if (model !== null && catalog.models.length > 0 && !catalog.models.some((candidate) => candidate.id === model)) {
+      if (model !== null && !claudeModelStorable(model)) {
         throw new Error("runtime_settings_change_unavailable");
       }
       // An Online / Local model is a per-task choice behind the online reminder; as the global default
