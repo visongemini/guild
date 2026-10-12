@@ -222,6 +222,8 @@ span.guild-pill { cursor: default; }
 .guild-status-mark.cancelled { background: none; width: 8px; height: 8px; border: 1.6px solid var(--guild-faint); }
 .guild-status-mark.running { width: 11px; height: 11px; background: none; border: 1.6px solid color-mix(in srgb, var(--guild-run) 25%, transparent); border-top-color: var(--guild-run); animation: guild-spin .9s linear infinite; }
 .guild-task-pin { width: 12px; height: 14px; display: grid; place-items: center; color: var(--guild-faint); }
+.guild-task-engine { flex: 0 0 auto; width: 14px; height: 14px; display: grid; place-items: center; border: 1px solid var(--guild-line-strong); border-radius: var(--guild-r-xs); color: var(--guild-faint); font-size: 9px; font-weight: 650; line-height: 1; }
+.guild-task-engine.claude { border-color: color-mix(in srgb, var(--guild-accent) 45%, var(--guild-line-strong)); color: var(--guild-accent-text); }
 .guild-task-banny-slot { width: 24px; height: 32px; display: flex; align-items: flex-end; justify-content: center; overflow: visible; pointer-events: none; }
 .guild-task-banny { width: 28px; height: 28px; object-fit: contain; image-rendering: pixelated; cursor: grab; pointer-events: auto; user-select: none; filter: drop-shadow(0 3px 3px color-mix(in srgb, var(--guild-text) 14%, transparent)); transform: translateY(-2px); transition: transform var(--guild-dur-1) var(--guild-ease), filter var(--guild-dur-1) var(--guild-ease); }
 .guild-task-banny:hover { transform: translateY(-3px); filter: drop-shadow(0 4px 4px color-mix(in srgb, var(--guild-text) 18%, transparent)); }
@@ -747,6 +749,8 @@ span.guild-pill { cursor: default; }
 .guild-model-heading { margin: 6px var(--guild-s2) var(--guild-s1); color: var(--guild-faint); font-size: 11px; font-weight: 600; letter-spacing: .03em; }
 .guild-model-list + .guild-model-heading { margin-top: var(--guild-s2); padding-top: var(--guild-s2); border-top: 1px solid var(--guild-line); }
 .guild-model-hint { margin: 0; padding: var(--guild-s2); color: var(--guild-muted); }
+.guild-model-hint p { margin: 0; }
+.guild-model-hint small { display: block; margin-top: 2px; color: var(--guild-faint); font-size: var(--guild-fs-meta); line-height: 1.4; }
 .guild-model-list { display: grid; gap: 1px; }
 .guild-model-row { min-width: 0; padding: 7px var(--guild-s2); display: grid; gap: 2px; border: 0; border-radius: 9px; background: transparent; color: var(--guild-text); text-align: left; cursor: pointer; transition: background-color var(--guild-dur-1) var(--guild-ease); }
 .guild-model-row:hover, .guild-model-row:focus-visible { background: var(--guild-hover); }
@@ -774,6 +778,22 @@ span.guild-pill { cursor: default; }
   .guild-model-row.selected, .guild-model-efforts button.selected { outline: 2px solid Highlight; outline-offset: -2px; }
   .guild-model-default-dot { forced-color-adjust: none; background: Highlight; }
 }
+/* Guild 3.0 grouped picker (PC-MODEL-001): one listbox, a labelled group per engine group. */
+.guild-model-group { display: grid; gap: 1px; }
+.guild-model-group + .guild-model-group { margin-top: var(--guild-s2); padding-top: var(--guild-s1); border-top: 1px solid var(--guild-line); }
+.guild-model-group-heading { margin-bottom: 2px; }
+.guild-model-list + .guild-model-heading { margin-top: var(--guild-s2); }
+.guild-model-action { min-height: 28px; margin: 0 var(--guild-s2) var(--guild-s1); padding: 0 var(--guild-s3); justify-self: start; border: 1px solid var(--guild-line-strong); border-radius: var(--guild-r-sm); background: var(--guild-surface); color: var(--guild-text); font-size: var(--guild-fs-sm); cursor: pointer; transition: background-color var(--guild-dur-1) var(--guild-ease); }
+.guild-model-action:hover { background: var(--guild-soft); }
+.guild-model-engine-note { margin-top: 0; }
+@media (forced-colors: active) {
+  .guild-model-action { border-color: CanvasText; }
+}
+/* Online-model reminder (PC-PRIV-001) */
+.guild-online-reminder { width: min(460px, calc(100vw - 16px)); }
+.guild-online-reminder-body { display: grid; gap: var(--guild-s3); align-content: start; }
+.guild-online-reminder-body p { margin: 0; color: var(--guild-muted); font-size: var(--guild-fs-ui); line-height: 1.55; }
+.guild-online-reminder-body ul { margin: 0; padding: var(--guild-s3) var(--guild-s3) var(--guild-s3) var(--guild-s6); display: grid; gap: 4px; border-radius: var(--guild-r-md); background: var(--guild-soft); color: var(--guild-text); font-size: var(--guild-fs-ui); line-height: 1.5; }
 
 /* ------------------------------------------------------------------ workbench */
 .guild-workbench { position: relative; z-index: 45; min-width: 0; min-height: 0; height: 100%; display: grid; grid-template-rows: 52px 44px minmax(0,1fr); overflow: hidden; border-left: 1px solid var(--guild-line); background: var(--guild-canvas); }
@@ -875,12 +895,13 @@ span.guild-pill { cursor: default; }
 .guild-dialog-backdrop { position: fixed; inset: 0; z-index: 80; display: grid; place-items: center; padding: clamp(8px, 3vh, 24px) clamp(8px, 3vw, 24px); background: var(--guild-scrim); backdrop-filter: blur(2px); }
 .guild-dialog { width: min(560px, calc(100vw - 16px)); max-height: min(720px, calc(100vh - 16px)); display: flex; flex-direction: column; border: 1px solid var(--guild-line); border-radius: var(--guild-r-lg); background: var(--guild-surface); box-shadow: var(--guild-shadow-pop); animation: guild-pop-in var(--guild-dur-2) var(--guild-ease); }
 .guild-dialog-account { width: min(420px, calc(100vw - 16px)); }
+.guild-dialog-settings { width: min(640px, calc(100vw - 16px)); }
 .guild-dialog-header, .guild-dialog-footer { flex: 0 0 auto; display: flex; align-items: center; justify-content: space-between; gap: var(--guild-s3); padding: var(--guild-s3) var(--guild-s4); }
 .guild-dialog-header { border-bottom: 1px solid var(--guild-line); }
 .guild-dialog-footer { border-top: 1px solid var(--guild-line); }
 .guild-dialog-header strong { font-size: var(--guild-fs-title); font-weight: 620; }
 .guild-dialog-body { min-height: 0; overflow: auto; padding: var(--guild-s4); }
-.guild-dialog-tabs { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 2px; margin-bottom: var(--guild-s4); padding: 3px; border-radius: 9px; background: var(--guild-selected); }
+.guild-dialog-tabs { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 2px; margin-bottom: var(--guild-s4); padding: 3px; border-radius: 9px; background: var(--guild-selected); }
 .guild-dialog-tabs button { min-width: 0; height: 32px; overflow: hidden; border: 0; border-radius: var(--guild-r-sm); background: transparent; color: var(--guild-muted); font-size: var(--guild-fs-ui); font-weight: 500; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; transition: background-color var(--guild-dur-1) var(--guild-ease); }
 .guild-dialog-tabs button.selected { background: var(--guild-surface); color: var(--guild-text); box-shadow: var(--guild-shadow-1); font-weight: 600; }
 .guild-dialog-footer button { min-height: 32px; padding: 0 var(--guild-s3); border: 1px solid var(--guild-line-strong); border-radius: var(--guild-r-sm); background: var(--guild-surface); color: var(--guild-text); font-size: var(--guild-fs-sm); cursor: pointer; }
@@ -970,6 +991,60 @@ span.guild-pill { cursor: default; }
 .guild-local-data-controls { display: grid; gap: var(--guild-s2); }
 .guild-local-data-controls > div > strong { font-size: var(--guild-fs-sm); }
 .guild-local-data-controls .guild-soft-button { justify-self: start; }
+/* Engines tab (PC-SET-002) */
+.guild-engine-heading { margin: 0 0 var(--guild-s2); color: var(--guild-text); font-size: var(--guild-fs-title); font-weight: 650; }
+.guild-engine-claude { padding-top: var(--guild-s4); border-top: 1px solid var(--guild-line); }
+.guild-engine-status { margin: var(--guild-s2) 1px 1px; padding: var(--guild-s2) var(--guild-s3); display: grid; gap: 2px; border-radius: var(--guild-r-sm); background: var(--guild-soft); color: var(--guild-muted); font-size: var(--guild-fs-sm); line-height: 1.5; }
+.guild-engine-status strong { color: var(--guild-ok-text); font-weight: 600; }
+.guild-engine-status.not_found strong, .guild-engine-status.not_logged_in strong, .guild-engine-status.unavailable strong { color: var(--guild-wait-text); }
+.guild-claude-modes { margin-top: var(--guild-s2); display: grid; gap: var(--guild-s1); }
+.guild-claude-mode { min-height: 44px; padding: 6px var(--guild-s3); display: grid; gap: 1px; justify-items: start; border: 1px solid var(--guild-line); border-radius: var(--guild-r-sm); background: var(--guild-surface); color: var(--guild-text); text-align: left; cursor: pointer; transition: background-color var(--guild-dur-1) var(--guild-ease), border-color var(--guild-dur-1) var(--guild-ease); }
+.guild-claude-mode strong { font-size: var(--guild-fs-ui); font-weight: 600; }
+.guild-claude-mode small { color: var(--guild-muted); font-size: var(--guild-fs-sm); line-height: 1.45; }
+.guild-claude-mode:hover:not(:disabled):not(.selected) { background: var(--guild-soft); }
+.guild-claude-mode.selected { border-color: color-mix(in srgb, var(--guild-accent) 55%, var(--guild-line-strong)); background: var(--guild-accent-soft); }
+.guild-claude-mode.warn.selected strong { color: var(--guild-wait-text); }
+.guild-claude-mode:disabled { opacity: .55; cursor: not-allowed; }
+/* Model sources tab (PC-MODEL-001) */
+.guild-sources { display: grid; gap: var(--guild-s3); align-content: start; }
+.guild-sources .guild-setting-scope { margin-bottom: 0; }
+.guild-sources .guild-setting-help { margin: 0; }
+.guild-source-list { margin: 0; padding: 0; list-style: none; display: grid; gap: var(--guild-s2); }
+.guild-source-row { padding: var(--guild-s3); display: grid; gap: var(--guild-s2); border: 1px solid var(--guild-line); border-radius: var(--guild-r-md); background: var(--guild-surface); }
+.guild-source-main { min-width: 0; display: flex; flex-wrap: wrap; align-items: center; gap: var(--guild-s2); }
+.guild-source-main strong { min-width: 0; overflow: hidden; font-size: var(--guild-fs-ui); font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.guild-source-chip { height: 20px; padding: 0 var(--guild-s2); display: inline-flex; align-items: center; border: 1px solid var(--guild-line-strong); border-radius: 10px; background: var(--guild-soft); color: var(--guild-muted); font-size: var(--guild-fs-meta); font-weight: 560; white-space: nowrap; }
+.guild-source-chip.status.confirmed { color: var(--guild-ok-text); }
+.guild-source-chip.status.needs_confirmation { color: var(--guild-wait-text); }
+.guild-source-meta { min-width: 0; display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--guild-s3); color: var(--guild-muted); font-size: var(--guild-fs-sm); }
+.guild-source-meta code { min-width: 0; overflow: hidden; color: var(--guild-text); font: 12px var(--guild-font-mono); text-overflow: ellipsis; white-space: nowrap; }
+.guild-source-actions { display: flex; flex-wrap: wrap; align-items: center; gap: var(--guild-s2); }
+.guild-source-delete { display: grid; gap: var(--guild-s2); }
+.guild-soft-button.primary { border-color: var(--guild-accent); background: var(--guild-accent); color: var(--guild-on-accent); font-weight: 560; }
+.guild-soft-button.primary:hover:not(:disabled) { background: var(--guild-accent-hover); }
+.guild-soft-button.danger { border-color: var(--guild-error); background: var(--guild-error); color: var(--guild-on-accent); font-weight: 560; }
+.guild-soft-button.danger:hover:not(:disabled) { background: color-mix(in srgb, var(--guild-error) 86%, var(--guild-text)); }
+.guild-soft-button.primary, .guild-soft-button.danger, .guild-source-add, .guild-source-add-model { display: inline-flex; align-items: center; gap: 6px; }
+.guild-source-add { justify-self: start; }
+.guild-sources-form { display: grid; gap: var(--guild-s2); align-content: start; }
+.guild-sources-form .guild-setting-field { margin-top: var(--guild-s2); gap: var(--guild-s1); }
+.guild-sources-form .guild-setting-help { margin: 0; }
+.guild-source-field-label { margin-top: var(--guild-s2); }
+.guild-setting-field input[type="text"] { width: 100%; height: 36px; padding: 0 var(--guild-s3); border: 1px solid var(--guild-line-strong); border-radius: var(--guild-r-sm); outline: 0; background: var(--guild-surface); color: var(--guild-text); font: inherit; font-size: var(--guild-fs-ui); }
+.guild-setting-field input[type="text"]::placeholder, .guild-source-model-row input::placeholder { color: var(--guild-faint); }
+.guild-setting-field input[type="text"]:focus-visible, .guild-source-model-row input[type="text"]:focus-visible { border-color: var(--guild-focus-border); box-shadow: 0 0 0 3px color-mix(in srgb, var(--guild-accent) 14%, transparent); outline: 0; }
+.guild-setting-field input[aria-invalid="true"], .guild-source-model-row input[aria-invalid="true"] { border-color: var(--guild-error); }
+.guild-source-error { margin: 0; color: var(--guild-error-text); font-size: var(--guild-fs-sm); line-height: 1.45; }
+.guild-source-models { display: grid; gap: var(--guild-s1); }
+.guild-source-model-row { display: grid; grid-template-columns: minmax(0, 1.3fr) minmax(0, 1fr) minmax(0, .8fr) 52px 28px; align-items: center; gap: var(--guild-s2); }
+.guild-source-model-row.head { color: var(--guild-muted); font-size: var(--guild-fs-meta); font-weight: 600; }
+.guild-source-model-row input[type="text"] { min-width: 0; height: 32px; padding: 0 var(--guild-s2); border: 1px solid var(--guild-line-strong); border-radius: var(--guild-r-sm); outline: 0; background: var(--guild-surface); color: var(--guild-text); font: inherit; font-size: var(--guild-fs-sm); }
+.guild-source-model-row input[type="checkbox"] { justify-self: center; width: 16px; height: 16px; margin: 0; accent-color: var(--guild-accent); }
+.guild-source-model-entry { display: grid; gap: 2px; }
+.guild-source-add-model { justify-self: start; }
+.guild-sources-actions { margin-top: var(--guild-s3); display: flex; justify-content: flex-end; gap: var(--guild-s2); }
+.guild-online-reminder-setting .guild-setting-toggle { min-height: 0; }
+
 .guild-profile-editor { display: grid; gap: var(--guild-s4); }
 .guild-avatar-preview { width: 96px; height: 96px; border-radius: 18px; font-size: 36px; }
 .guild-avatar-actions { display: flex; flex-wrap: wrap; gap: var(--guild-s2); }

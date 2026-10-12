@@ -1,4 +1,4 @@
-import type { GuildLocale, RunPhaseProjection } from "@guild/contracts";
+import type { GuildEngine, GuildLocale, RunPhaseProjection } from "@guild/contracts";
 import { useEffect, useState } from "react";
 import { messagesFor } from "./locales.js";
 import {
@@ -14,6 +14,8 @@ import {
 export type RunPhaseLineProps = Readonly<{
   projection: RunPhaseProjection;
   locale: GuildLocale;
+  /** Engine of the task; the phase labels that name the runtime follow it. Grok when absent. */
+  engine?: GuildEngine;
   /** Clock seed for the first render (tests); the 1 Hz timer takes over once mounted. */
   initialNowMs?: number;
 }>;
@@ -24,8 +26,8 @@ export type RunPhaseLineProps = Readonly<{
  * `.guild-run-status` grid with the legacy status line. The single 1 Hz interval lives only while
  * the line is mounted, and the live region announces the label alone, never the ticking time.
  */
-export function RunPhaseLine({ projection, locale, initialNowMs }: RunPhaseLineProps) {
-  const messages = messagesFor(locale);
+export function RunPhaseLine({ projection, locale, engine = "grok", initialNowMs }: RunPhaseLineProps) {
+  const messages = messagesFor(locale, engine);
   const [nowMs, setNowMs] = useState(() => initialNowMs ?? Date.now());
   // Derived state, updated while rendering: the history follows the projection without an extra pass.
   const [history, setHistory] = useState<RunPhaseHistory>(() => startRunPhaseHistory(projection));

@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  EMPTY_CLAUDE_MODEL_CATALOG,
   defaultReasoningEffortOf,
   freezeGrokModelCatalog,
+  freezeModelCatalog,
   grokModelById,
   modelSupportsReasoningEffort,
   resolveEffectiveSelection,
@@ -11,7 +13,7 @@ import {
   type TaskViewProjection,
 } from "@guild/contracts";
 import { messagesFor } from "./locales.js";
-import { REAL_CATALOG } from "./model-catalog.fixture.js";
+import { CLAUDE_CATALOG, REAL_CATALOG } from "./model-catalog.fixture.js";
 import {
   CLEAR_MODEL_OVERRIDE,
   catalogModelById,
@@ -21,6 +23,7 @@ import {
   isSameSelection,
   modelDefaultEffort,
   modelOffersEffort,
+  modelCatalogsOf,
   modelPickerView,
   nextPickerIndex,
   noticeForResponse,
@@ -28,6 +31,8 @@ import {
   pickerDisabledReason,
   pickerIsLocked,
   selectionAfterModelChange,
+  selectionForRow,
+  visibleModelGroups,
 } from "./model-picker.js";
 
 const EN = messagesFor("en-US");
@@ -337,3 +342,166 @@ test("the Settings default control maps null to the runtime default and lists th
   assert.equal(unlisted.unlistedModelId, "grok-4.6");
   assert.equal(unlisted.efforts.length, 0);
 });
+
+// ---- Guild 3.0 grouped picker (PC-MODEL-001)
+
+const CATALOGS = Object.freeze({ grok: REAL_CATALOG, claude: CLAUDE_CATALOG });
+const groupView = (view: ReturnType<typeof modelPickerView>, group: string) =>
+  view.groups.find((entry) => entry.group === group)!;
+
+test("a task with a Run lists only its engine's groups, a task without one lists all four in order", () => {
+  assert.deepEqual(visibleModelGroups("grok", true), ["grok"]);
+  assert.deepEqual(visibleModelGroups("claude", true), ["claude", "online", "local"]);
+  assert.deepEqual(visibleModelGroups("grok", false), ["grok", "claude", "online", "local"]);
+  assert.deepEqual(visibleModelGroups("claude", false), ["grok", "claude", "online", "local"]);
+  const fixed = modelPickerView({
+    messages: EN, catalogs: CATALOGS, selection: selection("opus", "high"), taskEngine: "claude", engineFixed: true,
+  });
+  assert.deepEqual(fixed.groups.map((entry) => entry.group), ["claude", "online", "local"]);
+  assert.equal(fixed.showGroupHeadings, true);
+  assert.equal(fixed.engineNote, undefined);
+  const fresh = modelPickerView({
+    messages: EN, catalogs: CATALOGS, selection: selection("grok-4.7", "high", "runtime"), taskEngine: "grok", engineFixed: false,
+  });
+  assert.deepEqual(fresh.groups.map((entry) => entry.label), ["Grok", "Claude", "Online", "Local"]);
+  assert.equal(fresh.engineNote, EN.modelPickerEngineNote);
+  // A Grok task that already ran keeps the old single, heading-less list.
+  const grokFixed = modelPickerView({ messages: EN, catalogs: CATALOGS, selection: selection("grok-4.7", "high"), taskEngine: "grok", engineFixed: true });
+  assert.equal(grokFixed.showGroupHeadings, false);
+  assert.equal(grokFixed.groups.length, 1);
+});
+
+test("group headings are localized: Grok, Claude (subscription), Online, Local", () => {
+  const zh = modelPickerView({
+    messages: ZH, catalogs: CATALOGS, selection: selection("grok-4.7", "high", "runtime"), taskEngine: "grok", engineFixed: false,
+  });
+  assert.deepEqual(zh.groups.map((entry) => entry.label), ["Grok", "Claude\uff08\u8ba2\u9605\uff09", "\u5728\u7ebf", "\u672c\u5730"]);
+});
+
+test("rows go to the group their catalog entry names and only the task's own engine marks a selection", () => {
+  const view = modelPickerView({
+    messages: EN, catalogs: CATALOGS, selection: selection("deepseek-v4-flash", null), taskEngine: "claude", engineFixed: true,
+  });
+  assert.deepEqual(groupView(view, "claude").models.map((row) => row.id), ["default", "opus", "haiku"]);
+  assert.deepEqual(groupView(view, "online").models.map((row) => row.id), ["deepseek-v4-flash", "deepseek-v4-reasoner"]);
+  assert.deepEqual(groupView(view, "local").models.map((row) => row.id), ["local-27b-model"]);
+  assert.deepEqual(view.models.filter((row) => row.selected).map((row) => row.id), ["deepseek-v4-flash"]);
+  assert.deepEqual(view.models.filter((row) => row.tabStop).map((row) => row.id), ["deepseek-v4-flash"]);
+  assert.equal(view.models.every((row) => row.engine === "claude"), true);
+  assert.equal(view.triggerText, "DeepSeek V4 Flash");
+  // Without a selection the first row of the first group is the one tab stop.
+  const none = modelPickerView({
+    messages: EN, catalogs: CATALOGS, selection: selection(null, null, "runtime"), taskEngine: "grok", engineFixed: false,
+  });
+  assert.deepEqual(none.models.filter((row) => row.tabStop).map((row) => row.id), ["grok-4.7"]);
+  assert.equal(none.models.some((row) => row.selected), false);
+  assert.equal(groupView(none, "grok").models.every((row) => row.engine === "grok" && row.group === "grok"), true);
+});
+
+test("an empty Online or Local group says so and points at Model sources", () => {
+  const catalogs = { grok: REAL_CATALOG, claude: freezeClaude([{ id: "opus", name: "Opus", group: "claude" }]) };
+  const view = modelPickerView({
+    messages: EN, catalogs, selection: selection("opus", "high"), taskEngine: "claude", engineFixed: true, claudeState: "ready",
+  });
+  const online = groupView(view, "online");
+  assert.equal(online.models.length, 0);
+  assert.equal(online.empty?.kind, "no_sources");
+  assert.equal(online.empty?.action, "open_model_sources");
+  assert.equal(online.empty?.text, "No online models \u2014 add one in Settings \u203a Model sources");
+  assert.equal(groupView(view, "local").empty?.text, "No local models \u2014 add one in Settings \u203a Model sources");
+  assert.equal(groupView(view, "claude").empty, undefined);
+  assert.equal(view.catalogEmpty, false);
+});
+
+test("the Claude group is unavailable when the status says so, or the Claude catalog is empty without a status", () => {
+  const input = { messages: EN, selection: selection(null, null, "runtime"), taskEngine: "claude" as const, engineFixed: true };
+  const emptyClaude = { grok: REAL_CATALOG, claude: EMPTY_CLAUDE_MODEL_CATALOG };
+  const noStatus = modelPickerView({ ...input, catalogs: emptyClaude });
+  assert.equal(groupView(noStatus, "claude").empty?.kind, "claude_unavailable");
+  assert.equal(groupView(noStatus, "claude").empty?.text, "Claude Code not found or not logged in");
+  assert.match(groupView(noStatus, "claude").empty?.help ?? "", /run `claude` once in Terminal/u);
+  // A status wins over the catalog: ready but nothing reported yet is just "not started".
+  const ready = modelPickerView({ ...input, catalogs: emptyClaude, claudeState: "ready" });
+  assert.equal(groupView(ready, "claude").empty?.kind, "not_started");
+  assert.equal(groupView(ready, "claude").empty?.text, EN.modelPickerClaudeNotStarted);
+  for (const claudeState of ["not_found", "not_logged_in"] as const) {
+    const view = modelPickerView({ ...input, catalogs: CATALOGS, claudeState });
+    assert.equal(groupView(view, "claude").models.length, 3, "the models stay listed; only an empty group explains itself");
+    const empty = modelPickerView({ ...input, catalogs: emptyClaude, claudeState });
+    assert.equal(groupView(empty, "claude").empty?.text, "Claude Code not found or not logged in");
+  }
+  // Installed but unusable (for example an unsupported adapter) is not "not found".
+  const unusable = modelPickerView({ ...input, catalogs: emptyClaude, claudeState: "unavailable" });
+  assert.equal(groupView(unusable, "claude").empty?.text, EN.claudeStatusUnavailable);
+  assert.equal(groupView(unusable, "claude").empty?.help, undefined);
+});
+
+test("the Grok group of a not-yet-started runtime keeps its own hint, whatever engine the task sits on", () => {
+  const view = modelPickerView({
+    messages: messagesFor("en-US", "claude"),
+    catalogs: { grok: { models: [] }, claude: CLAUDE_CATALOG },
+    selection: selection("opus", "high"),
+    taskEngine: "claude",
+    engineFixed: false,
+  });
+  assert.equal(groupView(view, "grok").empty?.text, "Model choices appear once Grok has started.");
+});
+
+test("effort control follows the selected model; Online and Local models hide it unless they list efforts", () => {
+  const base = { messages: EN, catalogs: CATALOGS, taskEngine: "claude" as const, engineFixed: true };
+  const opus = modelPickerView({ ...base, selection: selection("opus", "high") });
+  assert.deepEqual(opus.efforts.map((effort) => effort.id), ["default", "low", "medium", "high", "xhigh", "max"]);
+  assert.equal(opus.showEfforts, true);
+  assert.equal(opus.triggerText, "Opus \u00b7 High");
+  // A Claude model without efforts keeps today's explanatory hint.
+  const haiku = modelPickerView({ ...base, selection: selection("haiku", null) });
+  assert.equal(haiku.efforts.length, 0);
+  assert.equal(haiku.showEfforts, true);
+  const flash = modelPickerView({ ...base, selection: selection("deepseek-v4-flash", null) });
+  assert.equal(flash.showEfforts, false);
+  assert.equal(modelPickerView({ ...base, selection: selection("local-27b-model", null) }).showEfforts, false);
+  const reasoner = modelPickerView({ ...base, selection: selection("deepseek-v4-reasoner", null) });
+  assert.equal(reasoner.showEfforts, true);
+  assert.deepEqual(reasoner.efforts.map((effort) => effort.id), ["high", "max"]);
+  assert.equal(reasoner.selectedEffortId, "high");
+});
+
+test("picking a row carries its group, moves the task only when the engine differs, and uses its own catalog's effort rules", () => {
+  const claudeRow = modelPickerView({
+    messages: EN, catalogs: CATALOGS, selection: selection("grok-4.7", "high", "runtime"), taskEngine: "grok", engineFixed: false,
+  }).models.find((row) => row.id === "opus")!;
+  assert.deepEqual(selectionForRow(CATALOGS, claudeRow, "high", "grok"), {
+    model: "opus", reasoningEffort: "high", group: "claude", engine: "claude",
+  });
+  // Same engine: no move. An effort the model lacks falls back to the model's own default.
+  assert.deepEqual(selectionForRow(CATALOGS, claudeRow, "high", "claude"), {
+    model: "opus", reasoningEffort: "high", group: "claude",
+  });
+  const onlineRow = { id: "deepseek-v4-flash", group: "online", engine: "claude" } as const;
+  assert.deepEqual(selectionForRow(CATALOGS, onlineRow, "high", "claude"), {
+    model: "deepseek-v4-flash", reasoningEffort: null, group: "online",
+  });
+  const grokRow = { id: "grok-4.5", group: "grok", engine: "grok" } as const;
+  assert.deepEqual(selectionForRow(CATALOGS, grokRow, "xhigh", "claude"), {
+    model: "grok-4.5", reasoningEffort: "high", group: "grok", engine: "grok",
+  });
+});
+
+test("the catalogs come from modelCatalogs, falling back to the single Grok catalog", () => {
+  const legacy = modelCatalogsOf({ modelCatalog: REAL_CATALOG });
+  assert.equal(legacy.grok, REAL_CATALOG);
+  assert.equal(legacy.claude, EMPTY_CLAUDE_MODEL_CATALOG);
+  const both = modelCatalogsOf({ modelCatalog: { models: [] }, modelCatalogs: { grok: REAL_CATALOG, claude: CLAUDE_CATALOG } });
+  assert.equal(both.grok, REAL_CATALOG);
+  assert.equal(both.claude, CLAUDE_CATALOG);
+});
+
+test("a cancelled switch needs no notice", () => {
+  assert.equal(noticeForResponse(undefined), undefined);
+});
+
+function freezeClaude(models: readonly { id: string; name: string; group: "claude" | "online" | "local" }[]) {
+  return freezeModelCatalog("claude", {
+    models: models.map((model) => ({ ...model, reasoningEfforts: [], contextWindows: [] })),
+  });
+}

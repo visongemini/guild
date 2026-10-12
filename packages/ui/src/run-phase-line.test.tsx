@@ -76,7 +76,7 @@ test("the only timer is one 1 Hz interval that is cleared on unmount", async () 
 
 test("the timeline shows the phase line instead of the legacy status line and re-renders on change", async () => {
   const app = await readFile(new URL("../src/App.tsx", import.meta.url), "utf8");
-  assert.match(app, /runPhase !== undefined\s*\?\s*<RunPhaseLine projection=\{runPhase\} locale=\{locale\} \/>\s*:\s*runStatus !== undefined && <RunStatusLine/u);
+  assert.match(app, /runPhase !== undefined\s*\?\s*<RunPhaseLine projection=\{runPhase\} locale=\{locale\} engine=\{engine\} \/>\s*:\s*runStatus !== undefined && <RunStatusLine/u);
   assert.match(app, /previous\.runPhase === next\.runPhase/u);
   assert.match(app, /runPhase=\{commandStatus === undefined \? activeTask\.runPhase : undefined\}/u);
 });
