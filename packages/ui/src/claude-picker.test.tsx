@@ -417,6 +417,8 @@ test("the trigger says Switching while a cross-mode switch of the task runs, and
   assert.equal(running.switching, true);
   assert.equal(running.triggerText, "切换中…");
   assert.match(running.ariaLabel, /切换中…/u);
+  assert.match(running.title, /正在应用更改/u, "main holds the selection during the restart, which must not read as a running turn");
+  assert.doesNotMatch(running.title, /当前轮次结束后/u);
   assert.equal(claudeView({ switching: true, messages: EN }).triggerText, "Switching\u2026");
   const markup = render({ switching: true });
   assert.match(markup, /<span>切换中…<\/span><svg[^>]*class="guild-spin"/u);

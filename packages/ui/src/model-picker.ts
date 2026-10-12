@@ -382,13 +382,16 @@ export function modelPickerView(input: {
       ? messages.modelPickerScopeGlobal
       : messages.modelPickerScopeRuntime;
   const disabledReason = pickerDisabledReason({ selection, pending: input.pending === true });
-  const disabledText = disabledReason === "no_task"
-    ? messages.modelPickerDisabledNoTask
-    : disabledReason === "running"
-      ? messages.modelPickerDisabledRunning
-      : disabledReason === "pending"
-        ? messages.modelPickerDisabledPending
-        : undefined;
+  // Main holds the selection while the engine restarts, which reads as "running"; a switch says what it is instead.
+  const disabledText = switching
+    ? messages.modelPickerDisabledPending
+    : disabledReason === "no_task"
+      ? messages.modelPickerDisabledNoTask
+      : disabledReason === "running"
+        ? messages.modelPickerDisabledRunning
+        : disabledReason === "pending"
+          ? messages.modelPickerDisabledPending
+          : undefined;
 
   const visible = visibleModelGroups(taskEngine, engineFixed);
   // The mode the task runs in follows its selected model; a row of the other mode restarts Claude Code (D-062).
