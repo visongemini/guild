@@ -289,14 +289,13 @@ product decision and their own parity and release gates.
 - Window title-bar double-click follows platform maximize/zoom behavior.
 - Layout adapts to narrow, default, and wide windows; popovers never clip beyond the window.
 - Sidebar task titles consume every available pixel between the aligned state icon and the actual
-  trailing metadata; empty mascot or pin slots never reserve width, and the title leaves only a
+  trailing metadata; an empty pin slot never reserves width, and the title leaves only a
   small optical gap before the right-aligned activity time.
 - The conversation column, composer border, and composer metadata share one responsive left/right
   alignment axis at every supported window width.
-- Banny has exactly one persisted decorative placement. It can move in both directions between its
-  main-area home and any visible task, can stay at a bounded free position elsewhere in the window,
-  and snaps back to its original centered home when dropped near the conversation center. Moving or
-  archiving a task must never leave Banny in an unreachable placement.
+- Banny appears in exactly one place: centered above the starter title of an empty task. It is not
+  draggable and has no other placement, so it never appears in the sidebar header, on a task row or
+  floating over a conversation.
 - The application recovers correctly when external displays are removed or scale changes.
 - System resume refreshes lifecycle and renderer state without revealing, restoring, or focusing
   Guild. Only an explicit user activation may bring a background or minimized window forward.
@@ -425,6 +424,6 @@ indicator without a second rectangle around the textarea.
 
 ### Wordmark alignment refinement (2026-09-12, D-048)
 
-The visible mascot and GUILD lettering share an optical vertical center.
-Brand spacing accounts for transparent padding in the admitted image rather
-than aligning only its full bitmap box.
+The sidebar header carries the GUILD lettering and the engine-version line
+without a mascot image (amended 2026-10-12, D-048). The lettering is aligned
+with the search icon and section label below it.

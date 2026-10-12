@@ -489,14 +489,27 @@ the redesign's 65px minimum textarea height and vertical padding to one text row
 The outer focus-within ring remains; suppress the duplicate textarea outline.
 No sending, queue, persistence, runtime, or continuous-task behavior changes.
 
-## D-048 — Optical alignment of the Guild wordmark
+## D-048 — Optical alignment of the Guild wordmark; Banny only in the empty-task centre
 
-Date: 2026-09-12. The user supplied a cropped brand screenshot and requested
-proper mascot/text alignment. The admitted 314x314 Banny PNG has nontransparent
-bounds (102,95)-(269,308): its vertical content center is 44.5 source pixels
-below the image center. At the existing 28px image width that is 3.97 CSS pixels.
-Keep the original asset and scale; move only the brand image up 4px and tighten
-the flex gap from 9px to 7px. Task mascots and empty-state mascots are unchanged.
+Date: 2026-09-12. Amended: 2026-10-12.
+
+The user supplied a cropped brand screenshot and requested proper mascot/text
+alignment. The admitted 314x314 Banny PNG has nontransparent bounds
+(102,95)-(269,308): its vertical content center is 44.5 source pixels below the
+image center, so aligning the bitmap box looked low beside the lettering.
+
+Amendment (2026-10-12). Guild is a complete product and Banny is only a mascot,
+so it now appears in exactly one place: centered above the starter title of an
+empty task, 76x92 CSS pixels (56x68 in windows up to 760px wide), with its gentle
+idle bob, which reduced motion switches off. The sidebar header is the Guild title
+and the engine-version line only, aligned with the search icon and section label,
+so there is no header image to align. The floating window placement, the
+task-row seat and drag-and-drop moving are removed; Banny is not draggable.
+Placements saved by earlier builds are ignored and their storage keys are
+dropped once at startup. The Welcome screen shown with no task open keeps its
+Code icon. The original alignment note (28px image, 4px lift, flex gap 9px to
+7px) no longer describes the code, which had a 22px header image and an 8px gap
+before the image was removed, and is withdrawn with the image.
 
 ## D-049 — Bound streaming admission and decouple display cadence
 
