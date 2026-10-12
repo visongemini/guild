@@ -216,6 +216,25 @@ describe("dual engine orchestration [PC-ENG-001, PC-MODEL-001]", () => {
     assert.equal(quiet.world.adapters[0]!.log.some((entry) => entry.startsWith("mode=")), false);
   });
 
+  it("adds OPENVIKING_AUTO_CAPTURE=false to native Claude spawns only when the dev capture hook is on [PC-OV-001]", async () => {
+    const off = await harness({ claudeCaptureOff: true });
+    const claudeTask = await off.service.createTask(off.workspaceId, undefined, "claude");
+    await off.send(claudeTask.task.taskId, "native turn");
+    await off.completed();
+    assert.deepEqual(off.world.inputs[0]!.extraEnvironment, { OPENVIKING_AUTO_CAPTURE: "false" });
+    const grokTask = await off.service.createTask(off.workspaceId, undefined, "grok");
+    await off.send(grokTask.task.taskId, "grok turn");
+    await off.completed();
+    const grokInput = off.world.inputs.find((input) => input.engine === "grok");
+    assert.equal(grokInput?.extraEnvironment, undefined, "the Grok engine never gets the Claude variable");
+
+    const normal = await harness();
+    const task = await normal.service.createTask(normal.workspaceId, undefined, "claude");
+    await normal.send(task.task.taskId, "native turn");
+    await normal.completed();
+    assert.equal(normal.world.inputs[0]!.extraEnvironment, undefined, "off by default");
+  });
+
   it("switches a native session to the router between turns and keeps the task routed [PC-ROUTE-002, docs/20 3.3]", async () => {
     const router = new FakeRouterHost([DEEPSEEK, LOCAL_MODEL]);
     const h = await harness({ modelRouterHost: router });

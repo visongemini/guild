@@ -1,6 +1,6 @@
 {
   "name": "@guild/desktop",
-  "version": "2.2.1",
+  "version": "3.0.0",
   "author": "BDV",
   "description": "An independent desktop client for the official Grok agent process.",
   "license": "MIT",
@@ -71,6 +71,7 @@
       "!node_modules/@guild/*/src{,/**/*}",
       "!node_modules/@guild/*/dist/**/*.test.js",
       "!node_modules/@guild/*/dist/**/*-testing.js",
+      "!node_modules/@guild/*/dist/fixtures{,/**/*}",
       "!node_modules/@guild/*/dist/**/*.d.ts",
       "!node_modules/@guild/*/tsconfig*.json",
       "!node_modules/@guild/*/*.tsbuildinfo",

@@ -65,7 +65,7 @@ describe("ACP v1 request encoders", () => {
       clientCapabilities: {
         session: { configOptions: { boolean: {} } },
       },
-      clientInfo: { name: "guild", title: "Guild", version: "2.0.31" },
+      clientInfo: { name: "guild", title: "Guild", version: "3.0.0" },
     });
     assert.deepEqual(encodeTextPromptParams("session-1", "Do the task"), {
       sessionId: "session-1",

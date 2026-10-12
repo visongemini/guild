@@ -15,6 +15,7 @@ import type { DesktopApplicationService } from "./application-service.js";
 import { createBrowserPaneBridge, type BrowserPaneBridge, type BrowserPaneIpcPort } from "./browser-pane-bridge.js";
 import { configureBrowserPaneProcess } from "./browser-pane.js";
 import { createElectronBrowserPane } from "./browser-pane-electron.js";
+import { resolveDevHooks } from "./dev-hooks.js";
 import { createElectronRouterFetches } from "./electron-router-fetch.js";
 import { registerDesktopIpc } from "./ipc-handlers.js";
 import { createLiveDesktopService } from "./live-service.js";
@@ -55,6 +56,8 @@ let validatingRestoreBoot = false;
 let shutdownComplete = false;
 let rendererRecoveryFailures = 0;
 let rendererRecoveryErrorPending = false;
+// Dev-only QA hooks; a packaged app ignores them (see dev-hooks.ts).
+const devHooks = resolveDevHooks({ isPackaged: app.isPackaged, env: process.env });
 const fixtureRequested = !app.isPackaged && process.env["GUILD_DESKTOP_FIXTURE"] === "1";
 const fixtureCapturePath = fixtureRequested
   ? validatedFixtureCapturePath(process.env["GUILD_FIXTURE_CAPTURE_PATH"])
@@ -76,7 +79,7 @@ app.setPath(
   "userData",
   fixtureRequested
     ? join(app.getPath("temp"), `Guild-v2-fixture-${process.pid}`)
-    : join(app.getPath("appData"), "Guild-v2"),
+    : devHooks.userDataDir ?? join(app.getPath("appData"), "Guild-v2"),
 );
 const ownsSingleInstanceLock = app.requestSingleInstanceLock();
 if (!ownsSingleInstanceLock) app.quit();
@@ -157,6 +160,7 @@ app.whenReady().then(async () => {
         persistence,
         modelRouterHost: routerHost,
         browserMcp: bridge.mcp,
+        claudeCaptureOff: devHooks.claudeCaptureOff,
         appVersion: app.getVersion(),
         databasePath: join(app.getPath("userData"), "guild.sqlite3"),
         initialLocale: app.getLocale().toLowerCase().startsWith("zh") ? "zh-CN" : "en-US",
