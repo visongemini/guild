@@ -33,7 +33,7 @@ export type ModelRouterHostOptions = {
   readonly store: ModelRouterHostStore;
   /** Absolute path of the key file used by sources with `keyFile: null`. */
   readonly defaultKeyFile: string;
-  /** Transport for Anthropic and Online upstreams. Production: Electron `net.fetch` on a dedicated session. */
+  /** Transport for Online upstreams. Production: Electron `net.fetch` on a dedicated session. */
   readonly fetchImpl: typeof fetch;
   /** Transport for Local upstreams (never through a system proxy). Defaults to `fetchImpl`. */
   readonly directFetchImpl?: typeof fetch;
@@ -43,21 +43,16 @@ export type ModelRouterHostOptions = {
 type Snapshot = {
   readonly sources: readonly RouterSource[];
   readonly models: readonly RoutedModelInfo[];
-  /** Model ids some usable source claims; they are never Anthropic ids. */
-  readonly claimed: ReadonlySet<string>;
   readonly signature: string;
 };
 
 const EMPTY_SNAPSHOT: Snapshot = {
   sources: Object.freeze([]),
   models: Object.freeze([]),
-  claimed: new Set(),
   signature: "[]",
 };
 
 const ELECTRON_REDIRECT_CANCELLED = "Redirect was cancelled";
-const MAX_NOTED_ANTHROPIC_MODELS = 1024;
-const MAX_MODEL_ID_LENGTH = 128;
 
 export function createModelRouterHost(options: ModelRouterHostOptions): ModelRouterHost {
   const { store } = options;
@@ -69,7 +64,6 @@ export function createModelRouterHost(options: ModelRouterHostOptions): ModelRou
     }
   };
   const listeners = new Set<() => void>();
-  const notedAnthropic = new Set<string>();
   let snapshot: Snapshot = EMPTY_SNAPSHOT;
   let primed = false;
   let refreshTail: Promise<void> = Promise.resolve();
@@ -77,9 +71,6 @@ export function createModelRouterHost(options: ModelRouterHostOptions): ModelRou
   let handle: ModelRouterHandle | undefined;
   let closed = false;
   let closing: Promise<void> | undefined;
-
-  const isAnthropicModel = (id: string): boolean =>
-    !snapshot.claimed.has(id) && (notedAnthropic.has(id) || id.startsWith("claude-"));
 
   const provenance: ProvenanceStore = {
     get: (hash) => {
@@ -185,7 +176,6 @@ export function createModelRouterHost(options: ModelRouterHostOptions): ModelRou
     return Object.freeze({
       sources: Object.freeze(sources),
       models: Object.freeze(models),
-      claimed,
       signature: JSON.stringify(models),
     });
   }
@@ -232,7 +222,6 @@ export function createModelRouterHost(options: ModelRouterHostOptions): ModelRou
     await runRefresh(true);
     const started = await startModelRouter({
       sources: snapshot.sources,
-      isAnthropicModel,
       provenance,
       logger: { info: (event, fields) => log(event, fields) },
       fetchImpl: routerFetch,
@@ -267,13 +256,6 @@ export function createModelRouterHost(options: ModelRouterHostOptions): ModelRou
         throw error;
       });
       return { baseUrl: (await starting).url };
-    },
-    noteAnthropicModels: (ids) => {
-      for (const id of ids) {
-        if (typeof id !== "string" || id.length === 0 || id.length > MAX_MODEL_ID_LENGTH) continue;
-        if (notedAnthropic.size >= MAX_NOTED_ANTHROPIC_MODELS) break;
-        notedAnthropic.add(id);
-      }
     },
     onChange: (listener) => {
       listeners.add(listener);

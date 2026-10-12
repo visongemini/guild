@@ -1,24 +1,16 @@
 import { createHash } from "node:crypto";
 import { isJsonObject, type JsonObject, type JsonValue } from "./json.js";
-import type { ProvenanceStore, SourceKind } from "./types.js";
+import type { ProvenanceStore } from "./types.js";
 
 const HASH_LENGTH = 32;
-const MIN_ANTHROPIC_SIGNATURE_LENGTH = 100;
-const BASE64_PATTERN = /^[A-Za-z0-9+/]+={0,2}$/u;
 const EMPTY_TEXT = "(empty)";
 
 export function signatureHash(signature: string): string {
   return createHash("sha256").update(signature, "utf8").digest("hex").slice(0, HASH_LENGTH);
 }
 
-/** Anthropic signatures are long base64 strings; used only when provenance is unknown. */
-export function looksLikeAnthropicSignature(signature: string): boolean {
-  return signature.length > MIN_ANTHROPIC_SIGNATURE_LENGTH && BASE64_PATTERN.test(signature);
-}
-
 export interface ThinkingTarget {
   readonly sourceId: string;
-  readonly kind: SourceKind;
 }
 
 export interface ThinkingSanitizeResult {
@@ -41,16 +33,14 @@ function keepsBlock(block: JsonObject, target: ThinkingTarget, store: Provenance
   const proof = proofOf(block);
   // An unsigned block (empty or missing signature) proves nothing about who produced it: no target keeps it.
   if (proof.length === 0) return false;
-  const producer = store.get(signatureHash(proof));
-  if (producer !== undefined) return producer === target.sourceId;
-  return target.kind === "anthropic" && looksLikeAnthropicSignature(proof);
+  // A block whose producer is unknown (or is another source, Anthropic included) is dropped.
+  return store.get(signatureHash(proof)) === target.sourceId;
 }
 
 /**
- * Drops thinking blocks the target source did not produce. Unsigned (empty-signature) blocks are
- * dropped for every target. Unknown provenance is dropped for online/local targets; for Anthropic
- * only long base64 signatures survive. The input body is returned unchanged (same reference) when
- * nothing is dropped.
+ * Drops thinking blocks the target source did not produce. Unsigned (empty-signature) blocks and
+ * blocks of unknown provenance are dropped for every target. The input body is returned unchanged
+ * (same reference) when nothing is dropped.
  */
 export function sanitizeThinking(
   body: JsonObject,

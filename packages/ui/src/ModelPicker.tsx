@@ -22,6 +22,7 @@ import {
   selectionForRow,
   type ModelGroupEmptyView,
   type ModelPickerCatalogs,
+  type ModelRowView,
   type ModelSelectionChange,
   type PickerNavigationOrientation,
   type PickerNotice,
@@ -39,6 +40,8 @@ export type ModelPickerProps = Readonly<{
   engineFixed: boolean;
   /** Claude Code's state, when the main process reports one; see `modelPickerView`. */
   claudeState?: ClaudeStatusState;
+  /** The task runs through the model router: its Claude rows are shown disabled (D-061). */
+  routed?: boolean;
   /**
    * Applies a change for the active task and resolves with the response. The caller owns the API
    * calls (moving the task to the other engine first, the Online reminder) and replaces its task
@@ -49,9 +52,10 @@ export type ModelPickerProps = Readonly<{
   onApply: (change: ModelSelectionChange) => Promise<SetTaskRuntimeSettingsResponse | undefined>;
   /** Opens Settings on the Model sources tab (the way out of an empty Online or Local group). */
   onOpenModelSources?: () => void;
-  /** Test seams: render the popover / a notice without a pointer. */
+  /** Test seams: render the popover / a notice / the open "Older models" row without a pointer. */
   initialOpen?: boolean;
   initialNotice?: PickerNotice;
+  initialOlderOpen?: boolean;
 }>;
 
 /** Moves focus between the enabled items of a roving group (model rows or effort buttons). */
@@ -94,12 +98,16 @@ export function ModelPicker({
   taskEngine,
   engineFixed,
   claudeState,
+  routed = false,
   onApply,
   onOpenModelSources,
   initialOpen = false,
   initialNotice,
+  initialOlderOpen,
 }: ModelPickerProps) {
   const [open, setOpen] = useState(initialOpen);
+  // The Claude group's "Older models" row: untouched, it is open exactly when the selected model is one of them.
+  const [olderOpen, setOlderOpen] = useState<boolean | undefined>(initialOlderOpen);
   const [pending, setPending] = useState(false);
   const [notice, setNotice] = useState<PickerNotice | undefined>(initialNotice);
   const wrapperRef = useRef<HTMLDivElement>(null);
@@ -114,6 +122,8 @@ export function ModelPicker({
     pending,
     taskEngine,
     engineFixed,
+    routed,
+    ...(olderOpen === undefined ? {} : { olderExpanded: olderOpen }),
     ...(claudeState === undefined ? {} : { claudeState }),
   });
   const locked = pickerIsLocked(view.disabledReason);
@@ -133,8 +143,10 @@ export function ModelPicker({
     if (!panelOpen) return;
     const popover = popoverRef.current;
     if (popover === null) return;
-    // The selected row, else the first row (a hint is an option too, but a row is what the person came to pick).
+    // The selected row, else the first row that can be chosen (a hint or a disabled row is an option too, but a
+    // choosable row is what the person came to pick).
     const target = popover.querySelector<HTMLElement>('[role="option"][aria-selected="true"]') ??
+      popover.querySelector<HTMLElement>('button[role="option"]:not([aria-disabled="true"])') ??
       popover.querySelector<HTMLElement>('button[role="option"]') ??
       popover.querySelector<HTMLElement>('[role="option"]') ??
       popover;
@@ -175,6 +187,36 @@ export function ModelPicker({
     const focusInside = wrapperRef.current?.contains(document.activeElement) === true;
     setOpen(false);
     if (focusInside) triggerRef.current?.focus();
+  }
+
+  function renderRow(row: ModelRowView) {
+    return (
+      <button
+        key={`${row.group}:${row.runtimeDefault === true ? "(default)" : row.id}`}
+        type="button"
+        role="option"
+        aria-selected={row.selected}
+        aria-disabled={pending || row.disabled === true || undefined}
+        tabIndex={row.tabStop ? 0 : -1}
+        className={`guild-model-row${row.selected ? " selected" : ""}${row.disabled === true ? " locked" : ""}`}
+        onClick={() => {
+          if (row.disabled === true) return;
+          void apply(selectionForRow(catalogs, row, view.selectedEffortId, taskEngine));
+        }}
+      >
+        <span className="guild-model-row-name">
+          <span className="guild-model-row-title">
+            <strong>{row.name}</strong>
+            {row.priceMultiplier !== undefined && (
+              <em className="guild-model-price-tag">{messages.modelPriceTag(row.priceMultiplier)}</em>
+            )}
+          </span>
+          {row.selected && <Check size={14} weight="bold" aria-hidden="true" />}
+        </span>
+        {row.description !== undefined && <small className="guild-model-row-description">{row.description}</small>}
+        {row.contextLabel !== undefined && <small className="guild-model-row-meta">{row.contextLabel}</small>}
+      </button>
+    );
   }
 
   return <div className="guild-model-picker" ref={wrapperRef} onKeyDown={onKeyDown}>
@@ -228,30 +270,23 @@ export function ModelPicker({
                   id={headingId}
                   className={view.showGroupHeadings ? "guild-model-heading guild-model-group-heading" : "guild-sr-only"}
                 >{group.label}</div>
-                {group.models.map((row) => (
+                {group.note !== undefined && <p className="guild-model-group-note">{group.note}</p>}
+                {group.models.map(renderRow)}
+                {group.older !== undefined && <>
                   <button
-                    key={`${row.group}:${row.runtimeDefault === true ? "(default)" : row.id}`}
                     type="button"
                     role="option"
-                    aria-selected={row.selected}
-                    aria-disabled={pending || undefined}
-                    tabIndex={row.tabStop ? 0 : -1}
-                    className={`guild-model-row${row.selected ? " selected" : ""}`}
-                    onClick={() => void apply(selectionForRow(catalogs, row, view.selectedEffortId, taskEngine))}
+                    aria-selected="false"
+                    tabIndex={-1}
+                    className={`guild-model-older${group.older.expanded ? " expanded" : ""}`}
+                    onClick={() => setOlderOpen(!group.older?.expanded)}
                   >
-                    <span className="guild-model-row-name">
-                      <span className="guild-model-row-title">
-                        <strong>{row.name}</strong>
-                        {row.priceMultiplier !== undefined && (
-                          <em className="guild-model-price-tag">{messages.modelPriceTag(row.priceMultiplier)}</em>
-                        )}
-                      </span>
-                      {row.selected && <Check size={14} weight="bold" aria-hidden="true" />}
-                    </span>
-                    {row.description !== undefined && <small className="guild-model-row-description">{row.description}</small>}
-                    {row.contextLabel !== undefined && <small className="guild-model-row-meta">{row.contextLabel}</small>}
+                    <CaretDown size={11} className="guild-model-older-caret" aria-hidden="true" />
+                    <span>{group.older.label}</span>
+                    <span className="guild-sr-only">{group.older.state}</span>
                   </button>
-                ))}
+                  {group.older.models.map(renderRow)}
+                </>}
                 {group.empty !== undefined && <>
                   <EmptyHint empty={group.empty} fallback={messages.modelPickerEmpty} inListbox />
                   {group.empty.action === "open_model_sources" && onOpenModelSources !== undefined && (

@@ -56,8 +56,17 @@ test("model picker and run phase strings exist and are non-empty in both catalog
 test("effort names are localized for the well-known ids and fall back to the runtime label, then the id", () => {
   assert.equal(messagesFor("en-US").reasoningEffortName("xhigh"), "Extra high");
   assert.equal(messagesFor("zh-CN").reasoningEffortName("xhigh"), "\u8d85\u9ad8");
-  assert.equal(messagesFor("en-US").reasoningEffortName("max", "Maximum"), "Maximum");
-  assert.equal(messagesFor("zh-CN").reasoningEffortName("max"), "max");
+  assert.equal(messagesFor("en-US").reasoningEffortName("turbo", "Turbo mode"), "Turbo mode");
+  assert.equal(messagesFor("zh-CN").reasoningEffortName("turbo"), "turbo");
+  // Claude's two extra efforts: its own "Default" and the top "Max".
+  assert.deepEqual(
+    ["default", "low", "medium", "high", "xhigh", "max"].map((effort) => messagesFor("zh-CN").reasoningEffortName(effort, "Official")),
+    ["默认", "低", "中", "高", "超高", "最高"],
+  );
+  assert.deepEqual(
+    ["default", "low", "medium", "high", "xhigh", "max"].map((effort) => messagesFor("en-US").reasoningEffortName(effort, "Official")),
+    ["Default", "Low", "Medium", "High", "Extra high", "Max"],
+  );
 });
 
 test("Guild 3.0 strings exist, are non-empty and mention no undefined in both catalogs", () => {

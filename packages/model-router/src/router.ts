@@ -3,7 +3,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { isIP, type AddressInfo } from "node:net";
 import { applyCompat } from "./compat.js";
 import {
-  allowlistedRequestHeaders,
+  anthropicCredentialPresent,
   clientCredentialsPresent,
   safeResponseHeaders,
   thirdPartyRequestHeaders,
@@ -14,8 +14,6 @@ import { ProvenanceRecorder, sanitizeThinking } from "./provenance.js";
 import { createRegistry, type SourceRegistry } from "./registry.js";
 import { SseBlockSequencer, SseParser, sseErrorEvent, type SseOverflow } from "./sse.js";
 import {
-  ANTHROPIC_BASE_URL,
-  ANTHROPIC_SOURCE_ID,
   type ModelRouterHandle,
   type ModelRouterOptions,
   type ProvenanceStore,
@@ -25,7 +23,6 @@ import {
 
 /** Values only the test hook may change. Production always uses the defaults below. */
 export interface RouterInternals {
-  readonly anthropicBaseUrl: string;
   readonly maxRequestBytes: number;
 }
 
@@ -36,6 +33,9 @@ const LOOPBACK_HOSTS = new Set(["127.0.0.1", "::1"]);
 const MODEL_CREATED_AT = "2026-01-01T00:00:00Z";
 const KEEP_ALIVE_MS = 60_000;
 const STREAM_OVERFLOW_MESSAGE = "model router stream buffer limit exceeded";
+const CLAUDE_MODEL_PREFIX = /^claude-/iu;
+const CLAUDE_SUBSCRIPTION_MESSAGE =
+  "Claude subscription models are not available in a task that uses online or local models";
 
 type LogFields = Record<string, string | number | boolean>;
 type Route = "models" | "messages" | "count_tokens";
@@ -357,6 +357,18 @@ class RouterCore {
       return;
     }
     ctx.fields.route = route;
+    // Defense in depth (D-061): a Claude subscription or Anthropic API credential is never accepted, let
+    // alone forwarded. Guild gives Claude Code a throwaway token instead, so seeing one is a wiring bug.
+    if (anthropicCredentialPresent(req.headers)) {
+      console.warn("model-router: anthropic_credential_rejected");
+      this.reject(res, ctx, {
+        status: 400,
+        type: "invalid_request_error",
+        message: "Anthropic credentials are not accepted by the Guild model router",
+        outcome: "anthropic_credential_rejected",
+      });
+      return;
+    }
     if (route === "models") {
       this.sendModels(res, ctx);
       return;
@@ -414,45 +426,27 @@ class RouterCore {
     const model = parsed.model;
     ctx.fields.model = model.slice(0, LOG_MODEL_LENGTH);
 
-    const isAnthropic = this.options.isAnthropicModel(model);
-    const source = isAnthropic ? undefined : this.registry.sourceForModel(model);
-    if (!isAnthropic && source === undefined) {
+    // Only a registered, enabled and confirmed Online / Local model is served. There is no other upstream:
+    // a Claude model id (Claude Code asking for its own model) is refused with a message that says why.
+    const source = this.registry.sourceForModel(model);
+    if (source === undefined) {
       ctx.fields.source = "none";
-      this.reject(res, ctx, { status: 404, type: "not_found_error", message: `model not registered: ${model.slice(0, LOG_MODEL_LENGTH)}`, outcome: "unknown_model" });
+      const claude = CLAUDE_MODEL_PREFIX.test(model);
+      this.reject(res, ctx, {
+        status: claude ? 400 : 404,
+        type: claude ? "invalid_request_error" : "not_found_error",
+        message: claude ? CLAUDE_SUBSCRIPTION_MESSAGE : `model not registered: ${model.slice(0, LOG_MODEL_LENGTH)}`,
+        outcome: claude ? "claude_model_refused" : "unknown_model",
+      });
       return;
     }
 
-    const planned =
-      source === undefined
-        ? this.planAnthropic(req, ctx, raw, parsed, matched)
-        : await this.planSource(req, ctx, parsed, source, matched);
+    const planned = await this.planSource(req, ctx, parsed, source, matched);
     if ("rejection" in planned) {
       this.reject(res, ctx, planned.rejection);
       return;
     }
     await this.relay(res, ctx, planned.plan);
-  }
-
-  private planAnthropic(
-    req: IncomingMessage,
-    ctx: RequestContext,
-    raw: Buffer,
-    parsed: JsonObject,
-    matched: { path: string; search: string },
-  ): { plan: UpstreamPlan } {
-    ctx.fields.source = ANTHROPIC_SOURCE_ID;
-    const sanitized = sanitizeThinking(parsed, { sourceId: ANTHROPIC_SOURCE_ID, kind: "anthropic" }, this.store);
-    ctx.fields.thinkingKept = sanitized.kept;
-    ctx.fields.thinkingDropped = sanitized.dropped;
-    return {
-      plan: {
-        source: { id: ANTHROPIC_SOURCE_ID, kind: "anthropic" },
-        url: upstreamUrl(this.internals.anthropicBaseUrl, matched.path, matched.search),
-        headers: allowlistedRequestHeaders(req.headers),
-        // The original bytes are forwarded unless a foreign thinking block had to be removed.
-        body: sanitized.dropped > 0 ? Buffer.from(JSON.stringify(sanitized.body)) : raw,
-      },
-    };
   }
 
   private async planSource(
@@ -472,7 +466,7 @@ class RouterCore {
     ctx.fields.compatDeferredDropped = compat.stats.deferredDropped;
     ctx.fields.compatMergedMessages = compat.stats.mergedMessages;
     ctx.fields.compatEmptyFilled = compat.stats.emptyFilled;
-    const sanitized = sanitizeThinking(compat.body, { sourceId: source.id, kind: source.kind }, this.store);
+    const sanitized = sanitizeThinking(compat.body, { sourceId: source.id }, this.store);
     ctx.fields.thinkingKept = sanitized.kept;
     ctx.fields.thinkingDropped = sanitized.dropped;
 
@@ -682,8 +676,5 @@ export async function startRouterInternal(
 }
 
 export function startModelRouter(options: ModelRouterOptions): Promise<ModelRouterHandle> {
-  return startRouterInternal(options, {
-    anthropicBaseUrl: ANTHROPIC_BASE_URL,
-    maxRequestBytes: DEFAULT_MAX_REQUEST_BYTES,
-  });
+  return startRouterInternal(options, { maxRequestBytes: DEFAULT_MAX_REQUEST_BYTES });
 }

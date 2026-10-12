@@ -26,7 +26,7 @@ function between(source: string, from: string, to: string): string {
 }
 
 test("choosing a model of the other engine moves the task first, then applies the model", async () => {
-  const apply = between(app, "async function applyTaskRuntimeSettings", "async function confirmOnlineSwitch");
+  const apply = between(app, "async function applyTaskRuntimeSettings", "async function confirmModelSwitch");
   assert.match(apply, /applyModelSelectionChange\(api, \{\s*\n\s*taskId,\s*\n\s*taskEngine: taskEngineOf\(task\.task\),\s*\n\s*change,/u);
   // The moved task replaces the open one and its sidebar summary follows without waiting for a push.
   assert.match(apply, /withTaskSummary\(\{ \.\.\.current, activeTask: moved \}, moved\.task\)/u);

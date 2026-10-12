@@ -142,7 +142,7 @@ import {
   onlineSourceKey,
   vendorLabelFor,
 } from "./online-reminder.js";
-import { hasMixedEngines, taskEngineFixed, taskEngineOf } from "./task-engine.js";
+import { hasMixedEngines, taskEngineFixed, taskEngineOf, taskHasNativeClaudeSession } from "./task-engine.js";
 import { RewindDialog } from "./RewindDialog.js";
 import { RunChangesCard, type RunCardData } from "./RunChangesCard.js";
 import { RunDiffView } from "./RunDiffView.js";
@@ -222,7 +222,7 @@ type ContextMenu =
 type UiError = "bootstrap" | "claude_start" | "message" | "operation" | "recovery" | "runtime" | "workspace";
 type SettingsTab = "general" | "engines" | "sources" | "privacy" | "about";
 const SETTINGS_TABS: readonly SettingsTab[] = Object.freeze(["general", "engines", "sources", "privacy", "about"]);
-type OnlineReminderRequest = Readonly<{ vendorLabel: string }>;
+type OnlineReminderRequest = Readonly<{ vendorLabel?: string; routedModelName?: string }>;
 type OnlineReminderAnswer = Readonly<{ confirmed: boolean; dontRemindAgain: boolean }>;
 type ProfileAvatarDraft =
   | { readonly type: "keep" }
@@ -1509,7 +1509,8 @@ export function GuildApp({ api }: GuildAppProps) {
     if (task === undefined) throw new Error("no_active_task");
     const taskId = task.task.taskId;
     // PC-PRIV-001: the first switch to an Online model in this conversation says what goes to the vendor.
-    if (change.group === "online" && !(await confirmOnlineSwitch(task, change.model))) return undefined;
+    // D-061: the first switch of a Claude conversation to an Online or Local model also says it is one way.
+    if ((change.group === "online" || change.group === "local") && !(await confirmModelSwitch(task, change))) return undefined;
     // PC-ENG-001: a task that has not run yet may still choose its engine; the first turn fixes it.
     const response = await applyModelSelectionChange(api, {
       taskId,
@@ -1527,11 +1528,15 @@ export function GuildApp({ api }: GuildAppProps) {
   }
 
   /**
-   * True when the switch may go ahead: no reminder is due, or the user accepted it (and maybe silenced it). The
-   * agreement is per task and per vendor, so a second vendor in the same conversation asks again (PC-PRIV-001).
+   * True when the switch to an Online or Local model may go ahead: nothing is due, or the user accepted what is
+   * (and maybe silenced the reminder). Two things can be due, and they share one dialog so the user never gets two
+   * back to back: the one-way notice of a Claude conversation that has run on the subscription (D-061), and the
+   * Online reminder. The reminder agreement is per task and per vendor, so a second vendor in the same
+   * conversation asks again (PC-PRIV-001).
    */
-  async function confirmOnlineSwitch(task: TaskViewProjection, modelId: string | null): Promise<boolean> {
+  async function confirmModelSwitch(task: TaskViewProjection, change: ModelSelectionChange): Promise<boolean> {
     const taskId = task.task.taskId;
+    const modelId = change.model;
     const currentModel = (taskEngineOf(task.task) === "claude" ? modelCatalogs.claude : modelCatalogs.grok)
       .models.find((model) => model.id === task.modelSelection.modelId);
     const target = modelCatalogs.claude.models.find((model) => model.id === modelId);
@@ -1550,28 +1555,33 @@ export function GuildApp({ api }: GuildAppProps) {
       sources,
     });
     let dismissed = false;
-    if (!agreedSources.has(targetSource)) {
+    if (change.group === "online" && !agreedSources.has(targetSource)) {
       try {
         dismissed = (await api.getWorkspacePrefs({ workspaceId: task.task.workspaceId })).onlineReminderDismissed;
       } catch {
         // Unknown means not silenced: ask.
       }
     }
-    if (!onlineReminderNeeded({ targetGroup: "online", targetSource, agreedSources, dismissedForWorkspace: dismissed })) {
-      onlineConsent.current.agree(taskId, targetSource);
+    const reminderNeeded = onlineReminderNeeded({ targetGroup: change.group, targetSource, agreedSources, dismissedForWorkspace: dismissed });
+    const routedNotice = taskHasNativeClaudeSession(task, pendingSends.has(taskId));
+    if (!reminderNeeded && !routedNotice) {
+      if (change.group === "online") onlineConsent.current.agree(taskId, targetSource);
       return true;
     }
     const vendorLabel = vendorLabelFor(modelId ?? "", sources, target?.name);
     const answer = await new Promise<OnlineReminderAnswer>((resolve) => {
       onlineReminderAnswer.current = resolve;
-      setOnlineReminder(Object.freeze({ vendorLabel }));
+      setOnlineReminder(Object.freeze({
+        ...(reminderNeeded ? { vendorLabel } : {}),
+        ...(routedNotice ? { routedModelName: target?.name ?? modelId ?? "" } : {}),
+      }));
     });
     setOnlineReminder(undefined);
     onlineReminderAnswer.current = undefined;
     window.queueMicrotask(() => document.querySelector<HTMLElement>(".guild-model-picker-trigger")?.focus());
     if (!answer.confirmed) return false;
-    onlineConsent.current.agree(taskId, targetSource);
-    if (answer.dontRemindAgain) {
+    if (change.group === "online") onlineConsent.current.agree(taskId, targetSource);
+    if (reminderNeeded && answer.dontRemindAgain) {
       try {
         await api.setWorkspacePrefs({ workspaceId: task.task.workspaceId, onlineReminderDismissed: true });
       } catch {
@@ -2676,6 +2686,7 @@ export function GuildApp({ api }: GuildAppProps) {
                 selection={activeTask?.modelSelection}
                 taskEngine={activeEngine}
                 engineFixed={engineFixed}
+                routed={activeTask?.engineStatus?.routed === true}
                 {...(claudeStatus === undefined ? {} : { claudeState: claudeStatus.state })}
                 onApply={applyTaskRuntimeSettings}
                 onOpenModelSources={() => openSettings("sources")}
@@ -3448,7 +3459,8 @@ export function GuildApp({ api }: GuildAppProps) {
       {onlineReminder !== undefined && (
         <OnlineReminderDialog
           messages={baseMessages}
-          vendorLabel={onlineReminder.vendorLabel}
+          {...(onlineReminder.vendorLabel === undefined ? {} : { vendorLabel: onlineReminder.vendorLabel })}
+          {...(onlineReminder.routedModelName === undefined ? {} : { routedModelName: onlineReminder.routedModelName })}
           onCancel={() => onlineReminderAnswer.current?.({ confirmed: false, dontRemindAgain: false })}
           onSwitch={(dontRemindAgain) => onlineReminderAnswer.current?.({ confirmed: true, dontRemindAgain })}
           onDialogKeyDown={handleDialogKeyDown}

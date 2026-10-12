@@ -180,6 +180,7 @@ import {
   resolveOfficialGrokEnvironment,
 } from "./runtime-locator.js";
 import { CLAUDE_CAPTURE_OFF_ENVIRONMENT } from "./dev-hooks.js";
+import { routedClaudeEnvironment } from "./routed-environment.js";
 import { warmOfficialGrokRuntime } from "./runtime-warmup.js";
 import {
   applyRuntimeSelection,
@@ -350,7 +351,8 @@ export type RuntimeFactory = (input: {
   /**
    * Claude only: the per-spawn variables of a routed task (docs/20 3.3). Present for every process
    * start of a routed task and, apart from the dev-only capture switch of `claudeCaptureOff`, never
-   * for a native one. The `ANTHROPIC_BASE_URL` value carries the router token: never log it.
+   * for a native one. The `ANTHROPIC_BASE_URL` value carries the router token and `ANTHROPIC_AUTH_TOKEN`
+   * is a throwaway secret: never log either.
    */
   readonly extraEnvironment?: Readonly<Record<string, string>>;
 }) => Promise<{
@@ -654,7 +656,6 @@ export function createLiveDesktopService(
   // Claude's own models, the same way; the router's Online and Local ones are added when projected.
   let claudeNativeCatalog: ModelCatalog = store.loadModelCatalogCache("claude")?.catalog ?? EMPTY_CLAUDE_MODEL_CATALOG;
   let claudeCatalogMemo: { readonly native: ModelCatalog; readonly key: string; readonly value: ModelCatalog } | undefined;
-  let reportedAnthropicModelKey = "";
   let claudeRuntimeVersion: string | undefined;
   // What the Claude engine last said about its login. Account-level: one login serves every Claude task.
   let claudeAuth: Readonly<{ kind: string; label?: string }> | undefined;
@@ -918,15 +919,6 @@ export function createLiveDesktopService(
     } catch {
       return;
     }
-    const key = ids.join("\0");
-    if (key !== reportedAnthropicModelKey) {
-      reportedAnthropicModelKey = key;
-      try {
-        modelRouterHost?.noteAnthropicModels(ids);
-      } catch {
-        // The router's registry also learns models from its own traffic; this only seeds it.
-      }
-    }
     if (JSON.stringify(next) === JSON.stringify(claudeNativeCatalog)) return;
     claudeNativeCatalog = next;
     try {
@@ -1037,6 +1029,7 @@ export function createLiveDesktopService(
         selection: resolveClaudeSelection(
           override === undefined ? undefined : { modelId: override.modelId, reasoningEffort: override.reasoningEffort },
           { modelId: settings.claudeModel, reasoningEffort: settings.claudeEffort },
+          taskRouted(taskId),
         ),
         contextWindow: null,
       });
@@ -1073,9 +1066,26 @@ export function createLiveDesktopService(
     return isOfficialGrokModelId(modelId) && !routedModels().some((model) => model.id === modelId);
   }
 
-  /** A stored Claude choice, or null for one that cannot belong to a Claude task. */
-  function claudeChoiceOrNull(modelId: string | null | undefined): string | null {
-    return modelId === null || modelId === undefined || isGrokOnlyModelId(modelId) ? null : modelId;
+  /**
+   * The task runs, or is switching to run, through the model router for good (D-061): its marker is set or
+   * its process is routed. Such a task can never use a Claude subscription model again.
+   */
+  function taskRouted(taskId: TaskId): boolean {
+    if (controllers.get(taskId)?.routedProcess === true) return true;
+    try {
+      return readOncePerBuild(`routed:${taskId}`, () => store.loadTaskMetadata(taskId).routedAtMs) !== undefined;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * A stored Claude choice, or null for one that cannot belong to a Claude task. A routed task keeps only
+   * the router's own models: a Claude model a task chose before it was routed no longer counts (D-061).
+   */
+  function claudeChoiceOrNull(modelId: string | null | undefined, routed = false): string | null {
+    if (modelId === null || modelId === undefined || isGrokOnlyModelId(modelId)) return null;
+    return routed && !routedModels().some((model) => model.id === modelId) ? null : modelId;
   }
 
   /**
@@ -1100,13 +1110,20 @@ export function createLiveDesktopService(
   function resolveClaudeSelection(
     task: Readonly<{ modelId: string | null; reasoningEffort: string | null }> | undefined,
     global: Readonly<{ modelId: string | null; reasoningEffort: string | null }>,
+    routed: boolean,
   ): ReturnType<typeof resolveEffectiveSelection> {
     const taskPinned = task !== undefined && (task.modelId !== null || task.reasoningEffort !== null);
     const globalPinned = global.modelId !== null || global.reasoningEffort !== null;
+    // The runtime default of a Claude task is Claude's own pick (the adapter's list) or nothing,
+    // which reads "Claude Code default model": never a routed model, never a Grok one. A routed task has
+    // no such default (it is a Claude subscription model): it selects a routed model or none (D-061).
+    const modelId = claudeChoiceOrNull(task?.modelId, routed) ?? claudeChoiceOrNull(global.modelId, routed) ??
+      (routed ? null : nativeRuntimeDefaultId());
+    if (routed && modelId === null) {
+      return Object.freeze({ modelId: null, reasoningEffort: null, source: "runtime" as const });
+    }
     return Object.freeze({
-      // The runtime default of a Claude task is Claude's own pick (the adapter's list) or nothing,
-      // which reads "Claude Code default model": never a routed model, never a Grok one.
-      modelId: claudeChoiceOrNull(task?.modelId) ?? claudeChoiceOrNull(global.modelId) ?? nativeRuntimeDefaultId(),
+      modelId,
       reasoningEffort: task?.reasoningEffort ?? global.reasoningEffort ?? null,
       source: taskPinned ? "task" as const : globalPinned ? "global" as const : "runtime" as const,
     });
@@ -1144,12 +1161,34 @@ export function createLiveDesktopService(
       ? undefined
       : sessionSelectionOf(controller.sessionConfigOptions);
     const showLive = live !== undefined && (selection.source === "runtime" || controller?.selectionRefused === true);
+    let modelId = (showLive ? live.modelId : undefined) ?? selection.modelId;
+    // A routed task shows no Claude subscription model, not even one its session still reports (D-061).
+    if (modelId !== null && readOncePerBuild(`engine:${taskId}`, () => engineOfTask(taskId)) === "claude" &&
+      taskRouted(taskId) && !routedModels().some((model) => model.id === modelId)) {
+      modelId = null;
+    }
     return Object.freeze({
-      modelId: (showLive ? live.modelId : undefined) ?? selection.modelId,
+      modelId,
       reasoningEffort: (showLive ? live.reasoningEffort : undefined) ?? selection.reasoningEffort,
       source: selection.source,
       canChange: taskSelectionCanChange(taskId),
     });
+  }
+
+  /**
+   * A routed task never starts a turn on a model that is not one of the router's (D-061). A task routed by an
+   * earlier build may still select a Claude model, or none; its session would ask the router for a claude-*
+   * model, which the router refuses, so the turn ends here with the same named failure as any other selection
+   * that cannot be applied, and the picker (Claude rows disabled) is the way out.
+   */
+  function assertRoutedTaskModel(taskId: TaskId, controller: RuntimeController, session: AcpV1AdapterSession): void {
+    if (controller.engine !== "claude" || !taskRouted(taskId)) return;
+    // The stored choice, else the model the routed session itself runs on.
+    const modelId = desiredSelection(taskId).selection.modelId ?? sessionSelectionOf(controller.sessionConfigOptions).modelId;
+    if (modelId !== undefined && modelId !== null && routedModels().some((model) => model.id === modelId)) return;
+    controller.selectionRefused = true;
+    logRuntime({ category: "runtime", event: "model_switch_refused", taskId, sessionId: session.sessionId, reason: "claude_locked" });
+    throw new Error(MODEL_SELECTION_FAILED);
   }
 
   /**
@@ -1379,12 +1418,11 @@ export function createLiveDesktopService(
     const metadata = store.loadTaskMetadata(taskId);
     if (metadata.routedAtMs === undefined && !selectsRoutedModel(taskId)) return undefined;
     const baseUrl = await ensureRouterReady(taskId);
+    // Claude Code's background requests and subagents follow the routed model applied at this start (D-061).
+    const selected = desiredSelection(taskId).selection.modelId;
+    const modelId = selected !== null && routedModels().some((model) => model.id === selected) ? selected : undefined;
     return Object.freeze({
-      extraEnvironment: Object.freeze({
-        ANTHROPIC_BASE_URL: baseUrl,
-        ENABLE_TOOL_SEARCH: "true",
-        OPENVIKING_AUTO_CAPTURE: "false",
-      }),
+      extraEnvironment: routedClaudeEnvironment({ baseUrl, modelId }),
       picker: Object.freeze([...routedModels()]),
     });
   }
@@ -6595,6 +6633,7 @@ export function createLiveDesktopService(
       // The stored model and effort are brought up to date between turns, never mid-turn. Grok: a
       // refusal keeps the session on its previous selection and never blocks the turn. Claude: a
       // selection that could not be applied ends the turn here, before the prompt is sent.
+      assertRoutedTaskModel(taskId, controller, session);
       await reconcileRuntimeSelection(taskId, controller, adapter, session).catch((cause: unknown) => {
         if (controller.engine === "claude" && errorMessageIncludes(cause, MODEL_SELECTION_FAILED)) throw cause;
         logRuntime({ category: "runtime", event: "model_switch_failed", taskId });
@@ -8169,6 +8208,12 @@ export function createLiveDesktopService(
             if ((request.contextWindow ?? null) !== null || !claudeModelStorable(request.model)) {
               return refuse("unsupported_value");
             }
+          }
+          // D-061: a task that runs through the router never goes back to a Claude subscription model.
+          // Clearing the choice would fall back to one, so it is refused too.
+          if (taskRouted(taskId) && (request.model === null || !routedModels().some((model) => model.id === request.model))) {
+            logRuntime({ category: "runtime", event: "model_switch_refused", taskId, reason: "claude_locked" });
+            return refuse("claude_locked");
           }
         } else if (request.model !== null && modelCatalog.models.length > 0) {
           const offered = grokModelById(modelCatalog, request.model);

@@ -21,7 +21,6 @@ import { signatureHash } from "./provenance.js";
 import { startModelRouter } from "./router.js";
 import { startModelRouterForTesting } from "./router-testing.js";
 import {
-  ANTHROPIC_BASE_URL,
   type ModelRouterHandle,
   type ModelRouterOptions,
   type ProvenanceStore,
@@ -32,7 +31,8 @@ import {
 
 /*
  * Test transport choice: no TLS and no real network. Every upstream is a fake HTTP server on
- * 127.0.0.1. The "Anthropic" fake is reached through the package-internal test hook. The
+ * 127.0.0.1. There is no Anthropic upstream: the router never connects to one (D-061), and
+ * `harness.calls` proves it for every request that is refused. The
  * "online vendor" keeps its real https://vendor.example/... configuration, so the router's host,
  * https and credential checks run on the configured URL; the injected fetchImpl then redirects
  * that host to the fake (this is exactly what `fetchImpl` is for). Local sources use real
@@ -43,7 +43,8 @@ const ONLINE_KEY = "sk-online-SECRET-0001";
 const LOCAL_KEY = "sk-local-SECRET-0002";
 const OAUTH = "sk-ant-oat-SECRET-0003";
 const CLIENT_KEY = "client-x-api-key-SECRET-0004";
-const ANTHROPIC_MODELS = new Set(["claude-sonnet-5", "claude-haiku-5"]);
+// What Guild gives Claude Code as its auth token in a routed task: the router never sees a real credential.
+const DUMMY_TOKEN = "guild-router-0123456789abcdef0123456789abcdef";
 const OK_MESSAGE = {
   id: "msg_1",
   type: "message",
@@ -167,7 +168,6 @@ function tokenOf(url: string): string {
 function silentOptions(overrides: Partial<ModelRouterOptions> = {}): ModelRouterOptions {
   return {
     sources: [],
-    isAnthropicModel: (model) => ANTHROPIC_MODELS.has(model),
     provenance: new MemoryStore(),
     logger: { info: () => undefined },
     fetchImpl: fetch,
@@ -176,7 +176,6 @@ function silentOptions(overrides: Partial<ModelRouterOptions> = {}): ModelRouter
 }
 
 interface HarnessOptions {
-  readonly anthropic?: FakeHandler;
   readonly online?: FakeHandler;
   readonly local?: FakeHandler;
   readonly lookup?: (host: string) => Promise<string[]>;
@@ -186,7 +185,6 @@ interface HarnessOptions {
 
 interface Harness {
   readonly router: ModelRouterHandle;
-  readonly anthropic: Fake;
   readonly online: Fake;
   readonly local: Fake;
   readonly store: MemoryStore;
@@ -224,7 +222,6 @@ function defaultSources(localPort: number): RouterSource[] {
 }
 
 async function startHarness(t: TestContext, options: HarnessOptions = {}): Promise<Harness> {
-  const anthropic = await startFake(options.anthropic ?? okHandler);
   const online = await startFake(options.online ?? okHandler);
   const local = await startFake(options.local ?? okHandler);
   const store = new MemoryStore();
@@ -256,18 +253,14 @@ async function startHarness(t: TestContext, options: HarnessOptions = {}): Promi
       fetchImpl,
       ...(options.lookup === undefined ? {} : { lookup: options.lookup }),
     }),
-    {
-      anthropicBaseUrl: `http://127.0.0.1:${anthropic.port}`,
-      ...(options.maxRequestBytes === undefined ? {} : { maxRequestBytes: options.maxRequestBytes }),
-    },
+    options.maxRequestBytes === undefined ? {} : { maxRequestBytes: options.maxRequestBytes },
   );
   t.after(async () => {
     await router.close();
-    await Promise.all([anthropic.close(), online.close(), local.close()]);
+    await Promise.all([online.close(), local.close()]);
   });
   return {
     router,
-    anthropic,
     online,
     local,
     store,
@@ -281,6 +274,18 @@ async function startHarness(t: TestContext, options: HarnessOptions = {}): Promi
         body: typeof body === "string" ? body : JSON.stringify(body),
       }),
     requestLogs: () => logs.filter((entry) => entry.event === "router.request"),
+  };
+}
+
+/** One confirmed Local source whose only model is `fake-model`, for tests that need no harness. */
+function fakeLocalSource(port: number): RouterSource {
+  return {
+    id: "fake",
+    kind: "local",
+    label: "Fake",
+    baseUrl: `http://127.0.0.1:${port}`,
+    confirmedHost: `127.0.0.1:${port}`,
+    models: [{ id: "fake-model", label: "Fake" }],
   };
 }
 
@@ -395,7 +400,7 @@ describe("router binding and token", () => {
         assert.equal(payload.error.type, "not_found_error");
       }
     }
-    assert.equal(h.anthropic.requests.length + h.online.requests.length + h.local.requests.length, 0);
+    assert.equal(h.calls.length, 0);
   });
 
   it("answers 404 for unknown routes and methods under a valid token", async (t) => {
@@ -411,7 +416,7 @@ describe("router binding and token", () => {
       const response = await fetch(`${h.router.url}${path}`, { method, ...(method === "POST" ? { body: "{}" } : {}) });
       assert.equal(response.status, 404, `${method} ${path}`);
     }
-    assert.equal(h.anthropic.requests.length + h.online.requests.length + h.local.requests.length, 0);
+    assert.equal(h.calls.length, 0);
   });
 });
 
@@ -454,18 +459,17 @@ describe("router /v1/models", () => {
 describe("router model registry", () => {
   it("routes each model to its own source only", async (t) => {
     const h = await startHarness(t);
-    for (const model of ["claude-sonnet-5", "deepseek-v4", "deepseek-v4-pro", "local-27b"]) {
+    for (const model of ["deepseek-v4", "deepseek-v4-pro", "local-27b"]) {
       const response = await h.post("v1/messages", simpleBody(model));
       assert.equal(response.status, 200, model);
     }
-    assert.deepEqual(h.anthropic.requests.map((r) => jsonOf(r).model), ["claude-sonnet-5"]);
     assert.deepEqual(h.online.requests.map((r) => jsonOf(r).model), ["deepseek-v4", "deepseek-v4-pro"]);
     assert.deepEqual(h.local.requests.map((r) => jsonOf(r).model), ["local-27b"]);
   });
 
   it("answers 404 not_found_error for unknown models and never uses a default upstream", async (t) => {
     const h = await startHarness(t);
-    for (const model of ["gpt-5", "claude-not-in-registry", "deepseek-v4-PRO", "deepseek", " deepseek-v4"]) {
+    for (const model of ["gpt-5", "deepseek-v4-PRO", "deepseek", " deepseek-v4", "sonnet"]) {
       const response = await h.post("v1/messages", simpleBody(model));
       assert.equal(response.status, 404, model);
       const payload = (await response.json()) as { error: { type: string; message: string } };
@@ -474,7 +478,7 @@ describe("router model registry", () => {
     }
     const counted = await h.post("v1/messages/count_tokens", simpleBody("mystery"));
     assert.equal(counted.status, 404);
-    assert.equal(h.anthropic.requests.length + h.online.requests.length + h.local.requests.length, 0);
+    assert.equal(h.calls.length, 0);
   });
 
   it("rejects bodies without a usable model before contacting anyone", async (t) => {
@@ -485,7 +489,7 @@ describe("router model registry", () => {
       const payload = (await response.json()) as { error: { type: string } };
       assert.equal(payload.error.type, "invalid_request_error");
     }
-    assert.equal(h.anthropic.requests.length + h.online.requests.length + h.local.requests.length, 0);
+    assert.equal(h.calls.length, 0);
   });
 
   it("applies updateSources to later requests and keeps the old registry on invalid input", async (t) => {
@@ -510,111 +514,99 @@ describe("router model registry", () => {
     assert.throws(() => h.router.updateSources([withNew, { ...withNew, models: [] }]), /duplicate source id/u);
     assert.equal((await h.post("v1/messages", simpleBody("new-model"))).status, 200);
   });
+});
 
-  it("lets the Anthropic registry win over a source that lists the same model id", async (t) => {
+describe("Claude subscription traffic (D-061)", () => {
+  it("refuses every Claude model id with a clear 400 and never opens a connection", async (t) => {
+    const h = await startHarness(t);
+    for (const path of ["v1/messages", "v1/messages?beta=true", "v1/messages/count_tokens"]) {
+      for (const model of ["claude-sonnet-5", "claude-haiku-4-5-20251001", "CLAUDE-OPUS-5"]) {
+        const response = await h.post(path, simpleBody(model), { authorization: `Bearer ${DUMMY_TOKEN}` });
+        assert.equal(response.status, 400, `${path} ${model}`);
+        assert.match(response.headers.get("content-type") ?? "", /application\/json/u);
+        const payload = (await response.json()) as { type: string; error: { type: string; message: string } };
+        assert.equal(payload.type, "error");
+        assert.equal(payload.error.type, "invalid_request_error");
+        assert.equal(payload.error.message, "Claude subscription models are not available in a task that uses online or local models");
+      }
+    }
+    assert.equal(h.calls.length, 0, "the transport must not be called");
+    assert.equal(h.online.requests.length + h.local.requests.length, 0);
+    const logged = h.requestLogs().filter((entry) => entry.fields.outcome === "claude_model_refused");
+    assert.equal(logged.length, 9);
+    assert.ok(logged.every((entry) => entry.fields.status === 400 && entry.fields.source === "none"));
+  });
+
+  it("does not let a Claude id reach a source that does not list it", async (t) => {
     const h = await startHarness(t);
     h.router.updateSources([
-      { id: "shadow", kind: "local", label: "x", baseUrl: `http://127.0.0.1:${h.local.port}`, confirmedHost: `127.0.0.1:${h.local.port}`, models: [{ id: "claude-sonnet-5", label: "shadow" }] },
+      { id: "shadow", kind: "local", label: "x", baseUrl: `http://127.0.0.1:${h.local.port}`, confirmedHost: `127.0.0.1:${h.local.port}`, models: [{ id: "shadow-model", label: "shadow" }] },
     ]);
-    assert.equal((await h.post("v1/messages", simpleBody("claude-sonnet-5"))).status, 200);
-    assert.equal(h.anthropic.requests.length, 1);
+    assert.equal((await h.post("v1/messages", simpleBody("claude-sonnet-5"))).status, 400);
+    assert.equal(h.calls.length, 0);
     assert.equal(h.local.requests.length, 0);
   });
 
-  it("ignores sources of kind anthropic", async (t) => {
+  it("rejects a request that carries an Anthropic credential, before the model is looked at, and warns without the value", async (t) => {
+    const warnings: unknown[][] = [];
+    t.mock.method(console, "warn", (...args: unknown[]) => {
+      warnings.push(args);
+    });
     const h = await startHarness(t);
-    h.router.updateSources([
-      { id: "claude", kind: "anthropic", label: "Claude", baseUrl: "https://evil.example", models: [{ id: "claude-evil", label: "x" }] },
-    ]);
-    assert.equal((await h.post("v1/messages", simpleBody("claude-evil"))).status, 404);
-    assert.equal(h.anthropic.requests.length, 0);
+    const credentials: Record<string, string>[] = [
+      { authorization: `Bearer ${OAUTH}` },
+      { authorization: `bearer ${OAUTH}` },
+      { authorization: OAUTH },
+      { "x-api-key": "sk-ant-api03-SECRET-0007" },
+      { "x-api-key": `Bearer ${OAUTH}` },
+      { authorization: `Bearer ${DUMMY_TOKEN}`, "x-api-key": OAUTH },
+    ];
+    for (const model of ["deepseek-v4", "local-27b", "claude-sonnet-5", "unknown-model"]) {
+      for (const headers of credentials) {
+        const response = await h.post("v1/messages", simpleBody(model), headers);
+        assert.equal(response.status, 400, `${model} ${JSON.stringify(Object.keys(headers))}`);
+        const payload = (await response.json()) as { error: { type: string; message: string } };
+        assert.equal(payload.error.type, "invalid_request_error");
+        assert.ok(!payload.error.message.includes("sk-ant"));
+      }
+    }
+    const models = await fetch(`${h.router.url}v1/models`, { headers: { authorization: `Bearer ${OAUTH}` } });
+    assert.equal(models.status, 400);
+    assert.equal(h.calls.length, 0);
+    assert.equal(h.online.requests.length + h.local.requests.length, 0);
+    assert.equal(warnings.length, 4 * credentials.length + 1);
+    assert.ok(warnings.every((args) => args.length === 1 && args[0] === "model-router: anthropic_credential_rejected"));
+    const serialized = JSON.stringify([h.logs, warnings]);
+    for (const secret of [OAUTH, "SECRET-0007"]) assert.ok(!serialized.includes(secret), "a credential was logged");
+    assert.ok(h.requestLogs().every((entry) => entry.fields.outcome === "anthropic_credential_rejected"));
   });
-});
 
-describe("anthropic route", () => {
-  it("forwards the original body bytes unchanged, including fields the compat layer would strip", async (t) => {
+  it("does not take a Claude-looking value that is not a credential for one", async (t) => {
     const h = await startHarness(t);
-    const raw =
-      '{ "model" : "claude-sonnet-5",\n  "max_tokens":10, "unknown_field": 1.0e0, "context_management":{"x":1},' +
-      ' "output_config":{}, "tools":[{"name":"A","defer_loading":true}],' +
-      ' "messages":[{"role":"system","content":"keep me"},{"role":"user","content":"h\\u00e9llo \u4f60"}]}';
-    const response = await h.post("v1/messages", raw);
+    const response = await h.post("v1/messages", simpleBody("deepseek-v4"), {
+      authorization: `Bearer ${DUMMY_TOKEN}`,
+      "x-api-key": "sk-other-not-anthropic",
+      "x-claude-code-session-id": "sk-ant-in-a-harmless-header",
+    });
     assert.equal(response.status, 200);
-    const received = h.anthropic.requests[0];
-    assert.ok(received);
-    assert.equal(Buffer.compare(received.body, Buffer.from(raw, "utf8")), 0);
   });
 
-  it("keeps the query string and serves count_tokens", async (t) => {
-    const h = await startHarness(t);
-    await h.post("v1/messages?beta=true&x=1", simpleBody("claude-sonnet-5"));
-    await h.post("v1/messages/count_tokens?beta=true", simpleBody("claude-haiku-5"));
-    assert.deepEqual(h.anthropic.requests.map((r) => [r.method, r.url]), [
-      ["POST", "/v1/messages?beta=true&x=1"],
-      ["POST", "/v1/messages/count_tokens?beta=true"],
-    ]);
-  });
-
-  it("forwards only allowlisted headers and leaves credentials exactly as received", async (t) => {
-    const h = await startHarness(t);
-    const sent = {
-      authorization: `Bearer ${OAUTH}`,
-      "x-api-key": CLIENT_KEY,
-      "anthropic-version": "2023-06-01",
-      "anthropic-beta": "oauth-2025-04-20,interleaved-thinking-2025-05-14",
-      accept: "application/json",
-      "user-agent": "claude-cli/2.1.291",
-      "x-app": "cli",
-      "x-stainless-lang": "js",
-      "x-stainless-os": "MacOS",
-      "anthropic-dangerous-direct-browser-access": "true",
-      "x-claude-code-session-id": "abc-123",
-    };
-    const denied = {
-      cookie: "session=1",
-      "x-forwarded-for": "10.1.2.3",
-      "x-custom-secret": "nope",
-      referer: "https://example.com",
-      "proxy-authorization": "Basic Zm9v",
-      origin: "https://example.com",
-    };
-    await h.post("v1/messages", simpleBody("claude-sonnet-5"), { ...sent, ...denied });
-    const received = h.anthropic.requests[0]?.headers;
-    assert.ok(received);
-    for (const [name, value] of Object.entries(sent)) assert.equal(received[name], value, name);
-    for (const name of Object.keys(denied)) assert.equal(received[name], undefined, name);
-    assert.equal(received["content-type"], "application/json");
-  });
-
-  it("never adds credentials when the client sent none", async (t) => {
-    const h = await startHarness(t);
-    await h.post("v1/messages", simpleBody("claude-sonnet-5"));
-    const received = h.anthropic.requests[0]?.headers;
-    assert.ok(received);
-    assert.equal(received.authorization, undefined);
-    assert.equal(received["x-api-key"], undefined);
-  });
-
-  it("startModelRouter always uses the fixed Anthropic base URL", async (t) => {
-    assert.equal(ANTHROPIC_BASE_URL, "https://api.anthropic.com");
+  it("startModelRouter has no Anthropic upstream: a smuggled base URL is inert and nothing is fetched", async (t) => {
     const seen: FetchCall[] = [];
     const fetchImpl: UpstreamFetch = async (input, init, context) => {
       seen.push({ url: String(input), init, context });
       return new Response(JSON.stringify(OK_MESSAGE), { status: 200, headers: { "content-type": "application/json" } });
     };
-    // Options are copied structurally by TypeScript only; a smuggled override must be inert.
-    const smuggled = { ...silentOptions({ fetchImpl }), anthropicBaseUrl: "http://127.0.0.1:1", baseUrl: "http://127.0.0.1:1" };
+    const smuggled = { ...silentOptions({ fetchImpl }), anthropicBaseUrl: "http://127.0.0.1:1", isAnthropicModel: () => true };
     const router = await startModelRouter(smuggled as ModelRouterOptions);
     t.after(() => router.close());
     const response = await fetch(`${router.url}v1/messages?beta=true`, {
       method: "POST",
-      headers: { "content-type": "application/json", authorization: `Bearer ${OAUTH}` },
+      headers: { "content-type": "application/json" },
       body: JSON.stringify(simpleBody("claude-sonnet-5")),
     });
-    assert.equal(response.status, 200);
-    assert.equal(seen.length, 1);
-    assert.equal(seen[0]?.url, "https://api.anthropic.com/v1/messages?beta=true");
-    assert.equal((seen[0]?.init?.headers as Record<string, string>).authorization, `Bearer ${OAUTH}`);
+    assert.equal(response.status, 400);
+    assert.equal(seen.length, 0);
   });
 });
 
@@ -622,7 +614,7 @@ describe("online and local credential rules", () => {
   it("drops client credentials and beta flags and sends the source key", async (t) => {
     const h = await startHarness(t);
     const headers = {
-      authorization: `Bearer ${OAUTH}`,
+      authorization: `Bearer ${DUMMY_TOKEN}`,
       "x-api-key": CLIENT_KEY,
       "anthropic-beta": "oauth-2025-04-20",
       "anthropic-version": "2023-06-01",
@@ -644,7 +636,7 @@ describe("online and local credential rules", () => {
       assert.equal(received.cookie, undefined);
       assert.equal(received["anthropic-version"], "2023-06-01");
       assert.equal(received["x-claude-code-session-id"], "sess");
-      assert.ok(!JSON.stringify(received).includes(OAUTH));
+      assert.ok(!JSON.stringify(received).includes(DUMMY_TOKEN));
       assert.ok(!JSON.stringify(received).includes(CLIENT_KEY));
     }
   });
@@ -654,7 +646,7 @@ describe("online and local credential rules", () => {
     h.router.updateSources([
       { id: "open", kind: "local", label: "Open", baseUrl: `http://127.0.0.1:${h.local.port}`, confirmedHost: `127.0.0.1:${h.local.port}`, models: [{ id: "open-model", label: "Open" }] },
     ]);
-    const response = await h.post("v1/messages", simpleBody("open-model"), { authorization: `Bearer ${OAUTH}`, "x-api-key": CLIENT_KEY });
+    const response = await h.post("v1/messages", simpleBody("open-model"), { authorization: `Bearer ${DUMMY_TOKEN}`, "x-api-key": CLIENT_KEY });
     assert.equal(response.status, 200);
     const received = h.local.requests[0]?.headers;
     assert.ok(received);
@@ -849,12 +841,11 @@ describe("online and local credential rules", () => {
 describe("upstream transport context", () => {
   it("tells the transport the source kind of every upstream request [PC-ROUTE-002]", async (t) => {
     const h = await startHarness(t);
-    assert.equal((await h.post("v1/messages", simpleBody("claude-sonnet-5"))).status, 200);
     assert.equal((await h.post("v1/messages", simpleBody("deepseek-v4"))).status, 200);
     assert.equal((await h.post("v1/messages/count_tokens", simpleBody("local-27b"))).status, 200);
     assert.deepEqual(
       h.calls.map((call) => call.context),
-      [{ sourceKind: "anthropic" }, { sourceKind: "online" }, { sourceKind: "local" }],
+      [{ sourceKind: "online" }, { sourceKind: "local" }],
     );
   });
 
@@ -891,18 +882,18 @@ describe("redirects and upstream failures", () => {
       res.writeHead(302, { location: `http://127.0.0.1:${trap.port}/stolen` });
       res.end();
     };
-    const h = await startHarness(t, { anthropic: redirect, online: redirect, local: redirect });
-    for (const model of ["claude-sonnet-5", "deepseek-v4", "local-27b"]) {
-      const response = await h.post("v1/messages", simpleBody(model), { authorization: `Bearer ${OAUTH}` });
+    const h = await startHarness(t, { online: redirect, local: redirect });
+    for (const model of ["deepseek-v4", "local-27b"]) {
+      const response = await h.post("v1/messages", simpleBody(model), { authorization: `Bearer ${DUMMY_TOKEN}` });
       assert.equal(response.status, 502, model);
       const payload = (await response.json()) as { error: { type: string } };
       assert.equal(payload.error.type, "api_error");
     }
     assert.equal(trap.requests.length, 0);
-    assert.ok(h.calls.length >= 2);
+    assert.equal(h.calls.length, 2);
     assert.ok(h.calls.every((call) => call.init?.redirect === "manual"));
-    const anthropicCalls = h.requestLogs().filter((entry) => entry.fields.outcome === "upstream_redirect");
-    assert.equal(anthropicCalls.length, 3);
+    const refused = h.requestLogs().filter((entry) => entry.fields.outcome === "upstream_redirect");
+    assert.equal(refused.length, 2);
   });
 
   it("answers 502 JSON when the upstream is unreachable", async (t) => {
@@ -948,18 +939,18 @@ describe("redirects and upstream failures", () => {
 
   it("rejects oversized request bodies with 413 and unsupported content encodings with 415", async (t) => {
     const h = await startHarness(t, { maxRequestBytes: 2048 });
-    const big = await h.post("v1/messages", simpleBody("claude-sonnet-5", { pad: "x".repeat(4096) }));
+    const big = await h.post("v1/messages", simpleBody("deepseek-v4", { pad: "x".repeat(4096) }));
     assert.equal(big.status, 413);
-    const encoded = await h.post("v1/messages", simpleBody("claude-sonnet-5"), { "content-encoding": "gzip" });
+    const encoded = await h.post("v1/messages", simpleBody("deepseek-v4"), { "content-encoding": "gzip" });
     assert.equal(encoded.status, 415);
-    assert.equal(h.anthropic.requests.length, 0);
-    const small = await h.post("v1/messages", simpleBody("claude-sonnet-5"));
+    assert.equal(h.online.requests.length, 0);
+    const small = await h.post("v1/messages", simpleBody("deepseek-v4"));
     assert.equal(small.status, 200);
   });
 });
 
 describe("compat layer through the router", () => {
-  it("normalizes a Claude Code request for online and local sources only", async (t) => {
+  it("normalizes a Claude Code request for online and local sources", async (t) => {
     const h = await startHarness(t);
     const body = (model: string): JsonObject => ({
       model,
@@ -988,7 +979,6 @@ describe("compat layer through the router", () => {
     });
     assert.equal((await h.post("v1/messages", body("deepseek-v4"))).status, 200);
     assert.equal((await h.post("v1/messages", body("local-27b"))).status, 200);
-    assert.equal((await h.post("v1/messages", body("claude-sonnet-5"))).status, 200);
 
     for (const upstream of [h.online.requests[0], h.local.requests[0]]) {
       assert.ok(upstream);
@@ -1005,8 +995,6 @@ describe("compat layer through the router", () => {
         { type: "text", text: "context" },
       ]);
     }
-    const anthropicSent = jsonOf(h.anthropic.requests[0] as Recorded);
-    assert.deepEqual(anthropicSent, body("claude-sonnet-5"));
 
     const online = h.requestLogs().find((entry) => entry.fields.source === "deepseek");
     assert.equal(online?.fields.compatSystemMessages, 1);
@@ -1035,14 +1023,12 @@ describe("thinking provenance through the router", () => {
     await produced.text();
     assert.equal(h.store.get(signatureHash("sig-from-deepseek-stream")), "deepseek");
 
-    await h.post("v1/messages", historyWithThinking("claude-sonnet-5", "sig-from-deepseek-stream"));
-    assert.deepEqual(assistantBlocks(h.anthropic.requests[0] as Recorded), [{ type: "text", text: "a" }]);
     await h.post("v1/messages", historyWithThinking("local-27b", "sig-from-deepseek-stream"));
     assert.deepEqual(assistantBlocks(h.local.requests[0] as Recorded), [{ type: "text", text: "a" }]);
     await h.post("v1/messages", historyWithThinking("deepseek-v4", "sig-from-deepseek-stream"));
     assert.equal(assistantBlocks(h.online.requests[1] as Recorded).length, 2);
     const dropped = h.requestLogs().filter((entry) => entry.fields.thinkingDropped === 1);
-    assert.equal(dropped.length, 2);
+    assert.equal(dropped.length, 1);
     assert.equal(h.requestLogs().at(-1)?.fields.thinkingKept, 1);
   });
 
@@ -1052,34 +1038,34 @@ describe("thinking provenance through the router", () => {
       content: [{ type: "thinking", thinking: "t", signature }, { type: "text", text: "ok" }, { type: "redacted_thinking", data: "redacted-blob" }],
     });
     const h = await startHarness(t, {
-      anthropic: (_request, res) => replyJson(res, message("short-anthropic-sig")),
+      local: (_request, res) => replyJson(res, message("short-local-sig")),
       online: (_request, res) => replyJson(res, message("sig-online-json")),
     });
-    await (await h.post("v1/messages", simpleBody("claude-sonnet-5"))).text();
+    await (await h.post("v1/messages", simpleBody("local-27b"))).text();
     await (await h.post("v1/messages", simpleBody("deepseek-v4"))).text();
-    assert.equal(h.store.get(signatureHash("short-anthropic-sig")), "anthropic");
+    assert.equal(h.store.get(signatureHash("short-local-sig")), "local-1");
     assert.equal(h.store.get(signatureHash("sig-online-json")), "deepseek");
     assert.equal(h.store.get(signatureHash("redacted-blob")), "deepseek");
 
-    await h.post("v1/messages", historyWithThinking("claude-sonnet-5", "short-anthropic-sig"));
-    assert.equal(assistantBlocks(h.anthropic.requests[1] as Recorded).length, 2);
-    await h.post("v1/messages", historyWithThinking("deepseek-v4", "short-anthropic-sig"));
+    await h.post("v1/messages", historyWithThinking("local-27b", "short-local-sig"));
+    assert.equal(assistantBlocks(h.local.requests[1] as Recorded).length, 2);
+    await h.post("v1/messages", historyWithThinking("deepseek-v4", "short-local-sig"));
     assert.equal(assistantBlocks(h.online.requests[1] as Recorded).length, 1);
   });
 
-  it("drops unknown provenance for online and local; anthropic keeps only long base64 signatures", async (t) => {
+  it("drops unknown provenance, long base64 signatures included, and anything an older build attributed to Anthropic", async (t) => {
     const h = await startHarness(t);
     await h.post("v1/messages", historyWithThinking("deepseek-v4", LONG_BASE64));
     await h.post("v1/messages", historyWithThinking("local-27b", LONG_BASE64));
     assert.equal(assistantBlocks(h.online.requests[0] as Recorded).length, 1);
     assert.equal(assistantBlocks(h.local.requests[0] as Recorded).length, 1);
 
-    const keptBody = JSON.stringify(historyWithThinking("claude-sonnet-5", LONG_BASE64));
-    await h.post("v1/messages", keptBody);
-    assert.equal(Buffer.compare((h.anthropic.requests[0] as Recorded).body, Buffer.from(keptBody)), 0, "nothing dropped: original bytes");
-
-    await h.post("v1/messages", historyWithThinking("claude-sonnet-5", "too-short-unknown"));
-    assert.equal(assistantBlocks(h.anthropic.requests[1] as Recorded).length, 1);
+    // Guild 3.0.0 recorded Anthropic as a producer; such a row proves nothing for any source now.
+    h.store.put(signatureHash(LONG_BASE64), "anthropic");
+    await h.post("v1/messages", historyWithThinking("deepseek-v4", LONG_BASE64));
+    await h.post("v1/messages", historyWithThinking("local-27b", LONG_BASE64));
+    assert.equal(assistantBlocks(h.online.requests[1] as Recorded).length, 1);
+    assert.equal(assistantBlocks(h.local.requests[1] as Recorded).length, 1);
   });
 
   it("never records an empty signature and drops unsigned thinking for every target [PC-ROUTE-003]", async (t) => {
@@ -1094,8 +1080,6 @@ describe("thinking provenance through the router", () => {
     assert.equal(assistantBlocks(h.local.requests[1] as Recorded).length, 1);
     await h.post("v1/messages", historyWithThinking("deepseek-v4", ""));
     assert.equal(assistantBlocks(h.online.requests[0] as Recorded).length, 1);
-    await h.post("v1/messages", historyWithThinking("claude-sonnet-5", ""));
-    assert.equal(assistantBlocks(h.anthropic.requests[0] as Recorded).length, 1);
     const last = h.requestLogs().at(-1);
     assert.equal(last?.fields.thinkingDropped, 1);
     assert.equal(last?.fields.thinkingKept, 0);
@@ -1113,8 +1097,11 @@ describe("thinking provenance through the router", () => {
     const logs: LogEntry[] = [];
     const fake = await startFake((_request, res) => replyJson(res, { ...OK_MESSAGE, content: [{ type: "thinking", thinking: "t", signature: "s" }] }));
     const router = await startModelRouterForTesting(
-      silentOptions({ provenance: throwing, logger: { info: (event, fields) => logs.push({ event, fields: { ...fields } }) } }),
-      { anthropicBaseUrl: `http://127.0.0.1:${fake.port}` },
+      silentOptions({
+        sources: [fakeLocalSource(fake.port)],
+        provenance: throwing,
+        logger: { info: (event, fields) => logs.push({ event, fields: { ...fields } }) },
+      }),
     );
     t.after(async () => {
       await router.close();
@@ -1123,7 +1110,7 @@ describe("thinking provenance through the router", () => {
     const response = await fetch(`${router.url}v1/messages`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify(historyWithThinking("claude-sonnet-5", "whatever")),
+      body: JSON.stringify(historyWithThinking("fake-model", "whatever")),
     });
     assert.equal(response.status, 200);
     await response.text();
@@ -1132,7 +1119,7 @@ describe("thinking provenance through the router", () => {
 });
 
 describe("streaming", () => {
-  for (const [model, label] of [["claude-sonnet-5", "anthropic"], ["deepseek-v4", "online"], ["local-27b", "local"]] as const) {
+  for (const [model, label] of [["deepseek-v4", "online"], ["local-27b", "local"]] as const) {
     it(`relays ${label} SSE chunk by chunk without buffering`, { timeout: 15000 }, async (t) => {
       const gate = deferred();
       const handler: FakeHandler = async (_request, res) => {
@@ -1142,7 +1129,7 @@ describe("streaming", () => {
         res.write(sseEvent(MESSAGE_STOP));
         res.end();
       };
-      const h = await startHarness(t, { anthropic: handler, online: handler, local: handler });
+      const h = await startHarness(t, { online: handler, local: handler });
       const response = await h.post("v1/messages", { ...simpleBody(model), stream: true });
       assert.equal(response.status, 200);
       assert.match(response.headers.get("content-type") ?? "", /text\/event-stream/u);
@@ -1163,18 +1150,16 @@ describe("streaming", () => {
 
   it("re-sequences recorded llama.cpp streams for local sources only", async (t) => {
     const stream = sseResponder(LLAMA_CPP_EVENTS, 3);
-    const h = await startHarness(t, { local: stream, online: stream, anthropic: stream });
+    const h = await startHarness(t, { local: stream, online: stream });
     const local = await (await h.post("v1/messages", { ...simpleBody("local-27b"), stream: true })).text();
     assert.equal(local, NORMALIZED_EVENTS.map(sseEvent).join(""));
     assert.equal((local.match(/Hello there\./gu) ?? []).length, 1);
 
     const online = await (await h.post("v1/messages", { ...simpleBody("deepseek-v4"), stream: true })).text();
     assert.equal(online, LLAMA_CPP_EVENTS.map(sseEvent).join(""));
-    const anthropic = await (await h.post("v1/messages", { ...simpleBody("claude-sonnet-5"), stream: true })).text();
-    assert.equal(anthropic, LLAMA_CPP_EVENTS.map(sseEvent).join(""));
   });
 
-  for (const [model, target] of [["claude-sonnet-5", "anthropic"], ["deepseek-v4", "online"], ["local-27b", "local"]] as const) {
+  for (const [model, target] of [["deepseek-v4", "online"], ["local-27b", "local"]] as const) {
     it(`aborts the ${target} upstream request when the client disconnects mid-stream`, { timeout: 15000 }, async (t) => {
       const closed = deferred();
       const handler: FakeHandler = (_request, res) => {
@@ -1199,16 +1184,16 @@ describe("streaming", () => {
   it("aborts the upstream request when the client disconnects before response headers", { timeout: 15000 }, async (t) => {
     const closed = deferred();
     const h = await startHarness(t, {
-      anthropic: (_request, res) => {
+      online: (_request, res) => {
         res.on("close", () => closed.resolve());
       },
     });
     const request = httpRequest(`${h.router.url}v1/messages`, { method: "POST", headers: { "content-type": "application/json" } });
     request.on("error", () => undefined);
-    request.end(JSON.stringify(simpleBody("claude-sonnet-5")));
+    request.end(JSON.stringify(simpleBody("deepseek-v4")));
     await within(
       (async () => {
-        while (h.anthropic.requests.length === 0) await sleep(5);
+        while (h.online.requests.length === 0) await sleep(5);
       })(),
       5000,
       "the upstream to receive the request",
@@ -1264,13 +1249,13 @@ describe("router lifecycle", () => {
   it("close() stops listening, aborts in-flight upstream requests and is idempotent", { timeout: 15000 }, async (t) => {
     const closed = deferred();
     const h = await startHarness(t, {
-      anthropic: (_request, res) => {
+      online: (_request, res) => {
         res.on("close", () => closed.resolve());
         res.writeHead(200, { "content-type": "text/event-stream" });
         res.write(sseEvent(MESSAGE_START));
       },
     });
-    const response = await h.post("v1/messages", { ...simpleBody("claude-sonnet-5"), stream: true });
+    const response = await h.post("v1/messages", { ...simpleBody("deepseek-v4"), stream: true });
     await (response.body as ReadableStream<Uint8Array>).getReader().read();
     await Promise.all([h.router.close(), h.router.close()]);
     await within(closed.promise, 5000, "the upstream to observe the shutdown");
@@ -1281,6 +1266,7 @@ describe("router lifecycle", () => {
 
 describe("router logging", () => {
   it("logs model, source, status and booleans only and never a secret", async (t) => {
+    t.mock.method(console, "warn", () => undefined);
     const dead = await startFake(okHandler);
     const deadPort = dead.port;
     await dead.close();
@@ -1292,18 +1278,19 @@ describe("router logging", () => {
         { id: "dead", kind: "local", label: "x", baseUrl: `http://127.0.0.1:${deadPort}`, key: DEAD_KEY, confirmedHost: `127.0.0.1:${deadPort}`, models: [{ id: "dead-model", label: "x" }] },
       ],
     });
-    const secretHeaders = { authorization: `Bearer ${OAUTH}`, "x-api-key": CLIENT_KEY };
+    const secretHeaders = { authorization: `Bearer ${DUMMY_TOKEN}`, "x-api-key": CLIENT_KEY };
     await h.post("v1/messages", simpleBody("claude-sonnet-5"), secretHeaders);
     await h.post("v1/messages", simpleBody("deepseek-v4"), secretHeaders);
     await h.post("v1/messages", simpleBody("local-27b"), secretHeaders);
     await h.post("v1/messages", simpleBody("stranger-model"), secretHeaders);
     await h.post("v1/messages", simpleBody("dead-model"), secretHeaders);
     await h.post("v1/messages", simpleBody("unknown-model"), secretHeaders);
+    await h.post("v1/messages", simpleBody("deepseek-v4"), { authorization: `Bearer ${OAUTH}` });
     await fetch(`http://127.0.0.1:${h.router.port}/${"f".repeat(32)}/v1/messages`, { method: "POST", headers: secretHeaders, body: "{}" });
     await fetch(`${h.router.url}v1/models`, { headers: secretHeaders });
 
     const serialized = JSON.stringify(h.logs);
-    for (const secret of [ONLINE_KEY, LOCAL_KEY, OAUTH, CLIENT_KEY, UNCONFIRMED_KEY, DEAD_KEY, h.token, "Bearer", "sk-ant-oat"]) {
+    for (const secret of [ONLINE_KEY, LOCAL_KEY, OAUTH, CLIENT_KEY, DUMMY_TOKEN, UNCONFIRMED_KEY, DEAD_KEY, h.token, "Bearer", "sk-ant-oat"]) {
       assert.ok(!serialized.includes(secret), `a logged field leaked ${secret.slice(0, 12)}...`);
     }
     for (const entry of h.logs) {
@@ -1316,11 +1303,13 @@ describe("router logging", () => {
       {
         source: byModel("claude-sonnet-5")?.source,
         status: byModel("claude-sonnet-5")?.status,
+        outcome: byModel("claude-sonnet-5")?.outcome,
         authIn: byModel("claude-sonnet-5")?.authIn,
         authReplaced: byModel("claude-sonnet-5")?.authReplaced,
       },
-      { source: "anthropic", status: 200, authIn: true, authReplaced: false },
+      { source: "none", status: 400, outcome: "claude_model_refused", authIn: true, authReplaced: false },
     );
+    assert.ok(h.requestLogs().some((entry) => entry.fields.outcome === "anthropic_credential_rejected" && entry.fields.status === 400));
     assert.deepEqual(
       {
         source: byModel("deepseek-v4")?.source,
@@ -1344,19 +1333,19 @@ describe("router logging", () => {
     const fake = await startFake(okHandler);
     const router = await startModelRouterForTesting(
       silentOptions({
+        sources: [fakeLocalSource(fake.port)],
         logger: {
           info: () => {
             throw new Error("logger down");
           },
         },
       }),
-      { anthropicBaseUrl: `http://127.0.0.1:${fake.port}` },
     );
     t.after(async () => {
       await router.close();
       await fake.close();
     });
-    const response = await fetch(`${router.url}v1/messages`, { method: "POST", body: JSON.stringify(simpleBody("claude-sonnet-5")) });
+    const response = await fetch(`${router.url}v1/messages`, { method: "POST", body: JSON.stringify(simpleBody("fake-model")) });
     assert.equal(response.status, 200);
   });
 });

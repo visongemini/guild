@@ -18,6 +18,12 @@ import {
   modelSupportsReasoningEffort,
 } from "@guild/contracts/grok-models";
 import type { ClaudeStatusState } from "./claude-engine.js";
+import {
+  CLAUDE_DEFAULT_ROW_ID,
+  claudeModelIdentity,
+  modelNameFromDescription,
+  splitOlderClaudeModels,
+} from "./claude-model-families.js";
 import type { GuildMessages } from "./locales.js";
 
 /*
@@ -157,6 +163,11 @@ export type ModelRowView = Readonly<{
    * Claude lists no model of its own (a first run), so a task can still start on Claude before the list exists.
    */
   runtimeDefault?: true;
+  /**
+   * Shown but not choosable: a Claude subscription model in a task that runs through the model router, which can
+   * never go back to one (D-061). The row stays in the keyboard order, like a hint, and does nothing when activated.
+   */
+  disabled?: true;
 }>;
 
 export type EffortChoiceView = Readonly<{
@@ -177,10 +188,27 @@ export type ModelGroupEmptyView = Readonly<{
   action?: "open_model_sources";
 }>;
 
+/**
+ * The Claude group keeps only the Default row and the newest model of each family in `models`; every other model is
+ * one collapsed row, "Older models (N)", that opens inline.
+ */
+export type OlderModelsView = Readonly<{
+  label: string;
+  /** What a screen reader hears after the label: whether the rows are showing. */
+  state: string;
+  count: number;
+  expanded: boolean;
+  /** The older rows; empty while collapsed, so the tab stop and the keyboard walk only what is on screen. */
+  models: readonly ModelRowView[];
+}>;
+
 export type ModelGroupView = Readonly<{
   group: ModelGroup;
   label: string;
   models: readonly ModelRowView[];
+  older?: OlderModelsView;
+  /** One line under the heading that says why the group's rows are disabled. */
+  note?: string;
   /** Present exactly when the group lists no model of the catalog (the Claude group may still hold its default row). */
   empty?: ModelGroupEmptyView;
 }>;
@@ -232,7 +260,7 @@ export type ModelPickerView = Readonly<{
   groups: readonly ModelGroupView[];
   /** Group headings are shown only when more than one group is visible. */
   showGroupHeadings: boolean;
-  /** Every row of every visible group, in order (the keyboard and the tab stop walk this list). */
+  /** Every row on screen, in order (the keyboard and the tab stop walk this list); older rows count while expanded. */
   models: readonly ModelRowView[];
   efforts: readonly EffortChoiceView[];
   /** False for an Online or Local model whose catalog entry lists no effort: the control is hidden. */
@@ -243,6 +271,8 @@ export type ModelPickerView = Readonly<{
   showUseDefault: boolean;
   /** Said while the task can still choose its engine: the first message fixes it. */
   engineNote: string | undefined;
+  /** The task runs through the model router: its Claude rows are disabled (D-061). */
+  routed: boolean;
 }>;
 
 export function effortDisplayLabel(
@@ -302,8 +332,16 @@ export function modelPickerView(input: {
    * unavailable exactly while the Claude catalog is empty.
    */
   readonly claudeState?: ClaudeStatusState;
+  /** The task runs through the model router for good (`engineStatus.routed`): no Claude subscription model can be chosen. */
+  readonly routed?: boolean;
+  /**
+   * Whether the Claude group's "Older models" row is open. Absent: open exactly when the selected model is one of
+   * the older ones, so the selection is never hidden.
+   */
+  readonly olderExpanded?: boolean;
 }): ModelPickerView {
   const { messages, selection } = input;
+  const routed = input.routed === true && (input.taskEngine ?? "grok") === "claude";
   const catalogs: ModelPickerCatalogs = input.catalogs ?? Object.freeze({
     grok: input.catalog ?? EMPTY_GROK_MODEL_CATALOG,
     claude: EMPTY_CLAUDE_MODEL_CATALOG,
@@ -318,8 +356,14 @@ export function modelPickerView(input: {
   const modelId = selection?.modelId ?? null;
   // A Claude task that follows Claude's own default (nothing reported yet, nothing pinned) says so with the
   // label of the default row, never with another engine's model.
-  const modelName = model?.name ?? modelId ??
-    (taskEngine === "claude" ? messages.modelPickerClaudeDefault : messages.modelDefaultName);
+  // The Default row of Claude's list stands for a model: name that one, and say "default model" when the adapter does not.
+  const defaultRowModel = taskEngine === "claude" && model !== undefined && model.id === CLAUDE_DEFAULT_ROW_ID &&
+    modelGroupOf(model) === "claude";
+  const modelName = (defaultRowModel ? modelNameFromDescription(model.description) ?? messages.modelDefaultName : model?.name) ??
+    modelId ??
+    (routed
+      ? messages.modelPickerChooseModel
+      : taskEngine === "claude" ? messages.modelPickerClaudeDefault : messages.modelDefaultName);
   // An effort the task has not pinned is the model's own default, which is what the engine will use.
   const effortId = selection === undefined
     ? null
@@ -351,16 +395,28 @@ export function modelPickerView(input: {
     const engine = engineOfGroup(group);
     // The price tag always follows the runtime's own statement, whatever language the description is shown in.
     const priceMultiplier = officialPriceMultiplier(candidate.description);
-    const description = messages.modelDescription(candidate.id, candidate.description);
+    // The Claude group has its own wording: the Default row names the model it stands for, and a row is described
+    // by its family. Online, Local and Grok rows keep the table of known ids and the runtime's text.
+    const isDefaultRow = group === "claude" && candidate.id === CLAUDE_DEFAULT_ROW_ID;
+    const standsFor = isDefaultRow ? modelNameFromDescription(candidate.description) : undefined;
+    const description = group !== "claude"
+      ? messages.modelDescription(candidate.id, candidate.description)
+      : standsFor !== undefined
+        ? undefined
+        : isDefaultRow
+          ? candidate.description
+          : messages.claudeModelDescription(claudeModelIdentity(candidate).family, candidate.description);
     return {
       id: candidate.id,
-      name: candidate.name,
+      name: isDefaultRow ? messages.modelPickerClaudeDefaultRow(standsFor) : candidate.name,
       ...(description === undefined ? {} : { description }),
       ...(priceMultiplier === undefined ? {} : { priceMultiplier }),
       ...(contextSizes === undefined ? {} : { contextLabel: messages.modelPickerContext(contextSizes) }),
-      selected: engine === taskEngine && candidate.id === modelId,
+      // A Claude subscription row of a routed task is never the selection, whatever the projection still holds.
+      selected: engine === taskEngine && candidate.id === modelId && !(routed && group === "claude"),
       group,
       engine,
+      ...(routed && group === "claude" ? { disabled: true as const } : {}),
     };
   };
   const rowsOfGroup = (group: ModelGroup): Omit<ModelRowView, "tabStop">[] =>
@@ -378,33 +434,59 @@ export function modelPickerView(input: {
     id: "",
     name: messages.modelPickerClaudeDefault,
     // Selected while the task follows a default instead of a pinned model.
-    selected: taskEngine === "claude" && selection !== undefined && selection.source !== "task",
+    selected: taskEngine === "claude" && selection !== undefined && selection.source !== "task" && !routed,
     group: "claude",
     engine: "claude",
     runtimeDefault: true,
+    ...(routed ? { disabled: true as const } : {}),
   });
   const rawGroups = visible.map((group) => {
     const catalogRows = rowsOfGroup(group);
+    const allGroupRows = group === "claude" && claudeDefaultOffered ? [claudeDefaultRow(), ...catalogRows] : catalogRows;
+    // Claude's list: the Default row and the newest of each family up front, the rest behind "Older models (N)".
+    const { shown, older } = group === "claude"
+      ? splitOlderClaudeModels(allGroupRows, (row) => row.id === CLAUDE_DEFAULT_ROW_ID || row.runtimeDefault === true)
+      : { shown: allGroupRows, older: [] };
+    const expanded = older.length > 0 && (input.olderExpanded ?? older.some((row) => row.selected));
     return {
       group,
       catalogRows: catalogRows.length,
-      rows: group === "claude" && claudeDefaultOffered ? [claudeDefaultRow(), ...catalogRows] : catalogRows,
+      rows: shown,
+      older,
+      expanded,
+      // What is on screen, in order: the keyboard and the tab stop walk this list.
+      onScreen: expanded ? [...shown, ...older] : shown,
     };
   });
-  const allRows = rawGroups.flatMap((entry) => entry.rows);
-  // One roving tab stop: the selected row, else the first one.
-  const tabStopIndex = Math.max(0, allRows.findIndex((row) => row.selected));
+  const allRows = rawGroups.flatMap((entry) => entry.onScreen);
+  // One roving tab stop: the selected row, else the first one that can be chosen.
+  const selectedIndex = allRows.findIndex((row) => row.selected);
+  const tabStopIndex = selectedIndex >= 0 ? selectedIndex : Math.max(0, allRows.findIndex((row) => row.disabled !== true));
   let flatIndex = 0;
   const groups = rawGroups.map((entry): ModelGroupView => {
-    const models = entry.rows.map((row) => Object.freeze({ ...row, tabStop: flatIndex++ === tabStopIndex }));
+    const withStop = (row: Omit<ModelRowView, "tabStop">): ModelRowView => Object.freeze({ ...row, tabStop: flatIndex++ === tabStopIndex });
+    const models = entry.rows.map(withStop);
+    const olderModels = entry.expanded ? entry.older.map(withStop) : [];
     return Object.freeze({
       group: entry.group,
       label: messages.modelGroupName(entry.group),
       models: Object.freeze(models),
+      ...(entry.older.length === 0
+        ? {}
+        : {
+            older: Object.freeze({
+              label: messages.modelPickerOlderModels(entry.older.length),
+              state: messages.modelPickerOlderState(entry.expanded),
+              count: entry.older.length,
+              expanded: entry.expanded,
+              models: Object.freeze(olderModels),
+            }),
+          }),
+      ...(routed && entry.group === "claude" && models.length > 0 ? { note: messages.modelPickerClaudeLockedNote } : {}),
       ...(entry.catalogRows === 0 ? { empty: groupEmptyView(messages, entry.group, claudeAvailable, input.claudeState) } : {}),
     });
   });
-  const models = groups.flatMap((entry) => entry.models);
+  const models = groups.flatMap((entry) => [...entry.models, ...(entry.older?.models ?? [])]);
   const efforts = (model?.reasoningEfforts ?? []).map((candidate, index): EffortChoiceView => {
     const selected = candidate.id === effortId;
     return Object.freeze({
@@ -436,8 +518,10 @@ export function modelPickerView(input: {
     showEfforts,
     selectedModelId: modelId,
     selectedEffortId: effortId,
-    showUseDefault: selection?.source === "task",
+    // Clearing the choice would fall back to a Claude default, which a routed task cannot use.
+    showUseDefault: selection?.source === "task" && !routed,
     engineNote: !engineFixed && groups.length > 1 ? messages.modelPickerEngineNote : undefined,
+    routed,
   });
 }
 

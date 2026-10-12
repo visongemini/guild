@@ -96,8 +96,9 @@ acceptance_stories:
     summary: >-
       Run a task on the Claude engine with the user's own subscription login, write and read a file
       through a permission card, quit, reopen and resume, then switch the same task from Claude to an
-      Online model and back with tools, see the Online reminder once, run a Local model turn without
-      duplicated reply text, and show that OAuth credentials reach only api.anthropic.com.
+      Online model with tools through one dialog that carries the one-way notice and the Online reminder,
+      see the Claude rows disabled afterwards, run a Local model turn without duplicated reply text, and
+      show that no Claude credential reached the router and nothing went to api.anthropic.com.
   AS-012:
     source: docs/01-PRODUCT-CONTRACT.md#acceptance-stories
     summary: >-
@@ -334,25 +335,27 @@ acceptance_tests:
     status: planned
     proves: >-
       The router refuses a non-loopback bind at startup, answers a wrong token with 404, answers an
-      unknown model with a 404 JSON error without any default upstream, never follows a redirect and
-      lists only configured Online and Local models.
+      unknown model with a 404 JSON error and a claude-* model with a 400 JSON error without any default
+      upstream, never follows a redirect and lists only configured Online and Local models.
   AT-ROUTER-002:
     layer: packaged-integration
     phase: 3
     status: planned
     proves: >-
-      OAuth credentials are forwarded only to api.anthropic.com over https with the header allowlist,
-      Online and Local requests carry only their own source key, keys come from the user env file
-      into memory only, a source change needs a native confirmation naming variable and host, and no
-      secret appears in SQLite, IPC payloads, logs or the package.
+      The router never opens a connection to api.anthropic.com and rejects with 400 any request whose
+      Authorization or x-api-key looks like an Anthropic credential, a routed Claude process carries a
+      throwaway ANTHROPIC_AUTH_TOKEN and no API key, Online and Local requests carry only their own
+      source key under the header allowlist, keys come from the user env file into memory only, a source
+      change needs a native confirmation naming variable and host, and no secret appears in SQLite, IPC
+      payloads, logs or the package.
   AT-ROUTER-003:
     layer: packaged-acceptance
     phase: 3
     status: planned
     proves: >-
       Against fake upstreams including a recorded llama.cpp stream, the compat layer, thinking
-      provenance filter and local SSE normalizer hold; the same task moves Opus to an Online model
-      and back with tools, and a Local turn shows no duplicated text.
+      provenance filter and local SSE normalizer hold; the same task moves from Opus to an Online model
+      with tools and cannot go back to a Claude model, and a Local turn shows no duplicated text.
   AT-BROWSER-001:
     layer: packaged-acceptance
     phase: 3
@@ -1024,7 +1027,12 @@ requirements:
       The model picker groups models as Grok, Claude, Online and Local. A Grok task lists only models
       the official Grok process reports. A Claude task lists the models its adapter reports plus the
       enabled Online and Local models of sources the user configured and confirmed. Nothing from any
-      other origin is selectable. Inside a Claude task the model can change between turns.
+      other origin is selectable. Inside a Claude task the model can change between turns, but the
+      switch from Claude to an Online or Local model is one-way: a task that has run turns on the
+      Claude subscription confirms before its first such switch, and a task that goes through the
+      model router can no longer select a Claude subscription model (its Claude rows are disabled and
+      the main process refuses the selection). The Claude group lists the Default row and the newest
+      model of each family, with the other Claude models in one collapsed row.
     severity: P1
     phase: 3
     acceptance_stories: [AS-007, AS-011]
@@ -1038,8 +1046,9 @@ requirements:
       Guild's model router listens on 127.0.0.1 only, on a random port, under a random path token. A
       wrong token is answered with 404 and binding to a non-loopback address fails at startup. Only
       models in its exact registry are served; an unknown model is a 404 JSON error and never reaches
-      a default upstream. Redirects are never followed. The router is single-user and is never a
-      shared or externally reachable gateway.
+      a default upstream; a claude-* model is a 400 JSON error. Redirects are never followed. The router
+      serves Online and Local models only and has no Anthropic upstream. It is single-user and is never
+      a shared or externally reachable gateway.
     severity: P0
     phase: 3
     acceptance_stories: [AS-011]
@@ -1048,16 +1057,20 @@ requirements:
     sources: [docs/20-GUILD3-DUAL-ENGINE.md, docs/04-DECISION-LOG.md, docs/02-ARCHITECTURE.md]
 
   - id: PC-ROUTE-002
-    title: Credentials reach only their own host
+    title: Claude credentials never reach the router; third-party keys reach only their own host
     statement: >-
-      OAuth and Authorization values from Claude Code are forwarded only to api.anthropic.com over
-      https with a request-header allowlist. Online and Local sources receive their own key and never
-      Anthropic credentials. Third-party keys are read in main from a user-designated env file, kept in
-      memory only, and never written to SQLite, IPC payloads, the renderer or logs. Adding a source or
-      changing its base URL or key variable needs a native confirmation naming the variable and the
-      host, and a key is sent only to the host it was confirmed for. Online sources are https only and
-      Local sources must resolve to loopback or 100.64.0.0/10. Logs carry model, source id, status and
-      booleans, never credential or header values.
+      Claude subscription (OAuth) and Anthropic API credentials never traverse the router. A routed
+      Claude process carries a throwaway ANTHROPIC_AUTH_TOKEN generated per launch and no
+      ANTHROPIC_API_KEY, the router never connects to api.anthropic.com, and it rejects with 400 any
+      request whose Authorization or x-api-key value starts with sk-ant- (after an optional Bearer),
+      without forwarding it or logging its value. Online and Local sources receive their own key under a
+      request-header allowlist and never client credentials. Third-party keys are read in main from a
+      user-designated env file, kept in memory only, and never written to SQLite, IPC payloads, the
+      renderer or logs. Adding a source or changing its base URL or key variable needs a native
+      confirmation naming the variable and the host, and a key is sent only to the host it was
+      confirmed for. Online sources are https only and Local sources must resolve to loopback or
+      100.64.0.0/10. Logs carry model, source id, status and booleans, never credential or header
+      values.
     severity: P0
     phase: 3
     acceptance_stories: [AS-011]
@@ -1071,8 +1084,8 @@ requirements:
       For Online and Local sources the router normalizes the request shapes that plain
       Anthropic-compatible backends reject, drops thinking blocks the target source did not produce
       according to recorded signature provenance, and re-sequences local content-block events so a
-      reply is never duplicated. Anthropic receives the original body. The router speaks the Anthropic
-      Messages protocol only and performs no OpenAI-protocol translation.
+      reply is never duplicated. The router speaks the Anthropic Messages protocol only and performs no
+      OpenAI-protocol translation.
     severity: P1
     phase: 3
     acceptance_stories: [AS-011]

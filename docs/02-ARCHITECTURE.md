@@ -193,7 +193,8 @@ notarization when Guild is publicly distributed.
 - **Model router** (`packages/model-router`, in main; D-058). Loopback-only, random port and path
   token, exact model registry, credential rules, a compat layer for Online and Local sources,
   thinking-signature provenance and a local SSE normalizer. A Claude session is native until the
-  first Online or Local selection, then routed for good.
+  first Online or Local selection, then routed for good: its process carries a throwaway auth token, the
+  router has no Anthropic upstream, and the task can no longer use Claude subscription models (D-061).
 - **Browser pane and MCP server** (D-059). An isolated `WebContentsView` in its own partition and a
   loopback MCP server in main with a fixed tool set and no eval. The split Electron profile is in
   `docs/09-ELECTRON-SECURITY-PROFILE.md`.

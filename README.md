@@ -22,7 +22,8 @@ Guild 已开放源码，当前仓库包含可构建的桌面客户端源码：
 当前分支可能尚未全部可用）：
 
 - Claude Code 引擎：任务在第一轮时绑定引擎，之后不再更换；
-- 模型来源与本机路由器：Claude 任务内可在 Claude 订阅、Online 和 Local 模型之间切换；
+- 模型来源与本机路由器：Claude 任务内可在 Claude 订阅、Online 和 Local 模型之间切换，但从 Claude 订阅
+  切到 Online 或 Local 后不能再切回（要用 Claude 请新建任务）；
 - 隔离的浏览器面板，以及智能体可经本机 MCP 服务器操作它的固定工具集。
 
 源码公开不等于 macOS 安装包已通过 Apple 公证。面向普通用户分发的安装包仍需
@@ -87,12 +88,13 @@ Guild 1.1.13 只作为黑盒视觉与交互基准；它的渲染器、程序包�
 - Grok 任务的所有模型请求都由官方 `grok` 子进程通过 ACP stdio 发出，只使用官方 Grok 模型；
 - Claude 任务的请求由用户自行安装的 `claude` 发出；Online 和 Local 模型经 Guild 在 `127.0.0.1`
   上的本机路由器转发，该路由器仅回环、单用户、带随机令牌，不对外开放；
-- 不提取凭据来直接调用上游：Guild 不读取 Grok 或 Claude 的登录凭据，也不共享登录；Claude
-  订阅的凭据只会被转发到 `api.anthropic.com`；
+- 不提取凭据来直接调用上游：Guild 不读取 Grok 或 Claude 的登录凭据，也不共享登录；路由任务里的
+  Claude Code 只带 Guild 生成的一次性令牌，Claude 订阅的登录信息不会经过路由器，路由器也不会连接
+  Anthropic；
 - Online 模型会把对话发送给该模型的厂商：对话每换到一个新的厂商时会先提醒，内容包括 CLAUDE.md、
   记忆、对话以及对话里的浏览器页面文本和截图，可按工作区选择不再提醒；Local 模型的请求只留在本机或
-  你自己的 Tailscale 网络内，但 Claude Code 自己的后台请求（例如生成标题和摘要）仍会按你的订阅发往
-  Anthropic；
+  你自己的 Tailscale 网络内，路由任务里 Claude Code 自己的后台请求（例如生成标题和摘要）和子代理也走
+  最近一次启动时所用的第三方模型，不再发往 Anthropic；
 - 第三方模型的密钥从你指定的环境变量文件读取，只在内存中使用，不写入数据库、日志或界面；新增来源或
   修改其地址、密钥变量须经原生确认框；
 - 浏览器面板使用独立的存储分区和沙箱，访问不到 Node 或 Guild 自身界面；智能体只能使用固定工具集
@@ -150,8 +152,11 @@ single-user router on `127.0.0.1` that is never exposed to the network. The firs
 conversation to an Online model of a given vendor shows a reminder that CLAUDE.md, memory, the
 conversation, and browser page text or screenshots in the conversation will be sent to that vendor,
 and a different vendor asks again; requests to Local models stay on your machine or your own
-Tailscale network, while Claude Code's own background requests (titles, summaries) still go to
-Anthropic on your subscription. Keys for Online and Local sources are read from an env file you
+Tailscale network. In such a routed task Claude Code carries a throwaway token that Guild generated,
+so your Claude subscription login never reaches the router and the router never connects to Anthropic;
+Claude Code's own background requests (titles, summaries) and subagents use the third-party model the
+process started with, and the task cannot switch back to a Claude subscription model (start a new task
+to use Claude). Keys for Online and Local sources are read from an env file you
 designate, kept in memory only and never stored, and adding or changing a source needs a native
 confirmation. The browser pane runs in its own sandboxed partition, and agents reach it only through a
 fixed tool set with no eval, where every call follows the engine's permission mode (it prompts unless

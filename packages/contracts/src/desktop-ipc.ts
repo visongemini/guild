@@ -804,6 +804,8 @@ export const GUILD_MODEL_SWITCH_REFUSAL_REASONS = Object.freeze([
   "unsupported_value",
   /** The runtime could not be reached or refused for another reason. */
   "unavailable",
+  /** The task already runs through the model router, so no Claude subscription model can be chosen any more (D-061). */
+  "claude_locked",
 ] as const);
 export type GuildModelSwitchRefusalReason = (typeof GUILD_MODEL_SWITCH_REFUSAL_REASONS)[number];
 export type SetTaskRuntimeSettingsResponse =

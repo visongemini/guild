@@ -76,7 +76,7 @@ test("an effort Guild has no translation for shows the runtime's label, then its
   });
   assert.equal(
     modelPickerView({ messages: EN, catalog, selection: selection("grok-9", "max") }).effortLabel,
-    "Maximum",
+    "Max",
   );
   assert.equal(EN.reasoningEffortName("turbo"), "turbo");
   assert.equal(EN.reasoningEffortName("turbo", "Turbo mode"), "Turbo mode");

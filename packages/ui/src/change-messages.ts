@@ -7,6 +7,7 @@ import type {
   RewindAvailabilityProjection,
   RunFileChangeStatus,
 } from "@guild/contracts";
+import { zhClaudeFamilyDescription } from "./claude-model-families.js";
 import { zhModelDescription } from "./model-descriptions.js";
 
 // F2 (changed files, rewind) and F4 (Steer) strings. Kept in their own module, like the workshop strings, so the
@@ -97,6 +98,8 @@ export type ChangeMessages = {
   readonly steerNotice: (kind: SteerNoticeKind, reason: GuildSteerFallbackReason) => string;
   /** The Chinese description for a model id the catalog lists; undefined for ids it does not know (the official text then stays). */
   readonly modelDescription: (modelId: string, officialDescription: string | undefined) => string | undefined;
+  /** The description of a Claude row by its family (`claudeModelIdentity`); a family it does not know keeps the official text. */
+  readonly claudeModelDescription: (family: string | undefined, officialDescription: string | undefined) => string | undefined;
 };
 
 const ZH_UNAVAILABLE: Readonly<Record<GuildCheckpointUnavailableReason, string>> = Object.freeze({
@@ -265,6 +268,7 @@ function zhMessages(): ChangeMessages {
         ? `这条消息没有插话，已作为新消息发出：${ZH_FALLBACK[reason]}。`
         : `没能改成插话，这条消息还在队列里：${ZH_FALLBACK[reason]}。`,
     modelDescription: zhModelDescription,
+    claudeModelDescription: zhClaudeFamilyDescription,
   };
 }
 
@@ -371,5 +375,6 @@ function enMessages(): ChangeMessages {
         ? `Not steered; sent as a new message: ${EN_FALLBACK[reason]}.`
         : `Could not steer it; the message is still queued: ${EN_FALLBACK[reason]}.`,
     modelDescription: (_modelId, official) => official,
+    claudeModelDescription: (_family, official) => official,
   };
 }

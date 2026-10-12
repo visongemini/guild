@@ -1,4 +1,4 @@
-// Model ids and aliases that belong to the Claude subscription route (docs/20 section 3.4).
+// Model ids and aliases that belong to the Claude subscription (docs/20 section 3.4, D-061).
 // A model source can never claim one: its traffic would otherwise be sent to a third party
 // while the user believes they are talking to Claude (PC-ROUTE-001).
 

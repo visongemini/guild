@@ -57,6 +57,34 @@ const LOCAL_MODEL: RoutedModelInfo = {
   sourceId: "llama", sourceLabel: "Local llama.cpp",
 };
 
+/**
+ * What a routed Claude process is spawned with (D-061): the router URL, a throwaway auth token that is never the
+ * Claude login, no API key, no non-essential traffic, and every model family on the routed model applied then.
+ */
+function assertRoutedEnvironment(
+  environment: Readonly<Record<string, string>> | undefined,
+  modelId: string | undefined,
+): void {
+  assert.ok(environment !== undefined, "a routed process gets a per-spawn environment");
+  const { ANTHROPIC_AUTH_TOKEN: token, ...rest } = environment;
+  assert.match(token ?? "", /^guild-router-[0-9a-f]{32}$/u);
+  const models = modelId === undefined ? {} : {
+    ANTHROPIC_DEFAULT_HAIKU_MODEL: modelId,
+    ANTHROPIC_DEFAULT_SONNET_MODEL: modelId,
+    ANTHROPIC_DEFAULT_OPUS_MODEL: modelId,
+    ANTHROPIC_SMALL_FAST_MODEL: modelId,
+    CLAUDE_CODE_SUBAGENT_MODEL: modelId,
+  };
+  assert.deepEqual(rest, {
+    ANTHROPIC_BASE_URL: ROUTER_URL,
+    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
+    ENABLE_TOOL_SEARCH: "true",
+    OPENVIKING_AUTO_CAPTURE: "false",
+    ...models,
+  });
+  assert.equal(Object.hasOwn(environment, "ANTHROPIC_API_KEY"), false);
+}
+
 describe("dual engine orchestration [PC-ENG-001, PC-MODEL-001]", () => {
   it("persists the engine at create, projects it, and fixes it once the task has run [PC-ENG-001]", async () => {
     const h = await harness();
@@ -102,7 +130,7 @@ describe("dual engine orchestration [PC-ENG-001, PC-MODEL-001]", () => {
     assert.deepEqual(h.world.adapters[1]!.prompts, ["hi"]);
   });
 
-  it("projects Claude's own models with the router's Online and Local ones and tells the router the native ids [PC-MODEL-001]", async () => {
+  it("projects Claude's own models with the router's Online and Local ones [PC-MODEL-001]", async () => {
     const router = new FakeRouterHost([DEEPSEEK, LOCAL_MODEL]);
     const h = await harness({ modelRouterHost: router });
     const before = (await h.service.bootstrap()).runtimeSettings;
@@ -124,7 +152,6 @@ describe("dual engine orchestration [PC-ENG-001, PC-MODEL-001]", () => {
     assert.equal(claude.models.find((model) => model.id === "deepseek-v4-flash")?.name, "DeepSeek V4 Flash");
     assert.deepEqual(claude.models.find((model) => model.id === "deepseek-v4-flash")?.contextWindows, [128_000]);
     assert.deepEqual(catalogs.grok.models, [], "the Grok list is not touched by a Claude session");
-    assert.deepEqual(router.noted, [[...NATIVE_MODELS]], "the router learns Claude's ids, not its own");
 
     // A source change reaches the picker without a restart of anything.
     const seen: string[][] = [];
@@ -268,12 +295,7 @@ describe("dual engine orchestration [PC-ENG-001, PC-MODEL-001]", () => {
     assert.deepEqual(markedAtSpawn.slice(-1), [false], "no marker while the routed process is only starting");
     assert.deepEqual(markedAtModel, [false], "nor while it is taking the model: the marker follows the applied selection");
     assert.equal(h.world.adapters.length, 2);
-    const routedEnvironment = {
-      ANTHROPIC_BASE_URL: ROUTER_URL,
-      ENABLE_TOOL_SEARCH: "true",
-      OPENVIKING_AUTO_CAPTURE: "false",
-    };
-    assert.deepEqual(h.world.inputs[1]!.extraEnvironment, routedEnvironment);
+    assertRoutedEnvironment(h.world.inputs[1]!.extraEnvironment, "deepseek-v4-flash");
     const resume = h.world.adapters[1]!.startCalls[0]!;
     assert.equal(resume.kind, "resume");
     assert.equal(resume.sessionId, "claude-session", "the same session continues");
@@ -291,20 +313,39 @@ describe("dual engine orchestration [PC-ENG-001, PC-MODEL-001]", () => {
     // The routed session's picker models never become Claude's own.
     const claudeModels = (await h.service.bootstrap()).runtimeSettings.modelCatalogs!.claude.models;
     assert.deepEqual(claudeModels.filter((model) => model.group === "claude").map((model) => model.id), [...NATIVE_MODELS]);
-    assert.deepEqual(router.noted.at(-1), [...NATIVE_MODELS]);
+
+    // The switch is one-way (D-061): no Claude subscription model again, and the stored choice stays.
+    for (const claudeModel of ["opus", "default"]) {
+      const back = await h.service.setTaskRuntimeSettings({
+        taskId: task.task.taskId, model: claudeModel, reasoningEffort: null, contextWindow: null,
+      });
+      assert.equal(back.status === "refused" && back.reason, "claude_locked", claudeModel);
+      assert.equal(back.task.modelSelection.modelId, "deepseek-v4-flash");
+    }
+    const cleared = await h.service.setTaskRuntimeSettings({
+      taskId: task.task.taskId, model: null, reasoningEffort: null, contextWindow: null,
+    });
+    assert.equal(cleared.status === "refused" && cleared.reason, "claude_locked", "clearing would fall back to Claude");
+    assert.equal(h.world.adapters.length, 2);
+    assert.ok(!h.world.adapters[1]!.log.includes("config:model=opus"), "nothing was sent to the session");
 
     // Switching among models of a routed session is a plain config option, with no restart.
-    const back = await h.service.setTaskRuntimeSettings({
-      taskId: task.task.taskId, model: "opus", reasoningEffort: null, contextWindow: null,
+    const among = await h.service.setTaskRuntimeSettings({
+      taskId: task.task.taskId, model: "local-27b-model", reasoningEffort: null, contextWindow: null,
     });
-    assert.equal(back.status, "applied");
+    assert.equal(among.status, "applied");
     assert.equal(h.world.adapters.length, 2);
-    assert.equal(h.world.adapters[1]!.log.at(-1), "config:model=opus");
+    assert.equal(h.world.adapters[1]!.log.at(-1), "config:model=local-27b-model");
 
-    // A crash recovery starts the task routed again.
+    // A crash recovery starts the task routed again, on the model it runs now, with a token of its own.
     await h.world.adapters[1]!.emitTransportInterrupted();
     await eventually(() => h.world.adapters.length === 3 && h.world.adapters[2]!.session !== undefined);
-    assert.deepEqual(h.world.inputs[2]!.extraEnvironment, routedEnvironment);
+    assertRoutedEnvironment(h.world.inputs[2]!.extraEnvironment, "local-27b-model");
+    assert.notEqual(
+      h.world.inputs[2]!.extraEnvironment?.["ANTHROPIC_AUTH_TOKEN"],
+      h.world.inputs[1]!.extraEnvironment?.["ANTHROPIC_AUTH_TOKEN"],
+      "the throwaway token is new for every process start",
+    );
     assert.equal(h.world.adapters[2]!.startCalls[0]!.kind, "resume");
 
     // And so does a new Guild process.
@@ -313,7 +354,7 @@ describe("dual engine orchestration [PC-ENG-001, PC-MODEL-001]", () => {
     await h.send(task.task.taskId, "after restart");
     await h.completed(3);
     const restartedInput = restartedWorld.inputs.find((input) => input.engine === "claude");
-    assert.deepEqual(restartedInput?.extraEnvironment, routedEnvironment);
+    assertRoutedEnvironment(restartedInput?.extraEnvironment, "local-27b-model");
     assert.equal(restartedWorld.adapters.find((adapter) => adapter.engine === "claude")?.startCalls[0]?.options
       ?.claudeCodeOptions !== undefined, true);
 
@@ -323,6 +364,7 @@ describe("dual engine orchestration [PC-ENG-001, PC-MODEL-001]", () => {
     assert.ok(diagnostics.includes("task_routed"), "the switch itself is logged");
     assert.equal(diagnostics.includes("43210"), false);
     assert.equal(diagnostics.includes("0123456789abcdef"), false);
+    assert.equal(diagnostics.includes("guild-router-"), false, "the throwaway token is never logged");
   });
 
   it("starts a new task whose first model is routed through the router from its first process [docs/20 3.3]", async () => {
@@ -521,7 +563,7 @@ describe("dual engine orchestration [PC-ENG-001, PC-MODEL-001]", () => {
     assert.equal(h.world.adapters.length, 2, "no second restart");
   });
 
-  it("restarts a task marked routed that still has a native process at the next idle point, whatever Claude model it selects [docs/20 3.3]", async () => {
+  it("restarts a task marked routed that still has a native process at the next idle point; a Claude model it selected no longer counts [docs/20 3.3, D-061]", async () => {
     const router = new FakeRouterHost([DEEPSEEK]);
     let store!: GuildPersistence;
     const h = await harness({ modelRouterHost: router }, {}, (path) => {
@@ -537,20 +579,70 @@ describe("dual engine orchestration [PC-ENG-001, PC-MODEL-001]", () => {
     assert.equal(opus.status, "applied");
     assert.equal(h.world.adapters.length, 1, "opus is a native model: no restart");
 
-    // A marker with no routed process behind it, as an earlier build could leave after a failed switch.
+    // A marker with no routed process behind it, as an earlier build could leave after a failed switch, or a
+    // task a 3.0.0 build routed and then took back to Claude. Under D-061 that Claude choice is gone.
     store.markTaskRouted({ taskId });
-    assert.equal((await h.service.openTask(taskId)).engineStatus?.routed, true);
+    const reopened = await h.service.openTask(taskId);
+    assert.equal(reopened.engineStatus?.routed, true);
+    assert.equal(reopened.modelSelection.modelId, null, "no Claude subscription model is shown for a routed task");
     await h.send(taskId, "after");
-    await h.completed(2);
+    const failed = await eventuallyValue(async () => {
+      const view = (await h.service.bootstrap()).activeTask;
+      return view?.timeline.some((item) =>
+        item.kind === "error" && /could not switch to the model|未能切换到这个任务选择的模型/u.test(item.text)) === true
+        ? view
+        : undefined;
+    });
+    assert.equal(failed.task.activeRunState, "failed");
     assert.equal(h.world.adapters.length, 2);
     assert.equal(h.world.adapters[0]!.state, "closed");
-    assert.deepEqual(h.world.inputs[1]!.extraEnvironment, {
-      ANTHROPIC_BASE_URL: ROUTER_URL, ENABLE_TOOL_SEARCH: "true", OPENVIKING_AUTO_CAPTURE: "false",
-    });
+    assertRoutedEnvironment(h.world.inputs[1]!.extraEnvironment, undefined);
     assert.deepEqual(h.world.adapters[0]!.prompts, ["native"]);
-    assert.deepEqual(h.world.adapters[1]!.prompts, ["after"]);
+    assert.deepEqual(h.world.adapters[1]!.prompts, [], "the turn never reached the agent on a Claude model");
     assert.equal(h.world.adapters[1]!.startCalls[0]!.kind, "resume");
-    assert.ok(h.world.adapters[1]!.log.includes("config:model=opus"), "the chosen Claude model is applied on the routed process");
+    assert.ok(!h.world.adapters[1]!.log.includes("config:model=opus"), "opus is not applied on the routed process");
+
+    // A routed model is the way out, on the live routed process, and the next turn runs.
+    await h.idle();
+    const picked = await h.service.setTaskRuntimeSettings({ taskId, model: "deepseek-v4-flash", reasoningEffort: null, contextWindow: null });
+    assert.equal(picked.status, "applied");
+    assert.equal(h.world.adapters.length, 2, "no further restart");
+    await h.send(taskId, "again");
+    await eventually(() => h.world.adapters[1]!.prompts.length === 1);
+    assert.deepEqual(h.world.adapters[1]!.prompts, ["again"]);
+  });
+
+  it("ignores a Claude global default in a routed task, never shows it and never sends a turn on it [D-061]", async () => {
+    const router = new FakeRouterHost([DEEPSEEK]);
+    let store!: GuildPersistence;
+    const h = await harness({ modelRouterHost: router }, {}, (path) => {
+      store = openGuildPersistence({ path });
+      return store;
+    });
+    const task = await h.service.createTask(h.workspaceId, undefined, "claude");
+    const taskId = task.task.taskId;
+    await h.send(taskId, "native");
+    await h.completed();
+    await h.idle();
+    await h.service.setClaudeSettings("sonnet", "high", "default");
+    assert.equal((await h.service.openTask(taskId)).modelSelection.modelId, "sonnet", "a native task follows the global default");
+
+    const switched = await h.service.setTaskRuntimeSettings({ taskId, model: "deepseek-v4-flash", reasoningEffort: null, contextWindow: null });
+    assert.equal(switched.status, "applied");
+    // The global default changes later and the task's own choice is gone (a state only an earlier build can leave).
+    await h.service.setClaudeSettings("opus", null, "default");
+    const override = store.loadTaskRuntimeSettings(taskId);
+    assert.ok(override !== undefined);
+    store.clearTaskRuntimeSettings({ taskId, expectedRevision: override.revision });
+    const view = await h.service.openTask(taskId);
+    assert.equal(view.modelSelection.source, "runtime", "the Claude default is not a choice of the routed task");
+    assert.equal(view.modelSelection.modelId, "deepseek-v4-flash", "what the routed session runs on is shown");
+
+    await h.send(taskId, "routed");
+    await h.completed(2);
+    assert.deepEqual(h.world.adapters[1]!.prompts, ["routed"]);
+    assert.ok(!h.world.adapters[1]!.log.includes("config:model=opus"));
+    assert.ok(!h.world.adapters[1]!.log.includes("config:model=sonnet"));
   });
 
   it("refuses the prompt with model_selection_failed when the session cannot take the selected Claude model [docs/20 3.3]", async () => {
@@ -1316,7 +1408,6 @@ class FakeRouterHost implements ModelRouterHostPort {
   /** True while a held call waits for its gate. */
   waiting = false;
   private heldCall: { readonly at: number; readonly gate: Promise<void> } | undefined;
-  readonly noted: string[][] = [];
   private readonly listeners = new Set<() => void>();
   constructor(models: readonly RoutedModelInfo[]) { this.models = models; }
   listRoutedModels(): readonly RoutedModelInfo[] { return this.models; }
@@ -1337,7 +1428,6 @@ class FakeRouterHost implements ModelRouterHostPort {
     this.heldCall = { at, gate: new Promise<void>((resolve) => { open = resolve; }) };
     return { open };
   }
-  noteAnthropicModels(ids: readonly string[]): void { this.noted.push([...ids]); }
   onChange(listener: () => void): () => void {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);

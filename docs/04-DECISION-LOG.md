@@ -886,6 +886,11 @@ Consequences
 Date: 2026-10-12. Owner decision. Implements PC-ROUTE-001, PC-ROUTE-002, PC-ROUTE-003, PC-MODEL-001
 and PC-PRIV-001; amends D-003 and D-011 and narrows the gateway clause of PC-SEC-001.
 
+Amended by D-061 (2026-10-12): the Anthropic upstream described below (the Anthropic ids of the exact
+registry, forwarding of the Authorization header to `api.anthropic.com`, the Anthropic header allowlist
+and the Anthropic thinking-signature rule) no longer exists, and a routed task can no longer use Claude
+subscription models. The router serves Online and Local models only. The text below is kept as decided.
+
 Context: measured facts in `docs/20-GUILD3-DUAL-ENGINE.md` section 2. Claude Code can drive an
 Anthropic-compatible backend through `ANTHROPIC_BASE_URL`, but it then sends request shapes that
 plain backends reject (messages with `role: "system"`, `tool_addition` blocks, `defer_loading`,
@@ -1018,3 +1023,64 @@ Consequences
   permanent per task.
 - Content that reaches an Online vendor is still governed by the reminder of D-058, and OpenViking
   recall output is part of what that reminder names (memory).
+
+## D-061 — Subscription credentials never traverse the model router; the Claude-to-routed switch is one-way
+
+Date: 2026-10-12. Owner decision. Implements PC-ROUTE-001, PC-ROUTE-002 and PC-MODEL-001; amends D-058
+(credential rules, exact registry, thinking provenance, native and routed sessions) and D-057 (the model
+group choice inside a Claude task).
+
+Context: Anthropic's legal and compliance terms for Claude Code
+(`code.claude.com/docs/en/legal-and-compliance`) and its Acceptable Use Policy (effective 2026-11-12)
+forbid intermediating Claude subscription (OAuth) credentials and proxying requests through consumer
+subscriptions. In a routed task of Guild 3.0.0, Claude Code (with only `ANTHROPIC_BASE_URL` set) sent
+its subscription bearer token to the router, which forwarded `claude-*` requests carrying that token to
+`api.anthropic.com`. Verified on this machine on 2026-10-12 with Claude Code 2.1.296 in a clean
+environment: with `ANTHROPIC_BASE_URL` alone it sends `Authorization: Bearer sk-ant-oat...` (the
+subscription token) to the base URL; with `ANTHROPIC_AUTH_TOKEN` also set it sends only that value and the
+subscription token never leaves Claude Code.
+
+Decision
+- Throwaway token. Every start of a routed process gets `ANTHROPIC_AUTH_TOKEN=guild-router-<32 random hex
+  characters>`, new for each launch, never logged and redacted from diagnostics, and never an
+  `ANTHROPIC_API_KEY`. It also gets `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` and the routed model
+  applied at that start as `ANTHROPIC_DEFAULT_HAIKU_MODEL`, `ANTHROPIC_DEFAULT_SONNET_MODEL`,
+  `ANTHROPIC_DEFAULT_OPUS_MODEL`, `ANTHROPIC_SMALL_FAST_MODEL` and `CLAUDE_CODE_SUBAGENT_MODEL`, so Claude
+  Code's background requests (titles, summaries, compaction) and its subagents stay on the third-party
+  source instead of asking for `claude-*` models. Native Claude sessions keep their environment unchanged
+  (no base URL, no throwaway token).
+- Router. It has no Anthropic upstream: it never opens a connection to `api.anthropic.com`. A request is
+  served only if its model is a registered, enabled and confirmed Online or Local model; any other model
+  gets an Anthropic-style JSON error (a `claude-*` model: 400, "Claude subscription models are not
+  available in a task that uses online or local models"; another unknown model: 404). As defense in depth,
+  a request whose `Authorization` or `x-api-key` value (after an optional `Bearer `) starts with `sk-ant-`
+  is rejected with 400 before anything is forwarded, with a fixed console warning that carries no value.
+  Client credentials and `anthropic-beta` are still never sent to a third party; Online and Local sources
+  receive only their own key. The Anthropic registry and `noteAnthropicModels` plumbing, the Anthropic
+  header allowlist branch and the Anthropic-specific thinking-signature rule are removed; a thinking block
+  is kept only for the source that produced it.
+- One way. A task that is routed (`task_metadata.routed_at` set, or its process is routed) can no longer
+  use a Claude subscription model. The picker shows the Claude rows disabled under one line, the main
+  process refuses the selection with the reason `claude_locked`, a Claude choice stored by an earlier build
+  (or the Claude global default) no longer counts for such a task, and a turn that would start on a
+  non-routed model ends with `model_selection_failed` before anything is sent. A Claude task that has
+  already run turns on a native session confirms before its first switch to an Online or Local model; when
+  an Online reminder is also due, one dialog carries both messages. A new task with no turn yet picks
+  freely, because routing is decided at its first run. Tasks already marked routed follow these rules from
+  their next start (throwaway token, Claude rows disabled).
+- A user who wants Claude after a routed switch starts a new task.
+
+Consequences
+- The remaining routed traffic is Claude Code talking to Guild's router with a token that proves nothing,
+  and the router talking to the user's own Online and Local sources. No Claude credential is read,
+  forwarded, logged or stored by Guild.
+- Residual: the model variables are fixed when the process starts. A switch between routed models of a
+  live session is a plain config option, so Claude Code's background requests and subagents stay on the
+  source of the last (re)start until the next one; the Online reminder still covers each vendor the
+  conversation itself goes to.
+- Thinking-provenance rows that name `anthropic` stay in SQLite and prove nothing for any source; the id
+  `anthropic` stays reserved so no source can inherit them.
+- A routed process sends no Claude Code telemetry or update traffic.
+- Requirement text of PC-ROUTE-001, PC-ROUTE-002, PC-ROUTE-003 and PC-MODEL-001 and the acceptance story
+  AS-011 are updated in `requirements/requirements.yml`; `docs/20-GUILD3-DUAL-ENGINE.md` sections 2, 3.3,
+  3.4, 3.7 and 6 follow this entry.

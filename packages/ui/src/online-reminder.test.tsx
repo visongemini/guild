@@ -136,6 +136,55 @@ test("the dialog asks to send the conversation to the vendor and lists what goes
   assert.match(markup, /<button autofocus="" type="button">Cancel<\/button>/u);
 });
 
+test("a Claude conversation's first switch says it is one way; with an Online vendor the same box carries the reminder too [D-061]", async () => {
+  const routedOnly = (messages = EN) => renderToStaticMarkup(
+    <OnlineReminderDialog messages={messages} routedModelName="Local 27B" onCancel={noop} onSwitch={noop} onDialogKeyDown={noop} />,
+  );
+  const local = routedOnly();
+  assert.match(local, /<strong id="[^"]+">You can&#x27;t switch back to a Claude subscription<\/strong>/u);
+  assert.match(local, /After you switch to &quot;Local 27B&quot;, this task runs through Guild&#x27;s local relay and can no longer use Claude subscription models\. Your Claude login never passes through the relay\. To keep using Claude, start a new task\./u);
+  // Nothing is sent to a vendor, so there is no list and no checkbox to silence.
+  assert.doesNotMatch(local, /<li>|type="checkbox"|is an online model/u);
+  assert.match(local, /class="primary">Continue<\/button>/u);
+  assert.match(local, /<button autofocus="" type="button">Cancel<\/button>/u);
+
+  const zh = routedOnly(ZH);
+  assert.match(zh, /<strong id="[^"]+">切换后不能再切回 Claude 订阅<\/strong>/u);
+  assert.match(zh, /切到「Local 27B」后，这个任务会改用 Guild 的本地转发，之后不能再选 Claude 订阅模型。Claude 订阅的登录信息不会经过转发。要继续用 Claude，可以新建一个任务。/u);
+  assert.match(zh, /class="primary">继续切换<\/button>/u);
+  assert.match(zh, /<button autofocus="" type="button">取消<\/button>/u);
+
+  // An Online model of a vendor not agreed yet: one dialog, the one-way notice first, then what goes to the vendor.
+  const both = renderToStaticMarkup(
+    <OnlineReminderDialog messages={ZH} vendorLabel="DeepSeek" routedModelName="DeepSeek V4 Flash" onCancel={noop} onSwitch={noop} onDialogKeyDown={noop} />,
+  );
+  assert.equal(both.match(/role="alertdialog"/gu)?.length, 1);
+  assert.match(both, /<strong id="[^"]+">切换后不能再切回 Claude 订阅<\/strong>/u);
+  assert.ok(both.indexOf("切到「DeepSeek V4 Flash」后") < both.indexOf("是在线模型"));
+  for (const item of ["CLAUDE.md", "记忆", "本次对话"]) assert.match(both, new RegExp(`<li>${item}</li>`, "u"));
+  assert.match(both, /type="checkbox"/u);
+  assert.match(both, /class="primary">继续切换<\/button>/u);
+  assert.doesNotMatch(both, /class="primary">切换<\/button>/u);
+  // Without the one-way notice the dialog is exactly the Online reminder.
+  assert.match(dialog(), /Send this conversation to DeepSeek\?/u);
+  assert.doesNotMatch(dialog(), /local relay/u);
+});
+
+test("one dialog serves both messages: the app asks once per switch, and only a Claude conversation with turns asks the one-way question [D-061]", async () => {
+  const app = await readFile(new URL("../src/App.tsx", import.meta.url), "utf8");
+  const start = app.indexOf("async function confirmModelSwitch");
+  const flow = app.slice(start, app.indexOf("async function setSessionConfigOption", start));
+  assert.equal(flow.match(/new Promise<OnlineReminderAnswer>/gu)?.length, 1, "a single dialog per switch");
+  assert.match(flow, /const routedNotice = taskHasNativeClaudeSession\(task, pendingSends\.has\(taskId\)\);/u);
+  assert.match(flow, /if \(!reminderNeeded && !routedNotice\) \{/u);
+  assert.match(flow, /\.\.\.\(reminderNeeded \? \{ vendorLabel \} : \{\}\),\s*\n\s*\.\.\.\(routedNotice \? \{ routedModelName: target\?\.name \?\? modelId \?\? "" \} : \{\}\),/u);
+  // The vendor checkbox is only honoured when the reminder was part of the dialog.
+  assert.match(flow, /if \(reminderNeeded && answer\.dontRemindAgain\) \{/u);
+  const gate = app.slice(app.indexOf("async function applyTaskRuntimeSettings"), start);
+  assert.match(gate, /\(change\.group === "online" \|\| change\.group === "local"\) && !\(await confirmModelSwitch\(task, change\)\)/u);
+  assert.match(app, /routedModelName=\{|\{\.\.\.\(onlineReminder\.routedModelName === undefined/u);
+});
+
 test("the checkbox starts unticked, the dialog is localized, and the key handling is the app's", async () => {
   assert.match(dialog(EN, true), /type="checkbox"[^>]*checked/u);
   const zh = dialog(ZH);
@@ -169,21 +218,21 @@ test("the reminder flow in the app follows PC-PRIV-001", async () => {
   const end = app.indexOf("async function setSessionConfigOption", start);
   const flow = app.slice(start, end);
   // The reminder gates only Online models and comes before anything is changed.
-  assert.match(flow, /change\.group === "online" && !\(await confirmOnlineSwitch\(task, change\.model\)\)\) return undefined/u);
-  assert.ok(flow.indexOf("confirmOnlineSwitch(task") < flow.indexOf("applyModelSelectionChange("));
+  assert.match(flow, /\(change\.group === "online" \|\| change\.group === "local"\) && !\(await confirmModelSwitch\(task, change\)\)\) return undefined/u);
+  assert.ok(flow.indexOf("confirmModelSwitch(task") < flow.indexOf("applyModelSelectionChange("));
   // Agreement is kept per task and per vendor, in the ledger; the vendor is the source that lists the model.
   assert.match(app, /const onlineConsent = useRef\(createOnlineConsentLedger\(\)\);/u);
   assert.match(flow, /const targetSource = onlineSourceKey\(modelId \?\? "", sources\);/u);
   assert.match(flow, /agreedSourcesOf\(\{\s*\n\s*ledger: onlineConsent\.current,\s*\n\s*taskId,\s*\n\s*currentModelId: task\.modelSelection\.modelId,/u);
   // The workspace preference is read only when this vendor is not agreed yet; the checkbox writes it back.
-  assert.match(flow, /if \(!agreedSources\.has\(targetSource\)\) \{\s*\n\s*try \{\s*\n\s*dismissed = \(await api\.getWorkspacePrefs\(\{ workspaceId: task\.task\.workspaceId \}\)\)\.onlineReminderDismissed;/u);
+  assert.match(flow, /if \(change\.group === "online" && !agreedSources\.has\(targetSource\)\) \{\s*\n\s*try \{\s*\n\s*dismissed = \(await api\.getWorkspacePrefs\(\{ workspaceId: task\.task\.workspaceId \}\)\)\.onlineReminderDismissed;/u);
   assert.match(flow, /api\.setWorkspacePrefs\(\{ workspaceId: task\.task\.workspaceId, onlineReminderDismissed: true \}\)/u);
-  assert.match(flow, /onlineReminderNeeded\(\{ targetGroup: "online", targetSource, agreedSources, dismissedForWorkspace: dismissed \}\)/u);
+  assert.match(flow, /onlineReminderNeeded\(\{ targetGroup: change\.group, targetSource, agreedSources, dismissedForWorkspace: dismissed \}\)/u);
   assert.match(flow, /onlineConsent\.current\.agree\(taskId, targetSource\)/u);
   // The vendor named is the model source's label.
   assert.match(flow, /vendorLabelFor\(modelId \?\? "", sources, target\?\.name\)/u);
   // Cancel resolves without switching and never records an agreement.
-  assert.match(flow, /if \(!answer\.confirmed\) return false;\s*\n\s*onlineConsent\.current\.agree\(taskId, targetSource\);/u);
+  assert.match(flow, /if \(!answer\.confirmed\) return false;\s*\n\s*if \(change\.group === "online"\) onlineConsent\.current\.agree\(taskId, targetSource\);/u);
   assert.doesNotMatch(app, /onlineRemindedTaskIds/u);
   assert.match(app, /<OnlineReminderDialog\s*\n\s*messages=\{baseMessages\}/u);
 });
