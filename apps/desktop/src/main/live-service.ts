@@ -4708,12 +4708,10 @@ export function createLiveDesktopService(
       if (runtimeGeneration !== startGeneration) {
         throw new Error("runtime_start_invalidated_by_resume");
       }
-      if (routed !== undefined) {
-        // The routed process took the selection (or none is pinned): only now is the task marked,
-        // and before any turn can start on this session.
-        if (selectionStatus === "skipped" && selectsRoutedModel(taskId)) throw new Error(MODEL_SELECTION_FAILED);
-        startStage = "routed_marker";
-        commitRoutedMarker(taskId);
+      // The routed process must have taken the selection (or none is pinned); the marker itself is the
+      // last step of the start, below, once nothing that can fail for this switch is left.
+      if (routed !== undefined && selectionStatus === "skipped" && selectsRoutedModel(taskId)) {
+        throw new Error(MODEL_SELECTION_FAILED);
       }
       if (replacingSession) {
         persistedContextTokens.delete(taskId);
@@ -4751,6 +4749,18 @@ export function createLiveDesktopService(
         reason: session.establishedBy,
       });
       await publish();
+      if (routed !== undefined) {
+        // The marker is the last thing that can go wrong for this switch: a failure above leaves the
+        // task unmarked (and the caller rolls the selection back); once written, the routed process is
+        // valid and the session is handed out before any turn can start on it, so a failure to show
+        // the marker is logged, not raised.
+        if (runtimeGeneration !== startGeneration) throw new Error("runtime_start_invalidated_by_resume");
+        startStage = "routed_marker";
+        commitRoutedMarker(taskId);
+        await publish().catch(() => {
+          logRuntime({ category: "runtime", event: "routed_marker_publish_failed", taskId });
+        });
+      }
       return session;
     } catch (cause: unknown) {
       await created?.adapter.close().catch(() => undefined);
@@ -8229,7 +8239,10 @@ export function createLiveDesktopService(
         }));
       }
       return enqueueCommand(async () => {
-        await publish();
+        // The start succeeded, so the task is routed: a projection that cannot be built now is not a failed switch.
+        await publish().catch(() => {
+          logRuntime({ category: "runtime", event: "routed_switch_publish_failed", taskId });
+        });
         // "Applied" only when the routed process is the one running the model. A session that became
         // busy while the router came up keeps its process: the choice is stored and the switch
         // happens at the next idle point.

@@ -451,6 +451,76 @@ describe("dual engine orchestration [PC-ENG-001, PC-MODEL-001]", () => {
     );
   });
 
+  it("marks the task last: a publish failure before the marker leaves it unmarked and the selection rolled back [docs/20 3.3]", async () => {
+    const router = new FakeRouterHost([DEEPSEEK]);
+    let store!: GuildPersistence;
+    const h = await harness({ modelRouterHost: router }, {}, (path) => {
+      store = openGuildPersistence({ path });
+      return store;
+    });
+    const task = await h.service.createTask(h.workspaceId, undefined, "claude");
+    const taskId = task.task.taskId;
+    await h.send(taskId, "native");
+    await h.completed();
+    await h.idle();
+
+    // Publishing fails once after the routed process took the model.
+    let armed = false;
+    h.world.onConfigOption = async (_label, configId, value) => {
+      if (configId === "model" && value === "deepseek-v4-flash") armed = true;
+    };
+    h.service.subscribe(() => {
+      if (armed) { armed = false; throw new Error("projection_failed"); }
+    });
+    const refused = await h.service.setTaskRuntimeSettings({
+      taskId, model: "deepseek-v4-flash", reasoningEffort: null, contextWindow: null,
+    });
+    assert.equal(refused.status, "refused", "the switch failed ...");
+    assert.equal(store.loadTaskMetadata(taskId).routedAtMs, undefined, "... and the task was never marked");
+    assert.equal(refused.task.modelSelection.source, "runtime", "the previous choice is back, consistently");
+    assert.equal(refused.task.engineStatus?.routed, undefined);
+
+    // Native again for the next turn, exactly like any other failed switch.
+    await h.send(taskId, "again");
+    await h.completed(2);
+    assert.deepEqual(h.world.adapters.at(-1)!.prompts, ["again"]);
+    assert.equal(h.world.inputs.at(-1)!.extraEnvironment, undefined);
+  });
+
+  it("does not fail a switch whose routed process is valid when only showing the marker fails [docs/20 3.3]", async () => {
+    const router = new FakeRouterHost([DEEPSEEK]);
+    let store!: GuildPersistence;
+    const h = await harness({ modelRouterHost: router }, {}, (path) => {
+      store = openGuildPersistence({ path });
+      return store;
+    });
+    const task = await h.service.createTask(h.workspaceId, undefined, "claude");
+    const taskId = task.task.taskId;
+    await h.send(taskId, "native");
+    await h.completed();
+    await h.idle();
+
+    // The first two projections after the marker cannot be built.
+    let failures = 2;
+    h.service.subscribe(() => {
+      if (failures > 0 && store.loadTaskMetadata(taskId).routedAtMs !== undefined) {
+        failures -= 1;
+        throw new Error("projection_failed");
+      }
+    });
+    const switched = await h.service.setTaskRuntimeSettings({
+      taskId, model: "deepseek-v4-flash", reasoningEffort: null, contextWindow: null,
+    });
+    assert.equal(switched.status, "applied", "the routed process runs the model, so the selection is reported as applied");
+    assert.equal(switched.task.modelSelection.modelId, "deepseek-v4-flash");
+    assert.notEqual(store.loadTaskMetadata(taskId).routedAtMs, undefined);
+    assert.equal(switched.task.engineStatus?.routed, true);
+    await h.send(taskId, "after");
+    await h.completed(2);
+    assert.deepEqual(h.world.adapters.at(-1)!.prompts, ["after"]);
+    assert.equal(h.world.adapters.length, 2, "no second restart");
+  });
+
   it("restarts a task marked routed that still has a native process at the next idle point, whatever Claude model it selects [docs/20 3.3]", async () => {
     const router = new FakeRouterHost([DEEPSEEK]);
     let store!: GuildPersistence;
