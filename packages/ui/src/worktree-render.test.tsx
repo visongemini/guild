@@ -310,10 +310,9 @@ function sidebarRow(patch: Record<string, unknown>) {
   };
   return renderToStaticMarkup(
     <WorkspaceTree
-      workspace={workspace({ tasks: [task] as never })} expanded activeTaskId="other" bannySeatTaskId={undefined}
-      bannyDragging={false} bannyDropTargetId={undefined} pendingTaskIds={new Set()} unreadTaskIds={new Set()} locale="en-US"
-      onToggle={noop} onOpenTask={noop} onNewTask={noop} onBannyDragStart={noop} onBannyDragEnd={noop}
-      onBannyDropTarget={noop} onBannyDrop={noop} onPinTask={noop} onArchiveTask={noop} onContextMenu={noop}
+      workspace={workspace({ tasks: [task] as never })} expanded activeTaskId="other"
+      pendingTaskIds={new Set()} unreadTaskIds={new Set()} locale="en-US"
+      onToggle={noop} onOpenTask={noop} onNewTask={noop} onPinTask={noop} onArchiveTask={noop} onContextMenu={noop}
     />,
   );
 }

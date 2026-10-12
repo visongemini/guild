@@ -523,7 +523,7 @@ async function revealTaskFromNotification(
 
 async function applyFixtureUiState(
   window: BrowserWindow,
-  state: "slash" | "command-palette" | "task-menu" | "task-hover" | "account" | "account-narrow" | "settings" | "settings-narrow" | "settings-grok" | "settings-grok-narrow" | "grok-control" | "grok-control-narrow" | "statuses" | "statuses-narrow" | "workbench" | "workbench-narrow" | "waiting" | "run-boundaries" | "recovery" | "recovery-narrow" | "recovery-wide" | "queue-preempt" | "banny-seat" | "banny-home" | "banny-free" | undefined,
+  state: "slash" | "command-palette" | "task-menu" | "task-hover" | "account" | "account-narrow" | "settings" | "settings-narrow" | "settings-grok" | "settings-grok-narrow" | "grok-control" | "grok-control-narrow" | "statuses" | "statuses-narrow" | "workbench" | "workbench-narrow" | "waiting" | "run-boundaries" | "recovery" | "recovery-narrow" | "recovery-wide" | "queue-preempt" | undefined,
 ): Promise<void> {
   if (state === "account-narrow" || state === "settings-narrow" || state === "settings-grok-narrow" || state === "grok-control-narrow" || state === "statuses-narrow" || state === "recovery-narrow") {
     window.setSize(680, 520, false);
@@ -653,54 +653,6 @@ async function applyFixtureUiState(
         conversation.scrollTop = conversation.scrollHeight;
       })()
     `, true);
-  } else if (state === "banny-seat" || state === "banny-home" || state === "banny-free") {
-    await window.webContents.executeJavaScript(String.raw`
-      (async () => {
-        const newTask = document.querySelector('.guild-new-task');
-        if (!(newTask instanceof HTMLButtonElement)) throw new Error('fixture_new_task_missing');
-        newTask.click();
-        for (let attempt = 0; attempt < 40 && document.querySelector('.guild-banny') === null; attempt += 1) {
-          await new Promise((resolve) => setTimeout(resolve, 25));
-        }
-        const banny = document.querySelector('.guild-banny');
-        const tasks = document.querySelectorAll('.guild-task-row');
-        const target = tasks.item(1);
-        if (!(banny instanceof HTMLImageElement)) throw new Error('fixture_banny_missing');
-        if (!(target instanceof HTMLButtonElement)) throw new Error('fixture_banny_target_missing');
-        const dataTransfer = new DataTransfer();
-        banny.dispatchEvent(new DragEvent('dragstart', { bubbles: true, dataTransfer }));
-        target.dispatchEvent(new DragEvent('dragenter', { bubbles: true, cancelable: true, dataTransfer }));
-        target.dispatchEvent(new DragEvent('dragover', { bubbles: true, cancelable: true, dataTransfer }));
-        target.dispatchEvent(new DragEvent('drop', { bubbles: true, cancelable: true, dataTransfer }));
-        ${state === "banny-home" || state === "banny-free" ? String.raw`
-        await new Promise((resolve) => setTimeout(resolve, 50));
-        const seated = document.querySelector('.guild-task-banny');
-        const shell = document.querySelector('.guild-shell');
-        const conversation = document.querySelector('.guild-conversation');
-        if (!(seated instanceof HTMLImageElement)) throw new Error('fixture_banny_seat_missing');
-        if (!(shell instanceof HTMLDivElement)) throw new Error('fixture_banny_shell_missing');
-        if (!(conversation instanceof HTMLElement)) throw new Error('fixture_banny_conversation_missing');
-        const nextTransfer = new DataTransfer();
-        const shellRect = shell.getBoundingClientRect();
-        const conversationRect = conversation.getBoundingClientRect();
-        seated.dispatchEvent(new DragEvent('dragstart', { bubbles: true, dataTransfer: nextTransfer }));
-        shell.dispatchEvent(new DragEvent('dragover', {
-          bubbles: true,
-          cancelable: true,
-          dataTransfer: nextTransfer,
-          clientX: ${state === "banny-home" ? "conversationRect.left + conversationRect.width / 2" : "shellRect.right - 100"},
-          clientY: ${state === "banny-home" ? "conversationRect.top + conversationRect.height / 2" : "shellRect.top + 180"},
-        }));
-        shell.dispatchEvent(new DragEvent('drop', {
-          bubbles: true,
-          cancelable: true,
-          dataTransfer: nextTransfer,
-          clientX: ${state === "banny-home" ? "conversationRect.left + conversationRect.width / 2" : "shellRect.right - 100"},
-          clientY: ${state === "banny-home" ? "conversationRect.top + conversationRect.height / 2" : "shellRect.top + 180"},
-        }));
-        ` : ""}
-      })()
-    `, true);
   }
   await new Promise<void>((resolve) => setTimeout(resolve, 100));
 }
@@ -726,7 +678,7 @@ function validatedFixtureCapturePath(value: string | undefined): string | undefi
   return value;
 }
 
-function validatedFixtureUiState(value: string | undefined): "slash" | "command-palette" | "task-menu" | "task-hover" | "account" | "account-narrow" | "settings" | "settings-narrow" | "settings-grok" | "settings-grok-narrow" | "grok-control" | "grok-control-narrow" | "statuses" | "statuses-narrow" | "workbench" | "workbench-narrow" | "waiting" | "run-boundaries" | "recovery" | "recovery-narrow" | "recovery-wide" | "queue-preempt" | "banny-seat" | "banny-home" | "banny-free" | undefined {
+function validatedFixtureUiState(value: string | undefined): "slash" | "command-palette" | "task-menu" | "task-hover" | "account" | "account-narrow" | "settings" | "settings-narrow" | "settings-grok" | "settings-grok-narrow" | "grok-control" | "grok-control-narrow" | "statuses" | "statuses-narrow" | "workbench" | "workbench-narrow" | "waiting" | "run-boundaries" | "recovery" | "recovery-narrow" | "recovery-wide" | "queue-preempt" | undefined {
   if (value === undefined) return undefined;
   if (
     value !== "slash" &&
@@ -750,10 +702,7 @@ function validatedFixtureUiState(value: string | undefined): "slash" | "command-
     value !== "recovery" &&
     value !== "recovery-narrow" &&
     value !== "recovery-wide" &&
-    value !== "queue-preempt" &&
-    value !== "banny-seat" &&
-    value !== "banny-home" &&
-    value !== "banny-free"
+    value !== "queue-preempt"
   ) throw new Error("fixture_ui_state_invalid");
   return value;
 }
