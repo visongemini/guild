@@ -27,6 +27,11 @@ import {
   type PinnedExecutable,
   type PinnedExecutableCleanup,
 } from "./executable-pin.js";
+import {
+  snapshotDescendants,
+  terminateDescendants,
+  type DescendantRecord,
+} from "./process-tree.js";
 
 export type ProcessHostPreflightCode =
   | ExecutablePinFailureCode
@@ -180,6 +185,10 @@ export type InternalProcessHostTestConfiguration = {
   readonly cleanupPinned?: (pinned: PinnedExecutable) => Promise<PinnedExecutableCleanup>;
   readonly signalGroup?: (processGroupId: number, signal: "SIGTERM" | "SIGKILL") => ProcessGroupSignalEvidence;
   readonly probeGroup?: (processGroupId: number) => ProcessGroupProbeEvidence;
+  /** The engine's descendants outside its process group, read while the engine is still alive. */
+  readonly snapshotDescendants?: (rootPid: number, rootGroupId: number) => Promise<readonly DescendantRecord[]>;
+  /** Ends the snapshot's processes that are still the same ones; called once the group is gone. */
+  readonly terminateDescendants?: (records: readonly DescendantRecord[]) => Promise<unknown>;
   readonly delay?: (milliseconds: number) => Promise<void>;
   readonly monotonicNow?: () => number;
   readonly cleanupDeadlineMs?: number;
@@ -233,6 +242,8 @@ class ProcessHostCore {
   private groupTermSignal: ProcessGroupSignalEvidence | undefined;
   private groupKillSignal: ProcessGroupSignalEvidence | undefined;
   private groupGoneObserved = false;
+  /** Helpers of the engine that left its process group, read at stop time (see process-tree.ts). */
+  private descendantSnapshot: readonly DescendantRecord[] = [];
   private closeEvidence: ProcessCloseEvidence | undefined;
   private cleanupOperation: Promise<PinnedExecutableCleanup> | undefined;
   private cleanupEvidenceOperation: Promise<ProcessCleanupEvidence> | undefined;
@@ -454,6 +465,13 @@ class ProcessHostCore {
       return this.finalReceipt;
     }
     this.currentState = "stopping";
+    // Helpers that left the engine's group (setsid, a group of their own) survive the group signal
+    // below, and once the engine is gone nothing links them to it any more: read them now.
+    const enginePid = this.child?.pid;
+    if (enginePid !== undefined && !this.exitObserved && this.closeEvidence === undefined) {
+      this.descendantSnapshot = await this.lifecycle.snapshotDescendants(enginePid, processGroupId)
+        .catch(() => Object.freeze([]) as readonly DescendantRecord[]);
+    }
     this.observeGroupGone();
     this.groupTermSignal = this.groupGoneObserved
       ? { signal: "SIGTERM", outcome: "already_gone" }
@@ -526,6 +544,11 @@ class ProcessHostCore {
     const close = this.closeEvidence;
     if (close === undefined || !this.groupGoneObserved) {
       throw new Error("reap completion requires direct close and confirmed group absence");
+    }
+    if (this.descendantSnapshot.length > 0) {
+      const records = this.descendantSnapshot;
+      this.descendantSnapshot = [];
+      await this.lifecycle.terminateDescendants(records).catch(() => undefined);
     }
     const cleanup = await this.cleanupPin();
     const groupTermSignal = this.groupTermSignal ?? { signal: "SIGTERM", outcome: "already_gone" };
@@ -750,6 +773,8 @@ const PRODUCTION_LIFECYCLE = Object.freeze<ProcessHostLifecycle>({
   cleanupPinned: (pinned) => pinned.cleanup(),
   signalGroup,
   probeGroup,
+  snapshotDescendants,
+  terminateDescendants,
   delay,
   monotonicNow: () => performance.now(),
   cleanupDeadlineMs: PRODUCTION_CLEANUP_DEADLINE_MS,
@@ -771,6 +796,8 @@ export function createInternalProcessHostForTesting(
     cleanupPinned: configuration.cleanupPinned ?? PRODUCTION_LIFECYCLE.cleanupPinned,
     signalGroup: configuration.signalGroup ?? PRODUCTION_LIFECYCLE.signalGroup,
     probeGroup: configuration.probeGroup ?? PRODUCTION_LIFECYCLE.probeGroup,
+    snapshotDescendants: configuration.snapshotDescendants ?? PRODUCTION_LIFECYCLE.snapshotDescendants,
+    terminateDescendants: configuration.terminateDescendants ?? PRODUCTION_LIFECYCLE.terminateDescendants,
     delay: configuration.delay ?? PRODUCTION_LIFECYCLE.delay,
     monotonicNow: configuration.monotonicNow ?? PRODUCTION_LIFECYCLE.monotonicNow,
     cleanupDeadlineMs,
