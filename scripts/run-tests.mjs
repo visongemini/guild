@@ -71,6 +71,7 @@ const REQUIRED_TEST_BASENAMES = {
     "env-file.test.js",
     "network-policy.test.js",
     "provenance.test.js",
+    "router.test.js",
     "sse.test.js",
   ],
   "@guild/persistence": ["lease.test.js", "store.test.js"],
