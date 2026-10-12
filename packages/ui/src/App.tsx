@@ -151,9 +151,11 @@ import { RunPhaseLine } from "./RunPhaseLine.js";
 import { groupEntries, segmentTimeline, type TimelineRow } from "./rolled-back.js";
 import { attentionStripTasks } from "./attention-tasks.js";
 import type { RolledBackResult } from "./rewind-flow.js";
+import { GuildHero } from "./GuildHero.js";
 import { permissionOptionView } from "./permission-options.js";
 import { cardAnchors, latestChangedRun, resultSummaryRepeatsChangeCard } from "./run-changes.js";
 import { composerEnterAction, steerButtonState } from "./steer.js";
+import { noTaskComposerPlaceholder } from "./welcome.js";
 import {
   globalDefaultView,
   modelCatalogsOf,
@@ -215,7 +217,6 @@ import { mergeStreamText, StreamOverlayStore, type StreamOverlayRecord } from ".
 import { StreamingMarkdownSplitter } from "./streaming-markdown.js";
 import { replaceEqualDeep } from "./structural-sharing.js";
 
-const BANNY_ASSET_URL = new URL("./assets/banny.png", import.meta.url).href;
 const WORKBENCH_WIDTH_STORAGE_KEY = "guild:v1:workbench-width";
 const WORKBENCH_MIN_WIDTH = 280;
 const WORKBENCH_MAX_WIDTH = 480;
@@ -2392,15 +2393,7 @@ export function GuildApp({ api }: GuildAppProps) {
             <Welcome messages={messages} hasWorkspace={activeWorkspaces.length > 0} onChoose={() => void chooseWorkspace()} onCreate={() => void createTask()} />
           ) : activeTimeline.length === 0 && pendingSendForActive === undefined ? (
             <div className="guild-empty-task">
-              <img className="guild-banny" src={BANNY_ASSET_URL} alt="" draggable={false} />
-              <h1 className="guild-acronym" aria-label={messages.starterTitle}>{([
-                ["G", "Goal", messages.guildGoal],
-                ["U", "Understand", messages.guildUnderstand],
-                ["I", "Implement", messages.guildImplement],
-                ["L", "Loop", messages.guildLoop],
-                ["D", "Deliver", messages.guildDeliver],
-              ] as const).map(([letter, word, gloss]) => <span key={letter} aria-hidden="true"><b>{letter}</b><small>{word}</small>{gloss !== "" && <em>{gloss}</em>}</span>)}</h1>
-              <p>{messages.starterHelp}</p>
+              <GuildHero messages={messages} help={messages.starterHelp} />
               <div className="guild-starters">{([
                 [messages.starterReview, messages.starterReviewDraft, <MagnifyingGlass size={19} />],
                 [messages.starterBuild, messages.starterBuildDraft, <Code size={19} />],
@@ -2654,7 +2647,7 @@ export function GuildApp({ api }: GuildAppProps) {
                 if (enter === "steer") void sendComposerText(draft, "steer");
                 else event.currentTarget.form?.requestSubmit();
               }}
-              placeholder={activeTask === undefined ? messages.selectWorkspaceFirst : pendingSendForActive !== undefined ? messages.connectingRuntime : running ? (steerAvailable ? messages.queueSteerPlaceholder : messages.queuePlaceholder) : messages.composerPlaceholder}
+              placeholder={activeTask === undefined ? noTaskComposerPlaceholder(messages, activeWorkspaces.length > 0) : pendingSendForActive !== undefined ? messages.connectingRuntime : running ? (steerAvailable ? messages.queueSteerPlaceholder : messages.queuePlaceholder) : messages.composerPlaceholder}
               aria-label={messages.composerPlaceholder}
               aria-controls={slashMenuOpen ? "guild-slash-menu" : undefined}
               aria-expanded={slashMenuOpen}
@@ -3854,11 +3847,9 @@ function Welcome({ messages, hasWorkspace, onChoose, onCreate }: {
   readonly onCreate: () => void;
 }) {
   return (
-    <div className="guild-welcome">
-      <div className="guild-welcome-mark"><Code size={30} weight="light" /></div>
-      <h1>{hasWorkspace ? messages.welcomeTitle : messages.noWorkspaceTitle}</h1>
-      <p>{hasWorkspace ? messages.welcomeBody : messages.noWorkspaceBody}</p>
-      <button type="button" onClick={hasWorkspace ? onCreate : onChoose}><FolderOpen size={17} />{hasWorkspace ? messages.newTask : messages.chooseWorkspace}</button>
+    <div className="guild-empty-task">
+      <GuildHero messages={messages} help={hasWorkspace ? messages.welcomeBody : messages.noWorkspaceBody} />
+      <button type="button" className="guild-welcome-action" onClick={hasWorkspace ? onCreate : onChoose}><FolderOpen size={17} />{hasWorkspace ? messages.newTask : messages.chooseWorkspace}</button>
     </div>
   );
 }

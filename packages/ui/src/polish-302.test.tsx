@@ -6,11 +6,13 @@ import { freezeModelCatalog } from "@guild/contracts/grok-models";
 import { renderToStaticMarkup } from "react-dom/server";
 import { TimelineItem } from "./App.js";
 import { claudeDefaultsView } from "./claude-engine.js";
+import { GuildHero } from "./GuildHero.js";
 import { messagesFor } from "./locales.js";
 import { CLAUDE_CATALOG, REAL_CATALOG } from "./model-catalog.fixture.js";
 import { effortsDescending, headingIsStuck, modelPickerView, scrollCues } from "./model-picker.js";
 import { ModelPicker } from "./ModelPicker.js";
 import { permissionOptionView } from "./permission-options.js";
+import { noTaskComposerPlaceholder } from "./welcome.js";
 
 /*
  * Guild 3.0.2 UI polish: one test file for the behaviours added by the polish pass. Pure view logic is tested
@@ -206,4 +208,34 @@ test("the popover is wider, its group headings stick, and both edges have a fade
       taskEngine="claude" engineFixed onApply={async () => undefined} initialOpen />,
   );
   assert.equal(markup.match(/class="guild-model-fade (?:top|bottom)" aria-hidden="true"/gu)?.length, 2);
+});
+
+// ---- empty and welcome screens
+
+test("the composer without a task asks for a task when a workspace exists, and for a workspace only when none does", () => {
+  for (const [locale, task, workspace] of [
+    ["zh-CN", "新建任务后就能发送", "选择工作区后才能发送"],
+    ["en-US", "Start a task to send a message", "Choose a workspace before sending"],
+  ] as const) {
+    const messages = messagesFor(locale);
+    assert.equal(noTaskComposerPlaceholder(messages, true), task);
+    assert.equal(noTaskComposerPlaceholder(messages, false), workspace);
+  }
+});
+
+test("the hero renders the mascot, the five letters and the helper line it is given, in both languages", () => {
+  for (const locale of ["zh-CN", "en-US"] as const) {
+    const messages = messagesFor(locale);
+    const markup = renderToStaticMarkup(<div><GuildHero messages={messages} help="helper line" /></div>);
+    assert.equal(markup.match(/class="guild-banny"/gu)?.length, 1);
+    assert.match(markup, /<img class="guild-banny"[^>]*alt=""[^>]*draggable="false"\/>/u);
+    assert.deepEqual([...markup.matchAll(/<b>([A-Z])<\/b>/gu)].map((match) => match[1]), ["G", "U", "I", "L", "D"]);
+    assert.match(markup, new RegExp(`<h1 class="guild-acronym" aria-label="${messages.starterTitle}">`, "u"));
+    assert.match(markup, /<p>helper line<\/p>/u);
+  }
+  // The old welcome headline and its code-glyph tile are gone with their catalog entries.
+  const zh = messagesFor("zh-CN") as unknown as Record<string, unknown>;
+  assert.equal("welcomeTitle" in zh, false);
+  assert.equal("noWorkspaceTitle" in zh, false);
+  assert.match(messagesFor("zh-CN").welcomeBody, /新建/u);
 });

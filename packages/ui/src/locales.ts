@@ -13,10 +13,8 @@ export type GuildMessages = WorkshopMessages & ChangeMessages & {
   readonly automation: string;
   readonly library: string;
   readonly projectAndChats: string;
-  readonly noWorkspaceTitle: string;
   readonly noWorkspaceBody: string;
   readonly chooseWorkspace: string;
-  readonly welcomeTitle: string;
   readonly welcomeBody: string;
   readonly composerPlaceholder: string;
   readonly connectingRuntime: string;
@@ -28,6 +26,7 @@ export type GuildMessages = WorkshopMessages & ChangeMessages & {
   readonly preemptingQueued: string;
   readonly cancelQueued: string;
   readonly selectWorkspaceFirst: string;
+  readonly createTaskFirst: string;
   readonly send: string;
   readonly stop: string;
   readonly continuousMode: string;
@@ -551,11 +550,9 @@ const ZH_CN: GuildMessages = Object.freeze({
   automation: "自动化",
   library: "资料库",
   projectAndChats: "项目与对话",
-  noWorkspaceTitle: "先选择工作区",
   noWorkspaceBody: "任务必须归属于一个本地文件夹，Guild 不会在未选择工作区时发送。",
   chooseWorkspace: "选择项目文件夹",
-  welcomeTitle: "准备好做点什么？",
-  welcomeBody: "选择一个工作区，然后把任务交给 Guild。",
+  welcomeBody: "新建一个任务，把事情交给 Guild。",
   composerPlaceholder: "问 Guild…",
   connectingRuntime: "正在连接 Grok…",
   queuePlaceholder: "继续输入，回车后排队发送…",
@@ -566,6 +563,7 @@ const ZH_CN: GuildMessages = Object.freeze({
   preemptingQueued: "正在停止当前任务…",
   cancelQueued: "取消这条排队消息",
   selectWorkspaceFirst: "选择工作区后才能发送",
+  createTaskFirst: "新建任务后就能发送",
   send: "发送",
   stop: "停止",
   continuousMode: "持续任务",
@@ -1102,11 +1100,9 @@ const EN_US: GuildMessages = Object.freeze({
   automation: "Automation",
   library: "Library",
   projectAndChats: "Projects and chats",
-  noWorkspaceTitle: "Choose a workspace first",
   noWorkspaceBody: "Every task belongs to a local folder. Guild will not send before one is selected.",
   chooseWorkspace: "Choose project folder",
-  welcomeTitle: "What should we work on?",
-  welcomeBody: "Choose a workspace, then hand the task to Guild.",
+  welcomeBody: "Start a task and hand it to Guild.",
   composerPlaceholder: "Ask Guild…",
   connectingRuntime: "Connecting to Grok…",
   queuePlaceholder: "Keep typing, then press Enter to queue…",
@@ -1117,6 +1113,7 @@ const EN_US: GuildMessages = Object.freeze({
   preemptingQueued: "Stopping current task…",
   cancelQueued: "Cancel queued message",
   selectWorkspaceFirst: "Choose a workspace before sending",
+  createTaskFirst: "Start a task to send a message",
   send: "Send",
   stop: "Stop",
   continuousMode: "Continuous task",
