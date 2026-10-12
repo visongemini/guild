@@ -93,8 +93,10 @@ created and never changes. Process topology stays one engine process per task (D
   operation that concurrent callers join): restarts the task's adapter with
   `ANTHROPIC_BASE_URL=<router url>`, `ENABLE_TOOL_SEARCH=true`, `OPENVIKING_AUTO_CAPTURE=false`,
   resumes the same session with `_meta.claudeCode.options.settings.modelPicker` listing every
-  enabled Online/Local model, sets the model, and only after the model is confirmed applied records
-  `task_metadata.routed_at` (review fix 2026-10-12). If a run became active before the native process
+  enabled Online/Local model, sets the model, and only after the model is confirmed applied (and the start's projection
+  published) records `task_metadata.routed_at` as the last step that can fail (review fix 2026-10-12); a projection
+  that cannot be built after the marker is logged, not raised. Every prompt launch (send, queued turn, continuous
+  round) first joins a start in flight or due and uses the session it produced. If a run became active before the native process
   closed, the switch is deferred without marking; any failure leaves the task unmarked and surfaces
   `model_router_unavailable` / `model_selection_failed`. For the Claude engine a model that cannot be
   applied refuses the prompt (`model_selection_failed`) instead of running on another model.
