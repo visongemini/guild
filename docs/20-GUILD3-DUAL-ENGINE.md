@@ -103,7 +103,9 @@ created and never changes. Process topology stays one engine process per task (D
   time, while the engine is alive, it reads the engine's descendants outside the group
   (`ps -axo pid=,ppid=,pgid=,lstart=`, walked from the engine pid, at most 256, 1 s bound) and keeps the
   snapshot only if that same table shows the engine with the recorded start time; if the root is missing or its
-  start time differs (the pid was reused), it sweeps nothing and logs `helper_sweep_skipped_identity`. As soon as
+  start time differs (the pid was reused), or if the engine exited while the table was read (the start time has
+  one-second precision; the pid cannot be reused before Guild, its parent, reaps it and observes `exit`), it sweeps
+  nothing and logs `helper_sweep_skipped_identity`. As soon as
   the group is gone it sends TERM, then KILL, to exactly those processes, and only to a process whose pid, group
   and start time still match the snapshot. It does not wait for the engine's stdout to close first (a helper
   that inherited it would keep that from ever happening), and a stop that times out sweeps once too. Nothing

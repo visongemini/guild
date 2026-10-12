@@ -586,18 +586,21 @@ class ProcessHostCore {
   /**
    * Records the engine's escaped helpers, but only through the identity read at spawn: the engine must
    * show up with the same start time in the table the helpers are read from. Otherwise nothing is swept.
+   * The start time has one-second precision, so it is not the proof of identity on its own: Guild is the
+   * engine's parent, and its pid cannot be reused before Guild reaps it, which is the moment `exit` is
+   * observed. A snapshot is therefore kept only if the engine had not exited when the table was read.
    */
   private async snapshotHelpers(enginePid: number, processGroupId: number): Promise<void> {
     const identity = await this.engineIdentity;
     let snapshot: DescendantSnapshot | undefined;
-    if (identity !== undefined && identity.pid === enginePid) {
+    if (identity !== undefined && identity.pid === enginePid && !this.exitObserved) {
       try {
         snapshot = await this.lifecycle.snapshotDescendants(identity, processGroupId);
       } catch {
         return;
       }
     }
-    if (snapshot?.rootVerified !== true) {
+    if (snapshot?.rootVerified !== true || this.exitObserved) {
       console.warn("helper_sweep_skipped_identity", { pid: enginePid });
       return;
     }

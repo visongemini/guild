@@ -1518,6 +1518,43 @@ describe("GrokProcessHost execution policy and lifecycle (PC-TRN-001/002/003)", 
     }
   });
 
+  it("discards the snapshot when the engine exits while the table is being read (pid reuse window) [PC-ENG-001]", async () => {
+    const fixture = await prepareFixture();
+    let host: TestHost | undefined;
+    let group: number | undefined;
+    let terminations = 0;
+    const warnings = mock.method(console, "warn", () => undefined);
+    try {
+      host = testHost(fixture, ["linger"], {}, {
+        snapshotDescendants: async (root) => {
+          // The engine dies and is reaped while the table is read; a reused pid could now pass the
+          // second-precision start time, so the "verified" result must not be trusted.
+          try { process.kill(root.pid, "SIGKILL"); } catch { /* already gone */ }
+          await eventuallyGone(root.pid);
+          await new Promise((resolve) => setTimeout(resolve, 200));
+          return { rootVerified: true, records: [{ pid: 4_194_000, ppid: root.pid, pgid: 4_194_000, startedAt: root.startedAt }] };
+        },
+        terminateDescendants: async (records) => {
+          terminations += 1;
+          return records.length;
+        },
+      });
+      const ready = waitForStdout(host, "READY\n");
+      group = (await startOwned(host, fixture)).processGroupId;
+      await bounded(ready, FIXTURE_STARTUP_TIMEOUT_MS);
+      await bounded(host.stop(), 8_000);
+      assert.equal(terminations, 0, "a snapshot read across the engine's exit attributes no helper to it");
+      assert.ok(
+        warnings.mock.calls.some((call) => call.arguments[0] === "helper_sweep_skipped_identity"),
+        "the skipped sweep is logged",
+      );
+    } finally {
+      warnings.mock.restore();
+      await cleanup(host, group);
+      await fixture.remove();
+    }
+  });
+
   it("sweeps nothing and logs it when no identity could be recorded at spawn [PC-ENG-001]", async () => {
     const fixture = await prepareFixture();
     let host: TestHost | undefined;
