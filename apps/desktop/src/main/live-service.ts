@@ -187,6 +187,7 @@ import {
 import {
   CLAUDE_DEFAULT_MUST_BE_NATIVE,
   CLAUDE_LOGIN_REQUIRED,
+  ENGINE_INTEGRITY_CHANGED,
   MODEL_ROUTER_UNAVAILABLE,
   MODEL_SELECTION_FAILED,
   SESSION_RECOVERY_CONTEXT_REQUIRED,
@@ -348,7 +349,12 @@ export type RuntimeFactory = (input: {
    * router token: never log it.
    */
   readonly extraEnvironment?: Readonly<Record<string, string>>;
-}) => Promise<{ readonly adapter: RuntimeAdapterPort; readonly runtimeVersion?: string }>;
+}) => Promise<{
+  readonly adapter: RuntimeAdapterPort;
+  readonly runtimeVersion?: string;
+  /** Claude only: true when the process refused to run because its pinned files changed (PC-ENG-002). */
+  readonly refusedForIntegrity?: () => boolean;
+}>;
 
 export type LiveDesktopServiceOptions = {
   readonly appVersion: string;
@@ -643,7 +649,7 @@ export function createLiveDesktopService(
   // What the Claude engine last said about its login. Account-level: one login serves every Claude task.
   let claudeAuth: Readonly<{ kind: string; label?: string }> | undefined;
   // What was found of the Claude installation; undefined until something looked.
-  let claudeInstall: Readonly<{ status: "ready" | "not_found" | "unavailable"; version?: string }> | undefined;
+  let claudeInstall: Readonly<{ status: "ready" | "not_found" | "unavailable" | "integrity_changed"; version?: string }> | undefined;
   let claudeProbeAtMs = 0;
   let claudeProbeOperation: Promise<void> | undefined;
   const claudeProbe = options.claudeEngineProbe ?? (options.runtimeFactory === undefined
@@ -794,6 +800,9 @@ export function createLiveDesktopService(
       } catch (cause: unknown) {
         next = Object.freeze({ status: cause instanceof ClaudeLocatorError ? "not_found" as const : "unavailable" as const });
       }
+      // A refusal to run changed files stays until a Claude session opens again; a probe that only
+      // finds the pieces present must not hide it.
+      if (claudeInstall?.status === "integrity_changed") return;
       noteClaudeInstall(next);
     })().finally(() => { claudeProbeOperation = undefined; });
   }
@@ -806,7 +815,7 @@ export function createLiveDesktopService(
 
   /** `status`, `accountLabel` and `version` of `runtimeSettings.claude` (docs/20 3.2, 3.8). */
   function claudeEngineReport(): Readonly<{
-    status?: "ready" | "not_found" | "not_logged_in" | "unavailable";
+    status?: "ready" | "not_found" | "not_logged_in" | "unavailable" | "integrity_changed";
     accountLabel?: string;
     version?: string;
   }> {
@@ -4751,6 +4760,10 @@ export function createLiveDesktopService(
       }
       if (controller.engine === "claude" && cause instanceof ClaudeLocatorError) {
         noteClaudeInstall(Object.freeze({ status: "not_found" as const }));
+      }
+      if (controller.engine === "claude" && created?.refusedForIntegrity?.() === true) {
+        noteClaudeInstall(Object.freeze({ status: "integrity_changed" as const }));
+        throw new Error(ENGINE_INTEGRITY_CHANGED);
       }
       if (cause instanceof Error && (cause.message === MODEL_ROUTER_UNAVAILABLE || cause.message === MODEL_SELECTION_FAILED)) {
         throw cause;

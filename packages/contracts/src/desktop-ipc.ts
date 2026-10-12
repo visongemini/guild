@@ -515,10 +515,11 @@ export type RuntimeSettingsProjection = {
 /**
  * Whether Claude Code can run on this machine (PC-ENG-002): `not_found` when node, the ACP adapter
  * or the `claude` binary is missing or unsupported, `not_logged_in` when the engine reported that
- * nobody is logged in, `unavailable` when it is installed but could not be checked.
+ * nobody is logged in, `unavailable` when it is installed but could not be checked, and
+ * `integrity_changed` when its pinned files changed without an update and Guild refuses to run them.
  */
 export const GUILD_CLAUDE_ENGINE_STATUSES = Object.freeze([
-  "ready", "not_found", "not_logged_in", "unavailable",
+  "ready", "not_found", "not_logged_in", "unavailable", "integrity_changed",
 ] as const);
 export type GuildClaudeEngineStatus = (typeof GUILD_CLAUDE_ENGINE_STATUSES)[number];
 

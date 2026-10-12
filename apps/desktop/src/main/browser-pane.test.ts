@@ -7,6 +7,7 @@ import {
   BROWSER_PANE_IDLE_DEBOUNCE_MS,
   BROWSER_PANE_PARTITION,
   BROWSER_PANE_PAUSED_MESSAGE,
+  BROWSER_PANE_TAB_CHANGED_MESSAGE,
   BROWSER_PANE_WEB_PREFERENCES,
   BrowserToolError,
   configureBrowserPaneProcess,
@@ -14,6 +15,7 @@ import {
   safeDownloadName,
   type BrowserPaneBounds,
   type BrowserPaneController,
+  type BrowserPaneToolSurface,
   type PaneContentsHandlers,
   type PaneDownload,
   type PaneNetworkEvent,
@@ -136,6 +138,8 @@ type FakeViewState = {
 function setup(options: { registry?: ReturnType<typeof createBrowserPaneRegistry>; holdLoads?: boolean } = {}) {
   const registry = options.registry ?? createBrowserPaneRegistry();
   const timers = new FakeTimers();
+  /** The Guild window's renderer zoom factor, which tests change on the fly. */
+  const zoom = { factor: 1 };
   const views: FakeViewState[] = [];
   const stateOf = new Map<PaneView, FakeViewState>();
   let downloadListener: ((download: PaneDownload) => void) | undefined;
@@ -143,6 +147,7 @@ function setup(options: { registry?: ReturnType<typeof createBrowserPaneRegistry
   const controller: BrowserPaneController = createBrowserPaneController({
     registry,
     timers,
+    zoomFactor: () => zoom.factor,
     host: {
       createView: () => {
         const state: FakeViewState = { contents: new FakeContents(), bounds: undefined, visible: false, destroyed: false, nativeCalls: 0 };
@@ -168,7 +173,7 @@ function setup(options: { registry?: ReturnType<typeof createBrowserPaneRegistry
   });
   const flush = async () => { for (let i = 0; i < 30; i += 1) await Promise.resolve(); };
   return {
-    controller, registry, timers, views, flush,
+    controller, registry, timers, views, flush, zoom,
     download: (d: PaneDownload) => downloadListener?.(d),
     network: (e: PaneNetworkEvent) => networkListener?.(e),
   };
@@ -221,6 +226,13 @@ test("the process switch that keeps a covered window's pages alive is applied be
   configureBrowserPaneProcess({ commandLine: { appendSwitch: (name) => { applied.push(name); } } });
   assert.deepEqual(applied, ["disable-backgrounding-occluded-windows"]);
   assert.deepEqual([...BROWSER_PANE_COMMAND_LINE_SWITCHES], applied);
+});
+
+test("the Electron seam gives the controller the Guild window's zoom factor and refreshes on zoom-changed", async () => {
+  const adapter = await readFile(new URL("../../src/main/browser-pane-electron.ts", import.meta.url), "utf8");
+  assert.match(adapter, /zoomFactor: \(\) => \(window\.isDestroyed\(\) \? 1 : window\.webContents\.getZoomFactor\(\)\)/u);
+  assert.match(adapter, /window\.webContents\.on\("zoom-changed", onZoomChanged\)/u);
+  assert.match(adapter, /controller\.refreshLayout\(\)/u);
 });
 
 test("the pane module names nothing from the Guild window's own policy and Electron only as types", async () => {
@@ -745,4 +757,205 @@ test("dispose closes every tab, stops timers and refuses further commands", asyn
   assert.equal(env.timers.size, 0);
   assert.deepEqual(await env.controller.command({ kind: "newTab" }), { ok: false, reason: "failed" });
   env.controller.dispose();
+});
+
+// ---- a tool call is bound to its start: control generation, tab and page [PC-BROWSER-002] -----
+
+const paused = (error: unknown): boolean => error instanceof BrowserToolError && error.message === BROWSER_PANE_PAUSED_MESSAGE;
+const tabChanged = (error: unknown): boolean => error instanceof BrowserToolError && error.message === BROWSER_PANE_TAB_CHANGED_MESSAGE;
+const MOUSE = { type: "mousePressed", x: 1, y: 2, button: "left", clickCount: 1 };
+
+/** What a tab's debugger was sent, without the `Runtime.enable` that attaching itself sends. */
+function sentTo(env: ReturnType<typeof setup>, index: number): string[] {
+  return env.views[index]!.contents.cdp.map((entry) => entry.method).filter((method) => method !== "Runtime.enable");
+}
+
+test("a tool call that started before Take over sends nothing after it, not even after Resume agent", async () => {
+  const env = setup();
+  await openTabs(env, 1);
+  let stale!: BrowserPaneToolSurface;
+  const outcome = await env.controller.tools.runAgentTool(async (tool) => {
+    stale = tool;
+    await tool.send("DOM.enable");
+    await env.controller.command({ kind: "takeOver" });
+    return tool.send("Input.dispatchMouseEvent", MOUSE).then(() => "sent", (error: unknown) => error);
+  });
+  assert.equal(paused(outcome), true);
+  assert.deepEqual(sentTo(env, 0), ["DOM.enable"]);
+
+  await env.controller.command({ kind: "resumeAgent" });
+  await assert.rejects(stale.send("Input.dispatchMouseEvent", MOUSE), paused);
+  await assert.rejects(stale.navigate("https://example.com/"), paused);
+  assert.deepEqual(sentTo(env, 0), ["DOM.enable"]);
+  // A call that starts after the resume is a new call with the new generation.
+  await env.controller.tools.runAgentTool((tool) => tool.send("DOM.enable"));
+  assert.deepEqual(sentTo(env, 0), ["DOM.enable", "DOM.enable"]);
+});
+
+test("Take over while a command waits for the debugger stops it before it is dispatched", async () => {
+  const env = setup({ holdLoads: true });
+  await env.controller.command({ kind: "newTab" });
+  const contents = env.views[0]!.contents;
+  const running = env.controller.tools.runAgentTool((tool) => tool.send("Runtime.evaluate", { expression: "1" }));
+  await env.flush();
+  await env.controller.command({ kind: "takeOver" });
+  contents.finishLoad("about:blank");
+  await env.flush();
+  await assert.rejects(running, paused);
+  assert.deepEqual(sentTo(env, 0), [], "the tool's command was never dispatched");
+});
+
+test("Take over while a navigation waits for the tab stops it before the page is requested", async () => {
+  const env = setup({ holdLoads: true });
+  await env.controller.command({ kind: "newTab" });
+  const contents = env.views[0]!.contents;
+  const running = env.controller.tools.runAgentTool((tool) => tool.navigate("https://example.com/"));
+  await env.flush();
+  await env.controller.command({ kind: "takeOver" });
+  contents.finishLoad("about:blank");
+  await env.flush();
+  await assert.rejects(running, paused);
+  assert.deepEqual(contents.loads, ["about:blank"], "only the tab's own blank page was loaded");
+});
+
+test("history steps are refused after Take over", async () => {
+  const env = setup();
+  await openTabs(env, 1);
+  const contents = env.views[0]!.contents;
+  contents.back = true;
+  contents.forward = true;
+  await env.controller.tools.runAgentTool(async (tool) => {
+    await env.controller.command({ kind: "takeOver" });
+    await assert.rejects(tool.goBack(), paused);
+    await assert.rejects(tool.goForward(), paused);
+    await assert.rejects(tool.reload(), paused);
+  });
+  assert.deepEqual(contents.actions, []);
+});
+
+test("every step of a call goes to the tab it started on; a hidden tab gets no input or screenshot", async () => {
+  const env = setup();
+  await openTabs(env, 2);
+  env.views[0]!.contents.emitDebugger("Runtime.consoleAPICalled", { type: "log", args: [{ value: "one" }] });
+  env.views[1]!.contents.emitDebugger("Runtime.consoleAPICalled", { type: "log", args: [{ value: "two" }] });
+  assert.equal(env.controller.tools.activeTab()?.id, "tab-2");
+
+  await env.controller.tools.runAgentTool(async (tool) => {
+    await tool.send("DOM.enable");
+    // The user (or a pop-up) makes another tab the shown one while the call runs.
+    assert.equal(env.controller.tools.selectTab("tab-1"), true);
+    await tool.send("DOM.getBoxModel", { backendNodeId: 5 });
+    assert.deepEqual(tool.consoleMessages(), [{ level: "log", text: "two" }], "reads follow the bound tab");
+    await tool.send("Accessibility.getFullAXTree");
+    await assert.rejects(tool.send("Input.dispatchMouseEvent", MOUSE), tabChanged);
+    await assert.rejects(tool.send("Page.captureScreenshot"), tabChanged);
+  });
+  assert.deepEqual(sentTo(env, 1), ["DOM.enable", "DOM.getBoxModel", "Accessibility.getFullAXTree"]);
+  assert.deepEqual(sentTo(env, 0), [], "the tab the user switched to was never touched");
+  assert.deepEqual(env.controller.tools.consoleMessages(), [{ level: "log", text: "one" }]);
+});
+
+test("a call aborts with the tab-changed message when its tab was closed", async () => {
+  const env = setup();
+  await openTabs(env, 2);
+  await env.controller.tools.runAgentTool(async (tool) => {
+    await tool.send("DOM.enable");
+    assert.deepEqual(await env.controller.command({ kind: "closeTab", tabId: "tab-2" }), { ok: true });
+    await assert.rejects(tool.send("Accessibility.getFullAXTree"), tabChanged);
+    await assert.rejects(tool.navigate("https://example.com/"), tabChanged);
+    await assert.rejects(tool.goBack(), tabChanged);
+  });
+  assert.deepEqual(sentTo(env, 0), [], "the remaining tab was not used in its place");
+  assert.deepEqual(env.views[0]!.contents.loads, ["about:blank"]);
+});
+
+test("a click by ref aborts when the page navigated after the call started, before any input", async () => {
+  const env = setup();
+  await openTabs(env, 1);
+  const contents = env.views[0]!.contents;
+  contents.finishLoad("https://a.example/");
+  await env.controller.tools.runAgentTool(async (tool) => {
+    await tool.send("DOM.enable");
+    contents.finishLoad("https://b.example/");
+    await tool.send("Accessibility.getFullAXTree");
+    await assert.rejects(tool.send("DOM.getBoxModel", { backendNodeId: 1 }), tabChanged);
+    await assert.rejects(tool.send("Input.dispatchMouseEvent", MOUSE), tabChanged);
+  });
+  assert.deepEqual(sentTo(env, 0), ["DOM.enable", "Accessibility.getFullAXTree"]);
+
+  // A same-document change (hash, pushState) also moves the ref targets.
+  await env.controller.tools.runAgentTool(async (tool) => {
+    contents.url = "https://b.example/#next";
+    contents.handlers.didNavigate();
+    await assert.rejects(tool.send("DOM.getBoxModel", { backendNodeId: 1 }), tabChanged);
+  });
+  assert.equal(sentTo(env, 0).includes("DOM.getBoxModel"), false);
+});
+
+test("once a call has sent input, a navigation it caused does not cut the gesture in half", async () => {
+  const env = setup();
+  await openTabs(env, 1);
+  const contents = env.views[0]!.contents;
+  contents.finishLoad("https://a.example/");
+  await env.controller.tools.runAgentTool(async (tool) => {
+    await tool.send("DOM.getBoxModel", { backendNodeId: 1 });
+    await tool.send("Input.dispatchMouseEvent", { ...MOUSE, type: "mousePressed" });
+    contents.finishLoad("https://b.example/");
+    await tool.send("Input.dispatchMouseEvent", { ...MOUSE, type: "mouseReleased" });
+  });
+  assert.deepEqual(sentTo(env, 0), ["DOM.getBoxModel", "Input.dispatchMouseEvent", "Input.dispatchMouseEvent"]);
+});
+
+test("calls made outside runAgentTool bind to the pane as it is when they are made", async () => {
+  const env = setup();
+  await openTabs(env, 2);
+  await env.controller.tools.send("DOM.enable");
+  env.controller.tools.selectTab("tab-1");
+  await env.controller.tools.send("DOM.enable");
+  assert.deepEqual(sentTo(env, 1), ["DOM.enable"]);
+  assert.deepEqual(sentTo(env, 0), ["DOM.enable"]);
+});
+
+// ---- window zoom ------------------------------------------------------------------------------
+
+test("bounds in CSS pixels are multiplied by the window zoom factor and rounded before they reach the native view", async () => {
+  const env = setup();
+  env.zoom.factor = 1.25;
+  await openTabs(env, 1);
+  assert.deepEqual(env.views[0]!.bounds, { x: 0, y: 0, width: 1000, height: 750 }, "the default bounds are scaled too");
+  assert.deepEqual(await env.controller.command({ kind: "setBounds", x: 10, y: 21, width: 333, height: 101 }), { ok: true });
+  assert.deepEqual(env.views[0]!.bounds, { x: 13, y: 26, width: 416, height: 126 });
+
+  // A tab opened later gets the zoomed rectangle as well.
+  await openTabs(env, 1);
+  assert.deepEqual(env.views[1]!.bounds, { x: 13, y: 26, width: 416, height: 126 });
+
+  // Zoom 1 is the identity, and a nonsense factor is treated as 1.
+  env.zoom.factor = 1;
+  env.controller.refreshLayout();
+  assert.deepEqual(env.views[0]!.bounds, { x: 10, y: 21, width: 333, height: 101 });
+  for (const bad of [0, -2, Number.NaN, Number.POSITIVE_INFINITY]) {
+    env.zoom.factor = bad;
+    env.controller.refreshLayout();
+    assert.deepEqual(env.views[0]!.bounds, { x: 10, y: 21, width: 333, height: 101 }, String(bad));
+  }
+});
+
+test("a zoom change re-applies the last bounds, and unchanged layout is still not pushed twice", async () => {
+  const env = setup();
+  await openTabs(env, 2);
+  await env.controller.command({ kind: "setBounds", x: 20, y: 40, width: 300, height: 200 });
+  const calls = env.views.map((view) => view.nativeCalls);
+  env.controller.refreshLayout();
+  assert.deepEqual(env.views.map((view) => view.nativeCalls), calls, "same zoom, nothing to push");
+
+  env.zoom.factor = 1.5;
+  env.controller.refreshLayout();
+  assert.deepEqual(env.views[0]!.bounds, { x: 30, y: 60, width: 450, height: 300 });
+  assert.deepEqual(env.views[1]!.bounds, { x: 30, y: 60, width: 450, height: 300 }, "hidden tabs are kept in step");
+
+  // Even without the event, the next layout pass of the pane reads the factor afresh.
+  env.zoom.factor = 0.8;
+  env.controller.tools.selectTab("tab-1");
+  assert.deepEqual(env.views[0]!.bounds, { x: 16, y: 32, width: 240, height: 160 });
 });

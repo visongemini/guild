@@ -1,6 +1,6 @@
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import type { AddressInfo } from "node:net";
+import { isIP, type AddressInfo } from "node:net";
 import { applyCompat } from "./compat.js";
 import {
   allowlistedRequestHeaders,
@@ -9,10 +9,10 @@ import {
   thirdPartyRequestHeaders,
 } from "./headers.js";
 import { isJsonObject, type JsonObject } from "./json.js";
-import { defaultLookup, isAllowedLocalHost, type HostLookup } from "./network-policy.js";
+import { bareHostname, defaultLookup, resolveAllowedLocalAddress, type HostLookup } from "./network-policy.js";
 import { ProvenanceRecorder, sanitizeThinking } from "./provenance.js";
 import { createRegistry, type SourceRegistry } from "./registry.js";
-import { SseBlockSequencer, SseParser } from "./sse.js";
+import { SseBlockSequencer, SseParser, sseErrorEvent, type SseOverflow } from "./sse.js";
 import {
   ANTHROPIC_BASE_URL,
   ANTHROPIC_SOURCE_ID,
@@ -35,6 +35,7 @@ const LOG_MODEL_LENGTH = 128;
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "::1"]);
 const MODEL_CREATED_AT = "2026-01-01T00:00:00Z";
 const KEEP_ALIVE_MS = 60_000;
+const STREAM_OVERFLOW_MESSAGE = "model router stream buffer limit exceeded";
 
 type LogFields = Record<string, string | number | boolean>;
 type Route = "models" | "messages" | "count_tokens";
@@ -63,6 +64,12 @@ interface UpstreamPlan {
 interface Transform {
   push(chunk: Uint8Array): Piece[];
   end(): Piece[];
+  /**
+   * Set once the transform gave up on the upstream stream because it would have to buffer too
+   * much. Its last pieces already carry the client-facing error event; the pump must abort the
+   * upstream and end the response.
+   */
+  overflow?(): SseOverflow | undefined;
 }
 
 function errorCodeOf(error: unknown): string {
@@ -117,6 +124,13 @@ function routeOf(method: string | undefined, path: string): Route | undefined {
   if (path === "/v1/messages") return "messages";
   if (path === "/v1/messages/count_tokens") return "count_tokens";
   return undefined;
+}
+
+/** `base` with its host replaced by the IP literal the policy check validated (IPv6 bracketed). */
+function pinnedBaseUrl(base: string, address: string): string {
+  const pinned = new URL(base);
+  pinned.hostname = isIP(address) === 6 ? `[${address}]` : address;
+  return pinned.href;
 }
 
 function upstreamUrl(base: string, path: string, search: string): string {
@@ -198,14 +212,17 @@ function normalizingTransform(recorder: ProvenanceRecorder): Transform {
   const run = (events: ReturnType<SseParser["push"]>): Piece[] => {
     const out: Piece[] = [];
     for (const event of events) {
+      if (sequencer.overflow !== undefined) break;
       if (event.json !== undefined) recorder.observeEvent(event.json);
-      out.push(...sequencer.accept(event));
+      for (const piece of sequencer.accept(event)) out.push(piece);
+      if (sequencer.overflow !== undefined) out.push(sseErrorEvent("api_error", STREAM_OVERFLOW_MESSAGE));
     }
     return out;
   };
   return {
     push: (chunk) => run(parser.push(chunk)),
-    end: () => [...run(parser.end()), ...sequencer.finish()],
+    end: () => (sequencer.overflow !== undefined ? [] : [...run(parser.end()), ...sequencer.finish()]),
+    overflow: () => sequencer.overflow,
   };
 }
 
@@ -446,8 +463,8 @@ class RouterCore {
     matched: { path: string; search: string },
   ): Promise<{ plan: UpstreamPlan } | { rejection: Rejection }> {
     ctx.fields.source = source.id;
-    const rejection = await this.checkSource(source);
-    if (rejection !== undefined) return { rejection };
+    const checked = await this.checkSource(source);
+    if ("rejection" in checked) return checked;
 
     const compat = applyCompat(parsed);
     ctx.fields.compatSystemMessages = compat.stats.systemMessages;
@@ -466,16 +483,22 @@ class RouterCore {
     return {
       plan: {
         source: { id: source.id, kind: source.kind },
-        url: upstreamUrl(source.baseUrl, matched.path, matched.search),
+        url: upstreamUrl(checked.baseUrl, matched.path, matched.search),
         headers,
         body: Buffer.from(JSON.stringify(sanitized.body)),
       },
     };
   }
 
-  /** Host binding, transport and address rules; all failures are 403 before any connection. */
-  private async checkSource(source: RouterSource): Promise<Rejection | undefined> {
-    const deny = (message: string, outcome: string): Rejection => ({ status: 403, type: "permission_error", message, outcome });
+  /**
+   * Host binding, transport and address rules; all failures are 403 before any connection. Returns
+   * the base URL requests must use: for Local sources the host is resolved here, once, and replaced
+   * by the validated IP literal, so the connection cannot resolve the name again (DNS rebinding).
+   */
+  private async checkSource(source: RouterSource): Promise<{ baseUrl: string } | { rejection: Rejection }> {
+    const deny = (message: string, outcome: string): { rejection: Rejection } => ({
+      rejection: { status: 403, type: "permission_error", message, outcome },
+    });
     let url: URL;
     try {
       url = new URL(source.baseUrl);
@@ -487,13 +510,17 @@ class RouterCore {
       return deny("source not confirmed", "source_not_confirmed");
     }
     if (source.kind === "online") {
-      return url.protocol === "https:" ? undefined : deny("online sources require https", "online_requires_https");
+      return url.protocol === "https:" ? { baseUrl: source.baseUrl } : deny("online sources require https", "online_requires_https");
     }
     if (url.protocol !== "http:" && url.protocol !== "https:") return deny("source url is invalid", "invalid_source_url");
-    if (!(await isAllowedLocalHost(url.hostname, this.lookup))) {
-      return deny("local source address is not allowed", "local_address_denied");
+    const bare = bareHostname(url.hostname);
+    // A certificate name cannot match the IP literal a hostname is rewritten to.
+    if (url.protocol === "https:" && isIP(bare) === 0 && bare !== "localhost") {
+      return deny("local https requires an IP address or localhost", "local_https_requires_ip");
     }
-    return undefined;
+    const address = await resolveAllowedLocalAddress(url.hostname, this.lookup);
+    if (address === undefined) return deny("local source address is not allowed", "local_address_denied");
+    return { baseUrl: pinnedBaseUrl(source.baseUrl, address) };
   }
 
   private async relay(res: ServerResponse, ctx: RequestContext, plan: UpstreamPlan): Promise<void> {
@@ -510,13 +537,17 @@ class RouterCore {
 
     let upstream: Response;
     try {
-      upstream = await this.options.fetchImpl(plan.url, {
-        method: "POST",
-        headers: plan.headers,
-        body: plan.body,
-        redirect: "manual",
-        signal: controller.signal,
-      });
+      upstream = await this.options.fetchImpl(
+        plan.url,
+        {
+          method: "POST",
+          headers: plan.headers,
+          body: plan.body,
+          redirect: "manual",
+          signal: controller.signal,
+        },
+        { sourceKind: plan.source.kind },
+      );
     } catch (error) {
       if (controller.signal.aborted) {
         this.finish(ctx, 499, "client_closed");
@@ -541,18 +572,33 @@ class RouterCore {
       res.end();
       return;
     }
-    const recorder = new ProvenanceRecorder(this.store, plan.source.id, plan.source.kind);
-    await this.pump(res, upstream.body, chooseTransform(upstream, plan.source, recorder), controller.signal, ctx);
+    const recorder = new ProvenanceRecorder(this.store, plan.source.id);
+    await this.pump(res, upstream.body, chooseTransform(upstream, plan.source, recorder), controller, ctx);
   }
 
   private async pump(
     res: ServerResponse,
     body: ReadableStream<Uint8Array>,
     transform: Transform,
-    signal: AbortSignal,
+    controller: AbortController,
     ctx: RequestContext,
   ): Promise<void> {
+    const signal = controller.signal;
     const reader = body.getReader();
+    // The client already has the error event: stop the upstream and close the response.
+    const endOnOverflow = async (): Promise<boolean> => {
+      const overflow = transform.overflow?.();
+      if (overflow === undefined) return false;
+      controller.abort();
+      await reader.cancel().catch(() => undefined);
+      this.log("router.stream_overflow", {
+        route: String(ctx.fields.route),
+        source: String(ctx.fields.source),
+        limit: overflow,
+      });
+      res.end();
+      return true;
+    };
     try {
       for (;;) {
         const { done, value } = await reader.read();
@@ -563,10 +609,12 @@ class RouterCore {
             return;
           }
         }
+        if (await endOnOverflow()) return;
       }
       for (const piece of transform.end()) {
         if (!(await writePiece(res, piece))) return;
       }
+      if (await endOnOverflow()) return;
       res.end();
     } catch (error) {
       if (signal.aborted) return;

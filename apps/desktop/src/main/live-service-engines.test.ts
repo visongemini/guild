@@ -28,10 +28,10 @@ import {
   type XaiExtensionOutcome,
 } from "@guild/runtime-grok";
 import { ClaudeLocatorError } from "./claude-locator.js";
+import { toDesktopIpcFailure } from "./workspace-folder.js";
 import type { BrowserMcpPort, ModelRouterHostPort, RoutedModelInfo } from "./engine-ports.js";
 import { openGuildPersistence, type GuildPersistence } from "@guild/persistence";
 import { createFixtureDesktopService } from "./fixture-service.js";
-import { toDesktopIpcFailure } from "./workspace-folder.js";
 import {
   createLiveDesktopService,
   type LiveDesktopServiceOptions,
@@ -828,6 +828,33 @@ describe("dual engine orchestration [PC-ENG-001, PC-MODEL-001]", () => {
     const learnedSettings = (await learned.service.bootstrap()).runtimeSettings.claude;
     assert.equal(learnedSettings?.status, "ready");
     assert.equal(learnedSettings?.version, "2.1.291");
+  });
+
+  it("refuses a Claude start whose pinned files changed, names the reduced state and the IPC code, then recovers [PC-ENG-002]", async () => {
+    const world = newWorld();
+    const base = engineFactory(world, {});
+    let refuse = true;
+    const h = await harness({
+      runtimeFactory: async (input) => {
+        const created = await base(input);
+        if (input.engine !== "claude" || !refuse) return created;
+        // The real process port fails its start and remembers why; the adapter reports it as a plain failure.
+        (created.adapter as EngineFake).start = async () => { throw new AcpV1AdapterError("operation_failed"); };
+        return { ...created, refusedForIntegrity: () => true };
+      },
+    });
+    const task = await h.service.createTask(h.workspaceId, undefined, "claude");
+    const refused = await h.send(task.task.taskId, "x").then(() => undefined, (cause: unknown) => cause);
+    assert.match(String(refused), /^Error: engine_integrity_changed$/u);
+    assert.equal(toDesktopIpcFailure(refused).message, "engine_integrity_changed", "the code survives the IPC allowlist");
+    assert.equal((await h.service.bootstrap()).runtimeSettings.claude?.status, "integrity_changed");
+    assert.equal(world.adapters[0]!.prompts.length, 0, "nothing was run");
+
+    // Once the files pin again and a session opens, the reduced state is gone.
+    refuse = false;
+    await h.send(task.task.taskId, "again");
+    await h.completed();
+    assert.equal((await h.service.bootstrap()).runtimeSettings.claude?.status, "ready");
   });
 
   it("shows the permission mode of a Claude session as its session mode [PC-SET-002]", async () => {

@@ -12,8 +12,10 @@ import {
   locateClaudeBinary,
   locateClaudeEngine,
   locateNode,
+  unexpectedEngineChange,
   type ClaudeLocatorErrorCode,
   type ClaudeLocatorOptions,
+  type LocatedClaudeEngine,
 } from "./claude-locator.js";
 
 // Nothing here runs a real node, adapter or claude: files carry only a Mach-O magic number (or a
@@ -319,5 +321,64 @@ describe("Claude locator: whole engine", () => {
     await writeAdapterPackage(prefix, "0.89.1");
     await symlink("../lib/node_modules/@agentclientprotocol/claude-agent-acp/dist/index.js", join(prefix, "bin", "claude-agent-acp"));
     await expectLocatorError(locateClaudeEngine(box.options(probe.execute)), "claude_missing");
+  });
+});
+
+describe("Claude locator: what a re-locate may replace [PC-ENG-002]", () => {
+  const base: LocatedClaudeEngine = Object.freeze({
+    node: Object.freeze({ executablePath: "/usr/local/bin/node", sha256: "a".repeat(64), version: "26.8.1" }),
+    adapter: Object.freeze({
+      packageRoot: "/opt/adapter",
+      entryPath: "/opt/adapter/dist/index.js",
+      version: "0.89.1",
+      fingerprintSha256: "c".repeat(64),
+    }),
+    claude: Object.freeze({ executablePath: "/home/u/.local/share/claude/versions/2.1.291", version: "2.1.291" }),
+  });
+  const changed = (over: {
+    node?: Partial<LocatedClaudeEngine["node"]>;
+    adapter?: Partial<LocatedClaudeEngine["adapter"]>;
+    claude?: Partial<LocatedClaudeEngine["claude"]>;
+  }): LocatedClaudeEngine =>
+    Object.freeze({
+      node: Object.freeze({ ...base.node, ...over.node }),
+      adapter: Object.freeze({ ...base.adapter, ...over.adapter }),
+      claude: Object.freeze({ ...base.claude, ...over.claude }),
+    });
+
+  it("accepts an identical result and every kind of update", () => {
+    assert.equal(unexpectedEngineChange(base, changed({})), undefined);
+    assert.equal(unexpectedEngineChange(base, changed({ node: { version: "26.9.0", sha256: "b".repeat(64) } })), undefined);
+    assert.equal(
+      unexpectedEngineChange(base, changed({ adapter: { version: "0.89.2", fingerprintSha256: "d".repeat(64) } })),
+      undefined,
+    );
+    assert.equal(
+      unexpectedEngineChange(base, changed({ claude: { executablePath: "/home/u/.local/share/claude/versions/2.1.300", version: "2.1.300" } })),
+      undefined,
+    );
+  });
+
+  it("refuses the same version with other bytes, naming the piece", () => {
+    assert.equal(unexpectedEngineChange(base, changed({ node: { sha256: "b".repeat(64) } })), "node");
+    assert.equal(unexpectedEngineChange(base, changed({ adapter: { fingerprintSha256: "d".repeat(64) } })), "adapter");
+  });
+
+  it("accepts a claude link only when it now resolves to a versions/<ver> file", () => {
+    assert.equal(unexpectedEngineChange(base, changed({ claude: { executablePath: "/tmp/evil/claude" } })), "claude");
+    assert.equal(unexpectedEngineChange(base, changed({ claude: { executablePath: "/home/u/.local/share/claude/versions/latest" } })), "claude");
+    assert.equal(unexpectedEngineChange(base, changed({ claude: { executablePath: "/home/u/versions/2.1.300/other" } })), "claude");
+    // A claude binary that stays where it was is not a path change (it carries no hash pin).
+    assert.equal(unexpectedEngineChange(base, changed({ claude: { version: "2.1.292" } })), undefined);
+  });
+
+  it("reports node before adapter before claude", () => {
+    const all = changed({
+      node: { sha256: "b".repeat(64) },
+      adapter: { fingerprintSha256: "d".repeat(64) },
+      claude: { executablePath: "/tmp/x" },
+    });
+    assert.equal(unexpectedEngineChange(base, all), "node");
+    assert.equal(unexpectedEngineChange(base, changed({ adapter: all.adapter, claude: all.claude })), "adapter");
   });
 });

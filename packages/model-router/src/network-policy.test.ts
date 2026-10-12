@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { isAllowedLocalAddress, isAllowedLocalHost } from "./network-policy.js";
+import { isAllowedLocalAddress, resolveAllowedLocalAddress } from "./network-policy.js";
 
 const neverCalled = async (): Promise<string[]> => {
   throw new Error("lookup must not be called");
@@ -38,29 +38,31 @@ describe("local address policy", () => {
 });
 
 describe("local host policy", () => {
-  it("judges literal IP hosts without a lookup", async () => {
-    assert.equal(await isAllowedLocalHost("127.0.0.1", neverCalled), true);
-    assert.equal(await isAllowedLocalHost("100.64.0.5", neverCalled), true);
-    assert.equal(await isAllowedLocalHost("[::1]", neverCalled), true);
-    assert.equal(await isAllowedLocalHost("8.8.8.8", neverCalled), false);
-    assert.equal(await isAllowedLocalHost("[2001:db8::1]", neverCalled), false);
+  it("judges literal IP hosts without a lookup and returns them as is", async () => {
+    assert.equal(await resolveAllowedLocalAddress("127.0.0.1", neverCalled), "127.0.0.1");
+    assert.equal(await resolveAllowedLocalAddress("100.64.0.5", neverCalled), "100.64.0.5");
+    assert.equal(await resolveAllowedLocalAddress("[::1]", neverCalled), "::1");
+    assert.equal(await resolveAllowedLocalAddress("8.8.8.8", neverCalled), undefined);
+    assert.equal(await resolveAllowedLocalAddress("[2001:db8::1]", neverCalled), undefined);
   });
 
-  it("requires every resolved address to be allowed", async () => {
-    assert.equal(await isAllowedLocalHost("llm.local", async () => ["127.0.0.1", "::1"]), true);
-    assert.equal(await isAllowedLocalHost("llm.local", async () => ["100.101.102.103"]), true);
-    assert.equal(await isAllowedLocalHost("llm.local", async () => ["127.0.0.1", "8.8.8.8"]), false);
-    assert.equal(await isAllowedLocalHost("llm.local", async () => ["10.0.0.5"]), false);
+  it("requires every resolved address to be allowed and returns the first one", async () => {
+    assert.equal(await resolveAllowedLocalAddress("llm.local", async () => ["127.0.0.1", "::1"]), "127.0.0.1");
+    assert.equal(await resolveAllowedLocalAddress("llm.local", async () => ["::1", "127.0.0.1"]), "::1");
+    assert.equal(await resolveAllowedLocalAddress("llm.local", async () => ["100.101.102.103"]), "100.101.102.103");
+    assert.equal(await resolveAllowedLocalAddress("llm.local", async () => ["127.0.0.1", "8.8.8.8"]), undefined);
+    assert.equal(await resolveAllowedLocalAddress("llm.local", async () => ["8.8.8.8", "127.0.0.1"]), undefined);
+    assert.equal(await resolveAllowedLocalAddress("llm.local", async () => ["10.0.0.5"]), undefined);
   });
 
   it("denies an empty answer and a failed lookup", async () => {
-    assert.equal(await isAllowedLocalHost("llm.local", async () => []), false);
-    assert.equal(await isAllowedLocalHost("llm.local", neverCalled), false);
+    assert.equal(await resolveAllowedLocalAddress("llm.local", async () => []), undefined);
+    assert.equal(await resolveAllowedLocalAddress("llm.local", neverCalled), undefined);
   });
 
-  it("passes the bare hostname to the lookup", async () => {
+  it("looks the bare hostname up exactly once", async () => {
     const seen: string[] = [];
-    await isAllowedLocalHost("llm-box", async (host) => {
+    await resolveAllowedLocalAddress("llm-box", async (host) => {
       seen.push(host);
       return ["100.64.1.1"];
     });

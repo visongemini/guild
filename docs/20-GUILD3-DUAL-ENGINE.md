@@ -59,6 +59,12 @@ created and never changes. Process topology stays one engine process per task (D
 - Executable pin: the user's `node` (Mach-O, existing pin) plus the adapter entry script path as
   `argv[0]`. Pin the adapter by package version (supported range `>=0.89.0 <0.90.0`) and a SHA-256
   over its installed `package.json` and `dist/` tree; mismatch refuses to start with a named error.
+  A failed pin check may be followed by one automatic re-locate, and only an update is accepted:
+  `node --version` differs, the adapter `package.json` version differs, or the `claude` real path
+  now is a new `versions/<ver>` file. The same version with other bytes (node SHA-256, adapter
+  fingerprint) is refused with `engine_integrity_changed`, nothing is executed, and the Claude
+  status reads "Claude engine files changed unexpectedly; reinstall claude-agent-acp or restart
+  Guild". The code is on the IPC failure allowlist; the next session that opens clears the state.
 - Locator: `claude-agent-acp` from `~/.npm-global/bin`, the user's PATH and Homebrew paths;
   `claude` from `~/.local/bin/claude` / PATH (Mach-O). `node` from PATH (>= 22).
 - Env (allowlist + Guild-owned values): PATH, HOME, USER, LOGNAME (claude looks up its Keychain login by account name; without USER it reports "not logged in" [WP-A smoke]), LANG/LC_*, TMPDIR, proxy vars, SSL vars,
@@ -103,8 +109,15 @@ created and never changes. Process topology stays one engine process per task (D
 - **Host binding.** Adding a source or changing its base URL / key variable requires a native
   confirmation dialog in main (`dialog.showMessageBox`) naming the variable and the host. The router
   only sends a key to the host it was confirmed for. Renderer requests alone cannot activate a change.
-- Online sources: https only. Local sources: http or https; resolved IPs must be loopback or in
-  100.64.0.0/10 (Tailscale), checked before connecting.
+- Online sources: https only. Local sources: http or https; the host is resolved once per request,
+  every resolved address must be loopback or in 100.64.0.0/10 (Tailscale), and the request is then
+  sent to the first validated address as an IP literal (IPv6 bracketed), never to the hostname, so
+  a second DNS answer cannot reach the connection (DNS rebinding). Local https is allowed only when
+  the host is already an IP literal or `localhost` (a certificate name cannot match a rewritten IP);
+  any other https host answers 403 `local_https_requires_ip`. No `Host` header is set.
+- **Transport selection.** The router calls `fetchImpl(url, init, { sourceKind })` with the kind of the
+  source it chose for that request. The Electron host uses the direct (no proxy) session for `local`
+  and the proxied session otherwise, from that argument only, never from the URL or the live registry.
 - **Compat layer** (Online/Local only; Anthropic gets the original body):
   1. `role:"system"` messages are removed; their text is queued and inserted as one
      `<system-reminder>` text block into the next user message **after** its `tool_result` blocks
@@ -116,16 +129,19 @@ created and never changes. Process topology stays one engine process per task (D
   4. Top-level `context_management` and `output_config` are removed.
   5. Consecutive same-role messages are merged; in user messages `tool_result` blocks come first.
   6. Empty content becomes `[{"type":"text","text":"(empty)"}]`.
-- **Thinking provenance.** The router records `sha256(signature)[:32] -> source id` for every
+- **Thinking provenance.** The router records `sha256(signature)[:32] -> source id` for every non-empty
   thinking signature it sees in responses (SSE `signature_delta`, `content_block_start`, or JSON).
   Persistence goes through an injected store (Guild: SQLite table `thinking_provenance`).
   Before forwarding to source X, `thinking`/`redacted_thinking` blocks not produced by X are dropped.
   Unknown provenance: drop for Online/Local; for Anthropic keep only if the signature is a long
-  (> 100 chars) base64 string. Empty signature = "local" provenance of the source that produced it
-  when known, else drop.
+  (> 100 chars) base64 string. An empty (or missing) signature is never recorded and such unsigned
+  thinking blocks are dropped for every target, Local included.
 - **SSE normalizer** for Local sources: re-sequence content blocks so a block's events (deltas,
   `signature_delta`, `content_block_stop`) are emitted before any event of a higher index; buffer the
   higher block until the lower one stops.
+  The buffer is capped at 8 MiB of held event text and 64 waiting blocks; on overflow the router
+  aborts the upstream request, ends the client stream with an Anthropic-style SSE `error` event
+  (`api_error`) and logs `router.stream_overflow` (route, source, limit).
 - `GET /<token>/v1/models` returns the Online/Local models (Anthropic list format).
 - No OpenAI-protocol translation. Every supported backend speaks Anthropic Messages natively.
 - Router lifetime = Guild main process lifetime; it starts lazily on first routed session.
@@ -149,10 +165,19 @@ created and never changes. Process topology stays one engine process per task (D
   lines `[ref_<backendNodeId>] role "name"`), `get_text`, `find{query}`, `click{ref}|{x,y}`,
   `type{text}` (CDP `Input.insertText`), `key{key}`, `scroll{direction,amount}`,
   `console_messages`, `network_requests`, `tabs_list`, `tab_select`. No `eval`.
+- **Window zoom.** The renderer reports the pane's rectangle in CSS pixels; main multiplies x/y/width/height
+  by the Guild window's `webContents.getZoomFactor()` (rounded) before `setBounds`, and re-applies the last
+  rectangle when the zoom changes (`zoom-changed`, and every later layout pass reads the factor afresh).
 - Passed to engines in `session/new`/`session/resume` `mcpServers` as
   `{type:"http", name:"guild-browser", url, headers:[]}` for Claude, and for Grok only if its
   initialize advertises `mcpCapabilities.http`.
 - Tool calls go through the engine's normal permission flow (permission cards).
+- **A call is bound to its start.** Each tool call captures the control generation (bumped by every
+  "Take over") and the active tab and its page when it starts, and every step goes to that tab. Right
+  before each CDP command and each navigation the call checks the generation (mismatch: the paused
+  message) and that its tab is still open (else a tab-changed message). Input and screenshots also
+  need the bound tab to still be the shown one, and until a call has sent input, `DOM.*` and `Input.*`
+  steps need the page not to have navigated since the call began (a ref or coordinate belongs to that page).
 
 ### 3.6 OpenViking (D-060)
 Claude engine: OpenViking on (no kill-switch env). Routed Claude sessions: `OPENVIKING_AUTO_CAPTURE=false`

@@ -9,6 +9,20 @@ export interface SseEvent {
 
 const MAX_PENDING_CHARS = 16 * 1024 * 1024;
 
+/**
+ * Limits on what `SseBlockSequencer` may hold back for higher blocks while a lower block is open:
+ * the raw event text in bytes, and the blocks waiting behind the lowest open one.
+ */
+export const MAX_BUFFERED_BYTES = 8 * 1024 * 1024;
+export const MAX_BUFFERED_BLOCKS = 64;
+
+export type SseOverflow = "bytes" | "blocks";
+
+/** An Anthropic-style stream error event; the client treats it as the end of the stream. */
+export function sseErrorEvent(type: string, message: string): string {
+  return `event: error\ndata: ${JSON.stringify({ type: "error", error: { type, message } })}\n\n`;
+}
+
 function parseData(raw: string): JsonObject | undefined {
   const data: string[] = [];
   for (const line of raw.split(/\r?\n/u)) {
@@ -68,7 +82,7 @@ export class SseParser {
   }
 }
 
-type BlockQueue = { events: string[]; stopped: boolean };
+type BlockQueue = { events: string[]; bytes: number; stopped: boolean };
 
 function blockIndex(event: JsonObject): number | undefined {
   const index = event.index;
@@ -82,11 +96,23 @@ function blockIndex(event: JsonObject): number | undefined {
  * stopped. `message_*`, `ping` and unparsable events pass through in order; message_delta,
  * message_stop and error first flush any buffered blocks so nothing is lost or reordered after
  * the message ends.
+ *
+ * What is held back is bounded (`MAX_BUFFERED_BYTES`, `MAX_BUFFERED_BLOCKS`). When a limit is hit
+ * the sequencer drops everything it holds, reports it through `overflow` and accepts nothing more;
+ * the owner must end the client stream and abort the upstream.
  */
 export class SseBlockSequencer {
   private readonly blocks = new Map<number, BlockQueue>();
+  private bufferedBytes = 0;
+  private overflowed: SseOverflow | undefined;
+
+  /** Set once a buffering limit was exceeded; stays set. */
+  get overflow(): SseOverflow | undefined {
+    return this.overflowed;
+  }
 
   accept(event: SseEvent): string[] {
+    if (this.overflowed !== undefined) return [];
     const json = event.json;
     const type = json?.type;
     if (json !== undefined && typeof type === "string" && type.startsWith("content_block_")) {
@@ -115,15 +141,18 @@ export class SseBlockSequencer {
   private acceptBlockEvent(type: string, index: number, raw: string): string[] {
     const lowest = this.lowestOpen();
     if (type === "content_block_start" && !this.blocks.has(index)) {
-      this.blocks.set(index, { events: [], stopped: false });
+      const created: BlockQueue = { events: [], bytes: 0, stopped: false };
+      this.blocks.set(index, created);
       if (lowest === undefined || index < lowest) return [raw];
-      this.blocks.get(index)?.events.push(raw);
+      this.hold(created, raw);
+      // The lowest open block streams through; every other block is waiting behind it.
+      if (this.blocks.size - 1 > MAX_BUFFERED_BLOCKS) this.trip("blocks");
       return [];
     }
     const block = this.blocks.get(index);
     if (block === undefined) return [raw];
     if (index !== lowest) {
-      block.events.push(raw);
+      this.hold(block, raw);
       if (type === "content_block_stop") block.stopped = true;
       return [];
     }
@@ -132,14 +161,31 @@ export class SseBlockSequencer {
     return [raw, ...this.promote()];
   }
 
+  /** Holds a raw event back for a block that must wait for a lower one. */
+  private hold(block: BlockQueue, raw: string): void {
+    const size = Buffer.byteLength(raw);
+    block.events.push(raw);
+    block.bytes += size;
+    this.bufferedBytes += size;
+    if (this.bufferedBytes > MAX_BUFFERED_BYTES) this.trip("bytes");
+  }
+
+  private trip(reason: SseOverflow): void {
+    this.overflowed = reason;
+    this.blocks.clear();
+    this.bufferedBytes = 0;
+  }
+
   /** Emits the buffered events of each next-lowest block, stopping at the first still open. */
   private promote(): string[] {
     const out: string[] = [];
     for (let index = this.lowestOpen(); index !== undefined; index = this.lowestOpen()) {
       const block = this.blocks.get(index);
       if (block === undefined) break;
-      out.push(...block.events);
+      for (const raw of block.events) out.push(raw);
+      this.bufferedBytes -= block.bytes;
       block.events = [];
+      block.bytes = 0;
       if (!block.stopped) break;
       this.blocks.delete(index);
     }
@@ -149,8 +195,9 @@ export class SseBlockSequencer {
   private flushAll(): string[] {
     const out: string[] = [];
     const indexes = [...this.blocks.keys()].sort((a, b) => a - b);
-    for (const index of indexes) out.push(...(this.blocks.get(index)?.events ?? []));
+    for (const index of indexes) for (const raw of this.blocks.get(index)?.events ?? []) out.push(raw);
     this.blocks.clear();
+    this.bufferedBytes = 0;
     return out;
   }
 }

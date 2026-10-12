@@ -15,7 +15,7 @@ test("the status is read defensively from the Claude settings the main process s
   assert.deepEqual(claudeStatusOf({ status: "ready", accountLabel: "Claude Max", version: "2.1.291" }), {
     state: "ready", accountLabel: "Claude Max", version: "2.1.291",
   });
-  for (const state of ["not_found", "not_logged_in", "unavailable"]) {
+  for (const state of ["not_found", "not_logged_in", "unavailable", "integrity_changed"]) {
     assert.deepEqual(claudeStatusOf({ status: state }), { state });
   }
 });
@@ -35,6 +35,11 @@ test("each status has its own line, and a not-logged-in Claude tells the person 
   assert.match(claudeStatusText(EN, { state: "not_found" }), /not found/u);
   assert.match(claudeStatusText(EN, { state: "not_logged_in" }), /Run `claude` once in Terminal and log in/u);
   assert.match(claudeStatusText(EN, { state: "unavailable" }), /Not available/u);
+  assert.equal(
+    claudeStatusText(EN, { state: "integrity_changed" }),
+    "Claude engine files changed unexpectedly; reinstall claude-agent-acp or restart Guild.",
+  );
+  assert.match(claudeStatusText(messagesFor("zh-CN"), { state: "integrity_changed" }), /claude-agent-acp/u);
 });
 
 test("the permission mode of a Claude task is the live session mode, else the Settings default, else nothing", () => {

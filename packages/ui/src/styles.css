@@ -1031,7 +1031,7 @@ span.guild-pill { cursor: default; }
 .guild-engine-claude { padding-top: var(--guild-s4); border-top: 1px solid var(--guild-line); }
 .guild-engine-status { margin: var(--guild-s2) 1px 1px; padding: var(--guild-s2) var(--guild-s3); display: grid; gap: 2px; border-radius: var(--guild-r-sm); background: var(--guild-soft); color: var(--guild-muted); font-size: var(--guild-fs-sm); line-height: 1.5; }
 .guild-engine-status strong { color: var(--guild-ok-text); font-weight: 600; }
-.guild-engine-status.not_found strong, .guild-engine-status.not_logged_in strong, .guild-engine-status.unavailable strong { color: var(--guild-wait-text); }
+.guild-engine-status.not_found strong, .guild-engine-status.not_logged_in strong, .guild-engine-status.unavailable strong, .guild-engine-status.integrity_changed strong { color: var(--guild-wait-text); }
 .guild-claude-modes { margin-top: var(--guild-s2); display: grid; gap: var(--guild-s1); }
 .guild-claude-mode { min-height: 44px; padding: 6px var(--guild-s3); display: grid; gap: 1px; justify-items: start; border: 1px solid var(--guild-line); border-radius: var(--guild-r-sm); background: var(--guild-surface); color: var(--guild-text); text-align: left; cursor: pointer; transition: background-color var(--guild-dur-1) var(--guild-ease), border-color var(--guild-dur-1) var(--guild-ease); }
 .guild-claude-mode strong { font-size: var(--guild-fs-ui); font-weight: 600; }

@@ -6,7 +6,7 @@ import {
   type Server,
   type ServerResponse,
 } from "node:http";
-import { connect, type AddressInfo } from "node:net";
+import { connect, isIP, type AddressInfo } from "node:net";
 import { networkInterfaces } from "node:os";
 import { describe, it, type TestContext } from "node:test";
 import {
@@ -26,6 +26,8 @@ import {
   type ModelRouterOptions,
   type ProvenanceStore,
   type RouterSource,
+  type UpstreamFetch,
+  type UpstreamRequestContext,
 } from "./types.js";
 
 /*
@@ -72,6 +74,7 @@ interface LogEntry {
 interface FetchCall {
   readonly url: string;
   readonly init: RequestInit | undefined;
+  readonly context: UpstreamRequestContext | undefined;
 }
 
 class MemoryStore implements ProvenanceStore {
@@ -231,10 +234,12 @@ async function startHarness(t: TestContext, options: HarnessOptions = {}): Promi
     ["vendor.example", online.port],
     ["llm.tailnet.example:8080", local.port],
     ["100.64.0.5:8080", local.port],
+    ["100.101.102.103:8080", local.port],
+    ["[::1]:8080", local.port],
   ]);
-  const fetchImpl: typeof fetch = async (input, init) => {
+  const fetchImpl: UpstreamFetch = async (input, init, context) => {
     const url = new URL(String(input));
-    calls.push({ url: url.href, init });
+    calls.push({ url: url.href, init, context });
     const mapped = hostMap.get(url.host);
     if (mapped !== undefined) {
       url.protocol = "http:";
@@ -593,8 +598,8 @@ describe("anthropic route", () => {
   it("startModelRouter always uses the fixed Anthropic base URL", async (t) => {
     assert.equal(ANTHROPIC_BASE_URL, "https://api.anthropic.com");
     const seen: FetchCall[] = [];
-    const fetchImpl: typeof fetch = async (input, init) => {
-      seen.push({ url: String(input), init });
+    const fetchImpl: UpstreamFetch = async (input, init, context) => {
+      seen.push({ url: String(input), init, context });
       return new Response(JSON.stringify(OK_MESSAGE), { status: 200, headers: { "content-type": "application/json" } });
     };
     // Options are copied structurally by TypeScript only; a smuggled override must be inert.
@@ -753,14 +758,114 @@ describe("online and local credential rules", () => {
     assert.ok(lookups.includes("llm.tailnet.example"));
   });
 
-  it("allows https for local sources", async (t) => {
-    const h = await startHarness(t);
+  it("allows https for local sources only on an IP literal or localhost", async (t) => {
+    const h = await startHarness(t, { lookup: async (host) => (host === "localhost" ? ["127.0.0.1"] : ["100.101.102.103"]) });
+    const tls = (id: string, baseUrl: string): RouterSource => {
+      const host = new URL(baseUrl).host;
+      return { id, kind: "local", label: id, baseUrl, key: LOCAL_KEY, confirmedHost: host, models: [{ id: `${id}-model`, label: id }] };
+    };
     h.router.updateSources([
-      { id: "tls-local", kind: "local", label: "x", baseUrl: "https://127.0.0.1:9", key: LOCAL_KEY, confirmedHost: "127.0.0.1:9", models: [{ id: "tls-model", label: "x" }] },
+      tls("tls-ip", "https://127.0.0.1:9"),
+      tls("tls-v6", "https://[::1]:9"),
+      tls("tls-localhost", "https://localhost:9"),
+      tls("tls-name", "https://llm.tailnet.example:9"),
     ]);
-    const response = await h.post("v1/messages", simpleBody("tls-model"));
-    assert.equal(response.status, 502, "policy passed; the connection itself fails");
+    for (const id of ["tls-ip", "tls-v6", "tls-localhost"]) {
+      assert.equal((await h.post("v1/messages", simpleBody(`${id}-model`))).status, 502, `${id}: policy passed; the connection itself fails`);
+    }
+    assert.equal(h.calls.length, 3);
+
+    const callsBefore = h.calls.length;
+    const response = await h.post("v1/messages", simpleBody("tls-name-model"));
+    assert.equal(response.status, 403);
+    const payload = (await response.json()) as { error: { type: string; message: string } };
+    assert.equal(payload.error.type, "permission_error");
+    assert.match(payload.error.message, /IP address or localhost/u);
+    assert.equal(h.calls.length, callsBefore, "a named https host must not be contacted");
+    assert.equal(h.requestLogs().at(-1)?.fields.outcome, "local_https_requires_ip");
+  });
+
+  it("connects to the validated IP literal and never to the hostname (DNS rebinding) [PC-ROUTE-002]", async (t) => {
+    // The first answer is safe; every later answer points at a public host. A router that resolved
+    // again for the connection would see the public one.
+    const answers = [["100.101.102.103"], ["8.8.8.8"], ["8.8.8.8"]];
+    let lookups = 0;
+    const h = await startHarness(t, { lookup: async () => answers[Math.min(lookups++, answers.length - 1)] ?? [] });
+    h.router.updateSources([
+      { id: "rebind", kind: "local", label: "x", baseUrl: "http://llm.tailnet.example:8080/anthropic", key: LOCAL_KEY, confirmedHost: "llm.tailnet.example:8080", models: [{ id: "rebind-model", label: "x" }] },
+    ]);
+    const response = await h.post("v1/messages?beta=true", simpleBody("rebind-model"));
+    assert.equal(response.status, 200);
+    assert.equal(lookups, 1, "the host is resolved exactly once per request");
     assert.equal(h.calls.length, 1);
+    assert.equal(h.calls[0]?.url, "http://100.101.102.103:8080/anthropic/v1/messages?beta=true");
+    assert.equal(h.local.requests[0]?.url, "/anthropic/v1/messages?beta=true");
+    assert.equal(h.local.requests[0]?.headers["x-api-key"], LOCAL_KEY);
+
+    // The next request resolves again, now to a public address, and is refused before any connection.
+    assert.equal((await h.post("v1/messages", simpleBody("rebind-model"))).status, 403);
+    assert.equal(h.calls.length, 1);
+    assert.equal(lookups, 2);
+  });
+
+  it("sends every Local request to an IP literal, IPv6 bracketed, and keeps literal hosts as is", async (t) => {
+    const h = await startHarness(t, {
+      lookup: async (host) => (host === "v6.example" ? ["::1", "127.0.0.1"] : ["127.0.0.1", "::1"]),
+    });
+    const local = (id: string, baseUrl: string): RouterSource => ({
+      id, kind: "local", label: id, baseUrl, key: LOCAL_KEY, confirmedHost: new URL(baseUrl).host, models: [{ id: `${id}-model`, label: id }],
+    });
+    h.router.updateSources([
+      local("named-v6", "http://v6.example:8080"),
+      local("literal-v6", "http://[::1]:8080"),
+      local("literal-v4", `http://127.0.0.1:${h.local.port}`),
+      local("localhost", `http://localhost:${h.local.port}`),
+    ]);
+    for (const id of ["named-v6", "literal-v6", "literal-v4", "localhost"]) {
+      assert.equal((await h.post("v1/messages", simpleBody(`${id}-model`))).status, 200, id);
+    }
+    assert.deepEqual(
+      h.calls.map((call) => new URL(call.url).host),
+      ["[::1]:8080", "[::1]:8080", `127.0.0.1:${h.local.port}`, `127.0.0.1:${h.local.port}`],
+    );
+    assert.ok(h.calls.every((call) => isIP(new URL(call.url).hostname.replace(/^\[|\]$/gu, "")) !== 0), "no hostname may reach the transport");
+  });
+});
+
+describe("upstream transport context", () => {
+  it("tells the transport the source kind of every upstream request [PC-ROUTE-002]", async (t) => {
+    const h = await startHarness(t);
+    assert.equal((await h.post("v1/messages", simpleBody("claude-sonnet-5"))).status, 200);
+    assert.equal((await h.post("v1/messages", simpleBody("deepseek-v4"))).status, 200);
+    assert.equal((await h.post("v1/messages/count_tokens", simpleBody("local-27b"))).status, 200);
+    assert.deepEqual(
+      h.calls.map((call) => call.context),
+      [{ sourceKind: "anthropic" }, { sourceKind: "online" }, { sourceKind: "local" }],
+    );
+  });
+
+  it("decides the kind per request: a registry update after planning cannot change it", async (t) => {
+    const gate = deferred();
+    const entered = deferred();
+    const h = await startHarness(t, {
+      lookup: async () => {
+        entered.resolve();
+        await gate.promise;
+        return ["127.0.0.1"];
+      },
+    });
+    const source: RouterSource = {
+      id: "slow-local", kind: "local", label: "x", baseUrl: `http://localhost:${h.local.port}`, key: LOCAL_KEY,
+      confirmedHost: `localhost:${h.local.port}`, models: [{ id: "slow-model", label: "x" }],
+    };
+    h.router.updateSources([source]);
+    const pending = h.post("v1/messages", simpleBody("slow-model"));
+    // The request is admitted and waits in the address check; now the same origin becomes Online.
+    await within(entered.promise, 2000, "the address check");
+    h.router.updateSources([{ ...source, id: "swapped", kind: "online", baseUrl: `https://localhost:${h.local.port}`, confirmedHost: `localhost:${h.local.port}`, models: [{ id: "slow-model", label: "x" }] }]);
+    gate.resolve();
+    assert.equal((await pending).status, 200);
+    assert.deepEqual(h.calls.map((call) => call.context), [{ sourceKind: "local" }]);
   });
 });
 
@@ -963,17 +1068,23 @@ describe("thinking provenance through the router", () => {
     assert.equal(assistantBlocks(h.anthropic.requests[1] as Recorded).length, 1);
   });
 
-  it("attributes empty signatures to the local source that produced them", async (t) => {
+  it("never records an empty signature and drops unsigned thinking for every target [PC-ROUTE-003]", async (t) => {
     const h = await startHarness(t, { local: sseResponder(LLAMA_CPP_EVENTS) });
     await (await h.post("v1/messages", { ...simpleBody("local-27b"), stream: true })).text();
-    assert.equal(h.store.get(signatureHash("")), "local-1");
+    assert.equal(h.store.get(signatureHash("")), undefined, "llama.cpp streams an empty signature; it identifies nobody");
+    assert.equal(h.store.entries.size, 0);
 
+    // Even a row left behind by an older build must not keep an unsigned block alive.
+    h.store.put(signatureHash(""), "local-1");
     await h.post("v1/messages", historyWithThinking("local-27b", ""));
-    assert.equal(assistantBlocks(h.local.requests[1] as Recorded).length, 2);
+    assert.equal(assistantBlocks(h.local.requests[1] as Recorded).length, 1);
     await h.post("v1/messages", historyWithThinking("deepseek-v4", ""));
     assert.equal(assistantBlocks(h.online.requests[0] as Recorded).length, 1);
     await h.post("v1/messages", historyWithThinking("claude-sonnet-5", ""));
     assert.equal(assistantBlocks(h.anthropic.requests[0] as Recorded).length, 1);
+    const last = h.requestLogs().at(-1);
+    assert.equal(last?.fields.thinkingDropped, 1);
+    assert.equal(last?.fields.thinkingKept, 0);
   });
 
   it("keeps serving when the provenance store throws", async (t) => {
@@ -1090,6 +1201,36 @@ describe("streaming", () => {
     );
     request.destroy();
     await within(closed.promise, 5000, "the upstream to observe the disconnect");
+  });
+
+  it("aborts the upstream and ends the client stream with an SSE error when local buffering overflows [PC-ROUTE-003]", { timeout: 30000 }, async (t) => {
+    const closed = deferred();
+    // llama.cpp-style order, but the open thinking block never stops while the text block floods.
+    const flood: FakeHandler = async (_request, res) => {
+      res.on("close", () => closed.resolve());
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write(sseEvent(MESSAGE_START));
+      res.write(sseEvent({ type: "content_block_start", index: 0, content_block: { type: "thinking", thinking: "", signature: "" } }));
+      res.write(sseEvent({ type: "content_block_start", index: 1, content_block: { type: "text", text: "" } }));
+      const chunk = sseEvent({ type: "content_block_delta", index: 1, delta: { type: "text_delta", text: "x".repeat(1024 * 1024) } });
+      for (let i = 0; i < 64 && !res.destroyed; i += 1) {
+        res.write(chunk);
+        await sleep(2);
+      }
+    };
+    const h = await startHarness(t, { local: flood });
+    const response = await h.post("v1/messages", { ...simpleBody("local-27b"), stream: true });
+    assert.equal(response.status, 200);
+    const text = await within(response.text(), 20000, "the client stream to end");
+    await within(closed.promise, 5000, "the upstream to observe the abort");
+
+    // Events of the open block went out; the held text block did not; the stream ends with an error event.
+    assert.match(text, /message_start/u);
+    assert.match(text, /"index":0/u);
+    assert.ok(!text.includes("text_delta"), "buffered events are dropped, not forwarded out of order");
+    assert.ok(text.endsWith('event: error\ndata: {"type":"error","error":{"type":"api_error","message":"model router stream buffer limit exceeded"}}\n\n'));
+    const logged = h.logs.find((entry) => entry.event === "router.stream_overflow");
+    assert.deepEqual(logged?.fields, { route: "messages", source: "local-1", limit: "bytes" });
   });
 
   it("terminates the client stream when the upstream stream breaks", { timeout: 15000 }, async (t) => {

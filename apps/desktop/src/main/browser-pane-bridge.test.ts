@@ -33,7 +33,7 @@ function fakeController(initial: BrowserPaneProjection, refuse = false): FakeCon
   const commands: BrowserCommand[] = [];
   const toolCalls: string[] = [];
   const page = (url: string) => ({ tabId: "tab-1", url, title: "Page", loading: false });
-  return {
+  const controller: FakeController = {
     commands,
     toolCalls,
     push: (projection) => {
@@ -55,8 +55,9 @@ function fakeController(initial: BrowserPaneProjection, refuse = false): FakeCon
       return { ok: true };
     },
     dispose: () => undefined,
+    refreshLayout: () => undefined,
     tools: {
-      runAgentTool: (run) => run(),
+      runAgentTool: (run) => run(controller.tools),
       navigate: async (url) => {
         toolCalls.push(`navigate ${url}`);
         return page(url);
@@ -73,6 +74,7 @@ function fakeController(initial: BrowserPaneProjection, refuse = false): FakeCon
       networkRequests: () => [],
     },
   };
+  return controller;
 }
 
 async function callTool(url: string, name: string, args: Record<string, unknown>): Promise<{ readonly isError?: boolean; readonly text: string }> {

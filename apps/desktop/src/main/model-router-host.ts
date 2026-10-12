@@ -6,6 +6,7 @@ import {
   type ModelRouterHandle,
   type ProvenanceStore,
   type RouterSource,
+  type UpstreamFetch,
 } from "@guild/model-router";
 import { isReservedAnthropicModelId } from "./anthropic-model-ids.js";
 import type { ModelRouterHostPort, RoutedModelInfo } from "./engine-ports.js";
@@ -44,8 +45,6 @@ type Snapshot = {
   readonly models: readonly RoutedModelInfo[];
   /** Model ids some usable source claims; they are never Anthropic ids. */
   readonly claimed: ReadonlySet<string>;
-  /** Origins of usable Local sources. */
-  readonly localOrigins: ReadonlySet<string>;
   readonly signature: string;
 };
 
@@ -53,26 +52,12 @@ const EMPTY_SNAPSHOT: Snapshot = {
   sources: Object.freeze([]),
   models: Object.freeze([]),
   claimed: new Set(),
-  localOrigins: new Set(),
   signature: "[]",
 };
 
 const ELECTRON_REDIRECT_CANCELLED = "Redirect was cancelled";
 const MAX_NOTED_ANTHROPIC_MODELS = 1024;
 const MAX_MODEL_ID_LENGTH = 128;
-
-function requestUrl(input: Parameters<typeof fetch>[0]): string {
-  if (typeof input === "string") return input;
-  return input instanceof URL ? input.href : input.url;
-}
-
-function originOf(url: string): string | undefined {
-  try {
-    return new URL(url).origin;
-  } catch {
-    return undefined;
-  }
-}
 
 export function createModelRouterHost(options: ModelRouterHostOptions): ModelRouterHost {
   const { store } = options;
@@ -114,9 +99,10 @@ export function createModelRouterHost(options: ModelRouterHostOptions): ModelRou
     },
   };
 
-  const routerFetch: typeof fetch = async (input, init) => {
-    const origin = originOf(requestUrl(input));
-    const transport = options.directFetchImpl !== undefined && origin !== undefined && snapshot.localOrigins.has(origin)
+  const routerFetch: UpstreamFetch = async (input, init, context) => {
+    // The router decides the kind per request; the registry may have changed since, and a URL says
+    // nothing reliable (a Local request carries the validated IP, an Online URL may share an origin).
+    const transport = context.sourceKind === "local" && options.directFetchImpl !== undefined
       ? options.directFetchImpl
       : options.fetchImpl;
     try {
@@ -154,7 +140,6 @@ export function createModelRouterHost(options: ModelRouterHostOptions): ModelRou
     const models: RoutedModelInfo[] = [];
     const claimed = new Set<string>();
     const sourceIds = new Set<string>();
-    const localOrigins = new Set<string>();
     for (const record of store.listModelSources()) {
       if (!record.enabled || record.confirmedHost === null) continue;
       if (record.id.toLowerCase() === ANTHROPIC_SOURCE_ID || sourceIds.has(record.id)) {
@@ -184,10 +169,6 @@ export function createModelRouterHost(options: ModelRouterHostOptions): ModelRou
         confirmedHost: record.confirmedHost,
         models: Object.freeze(accepted.map((model) => Object.freeze({ ...model }))),
       }));
-      if (record.kind === "local") {
-        const origin = originOf(record.baseUrl);
-        if (origin !== undefined) localOrigins.add(origin);
-      }
       for (const model of accepted) {
         claimed.add(model.id);
         models.push(Object.freeze({
@@ -205,7 +186,6 @@ export function createModelRouterHost(options: ModelRouterHostOptions): ModelRou
       sources: Object.freeze(sources),
       models: Object.freeze(models),
       claimed,
-      localOrigins,
       signature: JSON.stringify(models),
     });
   }

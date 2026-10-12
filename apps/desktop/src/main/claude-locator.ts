@@ -37,6 +37,22 @@ export class ClaudeLocatorError extends Error {
   }
 }
 
+export type ClaudeEngineComponent = "node" | "adapter" | "claude";
+
+/**
+ * The pinned pieces changed on disk without an update: same version, different bytes (or a claude
+ * path outside the installer's `versions/<ver>` layout). Guild refuses to run them (PC-ENG-002).
+ */
+export class ClaudeEngineIntegrityError extends Error {
+  readonly component: ClaudeEngineComponent;
+
+  constructor(component: ClaudeEngineComponent) {
+    super("engine_integrity_changed");
+    this.name = "ClaudeEngineIntegrityError";
+    this.component = component;
+  }
+}
+
 export type LocatedNode = Readonly<{
   /** Real path; the Mach-O pin copies and verifies exactly this file. */
   executablePath: string;
@@ -58,6 +74,36 @@ export type LocatedClaudeEngine = Readonly<{
 }>;
 
 export const MINIMUM_NODE_MAJOR = 22;
+
+/** The claude installer keeps every release at `.../versions/<ver>` and repoints the link. */
+const CLAUDE_VERSIONED_PATH = /[\\/]versions[\\/]\d+\.\d+\.\d+[^\\/]*$/u;
+
+/**
+ * Decides whether a second locate may replace the first after a pin check failed (PC-ENG-002). A
+ * piece may differ only the way an update changes it: another `node --version`, another adapter
+ * package version, or the claude link now resolving to a different `versions/<ver>` file. The same
+ * version with other bytes (node SHA-256, adapter fingerprint) is an unexpected change. Returns the
+ * first offending piece, or undefined when re-pinning is allowed.
+ */
+export function unexpectedEngineChange(
+  before: LocatedClaudeEngine,
+  after: LocatedClaudeEngine,
+): ClaudeEngineComponent | undefined {
+  if (before.node.version === after.node.version && before.node.sha256 !== after.node.sha256) return "node";
+  if (
+    before.adapter.version === after.adapter.version &&
+    before.adapter.fingerprintSha256 !== after.adapter.fingerprintSha256
+  ) {
+    return "adapter";
+  }
+  if (
+    before.claude.executablePath !== after.claude.executablePath &&
+    !CLAUDE_VERSIONED_PATH.test(after.claude.executablePath)
+  ) {
+    return "claude";
+  }
+  return undefined;
+}
 
 export type ClaudeLocatorOptions = Readonly<{
   environment?: NodeJS.ProcessEnv;

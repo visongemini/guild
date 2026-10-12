@@ -14,7 +14,8 @@ import {
   MESSAGE_STOP,
   sseEvent,
 } from "./fixtures/llama-cpp-stream.js";
-import { SseBlockSequencer, SseParser } from "./sse.js";
+import type { JsonObject } from "./json.js";
+import { MAX_BUFFERED_BLOCKS, MAX_BUFFERED_BYTES, SseBlockSequencer, SseParser, sseErrorEvent, type SseEvent } from "./sse.js";
 
 const encoder = new TextEncoder();
 
@@ -202,5 +203,68 @@ describe("SseBlockSequencer", () => {
   it("passes events for blocks it never saw through unchanged", () => {
     const text = streamText([TEXT_DELTA, STOP_1]);
     assert.equal(normalize(splitInto(text, 1000)), text);
+  });
+});
+
+describe("SseBlockSequencer buffer limits [PC-ROUTE-003]", () => {
+  const event = (payload: JsonObject): SseEvent => {
+    const raw = sseEvent(payload);
+    return { raw, json: payload };
+  };
+  const start = (index: number): SseEvent => event({ type: "content_block_start", index, content_block: { type: "text", text: "" } });
+  const textDelta = (index: number, size: number): SseEvent =>
+    event({ type: "content_block_delta", index, delta: { type: "text_delta", text: "x".repeat(size) } });
+  const MIB = 1024 * 1024;
+
+  it("limits are 8 MiB and 64 blocks", () => {
+    assert.equal(MAX_BUFFERED_BYTES, 8 * MIB);
+    assert.equal(MAX_BUFFERED_BLOCKS, 64);
+  });
+
+  it("trips on bytes held back for a higher block and then accepts nothing", () => {
+    const sequencer = new SseBlockSequencer();
+    assert.equal(sequencer.accept(start(0)).length, 1);
+    assert.equal(sequencer.accept(start(1)).length, 0);
+    for (let i = 0; i < 7; i += 1) assert.equal(sequencer.accept(textDelta(1, MIB)).length, 0);
+    assert.equal(sequencer.overflow, undefined, "7 MiB is within the limit");
+    assert.equal(sequencer.accept(textDelta(1, MIB)).length, 0);
+    assert.equal(sequencer.overflow, "bytes", "just over 8 MiB");
+    assert.deepEqual(sequencer.accept(textDelta(0, 10)), [], "nothing is accepted after an overflow");
+    assert.deepEqual(sequencer.accept(event({ type: "content_block_stop", index: 0 })), []);
+    assert.deepEqual(sequencer.finish(), [], "the held events were dropped");
+    assert.equal(sequencer.overflow, "bytes", "the overflow is sticky");
+  });
+
+  it("does not count events of the lowest open block, which stream straight through", () => {
+    const sequencer = new SseBlockSequencer();
+    sequencer.accept(start(0));
+    for (let i = 0; i < 12; i += 1) assert.equal(sequencer.accept(textDelta(0, MIB)).length, 1);
+    assert.equal(sequencer.overflow, undefined);
+  });
+
+  it("gives the bytes back when the lower block stops, so the cap is on what is held at once", () => {
+    const sequencer = new SseBlockSequencer();
+    sequencer.accept(start(0));
+    sequencer.accept(start(1));
+    for (let round = 0; round < 3; round += 1) {
+      for (let i = 0; i < 5; i += 1) sequencer.accept(textDelta(1, MIB));
+      if (round === 0) assert.equal(sequencer.accept(event({ type: "content_block_stop", index: 0 })).length, 1 + 1 + 5);
+      assert.equal(sequencer.overflow, undefined, `round ${round}`);
+    }
+  });
+
+  it("trips on more than 64 blocks waiting behind the lowest open one", () => {
+    const sequencer = new SseBlockSequencer();
+    assert.equal(sequencer.accept(start(0)).length, 1);
+    for (let index = 1; index <= MAX_BUFFERED_BLOCKS; index += 1) sequencer.accept(start(index));
+    assert.equal(sequencer.overflow, undefined, "64 waiting blocks are allowed");
+    sequencer.accept(start(MAX_BUFFERED_BLOCKS + 1));
+    assert.equal(sequencer.overflow, "blocks");
+    assert.deepEqual(sequencer.finish(), []);
+  });
+
+  it("builds an Anthropic-style error event", () => {
+    const text = sseErrorEvent("api_error", "too much");
+    assert.equal(text, 'event: error\ndata: {"type":"error","error":{"type":"api_error","message":"too much"}}\n\n');
   });
 });

@@ -39,15 +39,18 @@ function proofOf(block: JsonObject): string {
 
 function keepsBlock(block: JsonObject, target: ThinkingTarget, store: ProvenanceStore): boolean {
   const proof = proofOf(block);
+  // An unsigned block (empty or missing signature) proves nothing about who produced it: no target keeps it.
+  if (proof.length === 0) return false;
   const producer = store.get(signatureHash(proof));
   if (producer !== undefined) return producer === target.sourceId;
   return target.kind === "anthropic" && looksLikeAnthropicSignature(proof);
 }
 
 /**
- * Drops thinking blocks the target source did not produce. Unknown provenance is dropped for
- * online/local targets; for Anthropic only long base64 signatures survive. The input body is
- * returned unchanged (same reference) when nothing is dropped.
+ * Drops thinking blocks the target source did not produce. Unsigned (empty-signature) blocks are
+ * dropped for every target. Unknown provenance is dropped for online/local targets; for Anthropic
+ * only long base64 signatures survive. The input body is returned unchanged (same reference) when
+ * nothing is dropped.
  */
 export function sanitizeThinking(
   body: JsonObject,
@@ -82,20 +85,18 @@ export function sanitizeThinking(
 }
 
 /**
- * Records which source produced each thinking signature seen in a response.
- * Local servers return thinking with an empty signature, so for local sources the empty
- * signature hash is attributed to the source (docs/20: empty = "local" provenance).
+ * Records which source produced each thinking signature seen in a response. An empty signature
+ * is never recorded (local servers send one, but it identifies nobody); such blocks are dropped
+ * from the history by `sanitizeThinking`.
  */
 export class ProvenanceRecorder {
   private readonly store: ProvenanceStore;
   private readonly sourceId: string;
-  private readonly kind: SourceKind;
   private readonly seen = new Set<string>();
 
-  constructor(store: ProvenanceStore, sourceId: string, kind: SourceKind) {
+  constructor(store: ProvenanceStore, sourceId: string) {
     this.store = store;
     this.sourceId = sourceId;
-    this.kind = kind;
   }
 
   /** One decoded SSE event payload. */
@@ -125,7 +126,7 @@ export class ProvenanceRecorder {
   }
 
   private recordProof(proof: string): void {
-    if (proof.length === 0 && this.kind !== "local") return;
+    if (proof.length === 0) return;
     const hash = signatureHash(proof);
     if (this.seen.has(hash)) return;
     this.seen.add(hash);

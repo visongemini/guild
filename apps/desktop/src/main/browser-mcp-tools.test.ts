@@ -31,7 +31,7 @@ function fakeSurface(options: {
       if (state.paused) throw new BrowserToolError(BROWSER_PANE_PAUSED_MESSAGE);
       events.push("start");
       try {
-        return await run();
+        return await run(surface);
       } finally {
         events.push("end");
       }
