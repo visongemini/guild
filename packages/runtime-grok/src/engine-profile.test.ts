@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { homedir } from "node:os";
+import { homedir, userInfo } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import type { ClaudeAdapterPin } from "./adapter-pin.js";
@@ -109,6 +109,8 @@ describe("Claude environment policy (docs/20 section 3.2)", () => {
     LANG: "en_US.UTF-8",
     LC_ALL: "C",
     LC_MESSAGES: "C",
+    USER: "someone",
+    LOGNAME: "someone",
     TMPDIR: "/tmp/x/",
     TMP: "/tmp/x",
     TEMP: "/tmp/x",
@@ -140,12 +142,21 @@ describe("Claude environment policy (docs/20 section 3.2)", () => {
     const environment = buildEngineEnvironment(CLAUDE_ENVIRONMENT_POLICY, rich);
     const kept = Object.keys(environment).sort();
     assert.deepEqual(kept, [
-      "ALL_PROXY", "HOME", "HTTP_PROXY", "LANG", "LC_ALL", "LC_MESSAGES", "NO_PROXY", "PATH",
-      "SSH_AUTH_SOCK", "SSL_CERT_DIR", "SSL_CERT_FILE", "TEMP", "TMP", "TMPDIR",
+      "ALL_PROXY", "HOME", "HTTP_PROXY", "LANG", "LC_ALL", "LC_MESSAGES", "LOGNAME", "NO_PROXY", "PATH",
+      "SSH_AUTH_SOCK", "SSL_CERT_DIR", "SSL_CERT_FILE", "TEMP", "TMP", "TMPDIR", "USER",
       "https_proxy", "no_proxy",
     ].sort());
+    assert.equal(environment.USER, "someone");
+    assert.equal(environment.LOGNAME, "someone");
     assert.equal(environment.HOME, homedir(), "HOME is the real home, not an inherited value");
     assert.equal(Object.isFrozen(environment), true);
+  });
+
+  it("keeps the account name Claude Code needs to find its Keychain login, filling USER when it is missing", () => {
+    assert.equal(buildEngineEnvironment(CLAUDE_ENVIRONMENT_POLICY, {}).USER, userInfo().username);
+    assert.equal(buildEngineEnvironment(CLAUDE_ENVIRONMENT_POLICY, { USER: "" }).USER, userInfo().username);
+    assert.equal(buildEngineEnvironment(CLAUDE_ENVIRONMENT_POLICY, { USER: "alias" }).USER, "alias");
+    assert.equal(buildEngineEnvironment(GROK_ENVIRONMENT_POLICY, { USER: "alias" }).USER, undefined, "Grok never saw USER");
   });
 
   it("adds no OpenViking kill-switch block and no Grok-only values", () => {

@@ -1,5 +1,5 @@
 import { realpath } from "node:fs/promises";
-import { homedir } from "node:os";
+import { homedir, userInfo } from "node:os";
 import { isAbsolute, join } from "node:path";
 import type {
   GuildGrokPermissionMode,
@@ -64,6 +64,8 @@ export type EnvironmentPolicy = Readonly<{
   fixedValues: Readonly<Record<string, string>>;
   /** Force NO_PROXY / no_proxy to include 127.0.0.1 and localhost. */
   loopbackNoProxy: boolean;
+  /** Fill USER from the account database when the parent environment has none. */
+  ensureUser: boolean;
   /** Keys a caller may add per spawn, each with its value validator. Anything else is rejected. */
   perSpawnKeys: Readonly<Record<string, (value: string) => boolean>>;
 }>;
@@ -158,6 +160,7 @@ export const GROK_ENVIRONMENT_POLICY: EnvironmentPolicy = Object.freeze({
   pathHomeDirectories: Object.freeze([join(".grok", "bin"), join(".local", "bin")]),
   fixedValues: GROK_FIXED_ENVIRONMENT,
   loopbackNoProxy: false,
+  ensureUser: false,
   perSpawnKeys: Object.freeze({}),
 });
 
@@ -166,6 +169,10 @@ export const GROK_ENVIRONMENT_POLICY: EnvironmentPolicy = Object.freeze({
  * different endpoint, credential, binary or Node behaviour. A routed session adds exactly the
  * per-spawn keys below; ANTHROPIC_BASE_URL must stay on the loopback because Claude Code sends
  * its subscription token to that URL.
+ *
+ * USER and LOGNAME are allowed because Claude Code finds its login in the macOS Keychain by
+ * account name: with USER missing `claude auth status` reports "not logged in" (verified with
+ * claude 2.1.291 on 2026-10-12). They are identity names, not credentials.
  */
 export const CLAUDE_PER_SPAWN_ENVIRONMENT: Readonly<Record<string, (value: string) => boolean>> = Object.freeze({
   ANTHROPIC_BASE_URL: isLoopbackHttpUrl,
@@ -175,13 +182,14 @@ export const CLAUDE_PER_SPAWN_ENVIRONMENT: Readonly<Record<string, (value: strin
 
 export const CLAUDE_ENVIRONMENT_POLICY: EnvironmentPolicy = Object.freeze({
   version: CLAUDE_ENVIRONMENT_POLICY_VERSION,
-  allowedKeys: new Set<string>(SHARED_ALLOWED_KEYS),
+  allowedKeys: new Set<string>([...SHARED_ALLOWED_KEYS, "USER", "LOGNAME"]),
   allowedKeyPrefixes: Object.freeze(["LC_"]),
   deniedKeys: new Set<string>(SHARED_DENIED_KEYS),
   deniedKeyPrefixes: Object.freeze(["DYLD_", "LD_", "ANTHROPIC_", "CLAUDE_CODE_"]),
   pathHomeDirectories: Object.freeze([join(".local", "bin")]),
   fixedValues: Object.freeze({}),
   loopbackNoProxy: true,
+  ensureUser: true,
   perSpawnKeys: CLAUDE_PER_SPAWN_ENVIRONMENT,
 });
 
@@ -213,6 +221,10 @@ export function buildEngineEnvironment(
     throw new TypeError("child environment contains an invalid key or value");
   }
   result.HOME = home;
+  if (policy.ensureUser && (result.USER === undefined || result.USER.length === 0)) {
+    const account = accountName();
+    if (account !== undefined) result.USER = account;
+  }
   result.PATH = mergeExecutableSearchPath(result.PATH, home, policy.pathHomeDirectories);
   if (policy.loopbackNoProxy) {
     const noProxy = [...new Set([
@@ -253,6 +265,15 @@ function isAllowedKey(policy: EnvironmentPolicy, key: string): boolean {
 
 function isDeniedKey(policy: EnvironmentPolicy, key: string): boolean {
   return policy.deniedKeys.has(key) || policy.deniedKeyPrefixes.some((prefix) => key.startsWith(prefix));
+}
+
+function accountName(): string | undefined {
+  try {
+    const name = userInfo().username;
+    return name.length > 0 && !name.includes("\0") && !name.includes("=") ? name : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function splitList(value: string | undefined): string[] {
