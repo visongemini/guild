@@ -101,6 +101,12 @@ created and never changes. Process topology stays one engine process per task (D
 - Once routed, always routed (every later process start for that task uses the routed env, also
   after Guild restarts). Claude models pass through the router to Anthropic.
 - Switching among models of a routed session is a plain `set_config_option` (no restart).
+- Selection before Claude has started: the runtime default of a Claude task is Claude's own pick (the
+  adapter-reported list, group `claude`) or nothing, which the picker shows as "Claude Code (default model)";
+  never a routed model and never a Grok model (a Grok id is refused as a Claude choice unless a router source
+  claims it). While the adapter's list is still unknown, the native aliases `default`, `opus`, `sonnet`,
+  `haiku` and `fable` can be saved as a task choice or as the global default; they are applied when the
+  session starts, and `model_selection_failed` answers if the adapter then does not offer one.
 - Never use the adapter's `providers/set` or gateway `authenticate`: they bypass the Claude login
   (adapter source comment on `GatewayAuthMeta`).
 

@@ -36,7 +36,9 @@ import {
   freezeModelCatalog,
   grokModelById,
   isClaudeModelId,
+  isOfficialGrokModelId,
   modelCatalogEngineOf,
+  modelGroupOf,
   modelSupportsReasoningEffort,
   parseGuildClaudePermissionMode,
   parseGuildClaudeReasoningEffort,
@@ -1045,6 +1047,45 @@ export function createLiveDesktopService(
     });
   }
 
+  /** Claude's own aliases: a choice before the adapter has reported its list, validated by the Claude grammar. */
+  const NATIVE_CLAUDE_ALIASES: ReadonlySet<string> = new Set(["default", "opus", "sonnet", "haiku", "fable"]);
+
+  /** The adapter-reported Claude models (group `claude`): never a routed or a Grok model. */
+  function nativeClaudeModels(): ModelCatalog["models"] {
+    return claudeNativeCatalog.models.filter((model) => modelGroupOf(model) === "claude");
+  }
+
+  /** The adapter's own default among its own models, or null while nothing has been reported. */
+  function nativeRuntimeDefaultId(): string | null {
+    const native = nativeClaudeModels();
+    if (native.length === 0) return null;
+    return runtimeDefaultModelOf({ ...claudeNativeCatalog, models: native })?.id ?? null;
+  }
+
+  /** An official Grok model id that no router source claims: it can never be a Claude model. */
+  function isGrokOnlyModelId(modelId: string): boolean {
+    return isOfficialGrokModelId(modelId) && !routedModels().some((model) => model.id === modelId);
+  }
+
+  /** A stored Claude choice, or null for one that cannot belong to a Claude task. */
+  function claudeChoiceOrNull(modelId: string | null | undefined): string | null {
+    return modelId === null || modelId === undefined || isGrokOnlyModelId(modelId) ? null : modelId;
+  }
+
+  /**
+   * Whether a Claude task or default may store this model. The adapter's list and the router's
+   * models are the choices; before the adapter reported its list (a task that has not started),
+   * its own aliases are accepted too: they are applied when the session starts, and the existing
+   * `model_selection_failed` path answers if the adapter then does not offer one.
+   */
+  function claudeModelStorable(modelId: string): boolean {
+    if (isGrokOnlyModelId(modelId)) return false;
+    const offered = claudeCatalogProjection();
+    if (offered.models.some((model) => model.id === modelId)) return true;
+    if (nativeClaudeModels().length === 0 && NATIVE_CLAUDE_ALIASES.has(modelId)) return true;
+    return offered.models.length === 0;
+  }
+
   /**
    * Same order as the Grok resolution. The effort is not reconciled with the catalog: the adapter
    * reports efforts only for the model that is selected, and the effort list of a model a session
@@ -1056,9 +1097,10 @@ export function createLiveDesktopService(
   ): ReturnType<typeof resolveEffectiveSelection> {
     const taskPinned = task !== undefined && (task.modelId !== null || task.reasoningEffort !== null);
     const globalPinned = global.modelId !== null || global.reasoningEffort !== null;
-    const catalog = claudeCatalogProjection();
     return Object.freeze({
-      modelId: task?.modelId ?? global.modelId ?? runtimeDefaultModelOf(catalog)?.id ?? null,
+      // The runtime default of a Claude task is Claude's own pick (the adapter's list) or nothing,
+      // which reads "Claude Code default model": never a routed model, never a Grok one.
+      modelId: claudeChoiceOrNull(task?.modelId) ?? claudeChoiceOrNull(global.modelId) ?? nativeRuntimeDefaultId(),
       reasoningEffort: task?.reasoningEffort ?? global.reasoningEffort ?? null,
       source: taskPinned ? "task" as const : globalPinned ? "global" as const : "runtime" as const,
     });
@@ -8118,11 +8160,7 @@ export function createLiveDesktopService(
             } catch {
               return refuse("unsupported_value");
             }
-            const offered = claudeCatalogProjection();
-            if (
-              (request.contextWindow ?? null) !== null ||
-              (offered.models.length > 0 && !offered.models.some((model) => model.id === request.model))
-            ) {
+            if ((request.contextWindow ?? null) !== null || !claudeModelStorable(request.model)) {
               return refuse("unsupported_value");
             }
           }
@@ -8300,7 +8338,7 @@ export function createLiveDesktopService(
       // The stored default must be something the engine or the router offers. The effort of a model
       // the session has not switched to is only known after the switch, so only its form is checked.
       const catalog = claudeCatalogProjection();
-      if (model !== null && catalog.models.length > 0 && !catalog.models.some((candidate) => candidate.id === model)) {
+      if (model !== null && !claudeModelStorable(model)) {
         throw new Error("runtime_settings_change_unavailable");
       }
       // An Online / Local model is a per-task choice behind the online reminder; as the global default

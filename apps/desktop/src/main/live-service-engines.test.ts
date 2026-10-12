@@ -640,6 +640,65 @@ describe("dual engine orchestration [PC-ENG-001, PC-MODEL-001]", () => {
     assert.deepEqual(h.world.inputs[1]!.extraEnvironment?.["ANTHROPIC_BASE_URL"], ROUTER_URL);
   });
 
+  it("never defaults a Claude task to a routed or a Grok model before Claude has started, and saves a native alias [PC-MODEL-001]", async () => {
+    const router = new FakeRouterHost([DEEPSEEK, LOCAL_MODEL]);
+    let store!: GuildPersistence;
+    const h = await harness({ modelRouterHost: router }, {}, (path) => {
+      store = openGuildPersistence({ path });
+      return store;
+    });
+    // The Claude catalog is still empty (the adapter has not reported its list) and the router offers two models.
+    const created = await h.service.createTask(h.workspaceId, undefined, "claude");
+    const taskId = created.task.taskId;
+    assert.equal(created.modelSelection.modelId, null, "Claude Code's own default, not DeepSeek or a Grok model");
+    assert.equal(created.modelSelection.source, "runtime");
+    assert.equal((await h.service.openTask(taskId)).modelSelection.modelId, null);
+
+    // A stale Grok default (the Claude grammar accepts any id) never shows on a Claude task.
+    store.updateAppSettings({ expectedRevision: store.loadAppSettings().revision, claudeModel: "grok-4.5" });
+    assert.equal((await h.service.openTask(taskId)).modelSelection.modelId, null);
+    store.updateAppSettings({ expectedRevision: store.loadAppSettings().revision, claudeModel: null });
+
+    // A known native alias can be saved as the task's choice before the first session, a Grok model and an unknown id cannot.
+    const alias = await h.service.setTaskRuntimeSettings({ taskId, model: "opus", reasoningEffort: null, contextWindow: null });
+    assert.equal(alias.status, "saved");
+    assert.equal(alias.task.modelSelection.modelId, "opus");
+    assert.equal(alias.task.modelSelection.source, "task");
+    for (const model of ["grok-4.5", "gpt-nope"]) {
+      const refused = await h.service.setTaskRuntimeSettings({ taskId, model, reasoningEffort: null, contextWindow: null });
+      assert.equal(refused.status, "refused", model);
+    }
+    // The same for the global Claude default.
+    const defaults = await h.service.setClaudeSettings("sonnet", null, "default");
+    assert.equal(defaults.runtimeSettings.claude?.model, "sonnet");
+    await assert.rejects(h.service.setClaudeSettings("grok-4.5", null, "default"), /runtime_settings_change_unavailable/u);
+    await assert.rejects(h.service.setClaudeSettings("deepseek-v4-flash", null, "default"), /claude_default_must_be_native/u);
+    await h.service.setClaudeSettings(null, null, "default");
+
+    // The alias is applied when the session starts.
+    await h.send(taskId, "first");
+    await h.completed();
+    assert.ok(h.world.adapters[0]!.log.includes("config:model=opus"));
+    assert.equal((await h.service.openTask(taskId)).modelSelection.modelId, "opus");
+
+    // Once the adapter reported its list, only what it (or the router) offers can be chosen.
+    await h.idle();
+    const unknown = await h.service.setTaskRuntimeSettings({ taskId, model: "fable", reasoningEffort: null, contextWindow: null });
+    assert.equal(unknown.status, "refused", "fable is an alias, but this adapter did not list it");
+  });
+
+  it("saves a native alias for a task whose adapter list is still unknown and fails by name if it is not offered [PC-MODEL-001]", async () => {
+    const h = await harness({ modelRouterHost: new FakeRouterHost([DEEPSEEK]) });
+    const created = await h.service.createTask(h.workspaceId, undefined, "claude");
+    const saved = await h.service.setTaskRuntimeSettings({
+      taskId: created.task.taskId, model: "fable", reasoningEffort: null, contextWindow: null,
+    });
+    assert.equal(saved.status, "saved");
+    // The fake adapter lists default, opus, sonnet and haiku: fable is not there.
+    await assert.rejects(h.send(created.task.taskId, "hi"), /^Error: model_selection_failed$/u);
+    assert.deepEqual(h.world.adapters.at(-1)!.prompts, [], "no turn runs on another model");
+  });
+
   it("keeps a Grok task running when its pinned model is not offered [PC-MODEL-001]", async () => {
     const h = await harness();
     const task = await h.service.createTask(h.workspaceId);

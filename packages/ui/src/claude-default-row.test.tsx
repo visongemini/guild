@@ -121,3 +121,45 @@ test("picking the row on a task that has not run moves it to Claude with setTask
   await applyModelSelectionChange(api, { taskId: TASK, taskEngine: "claude", change, onEngineMoved: (task) => adopted.push(task) });
   assert.deepEqual(calls, ['settings:{"taskId":"task-1","model":null,"reasoningEffort":null}']);
 });
+
+test("a Claude task before Claude's first start shows the default label in the trigger, whichever group is the first row (PC-MODEL-001)", () => {
+  const unpinned = modelPickerView({
+    messages: EN,
+    catalogs: FRESH_CATALOGS,
+    selection: Object.freeze({ modelId: null, reasoningEffort: null, source: "runtime", canChange: true }),
+    taskEngine: "claude",
+    engineFixed: false,
+    claudeState: "ready",
+  });
+  assert.equal(unpinned.triggerText, "Claude Code (default model)");
+  assert.equal(
+    modelPickerView({
+      messages: ZH,
+      catalogs: FRESH_CATALOGS,
+      selection: Object.freeze({ modelId: null, reasoningEffort: null, source: "runtime", canChange: true }),
+      taskEngine: "claude",
+      claudeState: "ready",
+    }).triggerText,
+    "Claude Code（默认模型）",
+  );
+  // A saved native alias names itself until the adapter has reported its list; a Grok task keeps its own label.
+  assert.equal(
+    modelPickerView({
+      messages: EN,
+      catalogs: FRESH_CATALOGS,
+      selection: Object.freeze({ modelId: "opus", reasoningEffort: null, source: "task", canChange: true }),
+      taskEngine: "claude",
+      claudeState: "ready",
+    }).triggerText,
+    "opus",
+  );
+  assert.equal(
+    modelPickerView({
+      messages: EN,
+      catalogs: FRESH_CATALOGS,
+      selection: Object.freeze({ modelId: null, reasoningEffort: null, source: "runtime", canChange: true }),
+      taskEngine: "grok",
+    }).triggerText,
+    "Default model",
+  );
+});
