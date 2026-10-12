@@ -5,6 +5,7 @@ import {
   cardAnchors,
   latestChangedRun,
   parseUnifiedDiff,
+  resultSummaryRepeatsChangeCard,
   rewindDisabledReason,
   runCardView,
   splitPath,
@@ -135,4 +136,29 @@ test("a unified diff drops the path headers, colors the changes and keeps hunk l
   const renamed = parseUnifiedDiff("diff --git a/x b/y\nsimilarity index 90%\nrename from x\nrename to y\n--- a/x\n+++ b/y\n@@ -1 +1 @@\n-a\n+b\n");
   assert.deepEqual(renamed.slice(0, 3).map((line) => line.kind), ["meta", "meta", "meta"]);
   assert.deepEqual(parseUnifiedDiff(""), []);
+});
+
+test("the latest-result strip is left out only where the finished run's own changed-files card says the same", () => {
+  const items = [
+    entry("user", "u1", { runId: "r1", sequence: 1 }),
+    entry("tool", "t1", { runId: "r1", sequence: 2 }),
+    entry("assistant", "a1", { runId: "r1", sequence: 3 }),
+  ];
+  const withFiles = [checkpoint({ runId: runId("r1") })];
+  const completed = { runId: runId("r1"), state: "completed" };
+  assert.equal(resultSummaryRepeatsChangeCard(completed, items, withFiles), true);
+  // Nothing else says how the turn went: no card for it, so the strip stays.
+  assert.equal(resultSummaryRepeatsChangeCard(completed, items, undefined), false);
+  assert.equal(resultSummaryRepeatsChangeCard(completed, items, [checkpoint({ runId: runId("r1"), files: [] })]), false, "no file changes, no card");
+  assert.equal(resultSummaryRepeatsChangeCard(completed, items, [checkpoint({ runId: runId("r1"), status: "capturing" })]), false, "a capturing card is only a placeholder");
+  assert.equal(resultSummaryRepeatsChangeCard(completed, items, [checkpoint({ runId: runId("r1"), status: "unavailable", files: [] })]), false);
+  // The card of another run does not stand in for this one.
+  assert.equal(resultSummaryRepeatsChangeCard({ runId: runId("r2"), state: "completed" }, items, withFiles), false);
+  // A turn that did not complete keeps its strip: it carries the state, not only the counts.
+  for (const state of ["failed", "cancelled", "interrupted"]) {
+    assert.equal(resultSummaryRepeatsChangeCard({ runId: runId("r1"), state }, items, withFiles), false);
+  }
+  assert.equal(resultSummaryRepeatsChangeCard(undefined, items, withFiles), false);
+  // A rewound run still shows its (rolled back) card, so the strip stays out of the way there too.
+  assert.equal(resultSummaryRepeatsChangeCard(completed, items, [checkpoint({ runId: runId("r1"), rolledBack: true })]), true);
 });

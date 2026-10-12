@@ -151,7 +151,7 @@ import { RunPhaseLine } from "./RunPhaseLine.js";
 import { groupEntries, segmentTimeline, type TimelineRow } from "./rolled-back.js";
 import { attentionStripTasks } from "./attention-tasks.js";
 import type { RolledBackResult } from "./rewind-flow.js";
-import { cardAnchors, latestChangedRun } from "./run-changes.js";
+import { cardAnchors, latestChangedRun, resultSummaryRepeatsChangeCard } from "./run-changes.js";
 import { composerEnterAction, steerButtonState } from "./steer.js";
 import {
   globalDefaultView,
@@ -861,6 +861,9 @@ export function GuildApp({ api }: GuildAppProps) {
       item.noticeType === "session_restored" &&
       item.sequence > latestInterruptedUserSequence);
   const running = isLiveRunState(activeTask?.task.activeRunState);
+  // The strip under the conversation is left out where the finished turn's own changed-files card says the same.
+  const resultSummaryRepeatsCard = !running &&
+    resultSummaryRepeatsChangeCard(activeTask?.recentResult, activeTimeline, activeTask?.runCheckpoints);
   const archivedWorkspaces = projection.workspaces.filter((workspace) => workspace.archived);
   const archivedTasks = projection.workspaces
     .filter((workspace) => !workspace.archived)
@@ -2421,7 +2424,7 @@ export function GuildApp({ api }: GuildAppProps) {
             />
           )}
           {commandStatus !== undefined && <CommandStatusLine status={commandStatus} locale={projection.locale} engine={activeEngine} />}
-          {activeTask?.recentResult !== undefined && !restoredNoticeCoversLatestResult &&
+          {activeTask?.recentResult !== undefined && !restoredNoticeCoversLatestResult && !resultSummaryRepeatsCard &&
             (activeTask.recentResult.state !== "completed" || activeTask.recentResult.workbench.files.length > 0 ||
               activeTask.recentResult.workbench.diffs.length > 0) && (
             <section className={`guild-result-summary ${activeTask.recentResult.state}`} aria-label={messages.latestResult}>

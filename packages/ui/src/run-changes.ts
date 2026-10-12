@@ -123,6 +123,25 @@ export function cardAnchors(
   return anchors;
 }
 
+/**
+ * Whether the "latest result" strip under the conversation would only repeat a card that is already on
+ * screen. A completed run whose changed-files card is shown says the same thing (how many files, one way
+ * to look at the diff), so the strip is left out; a run without that card (nothing tracked, a failed
+ * capture, no file changes) and a run that did not complete keep it, because it is then the only place
+ * that says how the turn ended.
+ */
+export function resultSummaryRepeatsChangeCard(
+  recentResult: Readonly<{ runId: RunId; state: string }> | undefined,
+  items: readonly TimelineItemProjection[],
+  checkpoints: readonly RunCheckpointProjection[] | undefined,
+): boolean {
+  if (recentResult === undefined || recentResult.state !== "completed") return false;
+  for (const checkpoint of cardAnchors(items, checkpoints).values()) {
+    if (checkpoint.runId === recentResult.runId) return runCardView(checkpoint, false)?.kind === "files";
+  }
+  return false;
+}
+
 export function rewindDisabledReason(
   rewind: RewindAvailabilityProjection | undefined,
 ): Extract<RewindAvailabilityProjection, { readonly available: false }>["reason"] | undefined {

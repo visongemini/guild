@@ -564,7 +564,7 @@ span.guild-pill { cursor: default; }
 .guild-image-viewer-close:hover, .guild-image-viewer-close:focus-visible { background: color-mix(in srgb, var(--guild-viewer-chrome) 70%, var(--guild-viewer-text)); }
 .guild-media-player { width: min(100%, 620px); }
 .guild-document { color: var(--guild-accent-text); }
-.guild-result-summary { min-width: 0; margin: var(--guild-s5) 0 var(--guild-s1); padding: var(--guild-s2) var(--guild-s2) var(--guild-s2) var(--guild-s3); display: flex; align-items: center; justify-content: space-between; gap: var(--guild-s4); border: 1px solid var(--guild-line); border-radius: var(--guild-r-md); background: var(--guild-surface); box-shadow: var(--guild-shadow-1); color: var(--guild-muted); }
+.guild-result-summary { min-width: 0; margin: 0 0 var(--guild-s1); padding: var(--guild-s2) var(--guild-s2) var(--guild-s2) var(--guild-s3); display: flex; align-items: center; justify-content: space-between; gap: var(--guild-s4); border: 1px solid var(--guild-line); border-radius: var(--guild-r-md); background: var(--guild-surface); box-shadow: var(--guild-shadow-1); color: var(--guild-muted); }
 .guild-result-summary > div { min-width: 0; display: flex; align-items: center; gap: var(--guild-s2); }
 .guild-result-summary > div > span { min-width: 0; display: grid; gap: 1px; }
 .guild-result-summary strong { color: var(--guild-text); font-size: var(--guild-fs-sm); font-weight: 620; }
