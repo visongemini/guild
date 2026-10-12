@@ -74,7 +74,6 @@ import type {
   TaskSummaryProjection,
   TimelineItemProjection,
   WorkspaceProjection,
-  WorkspacePrefsProjection,
 } from "@guild/contracts";
 import {
   canonicalGuildExternalUrl,
@@ -1563,9 +1562,10 @@ export function GuildApp({ api }: GuildAppProps) {
     const currentModel = (taskEngineOf(task.task) === "claude" ? modelCatalogs.claude : modelCatalogs.grok)
       .models.find((model) => model.id === task.modelSelection.modelId);
     const target = modelCatalogs.claude.models.find((model) => model.id === modelId);
+    const currentGroup = currentModel === undefined ? undefined : modelGroupOf(currentModel);
     const handledBefore = onlineRemindedTaskIds.current.has(taskId);
     let dismissed = false;
-    if (!handledBefore && currentModel !== undefined && modelGroupOf(currentModel) !== "online") {
+    if (!handledBefore && currentGroup !== "online") {
       try {
         dismissed = (await api.getWorkspacePrefs({ workspaceId: task.task.workspaceId })).onlineReminderDismissed;
       } catch {
@@ -1574,7 +1574,7 @@ export function GuildApp({ api }: GuildAppProps) {
     }
     if (!onlineReminderNeeded({
       targetGroup: "online",
-      currentGroup: currentModel === undefined ? undefined : modelGroupOf(currentModel),
+      currentGroup,
       alreadyHandledForTask: handledBefore,
       dismissedForWorkspace: dismissed,
     })) {

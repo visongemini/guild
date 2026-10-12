@@ -114,6 +114,10 @@ test("the reminder flow in the app follows PC-PRIV-001", async () => {
   assert.match(flow, /change\.group === "online" && !\(await confirmOnlineSwitch\(task, change\.model\)\)\) return undefined/u);
   assert.ok(flow.indexOf("confirmOnlineSwitch(task") < flow.indexOf("api.setTaskEngine("));
   assert.ok(flow.indexOf("confirmOnlineSwitch(task") < flow.indexOf("api.setTaskRuntimeSettings("));
+  // The preference is read whenever the task has not been asked and is not already on an Online model, even when the
+  // current model is not in the catalog (a fresh Claude task may name none).
+  assert.match(app, /const currentGroup = currentModel === undefined \? undefined : modelGroupOf\(currentModel\);/u);
+  assert.match(app, /if \(!handledBefore && currentGroup !== "online"\) \{\s*\n\s*try \{\s*\n\s*dismissed = \(await api\.getWorkspacePrefs/u);
   // The silenced state comes from the workspace preference; the checkbox writes it back; asked tasks are remembered per task id.
   assert.match(flow, /api\.getWorkspacePrefs\(\{ workspaceId: task\.task\.workspaceId \}\)/u);
   assert.match(flow, /api\.setWorkspacePrefs\(\{ workspaceId: task\.task\.workspaceId, onlineReminderDismissed: true \}\)/u);
