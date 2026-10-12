@@ -1068,17 +1068,23 @@ describe("thinking provenance through the router", () => {
     assert.equal(assistantBlocks(h.anthropic.requests[1] as Recorded).length, 1);
   });
 
-  it("attributes empty signatures to the local source that produced them", async (t) => {
+  it("never records an empty signature and drops unsigned thinking for every target [PC-ROUTE-003]", async (t) => {
     const h = await startHarness(t, { local: sseResponder(LLAMA_CPP_EVENTS) });
     await (await h.post("v1/messages", { ...simpleBody("local-27b"), stream: true })).text();
-    assert.equal(h.store.get(signatureHash("")), "local-1");
+    assert.equal(h.store.get(signatureHash("")), undefined, "llama.cpp streams an empty signature; it identifies nobody");
+    assert.equal(h.store.entries.size, 0);
 
+    // Even a row left behind by an older build must not keep an unsigned block alive.
+    h.store.put(signatureHash(""), "local-1");
     await h.post("v1/messages", historyWithThinking("local-27b", ""));
-    assert.equal(assistantBlocks(h.local.requests[1] as Recorded).length, 2);
+    assert.equal(assistantBlocks(h.local.requests[1] as Recorded).length, 1);
     await h.post("v1/messages", historyWithThinking("deepseek-v4", ""));
     assert.equal(assistantBlocks(h.online.requests[0] as Recorded).length, 1);
     await h.post("v1/messages", historyWithThinking("claude-sonnet-5", ""));
     assert.equal(assistantBlocks(h.anthropic.requests[0] as Recorded).length, 1);
+    const last = h.requestLogs().at(-1);
+    assert.equal(last?.fields.thinkingDropped, 1);
+    assert.equal(last?.fields.thinkingKept, 0);
   });
 
   it("keeps serving when the provenance store throws", async (t) => {

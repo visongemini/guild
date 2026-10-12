@@ -104,22 +104,25 @@ describe("thinking sanitize", () => {
     assert.equal(result.dropped, 0);
   });
 
-  it("treats an empty signature as the local source that produced it, else drops it", () => {
-    const store = new MemoryStore();
+  it("drops unsigned thinking blocks for every target, even with a stale empty-signature record [PC-ROUTE-003]", () => {
     const missing: JsonObject = { type: "thinking", thinking: "no signature field" };
-    const unrecorded = sanitizeThinking(history(thinking(""), missing), { sourceId: "local-1", kind: "local" }, store);
-    assert.equal(unrecorded.dropped, 2);
-
-    store.put(signatureHash(""), "local-1");
-    const own = sanitizeThinking(history(thinking(""), missing), { sourceId: "local-1", kind: "local" }, store);
-    assert.equal(own.kept, 2);
-    assert.equal(own.dropped, 0);
-    for (const target of [
+    const emptyRedacted: JsonObject = { type: "redacted_thinking", data: "" };
+    const targets = [
+      { sourceId: "local-1", kind: "local" },
+      { sourceId: "local-2", kind: "local" },
       { sourceId: "deepseek", kind: "online" },
       { sourceId: "anthropic", kind: "anthropic" },
-      { sourceId: "local-2", kind: "local" },
-    ] as const) {
-      assert.equal(sanitizeThinking(history(thinking("")), target, store).dropped, 1);
+    ] as const;
+    // A row written by an older build attributed the empty signature to local-1; it must stay inert.
+    const stale = new MemoryStore();
+    stale.put(signatureHash(""), "local-1");
+    for (const store of [new MemoryStore(), stale]) {
+      for (const target of targets) {
+        const result = sanitizeThinking(history(thinking(""), missing, emptyRedacted), target, store);
+        assert.deepEqual(assistantContent(result.body), [{ type: "text", text: "answer" }], `${target.sourceId}`);
+        assert.equal(result.kept, 0);
+        assert.equal(result.dropped, 3);
+      }
     }
   });
 
@@ -158,7 +161,7 @@ describe("thinking sanitize", () => {
 describe("provenance recorder", () => {
   it("records signatures from content_block_start and signature_delta events", () => {
     const store = new MemoryStore();
-    const recorder = new ProvenanceRecorder(store, "deepseek", "online");
+    const recorder = new ProvenanceRecorder(store, "deepseek");
     recorder.observeEvent({ type: "content_block_start", index: 0, content_block: { type: "thinking", thinking: "", signature: "" } });
     recorder.observeEvent({ type: "content_block_start", index: 1, content_block: { type: "thinking", thinking: "", signature: "sig-start" } });
     recorder.observeEvent({ type: "content_block_delta", index: 0, delta: { type: "signature_delta", signature: "sig-delta" } });
@@ -172,7 +175,7 @@ describe("provenance recorder", () => {
 
   it("records redacted_thinking data and non-streamed message content", () => {
     const store = new MemoryStore();
-    const recorder = new ProvenanceRecorder(store, "anthropic", "anthropic");
+    const recorder = new ProvenanceRecorder(store, "anthropic");
     recorder.observeMessage({
       type: "message",
       content: [
@@ -187,26 +190,25 @@ describe("provenance recorder", () => {
     assert.equal(store.get(signatureHash("redacted-stream")), "anthropic");
   });
 
-  it("attributes the empty signature to local sources only", () => {
-    const local = new MemoryStore();
-    const localRecorder = new ProvenanceRecorder(local, "local-1", "local");
-    localRecorder.observeEvent({ type: "content_block_start", index: 0, content_block: { type: "thinking", thinking: "", signature: "" } });
-    assert.equal(local.get(signatureHash("")), "local-1");
-
-    const online = new MemoryStore();
-    const onlineRecorder = new ProvenanceRecorder(online, "deepseek", "online");
-    onlineRecorder.observeEvent({ type: "content_block_start", index: 0, content_block: { type: "thinking", thinking: "", signature: "" } });
-    onlineRecorder.observeEvent({ type: "content_block_delta", index: 0, delta: { type: "signature_delta", signature: "" } });
-    onlineRecorder.observeMessage({ content: [{ type: "thinking", thinking: "t", signature: "" }] });
-    assert.equal(online.puts, 0);
+  it("never records an empty signature, for any source [PC-ROUTE-003]", () => {
+    for (const sourceId of ["local-1", "deepseek", "anthropic"]) {
+      const store = new MemoryStore();
+      const recorder = new ProvenanceRecorder(store, sourceId);
+      recorder.observeEvent({ type: "content_block_start", index: 0, content_block: { type: "thinking", thinking: "", signature: "" } });
+      recorder.observeEvent({ type: "content_block_delta", index: 0, delta: { type: "signature_delta", signature: "" } });
+      recorder.observeEvent({ type: "content_block_start", index: 1, content_block: { type: "thinking", thinking: "" } });
+      recorder.observeEvent({ type: "content_block_start", index: 2, content_block: { type: "redacted_thinking", data: "" } });
+      recorder.observeMessage({ content: [{ type: "thinking", thinking: "t", signature: "" }, { type: "redacted_thinking", data: "" }] });
+      assert.equal(store.puts, 0, sourceId);
+    }
   });
 
   it("writes each hash once per response", () => {
     const store = new MemoryStore();
-    const recorder = new ProvenanceRecorder(store, "local-1", "local");
+    const recorder = new ProvenanceRecorder(store, "local-1");
     for (let i = 0; i < 3; i += 1) {
-      recorder.observeEvent({ type: "content_block_start", index: i, content_block: { type: "thinking", thinking: "", signature: "" } });
-      recorder.observeEvent({ type: "content_block_delta", index: i, delta: { type: "signature_delta", signature: "" } });
+      recorder.observeEvent({ type: "content_block_start", index: i, content_block: { type: "thinking", thinking: "", signature: "sig-once" } });
+      recorder.observeEvent({ type: "content_block_delta", index: i, delta: { type: "signature_delta", signature: "sig-once" } });
     }
     assert.equal(store.puts, 1);
   });

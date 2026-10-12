@@ -123,13 +123,13 @@ created and never changes. Process topology stays one engine process per task (D
   4. Top-level `context_management` and `output_config` are removed.
   5. Consecutive same-role messages are merged; in user messages `tool_result` blocks come first.
   6. Empty content becomes `[{"type":"text","text":"(empty)"}]`.
-- **Thinking provenance.** The router records `sha256(signature)[:32] -> source id` for every
+- **Thinking provenance.** The router records `sha256(signature)[:32] -> source id` for every non-empty
   thinking signature it sees in responses (SSE `signature_delta`, `content_block_start`, or JSON).
   Persistence goes through an injected store (Guild: SQLite table `thinking_provenance`).
   Before forwarding to source X, `thinking`/`redacted_thinking` blocks not produced by X are dropped.
   Unknown provenance: drop for Online/Local; for Anthropic keep only if the signature is a long
-  (> 100 chars) base64 string. Empty signature = "local" provenance of the source that produced it
-  when known, else drop.
+  (> 100 chars) base64 string. An empty (or missing) signature is never recorded and such unsigned
+  thinking blocks are dropped for every target, Local included.
 - **SSE normalizer** for Local sources: re-sequence content blocks so a block's events (deltas,
   `signature_delta`, `content_block_stop`) are emitted before any event of a higher index; buffer the
   higher block until the lower one stops.

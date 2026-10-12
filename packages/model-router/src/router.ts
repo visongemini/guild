@@ -562,7 +562,7 @@ class RouterCore {
       res.end();
       return;
     }
-    const recorder = new ProvenanceRecorder(this.store, plan.source.id, plan.source.kind);
+    const recorder = new ProvenanceRecorder(this.store, plan.source.id);
     await this.pump(res, upstream.body, chooseTransform(upstream, plan.source, recorder), controller.signal, ctx);
   }
 
