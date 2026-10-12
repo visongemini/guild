@@ -52,9 +52,10 @@ test("index.ts reads the hooks through resolveDevHooks with app.isPackaged and n
   assert.doesNotMatch(source, /GUILD_DEV_DATA_DIR|GUILD_DEV_CLAUDE_CAPTURE_OFF/u);
 });
 
-test("the capture variable reaches Claude spawns only through the live service option [PC-OV-001]", async () => {
+test("the capture variable reaches Claude spawns only through the live service option and the routed marker [PC-OV-001]", async () => {
   const live = await readFile(new URL("../../src/main/live-service.ts", import.meta.url), "utf8");
-  assert.match(live, /controller\.engine === "claude" && options\.claudeCaptureOff === true/u);
+  assert.match(live, /const captureOff = options\.claudeCaptureOff === true \|\| store\.loadTaskMetadata\(taskId\)\.routedAtMs !== undefined;/u);
+  assert.match(live, /controller\.engine === "claude" && captureOff/u);
   assert.doesNotMatch(live, /process\.env\["GUILD_DEV/u);
   const hooks = await readFile(new URL("../../src/main/dev-hooks.ts", import.meta.url), "utf8");
   assert.match(hooks, /if \(input\.isPackaged\) return/u);

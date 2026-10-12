@@ -9,7 +9,10 @@ import { isAbsolute, normalize } from "node:path";
 export const DEV_DATA_DIR_VARIABLE = "GUILD_DEV_DATA_DIR";
 export const DEV_CLAUDE_CAPTURE_OFF_VARIABLE = "GUILD_DEV_CLAUDE_CAPTURE_OFF";
 
-/** Added to every Claude engine spawn when the capture hook is on (routed spawns carry it anyway). */
+/**
+ * Added to every Claude engine spawn when the capture hook is on, and to the native spawns of a task that has used a
+ * routed model (D-062, so third-party output never enters the memory store). Routed spawns carry it anyway.
+ */
 export const CLAUDE_CAPTURE_OFF_ENVIRONMENT: Readonly<Record<string, string>> = Object.freeze({
   OPENVIKING_AUTO_CAPTURE: "false",
 });

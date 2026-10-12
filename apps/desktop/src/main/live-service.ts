@@ -349,10 +349,11 @@ export type RuntimeFactory = (input: {
     readonly startup: GuildGrokStartupSettings;
   };
   /**
-   * Claude only: the per-spawn variables of a routed task (docs/20 3.3). Present for every process
-   * start of a routed task and, apart from the dev-only capture switch of `claudeCaptureOff`, never
-   * for a native one. The `ANTHROPIC_BASE_URL` value carries the router token and `ANTHROPIC_AUTH_TOKEN`
-   * is a throwaway secret: never log either.
+   * Claude only: the per-spawn variables of a start (docs/20 3.3, D-062). A process whose task selects an
+   * Online / Local model gets the routed set; a native process gets none, except
+   * `OPENVIKING_AUTO_CAPTURE=false` when the task has used a routed model or the dev-only capture switch of
+   * `claudeCaptureOff` is on. The `ANTHROPIC_BASE_URL` value carries the router token and
+   * `ANTHROPIC_AUTH_TOKEN` is a throwaway secret: never log either.
    */
   readonly extraEnvironment?: Readonly<Record<string, string>>;
 }) => Promise<{
@@ -400,9 +401,10 @@ export type LiveDesktopServiceOptions = {
   /** Loopback browser MCP server handed to engines that advertise HTTP MCP (docs/20 3.5). */
   readonly browserMcp?: BrowserMcpPort;
   /**
-   * Dev-only QA switch (`GUILD_DEV_CLAUDE_CAPTURE_OFF`, see dev-hooks.ts): native Claude spawns also
-   * get `OPENVIKING_AUTO_CAPTURE=false`, so QA turns are not written into the owner's memory store.
-   * The main process passes it only for an unpackaged app; routed spawns carry the variable anyway.
+   * Dev-only QA switch (`GUILD_DEV_CLAUDE_CAPTURE_OFF`, see dev-hooks.ts): every native Claude spawn also
+   * gets `OPENVIKING_AUTO_CAPTURE=false`, so QA turns are not written into the owner's memory store.
+   * The main process passes it only for an unpackaged app; routed spawns, and the native spawns of a task
+   * that has used a routed model (D-062), carry the variable anyway.
    */
   readonly claudeCaptureOff?: boolean;
   readonly usageFetcher?: (signal: AbortSignal) => Promise<AcpV1OfficialBillingSnapshot>;
@@ -1029,7 +1031,6 @@ export function createLiveDesktopService(
         selection: resolveClaudeSelection(
           override === undefined ? undefined : { modelId: override.modelId, reasoningEffort: override.reasoningEffort },
           { modelId: settings.claudeModel, reasoningEffort: settings.claudeEffort },
-          taskRouted(taskId),
         ),
         contextWindow: null,
       });
@@ -1066,26 +1067,9 @@ export function createLiveDesktopService(
     return isOfficialGrokModelId(modelId) && !routedModels().some((model) => model.id === modelId);
   }
 
-  /**
-   * The task runs, or is switching to run, through the model router for good (D-061): its marker is set or
-   * its process is routed. Such a task can never use a Claude subscription model again.
-   */
-  function taskRouted(taskId: TaskId): boolean {
-    if (controllers.get(taskId)?.routedProcess === true) return true;
-    try {
-      return readOncePerBuild(`routed:${taskId}`, () => store.loadTaskMetadata(taskId).routedAtMs) !== undefined;
-    } catch {
-      return false;
-    }
-  }
-
-  /**
-   * A stored Claude choice, or null for one that cannot belong to a Claude task. A routed task keeps only
-   * the router's own models: a Claude model a task chose before it was routed no longer counts (D-061).
-   */
-  function claudeChoiceOrNull(modelId: string | null | undefined, routed = false): string | null {
-    if (modelId === null || modelId === undefined || isGrokOnlyModelId(modelId)) return null;
-    return routed && !routedModels().some((model) => model.id === modelId) ? null : modelId;
+  /** A stored Claude choice, or null for one that cannot belong to a Claude task. */
+  function claudeChoiceOrNull(modelId: string | null | undefined): string | null {
+    return modelId === null || modelId === undefined || isGrokOnlyModelId(modelId) ? null : modelId;
   }
 
   /**
@@ -1110,20 +1094,13 @@ export function createLiveDesktopService(
   function resolveClaudeSelection(
     task: Readonly<{ modelId: string | null; reasoningEffort: string | null }> | undefined,
     global: Readonly<{ modelId: string | null; reasoningEffort: string | null }>,
-    routed: boolean,
   ): ReturnType<typeof resolveEffectiveSelection> {
     const taskPinned = task !== undefined && (task.modelId !== null || task.reasoningEffort !== null);
     const globalPinned = global.modelId !== null || global.reasoningEffort !== null;
-    // The runtime default of a Claude task is Claude's own pick (the adapter's list) or nothing,
-    // which reads "Claude Code default model": never a routed model, never a Grok one. A routed task has
-    // no such default (it is a Claude subscription model): it selects a routed model or none (D-061).
-    const modelId = claudeChoiceOrNull(task?.modelId, routed) ?? claudeChoiceOrNull(global.modelId, routed) ??
-      (routed ? null : nativeRuntimeDefaultId());
-    if (routed && modelId === null) {
-      return Object.freeze({ modelId: null, reasoningEffort: null, source: "runtime" as const });
-    }
     return Object.freeze({
-      modelId,
+      // The runtime default of a Claude task is Claude's own pick (the adapter's list) or nothing,
+      // which reads "Claude Code default model": never a routed model, never a Grok one.
+      modelId: claudeChoiceOrNull(task?.modelId) ?? claudeChoiceOrNull(global.modelId) ?? nativeRuntimeDefaultId(),
       reasoningEffort: task?.reasoningEffort ?? global.reasoningEffort ?? null,
       source: taskPinned ? "task" as const : globalPinned ? "global" as const : "runtime" as const,
     });
@@ -1161,14 +1138,8 @@ export function createLiveDesktopService(
       ? undefined
       : sessionSelectionOf(controller.sessionConfigOptions);
     const showLive = live !== undefined && (selection.source === "runtime" || controller?.selectionRefused === true);
-    let modelId = (showLive ? live.modelId : undefined) ?? selection.modelId;
-    // A routed task shows no Claude subscription model, not even one its session still reports (D-061).
-    if (modelId !== null && readOncePerBuild(`engine:${taskId}`, () => engineOfTask(taskId)) === "claude" &&
-      taskRouted(taskId) && !routedModels().some((model) => model.id === modelId)) {
-      modelId = null;
-    }
     return Object.freeze({
-      modelId,
+      modelId: (showLive ? live.modelId : undefined) ?? selection.modelId,
       reasoningEffort: (showLive ? live.reasoningEffort : undefined) ?? selection.reasoningEffort,
       source: selection.source,
       canChange: taskSelectionCanChange(taskId),
@@ -1176,18 +1147,16 @@ export function createLiveDesktopService(
   }
 
   /**
-   * A routed task never starts a turn on a model that is not one of the router's (D-061). A task routed by an
-   * earlier build may still select a Claude model, or none; its session would ask the router for a claude-*
-   * model, which the router refuses, so the turn ends here with the same named failure as any other selection
-   * that cannot be applied, and the picker (Claude rows disabled) is the way out.
+   * A turn never goes out on the wrong backend (docs/20 3.3, D-062): the process mode must be the mode of the
+   * selected model, a routed process for an Online / Local model and a native one for anything else. The
+   * start gating (`ensureSession`, `sessionStartPending`) restarts a process whose mode is stale before a
+   * prompt launches; this is the last check before the prompt is written, and a mismatch ends the turn with
+   * the same named failure as any other selection that cannot be applied.
    */
-  function assertRoutedTaskModel(taskId: TaskId, controller: RuntimeController, session: AcpV1AdapterSession): void {
-    if (controller.engine !== "claude" || !taskRouted(taskId)) return;
-    // The stored choice, else the model the routed session itself runs on.
-    const modelId = desiredSelection(taskId).selection.modelId ?? sessionSelectionOf(controller.sessionConfigOptions).modelId;
-    if (modelId !== undefined && modelId !== null && routedModels().some((model) => model.id === modelId)) return;
+  function assertProcessModeMatchesModel(taskId: TaskId, controller: RuntimeController, session: AcpV1AdapterSession): void {
+    if (controller.engine !== "claude" || controller.routedProcess === selectsRoutedModel(taskId)) return;
     controller.selectionRefused = true;
-    logRuntime({ category: "runtime", event: "model_switch_refused", taskId, sessionId: session.sessionId, reason: "claude_locked" });
+    logRuntime({ category: "runtime", event: "model_switch_refused", taskId, sessionId: session.sessionId, reason: "process_mode_mismatch" });
     throw new Error(MODEL_SELECTION_FAILED);
   }
 
@@ -1205,8 +1174,12 @@ export function createLiveDesktopService(
     session: AcpV1AdapterSession,
   ): Promise<RuntimeSelectionOutcome["status"] | "skipped"> {
     const { selection, contextWindow } = desiredSelection(taskId);
+    // A native session resumed after routed turns comes back on the model of its last turn, an Online / Local
+    // id that Claude does not offer; the runtime default is applied then, also when nothing is pinned (D-062).
+    const strayRoutedModel = controller.engine === "claude" && !controller.routedProcess &&
+      selection.modelId !== null && sessionModelUnoffered(controller.sessionConfigOptions);
     // Nothing pinned anywhere: the runtime default (or the session's own earlier choice) stays.
-    if (selection.source === "runtime" || adapter.state !== "ready") {
+    if ((selection.source === "runtime" && !strayRoutedModel) || adapter.state !== "ready") {
       controller.selectionRefused = false;
       return "skipped";
     }
@@ -1368,14 +1341,25 @@ export function createLiveDesktopService(
   }
 
   // ---------------------------------------------------------------------------------------------
-  // Guild 3.0 Claude engine: routed sessions, login state (docs/20 3.2, 3.3)
+  // Guild 3.0 Claude engine: native and routed sessions, login state (docs/20 3.2, 3.3)
   // ---------------------------------------------------------------------------------------------
 
-  /** `setTaskRuntimeSettings` stored a routed model for a live native session; the restart follows. */
-  type RoutedSelectionRestart = Readonly<{
-    status: "routed_restart";
+  /**
+   * `setTaskRuntimeSettings` stored a selection whose mode (native Claude or routed Online / Local) is not
+   * the live process's; the restart follows, outside the command queue (D-062).
+   */
+  type ModeSelectionRestart = Readonly<{
+    status: "mode_restart";
     previous: ReturnType<GuildPersistence["loadTaskRuntimeSettings"]>;
   }>;
+
+  /** The session runs on a model its own model list does not offer. */
+  function sessionModelUnoffered(options: readonly RuntimeConfigOption[]): boolean {
+    const modelOption = selectionOptionsOf(options).model;
+    return modelOption !== undefined &&
+      typeof modelOption.currentValue === "string" &&
+      !optionOffers(modelOption, modelOption.currentValue);
+  }
 
   /** Whether the session's own model list offers this model. */
   function optionOffersModel(options: readonly RuntimeConfigOption[], modelId: string): boolean {
@@ -1408,15 +1392,13 @@ export function createLiveDesktopService(
   }
 
   /**
-   * Whether this process start is routed, and with what. A task starts routed from the moment it
-   * selects an Online / Local model, and then for good: every later start (also after Guild restarts
-   * and crash recovery) goes through the router again (docs/20 3.3). The marker itself is committed
-   * by `commitRoutedMarker`, once the routed process has taken the selection and before any turn.
+   * Whether this process start is routed, and with what. The mode of every start (the switch, a crash
+   * recovery, a Guild restart) follows the task's selected model: an Online / Local model starts a routed
+   * process, anything else a native one (docs/20 3.3, D-062). The marker is committed by
+   * `commitRoutedMarker`, once a routed process has taken the selection and before any turn.
    */
   async function planRoutedStart(taskId: TaskId, controller: RuntimeController): Promise<RoutedStart | undefined> {
-    if (controller.engine !== "claude") return undefined;
-    const metadata = store.loadTaskMetadata(taskId);
-    if (metadata.routedAtMs === undefined && !selectsRoutedModel(taskId)) return undefined;
+    if (controller.engine !== "claude" || !selectsRoutedModel(taskId)) return undefined;
     const baseUrl = await ensureRouterReady(taskId);
     // Claude Code's background requests and subagents follow the routed model applied at this start (D-061).
     const selected = desiredSelection(taskId).selection.modelId;
@@ -1428,9 +1410,10 @@ export function createLiveDesktopService(
   }
 
   /**
-   * The routed marker: the task has run, and from now on always runs, through the router. It is
-   * committed only after the routed process took the selection and before the session is handed out,
-   * so a task is never marked without a routed process behind it and no turn precedes the marker.
+   * The routed marker: the task has used an Online / Local model at least once (D-062), so every process of
+   * it keeps OpenViking capture off from now on. It is committed only after a routed process took the
+   * selection and before the session is handed out, so a task is never marked without a routed process
+   * behind it and no routed turn precedes the marker.
    */
   function commitRoutedMarker(taskId: TaskId): void {
     if (store.loadTaskMetadata(taskId).routedAtMs !== undefined) return;
@@ -1439,14 +1422,15 @@ export function createLiveDesktopService(
   }
 
   /**
-   * An idle native session that has to go through the router: the task is marked routed but this
-   * process is not, or it selects an Online / Local model the process's model list lacks. The process
-   * restarts between turns, routed, and resumes the same session (`startRuntime`). `ownStart` is the
-   * restart itself asking again just before it closes the process. Selection changes are refused
-   * while a turn runs, so this never interrupts one.
+   * An idle session whose process is not the one the selected model needs (docs/20 3.3, D-062): a native
+   * process for an Online / Local model, a routed one for a Claude model or no choice, or a routed process
+   * whose model list lacks the selected routed model. The process restarts between turns, in the mode the
+   * selection needs, and resumes the same session (`startRuntime`). `ownStart` is the restart itself asking
+   * again just before it closes the process. Selection changes are refused while a turn runs, so this never
+   * interrupts one.
    */
-  function routedRestartNeeded(taskId: TaskId, controller: RuntimeController, ownStart = false): boolean {
-    if (controller.engine !== "claude" || modelRouterHost === undefined) return false;
+  function processModeRestartNeeded(taskId: TaskId, controller: RuntimeController, ownStart = false): boolean {
+    if (controller.engine !== "claude") return false;
     if (
       controller.adapter?.state !== "ready" ||
       controller.session === undefined ||
@@ -1455,20 +1439,22 @@ export function createLiveDesktopService(
       controller.promptRunId !== undefined ||
       controller.pendingPermissions.size > 0
     ) return false;
-    if (store.loadTaskMetadata(taskId).routedAtMs !== undefined && !controller.routedProcess) return true;
-    if (!selectsRoutedModel(taskId)) return false;
+    const wantsRouted = selectsRoutedModel(taskId);
+    if (controller.routedProcess !== wantsRouted) return true;
+    if (!wantsRouted) return false;
+    // A routed process started before the selected model joined its model list (a source added since).
     const modelId = desiredSelection(taskId).selection.modelId;
     const modelOption = selectionOptionsOf(controller.sessionConfigOptions).model;
     return modelId !== null && (modelOption === undefined || !optionOffers(modelOption, modelId));
   }
 
   /**
-   * A start (the routed switch included) is in flight or due for this task, so the session in hand may
-   * be about to go away: no prompt may launch on it. The caller goes through `ensureSession` instead,
-   * which joins the start and hands out the session it produced (docs/20 3.3).
+   * A start (a mode switch included) is in flight or due for this task, so the session in hand may be about
+   * to go away: no prompt may launch on it. The caller goes through `ensureSession` instead, which joins the
+   * start and hands out the session it produced (docs/20 3.3).
    */
   function sessionStartPending(taskId: TaskId, controller: RuntimeController): boolean {
-    return controller.startOperation !== undefined || routedRestartNeeded(taskId, controller);
+    return controller.startOperation !== undefined || processModeRestartNeeded(taskId, controller);
   }
 
   /**
@@ -3381,7 +3367,7 @@ export function createLiveDesktopService(
     });
   }
 
-  /** Claude's login summary and routed state (docs/20 3.8). A Grok task has none. */
+  /** Claude's login summary (docs/20 3.8). A Grok task has none. */
   function engineStatusProjection(
     metadata: ReturnType<GuildPersistence["loadTaskMetadata"]>,
   ): EngineStatusProjection | undefined {
@@ -3390,7 +3376,6 @@ export function createLiveDesktopService(
     const status: EngineStatusProjection = Object.freeze({
       ...(claudeAuth?.label === undefined || loginRequired ? {} : { accountLabel: claudeAuth.label }),
       ...(loginRequired ? { loginRequired: true as const } : {}),
-      ...(metadata.routedAtMs === undefined ? {} : { routed: true as const }),
     });
     return Object.keys(status).length === 0 ? undefined : status;
   }
@@ -3991,8 +3976,8 @@ export function createLiveDesktopService(
     if (managementOperationActive) throw new Error("grok_management_operation_active");
     const controller = controllerFor(taskId);
     if (!prewarm) controller.prewarmOnly = false;
-    // A start in flight, the routed switch included, is joined, never raced: while it runs the
-    // native session must not be handed out for a turn.
+    // A start in flight, a mode switch included, is joined, never raced: while it runs the
+    // old session must not be handed out for a turn.
     if (controller.startOperation !== undefined) {
       if (!prewarm) controller.startIsPrewarm = false;
       return controller.startOperation;
@@ -4000,11 +3985,11 @@ export function createLiveDesktopService(
     const live = controller.session !== undefined && controller.adapter?.state === "ready"
       ? controller.session
       : undefined;
-    if (live !== undefined && (prewarm || !routedRestartNeeded(taskId, controller))) return live;
+    if (live !== undefined && (prewarm || !processModeRestartNeeded(taskId, controller))) return live;
     controller.startIsPrewarm = prewarm;
     controller.prewarmOnly = prewarm;
-    // A live session here is an idle native one that has to go through the router (docs/20 3.3): the
-    // switch is this one start, assigned before anything is awaited.
+    // A live session here is an idle one whose process has the wrong mode for the selected model (docs/20 3.3):
+    // the switch is this one start, assigned before anything is awaited.
     controller.startOperation = startRuntime(taskId, controller, live);
     try {
       return await controller.startOperation;
@@ -4494,11 +4479,12 @@ export function createLiveDesktopService(
   }
 
   /**
-   * `switchFrom` is the idle native session this start replaces with a routed one (docs/20 3.3): the
-   * router comes up first, then the idle conditions are checked once more and the native process is
-   * closed in the same synchronous step; a session that became busy in between is returned untouched
-   * and the selection stays pending for the next idle point. The routed process resumes the session,
-   * takes the selection, and only then is the task marked routed; the session is handed out after that.
+   * `switchFrom` is the idle session this start replaces with a process of the other mode (docs/20 3.3,
+   * D-062), native to routed or routed to native. For a routed target the router comes up first; then the
+   * idle conditions are checked once more and the old process is closed in the same synchronous step; a
+   * session that became busy in between is returned untouched and the selection stays pending for the next
+   * idle point. The new process resumes the session and takes the selection; after a routed one has, the
+   * task is marked routed, and only then is the session handed out.
    */
   async function startRuntime(
     taskId: TaskId,
@@ -4515,16 +4501,16 @@ export function createLiveDesktopService(
     await worktreeManager.assertUsable(taskId);
     const taskRoot = taskRootPath(taskId, workspace.canonicalPath);
     await assertWorkspaceFolderExists(taskRoot);
-    // A router that cannot start leaves the working native session alone.
-    if (switchFrom !== undefined) await ensureRouterReady(taskId);
+    // A router that cannot start leaves the working native session alone. A switch back to Claude needs none.
+    if (switchFrom !== undefined && selectsRoutedModel(taskId)) await ensureRouterReady(taskId);
     const previousAdapter = controller.adapter;
     if (
       switchFrom !== undefined &&
       controller.session === switchFrom &&
       previousAdapter?.state === "ready" &&
-      !routedRestartNeeded(taskId, controller, true)
+      !processModeRestartNeeded(taskId, controller, true)
     ) {
-      logRuntime({ category: "runtime", event: "routed_switch_deferred", taskId });
+      logRuntime({ category: "runtime", event: "mode_switch_deferred", taskId });
       return switchFrom;
     }
     if (previousAdapter !== undefined) {
@@ -4611,12 +4597,15 @@ export function createLiveDesktopService(
     let startStage = "runtime_factory";
     try {
       const selectedRuntimeSettings = store.loadAppSettings();
-      // A routed Claude task always starts through the router, also after a Guild restart.
+      // The mode of every start follows the selected model, also after a Guild restart (D-062).
       startStage = "routed_plan";
       const routed = await planRoutedStart(taskId, controller);
       startStage = "runtime_factory";
+      // A native process of a task that has used a routed model keeps OpenViking capture off, so third-party
+      // output never enters the memory store; recall stays on.
+      const captureOff = options.claudeCaptureOff === true || store.loadTaskMetadata(taskId).routedAtMs !== undefined;
       const spawnEnvironment = routed?.extraEnvironment ??
-        (controller.engine === "claude" && options.claudeCaptureOff === true ? CLAUDE_CAPTURE_OFF_ENVIRONMENT : undefined);
+        (controller.engine === "claude" && captureOff ? CLAUDE_CAPTURE_OFF_ENVIRONMENT : undefined);
       created = await runtimeFactory({
         engine: controller.engine,
         adapterEpoch,
@@ -6633,7 +6622,7 @@ export function createLiveDesktopService(
       // The stored model and effort are brought up to date between turns, never mid-turn. Grok: a
       // refusal keeps the session on its previous selection and never blocks the turn. Claude: a
       // selection that could not be applied ends the turn here, before the prompt is sent.
-      assertRoutedTaskModel(taskId, controller, session);
+      assertProcessModeMatchesModel(taskId, controller, session);
       await reconcileRuntimeSelection(taskId, controller, adapter, session).catch((cause: unknown) => {
         if (controller.engine === "claude" && errorMessageIncludes(cause, MODEL_SELECTION_FAILED)) throw cause;
         logRuntime({ category: "runtime", event: "model_switch_failed", taskId });
@@ -8167,7 +8156,7 @@ export function createLiveDesktopService(
     }),
     setTaskRuntimeSettings: async (request: SetTaskRuntimeSettingsRequest) => {
       const outcome = await enqueueCommand(
-      async (): Promise<SetTaskRuntimeSettingsResponse | RoutedSelectionRestart> => {
+      async (): Promise<SetTaskRuntimeSettingsResponse | ModeSelectionRestart> => {
         assertOpen();
         const { taskId } = request;
         const metadata = store.loadTaskMetadata(taskId);
@@ -8209,12 +8198,6 @@ export function createLiveDesktopService(
               return refuse("unsupported_value");
             }
           }
-          // D-061: a task that runs through the router never goes back to a Claude subscription model.
-          // Clearing the choice would fall back to one, so it is refused too.
-          if (taskRouted(taskId) && (request.model === null || !routedModels().some((model) => model.id === request.model))) {
-            logRuntime({ category: "runtime", event: "model_switch_refused", taskId, reason: "claude_locked" });
-            return refuse("claude_locked");
-          }
         } else if (request.model !== null && modelCatalog.models.length > 0) {
           const offered = grokModelById(modelCatalog, request.model);
           if (
@@ -8237,23 +8220,27 @@ export function createLiveDesktopService(
           session !== undefined &&
           adapter.state === "ready"
         ) {
-          // docs/20 3.3: the first Online / Local model restarts the process, routed, between turns.
-          // The restart takes seconds, so it runs after this command, outside the queue.
-          if (
-            claude &&
-            request.model !== null &&
-            modelRouterHost !== undefined &&
-            routedModels().some((model) => model.id === request.model) &&
-            !optionOffersModel(controller.sessionConfigOptions, request.model)
-          ) {
-            try {
-              await ensureRouterReady(taskId);
-            } catch {
-              return refuse("unavailable");
+          // docs/20 3.3, D-062: a model of the other mode (native Claude, routed Online / Local) restarts the
+          // process in that mode between turns, as does a routed model the routed process does not list yet.
+          // Clearing the choice means the Claude default, so it is a native target. The restart takes
+          // seconds, so it runs after this command, outside the queue.
+          if (claude) {
+            const targetRouted = request.model !== null && routedModels().some((model) => model.id === request.model);
+            const modeRestart = targetRouted
+              ? !controller.routedProcess || !optionOffersModel(controller.sessionConfigOptions, request.model!)
+              : controller.routedProcess;
+            if (modeRestart) {
+              if (targetRouted) {
+                try {
+                  await ensureRouterReady(taskId);
+                } catch {
+                  return refuse("unavailable");
+                }
+              }
+              persist();
+              await publish();
+              return Object.freeze({ status: "mode_restart" as const, previous: existing });
             }
-            persist();
-            await publish();
-            return Object.freeze({ status: "routed_restart" as const, previous: existing });
           }
           // Apply to the live session first: a refused switch must leave the stored choice untouched.
           const outcome = request.model === null
@@ -8298,14 +8285,14 @@ export function createLiveDesktopService(
         return Object.freeze({ status: "saved" as const, task: view() });
       },
       );
-      if (outcome.status !== "routed_restart") return outcome;
-      // The override is stored; ensureSession sees the model the live session lacks and restarts it.
+      if (outcome.status !== "mode_restart") return outcome;
+      // The override is stored; ensureSession sees the process has the wrong mode and restarts it.
       const taskId = request.taskId;
       try {
         await ensureSession(taskId);
       } catch {
-        // The previous choice comes back; the task may already be routed, which only means it
-        // keeps going through the router with a model it offers.
+        // The previous choice comes back, and with it the mode the process had; the next turn starts
+        // a process in that mode again.
         await enqueueCommand(async () => {
           const current = store.loadTaskRuntimeSettings(taskId);
           if (outcome.previous === undefined) {
@@ -8328,17 +8315,18 @@ export function createLiveDesktopService(
         }));
       }
       return enqueueCommand(async () => {
-        // The start succeeded, so the task is routed: a projection that cannot be built now is not a failed switch.
+        // The start succeeded: a projection that cannot be built now is not a failed switch.
         await publish().catch(() => {
-          logRuntime({ category: "runtime", event: "routed_switch_publish_failed", taskId });
+          logRuntime({ category: "runtime", event: "mode_switch_publish_failed", taskId });
         });
-        // "Applied" only when the routed process is the one running the model. A session that became
+        // "Applied" only when the new process is the one running the model. A session that became
         // busy while the router came up keeps its process: the choice is stored and the switch
         // happens at the next idle point.
         const controller = controllers.get(taskId);
+        const targetRouted = request.model !== null && routedModels().some((model) => model.id === request.model);
         const live = controller?.session !== undefined && controller.adapter?.state === "ready" &&
-          controller.routedProcess &&
-          sessionSelectionOf(controller.sessionConfigOptions).modelId === request.model;
+          controller.routedProcess === targetRouted &&
+          (request.model === null || sessionSelectionOf(controller.sessionConfigOptions).modelId === request.model);
         return Object.freeze({
           status: live ? "applied" as const : "saved" as const,
           task: taskView(taskId, conversationPageDepths.get(taskId) ?? 1),
