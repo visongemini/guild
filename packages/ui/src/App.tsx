@@ -94,7 +94,6 @@ import {
   useRef,
   useState,
   useSyncExternalStore,
-  type DragEvent as ReactDragEvent,
   type FormEvent,
   type KeyboardEvent as ReactKeyboardEvent,
   type MouseEvent as ReactMouseEvent,
@@ -106,14 +105,7 @@ import {
 import ReactMarkdown from "react-markdown";
 import { createPortal } from "react-dom";
 import remarkGfm from "remark-gfm";
-import {
-  BANNY_DRAG_MIME,
-  bannyPlacementFromDrop,
-  readBannyPlacement,
-  resolveBannySeatTaskId,
-  writeBannyPlacement,
-  type BannyPlacement,
-} from "./banny-seat.js";
+import { removeLegacyBannyPlacement } from "./banny-legacy.js";
 import { resolveContextMenuSeed, type ContextMenuSeed } from "./context-menu.js";
 import { WorktreeGlyph, useWorktreeUi } from "./Worktree.js";
 import { worktreeMessagesFor } from "./worktree-messages.js";
@@ -313,11 +305,6 @@ export function GuildApp({ api }: GuildAppProps) {
   const rewindReturnFocus = useRef<HTMLElement | null>(null);
   const [runDiff, setRunDiff] = useState<{ readonly runId: RunId; readonly path: string | undefined }>();
   const [steerNotice, setSteerNotice] = useState<string>();
-  const [bannyPlacement, setBannyPlacement] = useState<BannyPlacement>(
-    () => readBannyPlacement(window.localStorage),
-  );
-  const [bannyDragging, setBannyDragging] = useState(false);
-  const [bannyDropTargetId, setBannyDropTargetId] = useState<string>();
   const [unreadTaskIds, setUnreadTaskIds] = useState<ReadonlySet<string>>(() => readUnreadTasks(window.localStorage));
   const unreadTaskIdsRef = useRef(unreadTaskIds);
   unreadTaskIdsRef.current = unreadTaskIds;
@@ -379,9 +366,6 @@ export function GuildApp({ api }: GuildAppProps) {
     readonly createTask: (workspaceId: string) => Promise<void>;
     readonly createNewTask: () => Promise<void>;
     readonly toggleWorkspace: (workspaceId: string) => void;
-    readonly beginBannyDrag: (event: ReactDragEvent<HTMLElement>) => void;
-    readonly endBannyDrag: () => void;
-    readonly seatBanny: (taskId: TaskSummaryProjection["taskId"]) => void;
     readonly pinTask: (task: TaskSummaryProjection) => void;
     readonly archiveTask: (task: TaskSummaryProjection) => void;
     readonly openContextMenu: (event: ReactMouseEvent, menu: ContextMenuSeed) => void;
@@ -399,9 +383,6 @@ export function GuildApp({ api }: GuildAppProps) {
     createTask: (workspaceId) => createTask(workspaceId),
     createNewTask: () => (busy || projection === undefined ? Promise.resolve() : createTask()),
     toggleWorkspace: (workspaceId) => setExpandedWorkspaces((current) => toggleSet(current, workspaceId)),
-    beginBannyDrag,
-    endBannyDrag,
-    seatBanny,
     pinTask: (task) => void updateTaskFromSidebar(task, task.pinned ? "unpin" : "pin"),
     archiveTask: (task) => void updateTaskFromSidebar(task, "archive"),
     openContextMenu: (event, menu) => {
@@ -425,9 +406,6 @@ export function GuildApp({ api }: GuildAppProps) {
     onToggleWorkspace: (workspaceId: string) => latestHandlers.current.toggleWorkspace(workspaceId),
     onOpenTask: (taskId: TaskSummaryProjection["taskId"]) => void latestHandlers.current.openTask(taskId),
     onNewTask: (workspaceId: string) => void latestHandlers.current.createTask(workspaceId),
-    onBannyDragStart: (event: ReactDragEvent<HTMLElement>) => latestHandlers.current.beginBannyDrag(event),
-    onBannyDragEnd: () => latestHandlers.current.endBannyDrag(),
-    onBannyDrop: (taskId: TaskSummaryProjection["taskId"]) => latestHandlers.current.seatBanny(taskId),
     onPinTask: (task: TaskSummaryProjection) => latestHandlers.current.pinTask(task),
     onArchiveTask: (task: TaskSummaryProjection) => latestHandlers.current.archiveTask(task),
     onContextMenu: (event: ReactMouseEvent, menu: ContextMenuSeed) =>
@@ -461,10 +439,9 @@ export function GuildApp({ api }: GuildAppProps) {
     cancelLabel: messagesFor(worktreeLocale).cancel,
     closeLabel: messagesFor(worktreeLocale).closeDialog,
   });
-  const bannySeatTaskId = useMemo(
-    () => resolveBannySeatTaskId(projection?.workspaces ?? [], bannyPlacement),
-    [projection?.workspaces, bannyPlacement],
-  );
+
+  // Banny used to be draggable; the saved placement is ignored now, so drop the stale keys once.
+  useEffect(() => removeLegacyBannyPlacement(window.localStorage), []);
 
   // "New result" marks come from watching the projection: a task that stops working quietly while
   // another task is open has something to read. The marks survive a reload through localStorage.
@@ -491,13 +468,6 @@ export function GuildApp({ api }: GuildAppProps) {
       setSlashCommandIndex(0);
     },
   }));
-
-  useEffect(() => {
-    if (projection === undefined || bannyPlacement.kind !== "task" || bannySeatTaskId !== undefined) return;
-    const home = Object.freeze({ kind: "home" }) as BannyPlacement;
-    setBannyPlacement(home);
-    writeBannyPlacement(window.localStorage, home);
-  }, [projection, bannyPlacement, bannySeatTaskId]);
 
   useEffect(() => {
     const query = searchQuery.trim();
@@ -984,11 +954,6 @@ export function GuildApp({ api }: GuildAppProps) {
     )
     ? activePendingSend
     : undefined;
-  const bannyUsesEmptyTaskSlot = bannyPlacement.kind === "home" &&
-    activeTask !== undefined &&
-    activeTimeline.length === 0 &&
-    pendingSendForActive === undefined;
-  const bannyFloatsInWindow = bannyPlacement.kind === "free";
   const visibleSlashCommands = slashCommandCatalogue(
     activeTask?.availableCommands ?? Object.freeze([]),
     projection.locale,
@@ -2002,79 +1967,20 @@ export function GuildApp({ api }: GuildAppProps) {
     }
   }
 
-  function beginBannyDrag(event: ReactDragEvent<HTMLElement>) {
-    event.stopPropagation();
-    event.dataTransfer.effectAllowed = "move";
-    event.dataTransfer.setData(BANNY_DRAG_MIME, "banny");
-    setBannyDragging(true);
-    setBannyDropTargetId(undefined);
-  }
-
-  function endBannyDrag() {
-    setBannyDragging(false);
-    setBannyDropTargetId(undefined);
-  }
-
-  function seatBanny(taskId: TaskSummaryProjection["taskId"]) {
-    const placement = Object.freeze({ kind: "task", taskId }) as BannyPlacement;
-    setBannyPlacement(placement);
-    writeBannyPlacement(window.localStorage, placement);
-    endBannyDrag();
-  }
-
-  function dropBannyInWindow(event: ReactDragEvent<HTMLDivElement>) {
-    if (!event.dataTransfer.types.includes(BANNY_DRAG_MIME)) return;
-    event.preventDefault();
-    const homeRegion = conversation.current?.getBoundingClientRect();
-    if (homeRegion === undefined) return;
-    const placement = bannyPlacementFromDrop(
-      event.currentTarget.getBoundingClientRect(),
-      homeRegion,
-      event.clientX,
-      event.clientY,
-    );
-    setBannyPlacement(placement);
-    writeBannyPlacement(window.localStorage, placement);
-    endBannyDrag();
-  }
-
   const effectiveWorkbenchWidth = viewport.width <= 1000 ? WORKBENCH_MIN_WIDTH : workbenchWidth;
 
   return (
     <StreamOverlayContext.Provider value={streamOverlay}>
     <div
-      className={`guild-shell ${workbenchOpen && activeTask !== undefined ? "workbench-open" : ""} ${bannyDragging ? "banny-dragging" : ""}`}
+      className={`guild-shell ${workbenchOpen && activeTask !== undefined ? "workbench-open" : ""}`}
       style={{
         "--sidebar-width": `${projection.sidebarWidth}px`,
         "--workbench-width": `${effectiveWorkbenchWidth}px`,
       } as React.CSSProperties}
-      onDragOver={(event) => {
-        if (!event.dataTransfer.types.includes(BANNY_DRAG_MIME)) return;
-        event.preventDefault();
-        event.dataTransfer.dropEffect = "move";
-      }}
-      onDrop={dropBannyInWindow}
     >
-      {bannyDragging && <span className="guild-banny-home-target" aria-hidden="true" />}
-      {bannyFloatsInWindow && (
-        <img
-          className={`guild-banny-floating ${bannyPlacement.kind} ${bannyDragging ? "dragging" : ""}`}
-          src={BANNY_ASSET_URL}
-          alt={messages.bannyDragHint}
-          title={messages.bannyDragHint}
-          draggable
-          onDragStart={beginBannyDrag}
-          onDragEnd={endBannyDrag}
-          style={bannyPlacement.kind === "free" ? {
-            left: `${bannyPlacement.x * 100}%`,
-            top: `${bannyPlacement.y * 100}%`,
-          } : undefined}
-        />
-      )}
       <aside className="guild-sidebar" aria-label={messages.projects} inert={workbenchOpen && viewport.width <= 1000}>
         <div className="guild-sidebar-drag" />
         <div className="guild-wordmark">
-          <img src={BANNY_ASSET_URL} alt="" />
           <span className="guild-wordmark-name">{messages.appName}</span>
           {engineVersionLabel !== undefined && <small title={engineVersionLabel}>{engineVersionLabel}</small>}
         </div>
@@ -2152,9 +2058,6 @@ export function GuildApp({ api }: GuildAppProps) {
               workspace={workspace}
               expanded={normalizedSearch.length > 0 || expandedWorkspaces.has(workspace.workspaceId)}
               activeTaskId={activeTask?.task.taskId}
-              bannySeatTaskId={bannySeatTaskId}
-              bannyDragging={bannyDragging}
-              bannyDropTargetId={bannyDropTargetId}
               pendingTaskIds={pendingTaskIds}
               unreadTaskIds={unreadTaskIds}
               engineMarkers={engineMarkers}
@@ -2162,10 +2065,6 @@ export function GuildApp({ api }: GuildAppProps) {
               onToggle={stableHandlers.onToggleWorkspace}
               onOpenTask={stableHandlers.onOpenTask}
               onNewTask={stableHandlers.onNewTask}
-              onBannyDragStart={stableHandlers.onBannyDragStart}
-              onBannyDragEnd={stableHandlers.onBannyDragEnd}
-              onBannyDropTarget={setBannyDropTargetId}
-              onBannyDrop={stableHandlers.onBannyDrop}
               onPinTask={stableHandlers.onPinTask}
               onArchiveTask={stableHandlers.onArchiveTask}
               onContextMenu={stableHandlers.onContextMenu}
@@ -2426,18 +2325,15 @@ export function GuildApp({ api }: GuildAppProps) {
             <Welcome messages={messages} hasWorkspace={activeWorkspaces.length > 0} onChoose={() => void chooseWorkspace()} onCreate={() => void createTask()} />
           ) : activeTimeline.length === 0 && pendingSendForActive === undefined ? (
             <div className="guild-empty-task">
-              {bannyUsesEmptyTaskSlot && (
-                <img
-                  className={`guild-banny ${bannyDragging ? "dragging" : ""}`}
-                  src={BANNY_ASSET_URL}
-                  alt={messages.bannyDragHint}
-                  title={messages.bannyDragHint}
-                  draggable
-                  onDragStart={beginBannyDrag}
-                  onDragEnd={endBannyDrag}
-                />
-              )}
-              <h1>{messages.starterTitle}</h1><p>{messages.starterHelp}</p>
+              <img className="guild-banny" src={BANNY_ASSET_URL} alt="" draggable={false} />
+              <h1 className="guild-acronym" aria-label={messages.starterTitle}>{([
+                ["G", "Goal", messages.guildGoal],
+                ["U", "Understand", messages.guildUnderstand],
+                ["I", "Implement", messages.guildImplement],
+                ["L", "Loop", messages.guildLoop],
+                ["D", "Deliver", messages.guildDeliver],
+              ] as const).map(([letter, word, gloss]) => <span key={letter} aria-hidden="true"><b>{letter}</b><small>{word}</small>{gloss !== "" && <em>{gloss}</em>}</span>)}</h1>
+              <p>{messages.starterHelp}</p>
               <div className="guild-starters">{([
                 [messages.starterReview, messages.starterReviewDraft, <MagnifyingGlass size={19} />],
                 [messages.starterBuild, messages.starterBuildDraft, <Code size={19} />],
@@ -3722,13 +3618,10 @@ function isTaskManagementBlocked(task: TaskSummaryProjection): boolean {
   return isLiveRunState(task.activeRunState) || (task.queuedTurnCount ?? 0) > 0;
 }
 
-export const WorkspaceTree = memo(function WorkspaceTree({ workspace, expanded, activeTaskId, bannySeatTaskId, bannyDragging, bannyDropTargetId, pendingTaskIds, unreadTaskIds, engineMarkers = false, locale, onToggle, onOpenTask, onNewTask, onBannyDragStart, onBannyDragEnd, onBannyDropTarget, onBannyDrop, onPinTask, onArchiveTask, onContextMenu }: {
+export const WorkspaceTree = memo(function WorkspaceTree({ workspace, expanded, activeTaskId, pendingTaskIds, unreadTaskIds, engineMarkers = false, locale, onToggle, onOpenTask, onNewTask, onPinTask, onArchiveTask, onContextMenu }: {
   readonly workspace: WorkspaceProjection;
   readonly expanded: boolean;
   readonly activeTaskId?: string;
-  readonly bannySeatTaskId?: TaskSummaryProjection["taskId"];
-  readonly bannyDragging: boolean;
-  readonly bannyDropTargetId?: string;
   readonly pendingTaskIds: ReadonlySet<string>;
   readonly unreadTaskIds: ReadonlySet<string>;
   /** True while both engines are in use: every row then carries its engine's monogram. */
@@ -3737,10 +3630,6 @@ export const WorkspaceTree = memo(function WorkspaceTree({ workspace, expanded, 
   readonly onToggle: (workspaceId: WorkspaceProjection["workspaceId"]) => void;
   readonly onOpenTask: (taskId: TaskSummaryProjection["taskId"]) => void;
   readonly onNewTask: (workspaceId: WorkspaceProjection["workspaceId"]) => void;
-  readonly onBannyDragStart: (event: ReactDragEvent<HTMLElement>) => void;
-  readonly onBannyDragEnd: () => void;
-  readonly onBannyDropTarget: (taskId: string | undefined) => void;
-  readonly onBannyDrop: (taskId: TaskSummaryProjection["taskId"]) => void;
   readonly onPinTask: (task: TaskSummaryProjection) => void;
   readonly onArchiveTask: (task: TaskSummaryProjection) => void;
   readonly onContextMenu: (event: ReactMouseEvent, menu: ContextMenuSeed) => void;
@@ -3779,30 +3668,10 @@ export const WorkspaceTree = memo(function WorkspaceTree({ workspace, expanded, 
             <div
               key={task.taskId}
               className={`guild-task-row-wrap ${task.taskId === activeTaskId ? "active" : ""}`}
-              onDragEnter={(event) => {
-                if (!bannyDragging) return;
-                event.preventDefault();
-                onBannyDropTarget(task.taskId);
-              }}
-              onDragOver={(event) => {
-                if (!bannyDragging) return;
-                event.preventDefault();
-                event.dataTransfer.dropEffect = "move";
-              }}
-              onDragLeave={(event) => {
-                if (event.currentTarget.contains(event.relatedTarget as Node | null)) return;
-                if (bannyDropTargetId === task.taskId) onBannyDropTarget(undefined);
-              }}
-              onDrop={(event) => {
-                if (!event.dataTransfer.types.includes(BANNY_DRAG_MIME)) return;
-                event.preventDefault();
-                event.stopPropagation();
-                onBannyDrop(task.taskId);
-              }}
               onContextMenu={(event) => onContextMenu(event, { type: "task", task })}
             >
               <button
-                className={`guild-task-row ${task.taskId === activeTaskId ? "active" : ""} ${task.taskId === bannySeatTaskId ? "banny-seated" : ""} ${task.taskId === bannyDropTargetId ? "banny-drop-target" : ""}`}
+                className={`guild-task-row ${task.taskId === activeTaskId ? "active" : ""}`}
                 type="button"
                 onClick={() => onOpenTask(task.taskId)}
               >
@@ -3814,21 +3683,6 @@ export const WorkspaceTree = memo(function WorkspaceTree({ workspace, expanded, 
                 </span>
                 <span className="guild-task-title">{task.title}</span>
                 <span className="guild-task-trailing">
-                  {task.taskId === bannySeatTaskId && (
-                    <span className="guild-task-banny-slot">
-                    <img
-                      className={`guild-task-banny ${bannyDragging ? "dragging" : ""}`}
-                      src={BANNY_ASSET_URL}
-                      alt={messages.bannySeated}
-                      title={messages.bannyDragHint}
-                      draggable
-                      onPointerDown={(event) => event.stopPropagation()}
-                      onClick={(event) => event.stopPropagation()}
-                      onDragStart={onBannyDragStart}
-                      onDragEnd={onBannyDragEnd}
-                    />
-                    </span>
-                  )}
                   {task.pinned && (
                     <span className="guild-task-pin" title={messages.pinned}>
                       <PushPinSimple size={11} weight="fill" />

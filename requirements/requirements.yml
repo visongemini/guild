@@ -817,8 +817,8 @@ requirements:
     statement: >-
       Window zoom, responsive popovers, external-display recovery and keyboard/pointer menus work
       without changing the accepted visual direction. Sidebar titles reserve width only for actual
-      trailing metadata, the composer shares the conversation alignment axis, and Banny supports one
-      persisted, reachable home, task, or bounded free-window placement with center-drop home snapping.
+      trailing metadata, the composer shares the conversation alignment axis, and Banny appears only
+      centered above the starter title of an empty task, is not draggable and has no other placement.
       After a turn is accepted and before official runtime activity arrives, a truthful elapsed status
       remains in normal conversation flow on that same axis and never invents completion progress.
       Opening task files or review creates a non-overlay third column beside the project and conversation
