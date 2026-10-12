@@ -1188,3 +1188,40 @@ Decisions
 Consequences
 - `requirements/requirements.yml` is unchanged: the statements already cover these behaviours; the commits cite
   the requirement IDs.
+
+## D-064 — Guild 3.0.3 fixes found testing the installed 3.0.2: native catalog, per-turn model line, workspace chip, modal layer
+
+Date: 2026-10-13. Found on the owner's machine with the installed 3.0.2. Implements PC-MODEL-001, PC-ROUTE-002,
+PC-CONV-001, PC-UI-003 and PC-A11Y-001. No schema or contract change.
+
+Decisions
+- **Only a native process sets the native Claude catalog.** A routed process runs Claude Code with Guild's throwaway
+  API token, and what it lists as Claude's own models is a poorer set: the Default row is bare ("Default / Opus"
+  instead of "Default (Opus 5.5)") and the older models are missing. `applySessionOptions` no longer passes a
+  routed process's options to `noteClaudeNativeCatalog`, so neither the picker's Claude group nor the persisted
+  cache (`saveModelCatalogCache`, engine `claude`) is overwritten by it. This is the same rule as the account label
+  (D-062, commit 39d9d24): the routed process authenticates differently, so what it reports about Claude says
+  nothing about the subscription. A routed process contributes nothing to the native catalog; a Guild that has
+  only ever started routed processes shows the router's Online and Local models and no Claude group until a
+  native process reports. The routed `modelPicker` ids and unlisted values stay excluded from the native catalog
+  as before.
+- **The model and the time stay on every finished answer.** The stylesheet used to hide the whole action row,
+  meta included, on every answer but the newest until hover. Only the Copy and Branch buttons wait for hover or
+  focus now (opacity, so they keep their space and nothing moves; `focus-within` still reveals them; the
+  reduced-motion rule still shortens the fade). The "model - time" line of D-063 is always visible, so a
+  conversation that switches models says which model answered each turn.
+- **The composer's workspace chip with no task open names the workspace New task would use.** One function
+  (`newTaskWorkspace`) decides it from the setting and the non-archived workspaces: the remembered workspace under
+  "use the last workspace" while it exists, otherwise the only workspace; otherwise the choice is open ("choose
+  project folder": several workspaces with no remembered one, or none at all). The create action and the chip
+  read the same decision. The chip is a label, as before; it is not a control.
+- **Modal dialogs make the page behind them inert.** `useModalLayer` finds an open `aria-modal` element (but not the
+  narrow-window workbench panel, which is part of the page) and the sidebar, the timeline and the workbench take
+  `inert` while one is open, so neither the accessibility tree nor the Tab order reaches them. Popovers (the model
+  picker, the account menu) are not modal and stay as they were. Focus is remembered outside modals; when the last
+  modal closes with focus lost, it goes back to the newest remembered element that can take it. The browser pane's
+  overlay selector is unchanged, so the native view still hides under every dialog.
+
+Consequences
+- `requirements/requirements.yml` is unchanged: the statements already cover these behaviours; the commits cite
+  the requirement IDs.
