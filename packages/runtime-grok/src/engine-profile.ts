@@ -1,6 +1,7 @@
 import { realpath } from "node:fs/promises";
 import { homedir, userInfo } from "node:os";
 import { isAbsolute, join } from "node:path";
+import { isClaudeModelId } from "@guild/contracts";
 import type {
   GuildEngine,
   GuildGrokPermissionMode,
@@ -83,8 +84,8 @@ export type ClaudeLaunch = Readonly<{
   /** Real path of the located `claude` binary; becomes CLAUDE_CODE_EXECUTABLE. */
   claudeExecutablePath: string;
   /**
-   * Per-spawn variables of a routed session (ANTHROPIC_BASE_URL, ENABLE_TOOL_SEARCH,
-   * OPENVIKING_AUTO_CAPTURE). Keys outside the profile allowlist are rejected.
+   * Per-spawn variables of a routed session (see `CLAUDE_PER_SPAWN_ENVIRONMENT`). Keys outside the profile
+   * allowlist are rejected.
    */
   extraEnvironment?: Readonly<Record<string, string>>;
 }>;
@@ -127,6 +128,9 @@ const SHARED_ALLOWED_KEYS = Object.freeze([
   "SSL_CERT_FILE", "SSL_CERT_DIR", "SSH_AUTH_SOCK",
 ] as const);
 
+/** The throwaway auth token a routed session carries: `guild-router-` and 32 random hex characters. */
+const ROUTED_AUTH_TOKEN_PATTERN = /^guild-router-[0-9a-f]{32}$/u;
+
 export const GROK_ENVIRONMENT_POLICY_VERSION = "macos-posix-v3";
 export const CLAUDE_ENVIRONMENT_POLICY_VERSION = "macos-posix-claude-v1";
 
@@ -165,8 +169,11 @@ export const GROK_ENVIRONMENT_POLICY: EnvironmentPolicy = Object.freeze({
 /**
  * Claude (docs/20 3.2): no OpenViking kill-switch block (D-060), nothing inherited that selects a
  * different endpoint, credential, binary or Node behaviour. A routed session adds exactly the
- * per-spawn keys below; ANTHROPIC_BASE_URL must stay on the loopback because Claude Code sends
- * its subscription token to that URL.
+ * per-spawn keys below. ANTHROPIC_BASE_URL must stay on the loopback, and it always comes with a
+ * throwaway ANTHROPIC_AUTH_TOKEN: with a base URL alone Claude Code sends its subscription token to that
+ * URL, with an auth token it sends only that token (D-061). There is no key for ANTHROPIC_API_KEY.
+ * The model variables keep Claude Code's background requests and subagents on the routed model instead
+ * of a claude-* model, which the router refuses.
  *
  * USER and LOGNAME are allowed because Claude Code finds its login in the macOS Keychain by
  * account name: with USER missing `claude auth status` reports "not logged in" (verified with
@@ -174,6 +181,13 @@ export const GROK_ENVIRONMENT_POLICY: EnvironmentPolicy = Object.freeze({
  */
 export const CLAUDE_PER_SPAWN_ENVIRONMENT: Readonly<Record<string, (value: string) => boolean>> = Object.freeze({
   ANTHROPIC_BASE_URL: isLoopbackHttpUrl,
+  ANTHROPIC_AUTH_TOKEN: (value: string) => ROUTED_AUTH_TOKEN_PATTERN.test(value),
+  CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: (value: string) => value === "1",
+  ANTHROPIC_DEFAULT_HAIKU_MODEL: isClaudeModelId,
+  ANTHROPIC_DEFAULT_SONNET_MODEL: isClaudeModelId,
+  ANTHROPIC_DEFAULT_OPUS_MODEL: isClaudeModelId,
+  ANTHROPIC_SMALL_FAST_MODEL: isClaudeModelId,
+  CLAUDE_CODE_SUBAGENT_MODEL: isClaudeModelId,
   ENABLE_TOOL_SEARCH: (value: string) => /^(?:true|false|auto(?::\d{1,3})?)$/u.test(value),
   OPENVIKING_AUTO_CAPTURE: (value: string) => value === "true" || value === "false",
 });
@@ -366,7 +380,10 @@ export const CLAUDE_ENGINE_PROFILE: EngineProfile = Object.freeze({
       throw new TypeError("claude executable path must be an absolute NUL-free path");
     }
     assertPerSpawnEnvironment(CLAUDE_ENVIRONMENT_POLICY, claude.extraEnvironment);
-    const baseUrl = claude.extraEnvironment?.["ANTHROPIC_BASE_URL"];
+    // The routed base URL carries the router token in its path; the auth token is a secret of the same kind.
+    const redactValues = ["ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN"]
+      .map((key) => claude.extraEnvironment?.[key])
+      .filter((value): value is string => value !== undefined);
     return Object.freeze({
       argv,
       environmentPolicyVersion: CLAUDE_ENVIRONMENT_POLICY.version,
@@ -378,8 +395,7 @@ export const CLAUDE_ENGINE_PROFILE: EngineProfile = Object.freeze({
         await verifyClaudeAdapterPin(claude.adapter);
         await verifyClaudeExecutable(claude.claudeExecutablePath);
       },
-      // The routed base URL carries the router token in its path.
-      redactValues: Object.freeze(baseUrl === undefined ? [] : [baseUrl]),
+      redactValues: Object.freeze(redactValues),
     });
   },
 });

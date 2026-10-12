@@ -15,7 +15,7 @@ const SAFE_DIAGNOSTIC_REASONS = new Set([
   "completed", "refused", "truncated", "decoder_fault", "explicit_close",
   "peer_fault", "process_fault", "protocol_fault", "sink_fault", "stdout_eof",
   "write_fault", "system_power_event", "unknown_error",
-  "incompatible_agent", "unsupported_value", "unavailable",
+  "incompatible_agent", "unsupported_value", "unavailable", "claude_locked",
 ]);
 const SAFE_DIAGNOSTIC_FAULT_CODES = new Set([
   "adapter_closed", "adapter_not_initialized", "aggregate_limit_exceeded", "blank_line",

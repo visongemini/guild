@@ -198,6 +198,13 @@ describe("Claude environment policy (docs/20 section 3.2)", () => {
   it("accepts only the routed-session keys per spawn and validates their values", () => {
     const routed = {
       ANTHROPIC_BASE_URL: "http://127.0.0.1:43120/0123456789abcdef0123456789abcdef/",
+      ANTHROPIC_AUTH_TOKEN: "guild-router-0123456789abcdef0123456789abcdef",
+      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
+      ANTHROPIC_DEFAULT_HAIKU_MODEL: "deepseek-v4-flash",
+      ANTHROPIC_DEFAULT_SONNET_MODEL: "deepseek-v4-flash",
+      ANTHROPIC_DEFAULT_OPUS_MODEL: "deepseek-v4-flash",
+      ANTHROPIC_SMALL_FAST_MODEL: "deepseek-v4-flash",
+      CLAUDE_CODE_SUBAGENT_MODEL: "deepseek-v4-flash",
       ENABLE_TOOL_SEARCH: "true",
       OPENVIKING_AUTO_CAPTURE: "false",
     };
@@ -206,7 +213,14 @@ describe("Claude environment policy (docs/20 section 3.2)", () => {
     assert.equal(environment.ANTHROPIC_BASE_URL, routed.ANTHROPIC_BASE_URL, "the caller's value wins over an inherited one");
     assert.equal(environment.ENABLE_TOOL_SEARCH, "true");
     assert.equal(environment.OPENVIKING_AUTO_CAPTURE, "false");
-    assert.deepEqual(plan.redactValues, [routed.ANTHROPIC_BASE_URL], "the token-bearing URL is redacted from diagnostics");
+    assert.equal(environment.ANTHROPIC_AUTH_TOKEN, routed.ANTHROPIC_AUTH_TOKEN);
+    assert.equal(environment.CLAUDE_CODE_SUBAGENT_MODEL, "deepseek-v4-flash");
+    assert.equal(environment.ANTHROPIC_API_KEY, undefined);
+    assert.deepEqual(
+      plan.redactValues,
+      [routed.ANTHROPIC_BASE_URL, routed.ANTHROPIC_AUTH_TOKEN],
+      "the token-bearing URL and the throwaway auth token are redacted from diagnostics",
+    );
 
     for (const rejected of [
       { ANTHROPIC_API_KEY: "sk-x" },
@@ -220,6 +234,14 @@ describe("Claude environment policy (docs/20 section 3.2)", () => {
       { ANTHROPIC_BASE_URL: "not a url" },
       { ENABLE_TOOL_SEARCH: "yes" },
       { OPENVIKING_AUTO_CAPTURE: "1" },
+      // Only the throwaway token shape is a valid auth token: never a real credential, never an empty one.
+      { ANTHROPIC_AUTH_TOKEN: "sk-ant-oat01-real-subscription-token" },
+      { ANTHROPIC_AUTH_TOKEN: "guild-router-short" },
+      { ANTHROPIC_AUTH_TOKEN: "" },
+      { CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "0" },
+      { ANTHROPIC_DEFAULT_SONNET_MODEL: "has space" },
+      { CLAUDE_CODE_SUBAGENT_MODEL: "" },
+      { ANTHROPIC_SMALL_FAST_MODEL: "m".repeat(200) },
       { ["__proto__"]: "x" },
     ]) {
       assert.throws(

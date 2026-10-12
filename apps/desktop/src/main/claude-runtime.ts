@@ -40,7 +40,7 @@ export type ClaudeRuntimeInput = Readonly<{
   sink: AcpV1AdapterSink;
   stagingRoot: string;
   workingDirectory: string;
-  /** `ANTHROPIC_BASE_URL`, `ENABLE_TOOL_SEARCH`, `OPENVIKING_AUTO_CAPTURE` of a routed task. */
+  /** The per-spawn variables of a routed task (`routedClaudeEnvironment`); the profile allowlists each key. */
   extraEnvironment?: Readonly<Record<string, string>>;
 }>;
 
