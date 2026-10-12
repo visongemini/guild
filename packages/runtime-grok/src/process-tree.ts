@@ -7,8 +7,11 @@ import { execFile } from "node:child_process";
  *
  * At stop time, while the engine is still alive, the host takes this snapshot of the engine's
  * descendants that sit outside its group; after the group is gone it ends exactly those processes.
- * Only descendants of the engine process Guild started are ever considered, and a process is signalled
- * only if its pid, group and start time still match the snapshot (a reused pid is left alone).
+ * Only descendants of the engine process Guild started are ever considered: the engine is identified
+ * by its pid and start time, read right after it was spawned, and the snapshot is discarded unless the
+ * very table it was read from shows the root with that same start time (an engine that exited and
+ * whose pid was reused is not a root). A process is signalled only if its pid, group and start time
+ * still match the snapshot (a reused pid is left alone).
  */
 
 export type ProcessTableRow = Readonly<{
@@ -20,6 +23,21 @@ export type ProcessTableRow = Readonly<{
 }>;
 
 export type DescendantRecord = ProcessTableRow;
+
+/** One process for its lifetime: its pid and `ps` start time. */
+export type ProcessIdentity = Readonly<{
+  pid: number;
+  startedAt: string;
+}>;
+
+export type DescendantSnapshot = Readonly<{
+  /**
+   * False when the table did not show the root with the recorded start time (it is missing, or the pid
+   * now belongs to another process) or could not be read: nothing is attributed to the engine then.
+   */
+  rootVerified: boolean;
+  records: readonly DescendantRecord[];
+}>;
 
 const PS_PATH = "/bin/ps";
 const PS_COLUMNS = "pid=,ppid=,pgid=,lstart=";
@@ -45,19 +63,29 @@ export function parseProcessTable(text: string): readonly ProcessTableRow[] {
   return Object.freeze(rows);
 }
 
+const NO_RECORDS: readonly DescendantRecord[] = Object.freeze([]);
+const UNVERIFIED_ROOT: DescendantSnapshot = Object.freeze({ rootVerified: false, records: NO_RECORDS });
+
+function verified(records: readonly DescendantRecord[]): DescendantSnapshot {
+  return Object.freeze({ rootVerified: true, records });
+}
+
 /**
- * The descendants of `rootPid` (children, their children, ...) that are outside the engine's own
- * process group. Members of that group are the host's group signal's business. Empty when the table
- * does not contain the root (the engine is already gone and its helpers have been re-parented, so
- * nothing can be attributed to it), or when the set is implausibly large.
+ * The descendants of `root` (children, their children, ...) that are outside the engine's own process
+ * group. Members of that group are the host's group signal's business. Unverified (and empty) when this
+ * table does not contain the root with the recorded start time: the engine is already gone and its
+ * helpers have been re-parented, or its pid was reused, so nothing can be attributed to it. Verified
+ * but empty when the set is implausibly large.
  */
 export function descendantsOutsideGroup(
   rows: readonly ProcessTableRow[],
-  rootPid: number,
+  root: ProcessIdentity,
   rootGroupId: number,
-): readonly DescendantRecord[] {
-  if (!Number.isSafeInteger(rootPid) || rootPid <= 1 || !rows.some((row) => row.pid === rootPid)) {
-    return Object.freeze([]);
+): DescendantSnapshot {
+  const rootPid = root.pid;
+  const rootRow = rows.find((row) => row.pid === rootPid);
+  if (!Number.isSafeInteger(rootPid) || rootPid <= 1 || rootRow === undefined || rootRow.startedAt !== root.startedAt) {
+    return UNVERIFIED_ROOT;
   }
   const childrenOf = new Map<number, ProcessTableRow[]>();
   for (const row of rows) {
@@ -75,10 +103,10 @@ export function descendantsOutsideGroup(
       seen.add(child.pid);
       queue.push(child.pid);
       if (child.pgid !== rootGroupId) found.push(child);
-      if (seen.size > MAX_DESCENDANTS * 4) return Object.freeze([]);
+      if (seen.size > MAX_DESCENDANTS * 4) return verified(NO_RECORDS);
     }
   }
-  return found.length > MAX_DESCENDANTS ? Object.freeze([]) : Object.freeze(found);
+  return verified(found.length > MAX_DESCENDANTS ? NO_RECORDS : Object.freeze(found));
 }
 
 function readProcessTable(pids?: readonly number[]): Promise<readonly ProcessTableRow[] | undefined> {
@@ -101,11 +129,25 @@ function readProcessTable(pids?: readonly number[]): Promise<readonly ProcessTab
   });
 }
 
-/** Snapshot of the engine's descendants outside its group; empty when the tree cannot be read. */
-export async function snapshotDescendants(rootPid: number, rootGroupId: number): Promise<readonly DescendantRecord[]> {
-  if (process.platform === "win32") return Object.freeze([]);
+/**
+ * The identity of a process this one has just spawned. Undefined unless the row shows this process as
+ * its parent, so the identity is of Guild's own child and never of a pid that was recycled meanwhile.
+ */
+export async function readChildIdentity(pid: number): Promise<ProcessIdentity | undefined> {
+  if (process.platform === "win32" || !Number.isSafeInteger(pid) || pid <= 1) return undefined;
+  const rows = await readProcessTable([pid]);
+  const row = rows?.find((entry) => entry.pid === pid && entry.ppid === process.pid);
+  return row === undefined ? undefined : Object.freeze({ pid, startedAt: row.startedAt });
+}
+
+/**
+ * Snapshot of the engine's descendants outside its group, read from one process table that must show
+ * the engine with its recorded start time; unverified and empty when it does not or cannot be read.
+ */
+export async function snapshotDescendants(root: ProcessIdentity, rootGroupId: number): Promise<DescendantSnapshot> {
+  if (process.platform === "win32") return UNVERIFIED_ROOT;
   const rows = await readProcessTable();
-  return rows === undefined ? Object.freeze([]) : descendantsOutsideGroup(rows, rootPid, rootGroupId);
+  return rows === undefined ? UNVERIFIED_ROOT : descendantsOutsideGroup(rows, root, rootGroupId);
 }
 
 /** The records whose process still exists with the same pid, group and start time. */

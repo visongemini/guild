@@ -19,7 +19,7 @@ import { createRequire, syncBuiltinESMExports } from "node:module";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { after, before, describe, it } from "node:test";
+import { after, before, describe, it, mock } from "node:test";
 import * as runtimeRoot from "./index.js";
 import {
   ExecutablePinError,
@@ -39,6 +39,7 @@ import {
   type GrokProcessHostOptions,
   type ProcessHostEvent,
 } from "./process-host.js";
+import { snapshotDescendants } from "./process-tree.js";
 import {
   createGrokProcessHostForTesting,
   type GrokProcessHostTestInstance,
@@ -424,6 +425,16 @@ function isFailure(type: GrokProcessHostError["failure"]["type"], code?: string)
 
 function stagedDirectories(root: string): Promise<string[]> {
   return import("node:fs/promises").then(({ readdir }) => readdir(root).then((entries) => entries.filter((entry) => entry.startsWith(".grok-pin-"))));
+}
+
+async function startedAtOf(pid: number): Promise<string> {
+  const output = await new Promise<string>((resolve, reject) => {
+    execFile(processListExecutable, ["-p", String(pid), "-o", "lstart="], { encoding: "utf8" }, (error, stdout) => {
+      if (error !== null) reject(error);
+      else resolve(stdout);
+    });
+  });
+  return output.trim();
 }
 
 function realProbe(processGroupId: number): "already_gone" | "failed" | "present" {
@@ -1400,7 +1411,7 @@ describe("GrokProcessHost execution policy and lifecycle (PC-TRN-001/002/003)", 
     const record = { pid: 4_194_000, ppid: 1, pgid: 4_194_000, startedAt: "Mon Oct 12 15:08:42 2026" };
     try {
       host = testHost(fixture, ["ignore-term"], { stopGraceMs: 30, killGraceMs: 30 }, {
-        snapshotDescendants: async () => [record],
+        snapshotDescendants: async () => ({ rootVerified: true, records: [record] }),
         terminateDescendants: async (records) => {
           swept.push(records.map((entry) => entry.pid).join(","));
           return records.length;
@@ -1434,12 +1445,14 @@ describe("GrokProcessHost execution policy and lifecycle (PC-TRN-001/002/003)", 
     let host: TestHost | undefined;
     let group: number | undefined;
     const calls: string[] = [];
+    let rootIdentity: { readonly pid: number; readonly startedAt: string } | undefined;
     const record = { pid: 4_194_000, ppid: 1, pgid: 4_194_000, startedAt: "Mon Oct 12 15:08:42 2026" };
     try {
       host = testHost(fixture, ["linger"], {}, {
-        snapshotDescendants: async (rootPid, rootGroupId) => {
-          calls.push(`snapshot:${rootPid === rootGroupId ? "leader" : "other"}`);
-          return [record];
+        snapshotDescendants: async (root, rootGroupId) => {
+          calls.push(`snapshot:${root.pid === rootGroupId ? "leader" : "other"}`);
+          rootIdentity = root;
+          return { rootVerified: true, records: [record] };
         },
         terminateDescendants: async (records) => {
           calls.push(`terminate:${records.map((entry) => entry.pid).join(",")}`);
@@ -1458,9 +1471,81 @@ describe("GrokProcessHost execution policy and lifecycle (PC-TRN-001/002/003)", 
       const ready = waitForStdout(host, "READY\n");
       group = (await startOwned(host, fixture)).processGroupId;
       await bounded(ready, FIXTURE_STARTUP_TIMEOUT_MS);
+      const started = await startedAtOf(group);
       await bounded(host.stop());
       assert.deepEqual(calls, ["snapshot:leader", "group:SIGTERM", "terminate:4194000"]);
+      assert.deepEqual(rootIdentity, { pid: group, startedAt: started }, "the root is the engine, with the start time it had when it was spawned");
     } finally {
+      await cleanup(host, group);
+      await fixture.remove();
+    }
+  });
+
+  it("sweeps nothing and logs it when the engine's start time no longer matches the recorded identity [PC-ENG-001]", async () => {
+    const fixture = await prepareFixture();
+    let host: TestHost | undefined;
+    let group: number | undefined;
+    let helper: number | undefined;
+    let terminations = 0;
+    const warnings = mock.method(console, "warn", () => undefined);
+    try {
+      host = testHost(fixture, ["detached-helper"], {}, {
+        // The real table is read, but the root is looked up as if its pid had been recycled.
+        snapshotDescendants: (root, rootGroupId) =>
+          snapshotDescendants({ pid: root.pid, startedAt: "Thu Jan  1 00:00:00 1970" }, rootGroupId),
+        terminateDescendants: async (records) => {
+          terminations += 1;
+          return records.length;
+        },
+      });
+      const pidLine = waitForStdout(host, "DETACHED:");
+      group = (await startOwned(host, fixture)).processGroupId;
+      helper = Number(/DETACHED:(\d+)/u.exec(await bounded(pidLine, FIXTURE_STARTUP_TIMEOUT_MS))?.[1]);
+      assert.ok(helper > 0);
+      const receipt = await bounded(host.stop(), 8_000);
+      assert.equal(receipt.type, "stop_reaped");
+      assert.equal(terminations, 0, "an unverified root attributes no helper to the engine");
+      assert.doesNotThrow(() => process.kill(helper!, 0), "the escaped helper was not signalled");
+      assert.deepEqual(warnings.mock.calls.map((call) => call.arguments), [["helper_sweep_skipped_identity", { pid: group }]]);
+    } finally {
+      warnings.mock.restore();
+      if (helper !== undefined) {
+        try { process.kill(helper, "SIGKILL"); } catch { /* already gone */ }
+        await eventuallyGone(helper);
+      }
+      await cleanup(host, group);
+      await fixture.remove();
+    }
+  });
+
+  it("sweeps nothing and logs it when no identity could be recorded at spawn [PC-ENG-001]", async () => {
+    const fixture = await prepareFixture();
+    let host: TestHost | undefined;
+    let group: number | undefined;
+    let snapshots = 0;
+    let terminations = 0;
+    const warnings = mock.method(console, "warn", () => undefined);
+    try {
+      host = testHost(fixture, ["linger"], {}, {
+        readProcessIdentity: async () => undefined,
+        snapshotDescendants: async () => {
+          snapshots += 1;
+          return { rootVerified: true, records: [{ pid: 4_194_000, ppid: 1, pgid: 4_194_000, startedAt: "x" }] };
+        },
+        terminateDescendants: async (records) => {
+          terminations += 1;
+          return records.length;
+        },
+      });
+      const ready = waitForStdout(host, "READY\n");
+      group = (await startOwned(host, fixture)).processGroupId;
+      await bounded(ready, FIXTURE_STARTUP_TIMEOUT_MS);
+      await bounded(host.stop());
+      assert.equal(snapshots, 0, "without a recorded identity the engine is not read at all");
+      assert.equal(terminations, 0);
+      assert.deepEqual(warnings.mock.calls.map((call) => call.arguments), [["helper_sweep_skipped_identity", { pid: group }]]);
+    } finally {
+      warnings.mock.restore();
       await cleanup(host, group);
       await fixture.remove();
     }
@@ -1475,7 +1560,7 @@ describe("GrokProcessHost execution policy and lifecycle (PC-TRN-001/002/003)", 
       host = testHost(fixture, ["immediate-exit"], {}, {
         snapshotDescendants: async () => {
           snapshots += 1;
-          return [];
+          return { rootVerified: true, records: [] };
         },
       });
       const exited = waitForEvent(host, "process_exit");
