@@ -159,17 +159,19 @@ export async function pinExecutableSharedInternal(
 }
 
 /**
- * Removes staging leftovers: shared copies of other SHA-256 values, and private stages orphaned
- * by a crashed process (older than one hour, so a live stage is never touched). Entries that are
- * not directories named like pins are ignored. Returns the number of removed directories.
+ * Removes staging leftovers: shared copies of SHA-256 values that are not in `keepSha256`, and
+ * private stages orphaned by a crashed process (older than one hour, so a live stage is never
+ * touched). Pass every pin still in use (the Grok binary and the Claude engine's node) so one
+ * engine never prunes the other's stage. Entries that are not directories named like pins are
+ * ignored. Returns the number of removed directories.
  */
 export async function pruneStalePinnedExecutables(
   stagingRoot: string,
-  keepSha256: string,
+  keepSha256: string | readonly string[],
   nowMs: number = Date.now(),
 ): Promise<number> {
   if (!isAbsolute(stagingRoot)) return 0;
-  const keep = keepSha256.toLowerCase();
+  const keep = new Set((typeof keepSha256 === "string" ? [keepSha256] : keepSha256).map((sha) => sha.toLowerCase()));
   let names: string[];
   try {
     names = await readdir(stagingRoot);
@@ -185,7 +187,7 @@ export async function pruneStalePinnedExecutables(
       const info = await lstat(directory);
       if (!info.isDirectory()) continue;
       const stale = SHA256_HEX.test(suffix)
-        ? suffix !== keep
+        ? !keep.has(suffix)
         : nowMs - info.mtimeMs >= STALE_PRIVATE_STAGE_AGE_MS;
       if (!stale) continue;
       await rm(directory, { recursive: true, force: true, maxRetries: 0 });
@@ -648,6 +650,25 @@ function assertRegularExecutable(stats: BigIntStats): void {
 function assertSpawnSafe(stats: BigIntStats): void {
   if (!stats.isFile() || (stats.mode & 0o111n) === 0n || (stats.mode & 0o222n) !== 0n) {
     throw failure("executable_changed", "staged executable is not spawn-safe");
+  }
+}
+
+/**
+ * Whether `path` itself (links are not followed) is a regular executable file that starts with a
+ * Mach-O magic number. A cheap check for binaries that are located but not copied (PC-ENG-002).
+ */
+export async function isMachOExecutableFile(path: string): Promise<boolean> {
+  if (!isAbsolute(path)) return false;
+  let handle: FileHandle | undefined;
+  try {
+    handle = await openReadNoFollow(path);
+    assertRegularExecutable(await handle.stat({ bigint: true }));
+    await assertMachO(handle);
+    return true;
+  } catch {
+    return false;
+  } finally {
+    await closeQuietly(handle);
   }
 }
 

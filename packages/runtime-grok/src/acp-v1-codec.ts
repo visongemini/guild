@@ -1,4 +1,5 @@
 import { isAbsolute, normalize } from "node:path";
+import type { AcpDialect } from "./engine-profile.js";
 import {
   ACP_PERMISSION_OPTION_KINDS,
   ACP_PROMPT_STOP_REASONS,
@@ -6,9 +7,13 @@ import {
   ACP_TOOL_STATUSES,
   classifyStopReason,
   freezeGrokModelCatalog,
+  freezeModelCatalog,
   freezeRuntimePayload,
+  GUILD_CLAUDE_IDENTIFIER_LIMITS,
   GUILD_GROK_IDENTIFIER_LIMITS,
+  isClaudeModelId,
   isOfficialGrokModelId,
+  parseGuildClaudeReasoningEffort,
   parseGuildGrokReasoningEffort,
   RUNTIME_PAYLOAD_LIMITS,
   type AcpPermissionOptionKind,
@@ -19,6 +24,8 @@ import {
   type GrokModelDescriptor,
   type GrokReasoningEffortDescriptor,
   type JsonRpcCallbackId,
+  type ModelCatalog,
+  type ModelDescriptor,
   type RuntimeConfigOption,
   type RuntimeConfigSelectChoice,
   type RuntimeConfigSelectChoices,
@@ -126,6 +133,15 @@ export type AcpV1InitializeResult = {
   } | null;
   /** Official models from `_meta.modelState`; absent when the runtime does not advertise any. */
   readonly modelCatalog?: GrokModelCatalog;
+  /** `agentCapabilities.mcpCapabilities`; present only when the agent advertised it. */
+  readonly mcpCapabilities?: { readonly http: boolean; readonly sse: boolean };
+  /** `_meta.steering.supported`; present only when the agent advertised it (the Claude adapter does). */
+  readonly steering?: { readonly supported: boolean };
+  /**
+   * Auth methods of a type this client cannot use (Claude dialect: `terminal`); present only when
+   * there were some. Never authenticated with; a non-zero count explains an auth-required failure.
+   */
+  readonly unusableAuthMethodCount?: number;
 };
 
 const decodedInitializeAuthMethodIds = new WeakMap<object, ReadonlySet<string>>();
@@ -181,12 +197,13 @@ export type AcpV1DecodedUpdate =
       readonly messageId?: string | null;
     };
 
-export function encodeInitializeParams(): Readonly<Record<string, unknown>> {
+export function encodeInitializeParams(dialect: AcpDialect = "grok"): Readonly<Record<string, unknown>> {
   return deepFreeze({
     protocolVersion: 1,
-    clientCapabilities: {
-      session: { configOptions: { boolean: {} } },
-    },
+    // The Claude adapter was verified with no optional client capability (docs/20 section 2).
+    clientCapabilities: dialect === "claude"
+      ? {}
+      : { session: { configOptions: { boolean: {} } } },
     clientInfo: ACP_V1_CLIENT_INFO,
   });
 }
@@ -213,25 +230,91 @@ export function encodeBillingParams(): Readonly<Record<string, never>> {
   return Object.freeze({});
 }
 
+/** An HTTP MCP server handed to the agent at session start (for example Guild's browser server). */
+export type AcpV1HttpMcpServer = Readonly<{
+  type: "http";
+  name: string;
+  url: string;
+  headers: readonly Readonly<{ name: string; value: string }>[];
+}>;
+
 export type AcpV1SessionStartOptions = {
-  /** Applied by the runtime at creation/resume; an unknown value is ignored by the runtime. */
+  /** Grok only. Applied by the runtime at creation/resume; an unknown value is ignored by the runtime. */
   readonly reasoningEffort?: string;
+  /** Passed through as `mcpServers`; the adapter checks `mcpCapabilities.http` first. Default `[]`. */
+  readonly mcpServers?: readonly AcpV1HttpMcpServer[];
+  /**
+   * Claude only: sent as `_meta.claudeCode.options` (for example `settings.modelPicker` of a routed
+   * session). Plain JSON; copied, never retained.
+   */
+  readonly claudeCodeOptions?: Readonly<Record<string, unknown>>;
 };
 
-function sessionStartMeta(options: AcpV1SessionStartOptions | undefined): Readonly<Record<string, unknown>> {
+const MAX_MCP_SERVERS = 16;
+const MAX_MCP_HEADERS = 16;
+
+function sessionStartMeta(
+  options: AcpV1SessionStartOptions | undefined,
+  dialect: AcpDialect,
+): Readonly<Record<string, unknown>> {
+  if (dialect === "claude") {
+    // Effort is a config option for Claude (set after the session starts), never `_meta`.
+    if (options?.claudeCodeOptions === undefined) return {};
+    boundedJson(options.claudeCodeOptions);
+    record(options.claudeCodeOptions, "$.claudeCodeOptions");
+    const copy = JSON.parse(JSON.stringify(options.claudeCodeOptions)) as unknown;
+    return { _meta: { claudeCode: { options: copy } } };
+  }
+  if (options?.claudeCodeOptions !== undefined) {
+    throw new AcpV1CodecError("invalid_value", "$.claudeCodeOptions");
+  }
   return options?.reasoningEffort === undefined
     ? {}
     : { _meta: { reasoningEffort: parseGuildGrokReasoningEffort(options.reasoningEffort) } };
 }
 
+function encodeMcpServers(options: AcpV1SessionStartOptions | undefined): readonly Record<string, unknown>[] {
+  const servers = options?.mcpServers ?? [];
+  if (servers.length > MAX_MCP_SERVERS) {
+    throw new AcpV1CodecError("collection_limit_exceeded", "$.mcpServers");
+  }
+  return servers.map((server, index) => {
+    const path = `$.mcpServers[${index}]`;
+    if (server.type !== "http") throw new AcpV1CodecError("invalid_value", `${path}.type`);
+    const url = identifier(server.url, `${path}.url`);
+    let protocol: string;
+    try {
+      protocol = new URL(url).protocol;
+    } catch {
+      throw new AcpV1CodecError("invalid_value", `${path}.url`);
+    }
+    if (protocol !== "http:" && protocol !== "https:") {
+      throw new AcpV1CodecError("invalid_value", `${path}.url`);
+    }
+    return {
+      type: "http",
+      name: identifier(server.name, `${path}.name`),
+      url,
+      headers: array(server.headers, `${path}.headers`, MAX_MCP_HEADERS).map((header, headerIndex) => {
+        const headerRecord = record(header, `${path}.headers[${headerIndex}]`, ["name", "value"]);
+        return {
+          name: identifier(headerRecord["name"], `${path}.headers[${headerIndex}].name`),
+          value: boundedText(headerRecord["value"], `${path}.headers[${headerIndex}].value`),
+        };
+      }),
+    };
+  });
+}
+
 export function encodeNewSessionParams(
   cwd: string,
   options?: AcpV1SessionStartOptions,
+  dialect: AcpDialect = "grok",
 ): Readonly<Record<string, unknown>> {
   return deepFreeze({
     cwd: canonicalAbsolutePath(cwd, "$.cwd"),
-    mcpServers: [],
-    ...sessionStartMeta(options),
+    mcpServers: encodeMcpServers(options),
+    ...sessionStartMeta(options, dialect),
   });
 }
 
@@ -239,12 +322,13 @@ export function encodeResumeSessionParams(
   sessionId: string,
   cwd: string,
   options?: AcpV1SessionStartOptions,
+  dialect: AcpDialect = "grok",
 ): Readonly<Record<string, unknown>> {
   return deepFreeze({
     sessionId: identifier(sessionId, "$.sessionId"),
     cwd: canonicalAbsolutePath(cwd, "$.cwd"),
-    mcpServers: [],
-    ...sessionStartMeta(options),
+    mcpServers: encodeMcpServers(options),
+    ...sessionStartMeta(options, dialect),
   });
 }
 
@@ -354,18 +438,31 @@ export function encodeCancelParams(sessionId: string): Readonly<Record<string, u
   return deepFreeze({ sessionId: identifier(sessionId, "$.sessionId") });
 }
 
-export function decodeInitializeResult(input: unknown): AcpV1InitializeResult {
+export function decodeInitializeResult(
+  input: unknown,
+  dialect: AcpDialect = "grok",
+): AcpV1InitializeResult {
   boundedJson(input);
   const rec = record(input, "$", ["protocolVersion"]);
   if (rec["protocolVersion"] !== 1) {
     throw new AcpV1CodecError("unsupported_protocol_version", "$.protocolVersion");
   }
   const capabilities = parseAgentCapabilities(rec["agentCapabilities"], "$.agentCapabilities");
-  const authMethods = Object.hasOwn(rec, "authMethods")
-    ? array(rec["authMethods"], "$.authMethods", ACP_V1_CODEC_LIMITS.maxContentCollectionItems).map(
-        (entry, index) => parseAuthMethod(entry, `$.authMethods[${index}]`),
-      )
-    : [];
+  let unusableAuthMethodCount = 0;
+  const authMethods: AcpV1AgentAuthMethod[] = [];
+  if (Object.hasOwn(rec, "authMethods")) {
+    const advertised = array(rec["authMethods"], "$.authMethods", ACP_V1_CODEC_LIMITS.maxContentCollectionItems);
+    for (const [index, entry] of advertised.entries()) {
+      const path = `$.authMethods[${index}]`;
+      // The Claude adapter advertises terminal login methods; Guild never authenticates for it, so
+      // any method that is not a plain agent method is counted and ignored instead of aborting.
+      if (dialect === "claude" && isNonAgentAuthMethod(entry)) {
+        unusableAuthMethodCount += 1;
+        continue;
+      }
+      authMethods.push(parseAuthMethod(entry, path));
+    }
+  }
   const authIds = new Set<string>();
   for (const method of authMethods) {
     if (authIds.has(method.id)) {
@@ -378,7 +475,8 @@ export function decodeInitializeResult(input: unknown): AcpV1InitializeResult {
     agentCapabilities: capabilities,
     authMethods,
   };
-  if (Object.hasOwn(rec, "_meta")) {
+  if (unusableAuthMethodCount > 0) result["unusableAuthMethodCount"] = unusableAuthMethodCount;
+  if (Object.hasOwn(rec, "_meta") && dialect === "grok") {
     const meta = record(rec["_meta"], "$._meta");
     if (Object.hasOwn(meta, "defaultAuthMethodId") && meta["defaultAuthMethodId"] !== null) {
       const defaultAuthMethodId = identifier(
@@ -397,10 +495,14 @@ export function decodeInitializeResult(input: unknown): AcpV1InitializeResult {
   if (Object.hasOwn(rec, "agentInfo")) {
     result["agentInfo"] = rec["agentInfo"] === null ? null : parseImplementation(rec["agentInfo"], "$.agentInfo");
   }
-  if (Object.hasOwn(rec, "_meta")) {
+  if (Object.hasOwn(rec, "_meta") && dialect === "grok") {
     const modelCatalog = decodeModelState(record(rec["_meta"], "$._meta")["modelState"], "$._meta.modelState");
     if (modelCatalog !== undefined) result["modelCatalog"] = modelCatalog;
   }
+  const mcpCapabilities = decodeMcpCapabilities(rec["agentCapabilities"]);
+  if (mcpCapabilities !== undefined) result["mcpCapabilities"] = mcpCapabilities;
+  const steering = decodeSteeringCapability(rec["_meta"]);
+  if (steering !== undefined) result["steering"] = steering;
   const decoded = deepFreeze(result) as AcpV1InitializeResult;
   decodedInitializeAuthMethodIds.set(decoded, authIds);
   return decoded;
@@ -475,12 +577,15 @@ export function decodeOfficialBillingResult(input: unknown): AcpV1OfficialBillin
   return deepFreeze(result) as AcpV1OfficialBillingSnapshot;
 }
 
-export function decodeNewSessionResult(input: unknown): AcpV1NewSessionResult {
+export function decodeNewSessionResult(
+  input: unknown,
+  dialect: AcpDialect = "grok",
+): AcpV1NewSessionResult {
   boundedJson(input);
   const rec = record(input, "$", ["sessionId"]);
   return deepFreeze({
     sessionId: identifier(rec["sessionId"], "$.sessionId"),
-    ...parseSessionStateRecord(rec, "$"),
+    ...parseSessionStateRecord(rec, "$", dialect),
   });
 }
 
@@ -587,6 +692,79 @@ function decodeModelDescriptor(entry: unknown): GrokModelDescriptor | undefined 
   });
 }
 
+/**
+ * Builds the model catalog of a Claude session from its `model` (category `model`) and effort
+ * (category `thought_level`) config options. The adapter rebuilds the effort list for every
+ * selected model, so efforts are attached only to the model that is currently selected; call this
+ * again with the options returned by `setConfigOption` or carried by `config_option_update`.
+ * Every model is in the `claude` picker group (routed Online / Local models are labelled by the
+ * caller); the engine's runtime default is the selected model. The result is validated by
+ * `freezeModelCatalog("claude", ...)`, so the Grok catalog validator refuses it. Returns
+ * `undefined` when no usable model option is present.
+ */
+export function deriveClaudeModelCatalog(
+  options: readonly RuntimeConfigOption[],
+): ModelCatalog | undefined {
+  const modelOption = options.find((option) => option.type === "select" && option.category === "model");
+  if (modelOption === undefined || modelOption.type !== "select") return undefined;
+  const effortOption = options.find((option) => option.type === "select" && option.category === "thought_level");
+  const limits = GUILD_GROK_IDENTIFIER_LIMITS;
+  const efforts: GrokReasoningEffortDescriptor[] = [];
+  if (effortOption !== undefined && effortOption.type === "select") {
+    for (const choice of flatChoices(effortOption.choices)) {
+      if (efforts.length >= limits.maxEffortsPerModel) break;
+      if (!isClaudeReasoningEffort(choice.value) || efforts.some((effort) => effort.id === choice.value)) continue;
+      const description = catalogText(choice.description, limits.maxEffortDescriptionLength);
+      efforts.push({
+        id: choice.value,
+        label: catalogText(choice.name, limits.maxEffortLabelLength) ?? choice.value,
+        ...(description === undefined ? {} : { description }),
+        isDefault: choice.value === "default",
+      });
+    }
+  }
+  const models: ModelDescriptor[] = [];
+  const seen = new Set<string>();
+  for (const choice of flatChoices(modelOption.choices)) {
+    if (models.length >= GUILD_CLAUDE_IDENTIFIER_LIMITS.maxModels) break;
+    if (!isClaudeModelId(choice.value) || seen.has(choice.value)) continue;
+    seen.add(choice.value);
+    const description = catalogText(choice.description, limits.maxDescriptionLength);
+    models.push({
+      id: choice.value,
+      name: catalogText(choice.name, limits.maxNameLength) ?? choice.value,
+      ...(description === undefined ? {} : { description }),
+      group: "claude",
+      reasoningEfforts: choice.value === modelOption.currentValue ? [...efforts] : [],
+      contextWindows: [],
+    });
+  }
+  if (models.length === 0) return undefined;
+  try {
+    return freezeModelCatalog("claude", {
+      engine: "claude",
+      models,
+      ...(seen.has(modelOption.currentValue) ? { runtimeDefaultModelId: modelOption.currentValue } : {}),
+    });
+  } catch {
+    // The catalog is advisory display data: a list the contracts refuse must not fault the session.
+    return undefined;
+  }
+}
+
+function isClaudeReasoningEffort(value: string): boolean {
+  try {
+    parseGuildClaudeReasoningEffort(value);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function flatChoices(choices: RuntimeConfigSelectChoices): readonly RuntimeConfigSelectChoice[] {
+  return choices.form === "flat" ? choices.options : choices.groups.flatMap((group) => group.options);
+}
+
 function parseSessionContextWindow(
   rec: Record<string, unknown>,
 ): Readonly<{ contextWindowSize?: number }> {
@@ -616,12 +794,12 @@ function parseSessionContextWindow(
   return Object.freeze({});
 }
 
-export function decodeResumeSessionResult(input: unknown): AcpV1SessionState {
-  return decodeSessionState(input);
+export function decodeResumeSessionResult(input: unknown, dialect: AcpDialect = "grok"): AcpV1SessionState {
+  return decodeSessionState(input, dialect);
 }
 
-export function decodeLoadSessionResult(input: unknown): AcpV1SessionState {
-  return decodeSessionState(input);
+export function decodeLoadSessionResult(input: unknown, dialect: AcpDialect = "grok"): AcpV1SessionState {
+  return decodeSessionState(input, dialect);
 }
 
 export function decodePromptResult(
@@ -798,6 +976,36 @@ function parseAgentCapabilities(value: unknown, path: string): AcpV1InitializeRe
   return deepFreeze({ loadSession, resumeSession, prompt });
 }
 
+/** The shared parser only knows the default (type-less) agent method; any typed method is not one. */
+function isNonAgentAuthMethod(value: unknown): boolean {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  return Object.hasOwn(value, "type");
+}
+
+/** Advisory capability: a malformed shape reads as "not advertised" rather than failing initialize. */
+function decodeMcpCapabilities(agentCapabilities: unknown): AcpV1InitializeResult["mcpCapabilities"] {
+  try {
+    const capabilities = record(agentCapabilities, "$.agentCapabilities");
+    if (!Object.hasOwn(capabilities, "mcpCapabilities")) return undefined;
+    const mcp = record(capabilities["mcpCapabilities"], "$.agentCapabilities.mcpCapabilities");
+    return Object.freeze({
+      http: optionalBoolean(mcp, "http", "$.agentCapabilities.mcpCapabilities", false),
+      sse: optionalBoolean(mcp, "sse", "$.agentCapabilities.mcpCapabilities", false),
+    });
+  } catch {
+    return undefined;
+  }
+}
+
+function decodeSteeringCapability(meta: unknown): AcpV1InitializeResult["steering"] {
+  try {
+    const steering = record(record(meta, "$._meta")["steering"], "$._meta.steering");
+    return Object.freeze({ supported: strictBoolean(steering["supported"], "$._meta.steering.supported") });
+  } catch {
+    return undefined;
+  }
+}
+
 function parseAuthMethod(value: unknown, path: string): AcpV1AgentAuthMethod {
   const rec = record(value, path, ["id", "name"]);
   if (Object.hasOwn(rec, "type")) {
@@ -825,27 +1033,35 @@ function parseImplementation(value: unknown, path: string): NonNullable<AcpV1Ini
   return deepFreeze(result) as NonNullable<AcpV1InitializeResult["agentInfo"]>;
 }
 
-function decodeSessionState(input: unknown): AcpV1SessionState {
+function decodeSessionState(input: unknown, dialect: AcpDialect): AcpV1SessionState {
   boundedJson(input);
   const rec = record(input, "$");
-  return parseSessionStateRecord(rec, "$");
+  return parseSessionStateRecord(rec, "$", dialect);
 }
 
 function parseSessionStateRecord(
   rec: Record<string, unknown>,
   path: string,
+  dialect: AcpDialect,
 ): AcpV1SessionState {
-  const result: Record<string, unknown> = { ...parseSessionContextWindow(rec) };
-  const modelCatalog = decodeModelState(rec["models"], `${path}.models`);
-  if (modelCatalog !== undefined) result["modelCatalog"] = modelCatalog;
+  // Claude has no `models` extension: its catalog is derived from the `model` config option below.
+  const result: Record<string, unknown> = dialect === "claude" ? {} : { ...parseSessionContextWindow(rec) };
+  if (dialect === "grok") {
+    const modelCatalog = decodeModelState(rec["models"], `${path}.models`);
+    if (modelCatalog !== undefined) result["modelCatalog"] = modelCatalog;
+  }
   if (Object.hasOwn(rec, "modes")) {
     result["modes"] = rec["modes"] === null ? null : parseModes(rec["modes"], `${path}.modes`);
   }
   if (Object.hasOwn(rec, "configOptions")) {
-    result["configOptions"] =
-      rec["configOptions"] === null
-        ? null
-        : parseConfigOptions(rec["configOptions"], `${path}.configOptions`);
+    const configOptions = rec["configOptions"] === null
+      ? null
+      : parseConfigOptions(rec["configOptions"], `${path}.configOptions`);
+    result["configOptions"] = configOptions;
+    if (dialect === "claude" && configOptions !== null) {
+      const modelCatalog = deriveClaudeModelCatalog(configOptions);
+      if (modelCatalog !== undefined) result["modelCatalog"] = modelCatalog;
+    }
   }
   return deepFreeze(result) as AcpV1SessionState;
 }

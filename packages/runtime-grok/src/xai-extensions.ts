@@ -36,8 +36,11 @@ export const XAI_METHOD_NOT_FOUND = -32601;
 
 export type XaiExtensionOutcome<Result> =
   | Readonly<{ status: "ok"; result: Result }>
-  /** The runtime answered -32601: this extension is not available in the installed binary. */
-  | Readonly<{ status: "unsupported" }>;
+  /**
+   * The runtime answered -32601: this extension is not available in the installed binary. With
+   * `reason: "engine"` no request was sent because the engine (Claude) has no `_x.ai/*` extensions.
+   */
+  | Readonly<{ status: "unsupported"; reason?: "engine" }>;
 
 export function isMethodNotFound(cause: unknown): boolean {
   return cause instanceof JsonRpcRemoteError && cause.response.code === XAI_METHOD_NOT_FOUND;
