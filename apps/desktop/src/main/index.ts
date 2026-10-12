@@ -12,6 +12,9 @@ import {
   registerGuildScheme,
 } from "./app-protocol.js";
 import type { DesktopApplicationService } from "./application-service.js";
+import { createBrowserPaneBridge, type BrowserPaneBridge, type BrowserPaneIpcPort } from "./browser-pane-bridge.js";
+import { configureBrowserPaneProcess } from "./browser-pane.js";
+import { createElectronBrowserPane } from "./browser-pane-electron.js";
 import { createElectronRouterFetches } from "./electron-router-fetch.js";
 import { registerDesktopIpc } from "./ipc-handlers.js";
 import { createLiveDesktopService } from "./live-service.js";
@@ -33,12 +36,15 @@ import {
 
 registerGuildScheme();
 app.enableSandbox();
+configureBrowserPaneProcess(app);
 
 let closeIpc: (() => void) | undefined;
 let closeTaskNotifications: (() => void) | undefined;
 let service: DesktopApplicationService | undefined;
 let modelRouterHost: ModelRouterHost | undefined;
 let modelSources: ModelSourcesService | undefined;
+let browserPane: BrowserPaneIpcPort | undefined;
+let browserBridge: BrowserPaneBridge | undefined;
 let routerLog: RouterDiagnosticLog | undefined;
 let guildWindow: BrowserWindow | undefined;
 let preloadPath = "";
@@ -97,6 +103,8 @@ app.whenReady().then(async () => {
     service = createFixtureDesktopService();
     const { createFixtureModelSources } = await import("./fixture-model-sources.js");
     modelSources = createFixtureModelSources();
+    const { createFixtureBrowserPane } = await import("./fixture-browser-pane.js");
+    browserPane = createFixtureBrowserPane();
   } else {
     // One database owner: the model sources service and the router host share the live service's store.
     const persistence = openGuildPersistence({
@@ -142,9 +150,13 @@ app.whenReady().then(async () => {
         void routerHost.refresh();
       },
     });
+    const bridge = createBrowserPaneBridge();
+    browserBridge = bridge;
+    browserPane = bridge;
     service = createLiveDesktopService({
         persistence,
         modelRouterHost: routerHost,
+        browserMcp: bridge.mcp,
         appVersion: app.getVersion(),
         databasePath: join(app.getPath("userData"), "guild.sqlite3"),
         initialLocale: app.getLocale().toLowerCase().startsWith("zh") ? "zh-CN" : "en-US",
@@ -369,7 +381,12 @@ async function openWindow(activation: WindowActivation = "user"): Promise<void> 
     fixtureCapturePath === undefined && activation === "user",
   );
   guildWindow = window;
-  closeIpc = registerDesktopIpc(window, service, { modelSources });
+  if (browserBridge !== undefined) {
+    // One pane controller per window; the MCP server and the IPC talk to the current one.
+    const detachPane = browserBridge.attach(createElectronBrowserPane(window));
+    window.once("closed", detachPane);
+  }
+  closeIpc = registerDesktopIpc(window, service, { modelSources, browserPane });
   let rendererRecoveryStarted = false;
   let unresponsiveRecoveryTimer: ReturnType<typeof setTimeout> | undefined;
   const clearUnresponsiveRecovery = () => {
@@ -781,9 +798,13 @@ async function shutdown(): Promise<boolean> {
   }
   // The router's requests write thinking provenance into the store the service is about to close.
   const currentRouterHost = modelRouterHost;
+  const currentBrowserBridge = browserBridge;
   modelRouterHost = undefined;
   modelSources = undefined;
+  browserBridge = undefined;
+  browserPane = undefined;
   await currentRouterHost?.close().catch(() => undefined);
+  await currentBrowserBridge?.mcp.close().catch(() => undefined);
   await routerLog?.flush().catch(() => undefined);
   const currentService = service;
   service = undefined;
