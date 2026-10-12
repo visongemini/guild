@@ -10,6 +10,8 @@ export const CLAUDE_LOGIN_REQUIRED = "claude_login_required";
 export const TASK_ENGINE_LOCKED = "task_engine_locked";
 /** Docs/20 3.3: a routed task needs the model router, which is not available. */
 export const MODEL_ROUTER_UNAVAILABLE = "model_router_unavailable";
+/** Docs/20 3.3: the Claude session could not be brought to the selected model, so no turn was started on another one. */
+export const MODEL_SELECTION_FAILED = "model_selection_failed";
 
 export async function workspaceFolderExists(canonicalPath: string): Promise<boolean> {
   if (canonicalPath.length === 0 || !isAbsolute(canonicalPath)) {
@@ -44,7 +46,8 @@ export function toDesktopIpcFailure(cause: unknown): Error {
     message === MESSAGE_TOO_LONG ||
     message === CLAUDE_LOGIN_REQUIRED ||
     message === TASK_ENGINE_LOCKED ||
-    message === MODEL_ROUTER_UNAVAILABLE
+    message === MODEL_ROUTER_UNAVAILABLE ||
+    message === MODEL_SELECTION_FAILED
   ) {
     return new Error(message);
   }
