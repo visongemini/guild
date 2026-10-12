@@ -1,0 +1,153 @@
+import {
+  AcpV1Adapter,
+  CLAUDE_ENGINE_PROFILE,
+  EngineProcessHost,
+  GrokProcessHostError,
+  type AcpV1AdapterSink,
+  type AcpV1ProcessPort,
+  type EngineProcessHostOptions,
+  type ProcessHostEvent,
+} from "@guild/runtime-grok";
+import {
+  invalidateClaudeLocatorCache,
+  locateClaudeEngine,
+  type LocatedClaudeEngine,
+} from "./claude-locator.js";
+import { resolveOfficialGrokEnvironment } from "./runtime-locator.js";
+
+/**
+ * PC-ENG-001 / PC-ENG-002: builds the Claude engine's runtime for one task process: the user's
+ * `node` (Mach-O pin) running the user-installed ACP adapter, which drives the user's `claude`
+ * binary. Guild never reads Claude credentials; a routed task adds exactly the per-spawn
+ * variables the profile allowlists (docs/20 3.3).
+ */
+
+/** Preflight failures that mean "the installed pieces changed": locate again, once. */
+const RELOCATE_PREFLIGHT_CODES: ReadonlySet<string> = new Set([
+  "adapter_changed",
+  "claude_executable_invalid",
+  "hash_mismatch",
+]);
+
+export type ClaudeRuntimeInput = Readonly<{
+  adapterEpoch: number;
+  sink: AcpV1AdapterSink;
+  stagingRoot: string;
+  workingDirectory: string;
+  /** `ANTHROPIC_BASE_URL`, `ENABLE_TOOL_SEARCH`, `OPENVIKING_AUTO_CAPTURE` of a routed task. */
+  extraEnvironment?: Readonly<Record<string, string>>;
+}>;
+
+export type ClaudeRuntimeDependencies = Readonly<{
+  locate?: () => Promise<LocatedClaudeEngine>;
+  invalidateLocatorCache?: () => void;
+  createHost?: (options: EngineProcessHostOptions) => EngineProcessHost;
+  baseEnvironment?: () => Promise<Readonly<Record<string, string | undefined>>>;
+}>;
+
+export async function createClaudeRuntime(
+  input: ClaudeRuntimeInput,
+  dependencies: ClaudeRuntimeDependencies = {},
+) {
+  const locate = dependencies.locate ?? (() => locateClaudeEngine());
+  const baseEnvironment = await (dependencies.baseEnvironment ?? resolveOfficialGrokEnvironment)();
+  const located = await locate();
+  const buildHost = (engine: LocatedClaudeEngine): EngineProcessHost => {
+    const options: EngineProcessHostOptions = {
+      profile: CLAUDE_ENGINE_PROFILE,
+      launch: {
+        engine: "claude",
+        adapter: engine.adapter,
+        claudeExecutablePath: engine.claude.executablePath,
+        ...(input.extraEnvironment === undefined ? {} : { extraEnvironment: input.extraEnvironment }),
+      },
+      executablePath: engine.node.executablePath,
+      expectedSha256: engine.node.sha256,
+      workingDirectory: input.workingDirectory,
+      stagingRoot: input.stagingRoot,
+      baseEnvironment,
+    };
+    return dependencies.createHost?.(options) ?? new EngineProcessHost(options);
+  };
+  const process = new RelocatingEngineProcess({
+    initial: buildHost(located),
+    relocate: async () => {
+      (dependencies.invalidateLocatorCache ?? invalidateClaudeLocatorCache)();
+      return buildHost(await locate());
+    },
+  });
+  return Object.freeze({
+    adapter: new AcpV1Adapter({
+      adapterEpoch: input.adapterEpoch,
+      process,
+      sink: input.sink,
+      profile: CLAUDE_ENGINE_PROFILE,
+    }),
+    runtimeVersion: `Claude Code ${located.claude.version}`,
+  });
+}
+
+/**
+ * The adapter's process port. When the first start fails its preflight because the adapter
+ * package, the claude binary or the pinned node changed on disk, the locator cache is dropped
+ * and the pieces are located once more; a second failure is reported as it is. The first
+ * failure's event is withheld from the adapter, which would otherwise treat it as a dead
+ * process.
+ */
+export class RelocatingEngineProcess implements AcpV1ProcessPort {
+  private host: EngineProcessHost;
+  private unsubscribe: () => void;
+  private relocated = false;
+  private readonly listeners = new Set<(event: ProcessHostEvent) => void>();
+
+  constructor(
+    private readonly options: Readonly<{
+      initial: EngineProcessHost;
+      relocate: () => Promise<EngineProcessHost>;
+    }>,
+  ) {
+    this.host = options.initial;
+    this.unsubscribe = this.attach(this.host);
+  }
+
+  readonly onEvent = (listener: (event: ProcessHostEvent) => void): (() => void) => {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  };
+
+  readonly start = async () => {
+    try {
+      return await this.host.start();
+    } catch (cause: unknown) {
+      if (this.relocated || !isRelocatablePreflightFailure(cause)) throw cause;
+      this.relocated = true;
+      this.unsubscribe();
+      this.host = await this.options.relocate();
+      this.unsubscribe = this.attach(this.host);
+      return this.host.start();
+    }
+  };
+
+  readonly stop = () => this.host.stop();
+  readonly waitForTermination = () => this.host.waitForTermination();
+  readonly write = (data: string | Uint8Array) => this.host.write(data);
+
+  private attach(host: EngineProcessHost): () => void {
+    return host.onEvent((event) => {
+      if (
+        event.type === "preflight_failure" &&
+        !this.relocated &&
+        RELOCATE_PREFLIGHT_CODES.has(event.failure.code)
+      ) {
+        return;
+      }
+      for (const listener of [...this.listeners]) listener(event);
+    });
+  }
+}
+
+function isRelocatablePreflightFailure(cause: unknown): boolean {
+  return cause instanceof GrokProcessHostError &&
+    cause.failure.type === "preflight_failure" &&
+    RELOCATE_PREFLIGHT_CODES.has(cause.failure.code);
+}
