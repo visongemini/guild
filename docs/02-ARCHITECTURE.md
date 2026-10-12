@@ -1,5 +1,12 @@
 # Guild 2 architecture
 
+> Guild 3.0 (D-057 to D-060, `docs/20-GUILD3-DUAL-ENGINE.md`): main also hosts a second engine
+> adapter for Claude Code, a loopback model router and a loopback browser MCP server, and the
+> workbench gains an isolated browser pane. Statements below that say the runtime is the official
+> Grok process describe the Grok engine; the Claude engine follows the same process, epoch and
+> admission rules with its own adapter dialect. The 3.0 additions are summarized in the section
+> "Guild 3.0 engines, router and browser pane" before "Persistence".
+
 ## Architecture goals
 
 - Make task/run ownership explicit and testable.
@@ -176,6 +183,24 @@ requirement contains the stable bundle identifier plus certificate root rather t
 `cdhash`. This solves local update identity continuity; it is not a substitute for Developer ID and
 notarization when Guild is publicly distributed.
 
+## Guild 3.0 engines, router and browser pane
+
+- **Engines.** A task is bound once, at its first turn, to `grok` (the official process) or `claude`
+  (the user-installed ACP adapter `claude-agent-acp` driving the user-installed `claude` binary).
+  Process topology stays one engine process per active task (D-057, D-008). The Claude process pin is
+  the user's `node` plus the adapter entry script, checked by version range and a SHA-256 over its
+  installed files. Guild never reads Claude credentials.
+- **Model router** (`packages/model-router`, in main; D-058). Loopback-only, random port and path
+  token, exact model registry, credential rules, a compat layer for Online and Local sources,
+  thinking-signature provenance and a local SSE normalizer. A Claude session is native until the
+  first Online or Local selection, then routed for good.
+- **Browser pane and MCP server** (D-059). An isolated `WebContentsView` in its own partition and a
+  loopback MCP server in main with a fixed tool set and no eval. The split Electron profile is in
+  `docs/09-ELECTRON-SECURITY-PROFILE.md`.
+- **OpenViking** (D-060). Per engine and routed state, as set in the decision log.
+- The repository target gains `packages/model-router/`; the work packages and file ownership are in
+  `docs/20-GUILD3-DUAL-ENGINE.md`.
+
 ## Persistence
 
 - SQLite is owned by main and uses forward-only schema migrations. Rollback restores a verified
@@ -230,7 +255,8 @@ tests/acceptance/         packaged-app black-box journeys
 The complete first-commit profile is normative in `docs/09-ELECTRON-SECURITY-PROFILE.md`.
 
 - No credential extraction for upstream calls.
-- No non-loopback local server and no shared gateway.
+- No non-loopback local server and no shared gateway. The 3.0 router and browser MCP server are
+  loopback-only, single-user and token-guarded (D-058, D-059).
 - No arbitrary renderer filesystem access.
 - No shell command construction from untrusted strings.
 - Media and workspace paths are canonicalized and scoped.

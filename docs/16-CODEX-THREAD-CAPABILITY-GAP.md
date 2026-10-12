@@ -31,7 +31,7 @@ Scope: actions and status attached to one task/thread, not global settings or mo
 | Move/handoff between checkout, worktree, host, or cloud | Yes | Missing | Codex-specific infrastructure; not a near-term Guild feature |
 | Immutable share link | Yes | Missing | Do not add a public Guild gateway; prefer local export |
 | Export conversation | Thread can be shared | Local Markdown + JSON export | Complete without a public gateway |
-| Open thread-owned file/browser/terminal/review tabs | Yes | Local file, terminal, and diff workbench | Browser remains absent until an owned browser surface exists |
+| Open thread-owned file/browser/terminal/review tabs | Yes | Local file, terminal, and diff workbench | Browser remains absent until an owned browser surface exists (Guild 3.0 adds the isolated browser pane, D-059) |
 | Read status without opening the thread | Yes | Yes through sidebar projection | Complete for the user-facing case |
 | Background completion notification | Yes | Yes | Complete |
 | Exact task context usage | Yes | Yes when official Grok reports it | Complete within official-data limits |
