@@ -392,6 +392,11 @@ export type LiveDesktopServiceOptions = {
   /** Minimum delay before a failed background prewarm of the same task is retried. */
   readonly prewarmRetryMs?: number;
   readonly diagnosticsRoot?: string;
+  /**
+   * An already opened store shared with the model sources service (the database lease allows one
+   * owner). When present the service uses it instead of opening its own and closes it with itself.
+   */
+  readonly persistence?: GuildPersistence;
 };
 
 type PendingPermission = {
@@ -578,7 +583,7 @@ function buildContinuousPrompt(
 export function createLiveDesktopService(
   options: LiveDesktopServiceOptions,
 ): DesktopApplicationService {
-  const store = openGuildPersistence({
+  const store = options.persistence ?? openGuildPersistence({
     path: options.databasePath,
     initialLocale: options.initialLocale,
   });

@@ -32,9 +32,12 @@ export async function assertWorkspaceFolderExists(canonicalPath: string): Promis
 /** F3: `worktree_<reason>` from a refused isolated-worktree creation; the reason is a fixed code, never a path. */
 const WORKTREE_REFUSAL_MESSAGE = /^worktree_[a-z_]{1,48}$/u;
 
+/** Guild 3.0: `model_source_<reason>` from the model sources service; the reason is a fixed code, never a path or key. */
+const MODEL_SOURCE_REFUSAL_MESSAGE = /^model_source_[a-z_]{1,48}$/u;
+
 export function toDesktopIpcFailure(cause: unknown): Error {
   const message = cause instanceof Error ? cause.message : "";
-  if (WORKTREE_REFUSAL_MESSAGE.test(message)) return new Error(message);
+  if (WORKTREE_REFUSAL_MESSAGE.test(message) || MODEL_SOURCE_REFUSAL_MESSAGE.test(message)) return new Error(message);
   if (
     message === WORKSPACE_FOLDER_MISSING ||
     message === SESSION_RECOVERY_CONTEXT_REQUIRED ||

@@ -8,13 +8,23 @@ import {
 } from "@guild/contracts";
 import { BrowserWindow, ipcMain, type IpcMainInvokeEvent } from "electron";
 import type { DesktopApplicationService } from "./application-service.js";
+import { wireBrowserPaneToRenderer, type BrowserPaneIpcPort } from "./browser-pane-bridge.js";
+import type { ModelSourcesService } from "./model-sources-service.js";
 import { createStreamDeltaForwarder } from "./stream-delta-channel.js";
 import { isTrustedGuildSender } from "./window-security.js";
 import { toDesktopIpcFailure } from "./workspace-folder.js";
 
+/** Guild 3.0 services that sit beside the application service (docs/20 section 3.4). */
+export type DesktopIpcExtras = {
+  readonly modelSources?: ModelSourcesService;
+  /** The browser pane of this window (docs/20 section 3.5). */
+  readonly browserPane?: BrowserPaneIpcPort;
+};
+
 export function registerDesktopIpc(
   window: BrowserWindow,
   service: DesktopApplicationService,
+  extras: DesktopIpcExtras = {},
 ): () => void {
   const channels: DesktopInvokeChannel[] = [];
   const handle = <Channel extends DesktopInvokeChannel>(
@@ -159,6 +169,37 @@ export function registerDesktopIpc(
   handle(DESKTOP_IPC_CHANNELS.setClaudeSettings, async (request) =>
     service.setClaudeSettings(request.model, request.reasoningEffort, request.permissionMode));
 
+  const modelSources = extras.modelSources;
+  if (modelSources !== undefined) {
+    handle(DESKTOP_IPC_CHANNELS.listModelSources, async () => modelSources.list());
+    handle(DESKTOP_IPC_CHANNELS.upsertModelSource, async (request) => modelSources.upsert(request));
+    handle(DESKTOP_IPC_CHANNELS.deleteModelSource, async (request) => {
+      await modelSources.remove(request.id);
+      return Object.freeze({});
+    });
+    handle(DESKTOP_IPC_CHANNELS.confirmModelSource, async (request) => modelSources.confirm(request.id));
+    handle(DESKTOP_IPC_CHANNELS.getWorkspacePrefs, async (request) => modelSources.getWorkspacePrefs(request));
+    handle(DESKTOP_IPC_CHANNELS.setWorkspacePrefs, async (request) => modelSources.setWorkspacePrefs(request));
+  }
+
+  let disposeBrowserPane: (() => void) | undefined;
+  if (extras.browserPane !== undefined) {
+    // The sender check of `handle` and `parseBrowserCommand` guard this channel like every other.
+    const wired = wireBrowserPaneToRenderer(extras.browserPane, {
+      send: (projection) => {
+        if (!window.isDestroyed()) window.webContents.send(DESKTOP_IPC_CHANNELS.browserPaneChanged, projection);
+      },
+      onRendererLoaded: (listener) => {
+        window.webContents.on("did-finish-load", listener);
+        return () => {
+          if (!window.isDestroyed()) window.webContents.off("did-finish-load", listener);
+        };
+      },
+    });
+    disposeBrowserPane = wired.dispose;
+    handle(DESKTOP_IPC_CHANNELS.browserCommand, async (request) => wired.command(request));
+  }
+
   const unsubscribe = service.subscribe((projection: DesktopBootstrapProjection) => {
     if (!window.isDestroyed()) {
       window.webContents.send(DESKTOP_IPC_CHANNELS.projectionChanged, projection);
@@ -173,6 +214,7 @@ export function registerDesktopIpc(
   return () => {
     unsubscribe();
     unsubscribeDeltas();
+    disposeBrowserPane?.();
     for (const channel of channels) ipcMain.removeHandler(channel);
   };
 }

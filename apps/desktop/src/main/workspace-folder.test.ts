@@ -39,6 +39,13 @@ describe("workspace folder presence", () => {
     assert.equal(toDesktopIpcFailure("unknown").message, "guild_operation_failed");
   });
 
+  it("passes model source refusal codes through and nothing that could carry a path or key", () => {
+    assert.equal(toDesktopIpcFailure(new Error("model_source_reserved_model")).message, "model_source_reserved_model");
+    assert.equal(toDesktopIpcFailure(new Error("model_source_changed")).message, "model_source_changed");
+    assert.equal(toDesktopIpcFailure(new Error("model_source_/Users/me/keys.env")).message, "guild_operation_failed");
+    assert.equal(toDesktopIpcFailure(new Error("model_source_Bearer_abc")).message, "guild_operation_failed");
+  });
+
   it("rejects a relative path and a regular file", async () => {
     const root = await mkdtemp(join(tmpdir(), "guild-workspace-folder-file-"));
     const file = join(root, "notes.txt");
