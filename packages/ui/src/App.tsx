@@ -157,7 +157,7 @@ import { GuildHero } from "./GuildHero.js";
 import { permissionOptionView } from "./permission-options.js";
 import { cardAnchors, latestChangedRun, resultSummaryRepeatsChangeCard } from "./run-changes.js";
 import { composerEnterAction, steerButtonState } from "./steer.js";
-import { noTaskComposerPlaceholder } from "./welcome.js";
+import { newTaskWorkspace, noTaskComposerPlaceholder, noTaskWorkspaceChip } from "./welcome.js";
 import {
   MODEL_PICKER_SEPARATOR,
   globalDefaultView,
@@ -446,6 +446,12 @@ export function GuildApp({ api }: GuildAppProps) {
       activeWorkspaceCache.current.set(workspace, derived);
       return derived;
     }), [projection?.workspaces]);
+  // Where "New task" starts a task when no workspace is named; the composer's workspace chip names it too (D-064).
+  const decidedNewTaskWorkspace = newTaskWorkspace(
+    projection?.generalSettings.newTaskWorkspaceMode,
+    projection?.generalSettings.lastWorkspaceId,
+    activeWorkspaces,
+  );
   const pendingTaskIds = useMemo(() => new Set(pendingSends.keys()), [pendingSends]);
   // F3: the per-task git worktree (new-task option, topbar chip and menu, dialogs).
   const worktreeLocale = projection?.locale ?? "en-US";
@@ -1131,19 +1137,11 @@ export function GuildApp({ api }: GuildAppProps) {
   async function createTask(workspaceId?: string, isolated?: boolean) {
     let target = workspaceId;
     if (target === undefined) {
-      const lastWorkspaceId = projection?.generalSettings.lastWorkspaceId;
-      if (
-        projection?.generalSettings.newTaskWorkspaceMode === "last" &&
-        lastWorkspaceId !== undefined &&
-        activeWorkspaces.some((workspace) => workspace.workspaceId === lastWorkspaceId)
-      ) {
-        target = lastWorkspaceId;
-      } else if (activeWorkspaces.length > 1) {
+      if (decidedNewTaskWorkspace.kind === "ask") {
         setWorkspacePickerOpen(true);
         return;
-      } else {
-        target = activeWorkspaces[0]?.workspaceId;
       }
+      target = decidedNewTaskWorkspace.kind === "workspace" ? decidedNewTaskWorkspace.workspaceId : undefined;
     }
     if (target === undefined) {
       const selected = await chooseWorkspace();
@@ -2684,7 +2682,7 @@ export function GuildApp({ api }: GuildAppProps) {
               ><Paperclip size={16} /></button>
               <span className="guild-pill guild-workspace-pill">
                 <FolderSimple size={14} aria-hidden="true" />
-                <span>{activeTask === undefined ? messages.chooseWorkspace : workspaceName(projection.workspaces, activeTask.task.workspaceId, messages.workspaceFallback)}</span>
+                <span>{activeTask === undefined ? noTaskWorkspaceChip(messages, decidedNewTaskWorkspace, activeWorkspaces) : workspaceName(projection.workspaces, activeTask.task.workspaceId, messages.workspaceFallback)}</span>
               </span>
               {permissionPill !== undefined && (
                 <button

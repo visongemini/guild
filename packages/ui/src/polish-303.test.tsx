@@ -4,6 +4,8 @@ import test from "node:test";
 import type { TimelineItemProjection } from "@guild/contracts";
 import { renderToStaticMarkup } from "react-dom/server";
 import { Timeline } from "./App.js";
+import { messagesFor } from "./locales.js";
+import { newTaskWorkspace, noTaskWorkspaceChip } from "./welcome.js";
 
 /*
  * Guild 3.0.3 fixes: one test file for the behaviours added after testing the installed 3.0.2. Pure view logic is
@@ -67,4 +69,48 @@ test("the reduced-motion rule still removes the buttons' fade", async () => {
   const css = await source("styles.css");
   const reduced = css.slice(css.indexOf("@media (prefers-reduced-motion: reduce)"));
   assert.match(reduced, /transition-duration: 0\.001ms !important/u);
+});
+
+// ---- the composer's workspace chip with no task open
+
+const WORKSPACES = [{ workspaceId: "w-a", name: "Alpha" }, { workspaceId: "w-b", name: "Beta" }];
+
+test("New task uses the remembered workspace under 'use last', the only workspace otherwise, and asks when the choice is open", () => {
+  // The remembered workspace wins while it still exists, whatever the number of workspaces.
+  assert.deepEqual(newTaskWorkspace("last", "w-b", WORKSPACES), { kind: "workspace", workspaceId: "w-b" });
+  assert.deepEqual(newTaskWorkspace("last", "w-a", WORKSPACES.slice(0, 1)), { kind: "workspace", workspaceId: "w-a" });
+  // A single workspace is the only choice there is, also when asked every time.
+  assert.deepEqual(newTaskWorkspace("ask", "w-a", WORKSPACES.slice(1)), { kind: "workspace", workspaceId: "w-b" });
+  assert.deepEqual(newTaskWorkspace("ask", undefined, WORKSPACES.slice(0, 1)), { kind: "workspace", workspaceId: "w-a" });
+  assert.deepEqual(newTaskWorkspace("last", undefined, WORKSPACES.slice(0, 1)), { kind: "workspace", workspaceId: "w-a" });
+  // A remembered workspace that is gone (archived or removed) falls back to the same rules.
+  assert.deepEqual(newTaskWorkspace("last", "w-gone", WORKSPACES.slice(0, 1)), { kind: "workspace", workspaceId: "w-a" });
+  assert.deepEqual(newTaskWorkspace("last", "w-gone", WORKSPACES), { kind: "ask" });
+  // The choice is open: several workspaces and nothing remembered or "ask every time".
+  assert.deepEqual(newTaskWorkspace("ask", "w-b", WORKSPACES), { kind: "ask" });
+  assert.deepEqual(newTaskWorkspace("last", undefined, WORKSPACES), { kind: "ask" });
+  assert.deepEqual(newTaskWorkspace(undefined, undefined, WORKSPACES), { kind: "ask" });
+  // No workspace at all.
+  assert.deepEqual(newTaskWorkspace("last", "w-a", []), { kind: "none" });
+  assert.deepEqual(newTaskWorkspace("ask", undefined, []), { kind: "none" });
+});
+
+test("the chip names the decided workspace and says 'choose project folder' only while the choice is open", () => {
+  for (const locale of ["zh-CN", "en-US"] as const) {
+    const messages = messagesFor(locale);
+    assert.equal(noTaskWorkspaceChip(messages, newTaskWorkspace("last", "w-b", WORKSPACES), WORKSPACES), "Beta");
+    assert.equal(noTaskWorkspaceChip(messages, newTaskWorkspace("ask", undefined, WORKSPACES.slice(0, 1)), WORKSPACES.slice(0, 1)), "Alpha");
+    assert.equal(noTaskWorkspaceChip(messages, newTaskWorkspace("ask", "w-b", WORKSPACES), WORKSPACES), messages.chooseWorkspace);
+    assert.equal(noTaskWorkspaceChip(messages, newTaskWorkspace("last", undefined, []), []), messages.chooseWorkspace);
+  }
+  assert.equal(messagesFor("zh-CN").chooseWorkspace, "选择项目文件夹");
+  // A decided id the list does not hold (it cannot happen with the one function, but a stale list must not blank the chip).
+  assert.equal(noTaskWorkspaceChip(messagesFor("zh-CN"), { kind: "workspace", workspaceId: "w-gone" }, WORKSPACES), "选择项目文件夹");
+});
+
+test("the create action and the composer chip read the same decision, and the chip is not a control", async () => {
+  const app = await source("App.tsx");
+  assert.match(app, /const decidedNewTaskWorkspace = newTaskWorkspace\(\s*projection\?\.generalSettings\.newTaskWorkspaceMode,\s*projection\?\.generalSettings\.lastWorkspaceId,\s*activeWorkspaces,\s*\);/u);
+  assert.match(app, /if \(decidedNewTaskWorkspace\.kind === "ask"\) \{\s*setWorkspacePickerOpen\(true\);\s*return;\s*\}/u);
+  assert.match(app, /<span className="guild-pill guild-workspace-pill">\s*<FolderSimple size=\{14\} aria-hidden="true" \/>\s*<span>\{activeTask === undefined \? noTaskWorkspaceChip\(messages, decidedNewTaskWorkspace, activeWorkspaces\) : workspaceName\(/u);
 });
