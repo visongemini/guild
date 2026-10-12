@@ -109,6 +109,16 @@ export const ACP_V1_ADAPTER_DEFAULT_TIMEOUTS = Object.freeze({
   writeMs: 10_000,
 });
 
+/**
+ * `session/new` of the Claude adapter initializes the whole Agent SDK and runs the user's session
+ * hooks first: 6 to 20 s were measured against claude 2.1.291 (2026-10-12), so the Grok default
+ * of 30 s leaves too little headroom for it.
+ */
+export const CLAUDE_ACP_ADAPTER_DEFAULT_TIMEOUTS = Object.freeze({
+  ...ACP_V1_ADAPTER_DEFAULT_TIMEOUTS,
+  sessionMs: 90_000,
+});
+
 export type AcpV1AdapterTimeouts = {
   readonly authenticateMs?: number;
   readonly initializeMs?: number;
@@ -528,21 +538,24 @@ export class AcpV1Adapter {
   constructor(options: AcpV1AdapterOptions) {
     this.adapterEpoch = positiveSafeInteger(options.adapterEpoch, "adapterEpoch");
     this.profile = options.profile ?? GROK_ENGINE_PROFILE;
+    const defaults = this.profile.dialect === "claude"
+      ? CLAUDE_ACP_ADAPTER_DEFAULT_TIMEOUTS
+      : ACP_V1_ADAPTER_DEFAULT_TIMEOUTS;
     this.timeouts = Object.freeze({
       authenticateMs: positiveSafeInteger(
-        options.timeouts?.authenticateMs ?? ACP_V1_ADAPTER_DEFAULT_TIMEOUTS.authenticateMs,
+        options.timeouts?.authenticateMs ?? defaults.authenticateMs,
         "authenticateMs",
       ),
       initializeMs: positiveSafeInteger(
-        options.timeouts?.initializeMs ?? ACP_V1_ADAPTER_DEFAULT_TIMEOUTS.initializeMs,
+        options.timeouts?.initializeMs ?? defaults.initializeMs,
         "initializeMs",
       ),
       sessionMs: positiveSafeInteger(
-        options.timeouts?.sessionMs ?? ACP_V1_ADAPTER_DEFAULT_TIMEOUTS.sessionMs,
+        options.timeouts?.sessionMs ?? defaults.sessionMs,
         "sessionMs",
       ),
       writeMs: positiveSafeInteger(
-        options.timeouts?.writeMs ?? ACP_V1_ADAPTER_DEFAULT_TIMEOUTS.writeMs,
+        options.timeouts?.writeMs ?? defaults.writeMs,
         "writeMs",
       ),
     });

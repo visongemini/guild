@@ -8,11 +8,13 @@ import {
   type AcpV1AdapterOptions,
   type AcpV1AdapterSession,
   type AcpV1AdapterSink,
+  type AcpV1PeerPort,
   type AcpV1ProcessPort,
 } from "./acp-adapter.js";
 import { ACP_V1_METHODS } from "./acp-v1-methods.js";
 import type { EngineSignal } from "./claude-dialect.js";
 import { CLAUDE_ENGINE_PROFILE } from "./engine-profile.js";
+import { JsonRpcPeer, type JsonRpcFrameWriter } from "./json-rpc-peer.js";
 import type { ProcessHostEvent } from "./process-host.js";
 
 type WireMessage = Record<string, unknown>;
@@ -229,6 +231,26 @@ function hasAdapterCode(code: AcpV1AdapterError["code"]): (cause: unknown) => bo
   return (cause) => cause instanceof AcpV1AdapterError && cause.code === code;
 }
 
+function timeoutObserver(observed: Map<string, number | null | undefined>): AcpV1AdapterOptions["peerFactory"] {
+  return (write: JsonRpcFrameWriter): AcpV1PeerPort => {
+    const peer = new JsonRpcPeer({ write, requestTimeoutMs: 1_000, writeTimeoutMs: 1_000 });
+    return {
+      close: peer.close.bind(peer),
+      failTransport: peer.failTransport.bind(peer),
+      onDiagnostic: peer.onDiagnostic.bind(peer),
+      onInboundResponseWrite: peer.onInboundResponseWrite.bind(peer),
+      receive: peer.receive.bind(peer),
+      sendNotification: peer.sendNotification.bind(peer),
+      sendRequest(method, params, options) {
+        observed.set(method, options?.responseTimeoutMs);
+        return peer.sendRequest(method, params, options);
+      },
+      setNotificationHandler: peer.setNotificationHandler.bind(peer),
+      setRequestHandler: peer.setRequestHandler.bind(peer),
+    };
+  };
+}
+
 describe("Claude dialect: initialize and authentication (PC-ENG-002)", () => {
   it("initializes against the recorded adapter result and reads the capabilities Guild needs", async () => {
     const process = new FakeProcess();
@@ -244,6 +266,36 @@ describe("Claude dialect: initialize and authentication (PC-ENG-002)", () => {
       agentInitiatedTurns: false,
     });
     await adapter.close();
+  });
+
+  it("allows the Claude adapter's slow session/new more time than Grok gets", async () => {
+    const claude = new Map<string, number | null | undefined>();
+    const process = new FakeProcess();
+    const adapter = await startClaude(process, new RecordingSink(), undefined, { peerFactory: timeoutObserver(claude) });
+    await newClaudeSession(adapter, process);
+    assert.equal(claude.get(ACP_V1_METHODS.initialize), 30_000);
+    assert.equal(claude.get(ACP_V1_METHODS.sessionNew), 90_000);
+    await adapter.close();
+
+    const grok = new Map<string, number | null | undefined>();
+    const grokProcess = new FakeProcess();
+    const grokAdapter = new AcpV1Adapter({
+      adapterEpoch: 1,
+      clock,
+      process: grokProcess,
+      sink: new RecordingSink(),
+      peerFactory: timeoutObserver(grok),
+    });
+    const starting = grokAdapter.start();
+    const initialize = await waitForOutbound(grokProcess, ACP_V1_METHODS.initialize);
+    grokProcess.emitMessages({ jsonrpc: "2.0", id: initialize.id, result: { protocolVersion: 1 } });
+    await starting;
+    const opening = grokAdapter.newSession(FIXTURE_CWD);
+    const request = await waitForOutbound(grokProcess, ACP_V1_METHODS.sessionNew);
+    grokProcess.emitMessages({ jsonrpc: "2.0", id: request.id, result: { sessionId: "grok-session" } });
+    await opening;
+    assert.equal(grok.get(ACP_V1_METHODS.sessionNew), 30_000);
+    await grokAdapter.close();
   });
 
   it("accepts and ignores terminal auth methods, never authenticating", async () => {
