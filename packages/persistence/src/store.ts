@@ -3,17 +3,25 @@ import { existsSync } from "node:fs";
 import { isMainThread } from "node:worker_threads";
 import {
   createRuntimeTurnEvent,
-  freezeGrokModelCatalog,
+  freezeModelCatalog,
   isConstructedRuntimeTurnEvent,
   isTerminalRunState,
+  modelSourceHost,
   parseAdapterEpoch,
+  parseGuildClaudePermissionMode,
+  parseGuildEngine,
   parseGuildGrokContextWindow,
   parseGuildGrokModel,
   parseGuildGrokPermissionMode,
   parseGuildGrokReasoningEffort,
   parseGuildGrokStartupSettings,
+  parseGuildModelId,
   parseGuildNewTaskWorkspaceMode,
   parseGuildNickname,
+  parseGuildReasoningEffort,
+  parseModelSourceDraft,
+  parseModelSourceId,
+  parseModelSourceModels,
   type GuildNewTaskWorkspaceMode,
   parseIdempotencyKey,
   parsePermissionIdentity,
@@ -26,12 +34,17 @@ import {
   type AdapterEpoch,
   type AdapterEpochStatus,
   type IdempotencyKey,
-  type GrokModelCatalog,
+  type GuildClaudePermissionMode,
+  type GuildEngine,
   type GuildGrokModel,
   type GuildGrokPermissionMode,
   type GuildGrokReasoningEffort,
   type GuildGrokStartupSettings,
   type JsonRpcCallbackId,
+  type ModelCatalog,
+  type ModelSourceDraft,
+  type ModelSourceModel,
+  type ModelSourceProjection,
   type PermissionDeliveryAttemptId,
   type PermissionIdentity,
   type PermissionOutboxCommandId,
@@ -106,6 +119,12 @@ const MAX_SIDEBAR_WIDTH = 600;
 const DEFAULT_CONVERSATION_PAGE_SIZE = 200;
 const MAX_CONVERSATION_PAGE_SIZE = 500;
 const MAX_QUEUED_TURNS_PER_TASK = 32;
+const MAX_MODEL_SOURCES = 32;
+const MAX_MODEL_SOURCES_JSON_LENGTH = 65_536;
+/** thinking_provenance keeps about this many newest rows (D-058). */
+const THINKING_PROVENANCE_RETENTION = 50_000;
+/** The retention helper also runs after this many inserts, so the table stays bounded unattended. */
+const THINKING_PROVENANCE_PRUNE_EVERY = 1_024;
 /** Streamed text is written at most this long after the first buffered chunk (WP2). */
 const STREAM_FLUSH_INTERVAL_MS = 100;
 /**
@@ -175,6 +194,10 @@ export type TaskMetadataRecord = {
   readonly workspaceId: string;
   readonly title: string;
   readonly pinned: boolean;
+  /** Engine the task runs on; fixed once the task has a Run (PC-ENG-001). */
+  readonly engine: GuildEngine;
+  /** When the task first switched to an Online / Local model (routed for good); Claude tasks only. */
+  readonly routedAtMs: number | undefined;
   readonly disposition: RecordDisposition;
   readonly revision: number;
   readonly createdAtMs: number;
@@ -451,6 +474,11 @@ export type AppSettingsRecord = {
   readonly reasoningEffort: GuildGrokReasoningEffort | null;
   readonly permissionMode: GuildGrokPermissionMode;
   readonly startup: GuildGrokStartupSettings;
+  /** Claude-engine default model; `null` follows the adapter's own default (PC-SET-002). */
+  readonly claudeModel: string | null;
+  /** Claude-engine default effort; `null` follows the adapter's own default. */
+  readonly claudeEffort: string | null;
+  readonly claudePermissionMode: GuildClaudePermissionMode;
   readonly sidebarWidth: number;
   readonly browserSyncEnabled: boolean;
   readonly nickname: string;
@@ -475,9 +503,23 @@ export type TaskRuntimeSettingsRecord = Readonly<{
 }>;
 
 export type ModelCatalogCacheRecord = Readonly<{
-  catalog: GrokModelCatalog;
+  engine: GuildEngine;
+  catalog: ModelCatalog;
   runtimeVersion?: string;
   updatedAtMs: number;
+}>;
+
+/** A configured Online / Local source as stored. It holds names and addresses, never a key. */
+export type ModelSourceRecord = Readonly<ModelSourceProjection & {
+  /** Bumps whenever the row changes; the confirmation compares it so a stale dialog cannot confirm a newer edit. */
+  revision: number;
+  createdAtMs: number;
+  updatedAtMs: number;
+}>;
+
+export type WorkspacePrefsRecord = Readonly<{
+  workspaceId: string;
+  onlineReminderDismissed: boolean;
 }>;
 
 export type CanonicalTaskRestore = {
@@ -665,8 +707,26 @@ export interface GuildPersistence {
     readonly workspaceId: string;
     readonly title: string;
     readonly owningWindowId?: WindowId;
+    /** Engine of the new task; absent means `grok`. */
+    readonly engine?: GuildEngine;
   }): CreateConversationTaskResult;
   loadTaskMetadata(taskId: TaskId): TaskMetadataRecord;
+  loadTaskEngine(taskId: TaskId): GuildEngine;
+  /**
+   * Changes the engine of a task (PC-ENG-001). Refused (`domain_operation_rejected`) once the task has
+   * any Run or has been routed; the task's own model override is cleared with the change because it
+   * was written for the other engine.
+   */
+  setTaskEngine(input: {
+    readonly taskId: TaskId;
+    readonly expectedRevision: number;
+    readonly engine: GuildEngine;
+  }): TaskMetadataRecord;
+  /**
+   * Records, once, that the Claude task switched to an Online / Local model and is routed for good
+   * (PC-ROUTE-002). Idempotent: a second call keeps the first time. Refused for a Grok task.
+   */
+  markTaskRouted(input: { readonly taskId: TaskId }): TaskMetadataRecord;
   listTasks(input: {
     readonly workspaceId: string;
     readonly includeArchived?: boolean;
@@ -841,6 +901,9 @@ export interface GuildPersistence {
     readonly reasoningEffort?: GuildGrokReasoningEffort | null;
     readonly permissionMode?: GuildGrokPermissionMode;
     readonly startup?: GuildGrokStartupSettings;
+    readonly claudeModel?: string | null;
+    readonly claudeEffort?: string | null;
+    readonly claudePermissionMode?: GuildClaudePermissionMode;
     readonly sidebarWidth?: number;
     readonly browserSyncEnabled?: boolean;
     readonly nickname?: string;
@@ -863,11 +926,48 @@ export interface GuildPersistence {
     readonly taskId: TaskId;
     readonly expectedRevision: number;
   }): void;
-  loadModelCatalogCache(): ModelCatalogCacheRecord | undefined;
+  /** The cached model list of `engine` (default `grok`); absent, unparsable or stale counts as no cache. */
+  loadModelCatalogCache(engine?: GuildEngine): ModelCatalogCacheRecord | undefined;
   saveModelCatalogCache(input: {
-    readonly catalog: GrokModelCatalog;
+    readonly catalog: ModelCatalog;
     readonly runtimeVersion?: string;
+    /** Engine the list belongs to; absent means `grok`. A catalog labelled with another engine is refused. */
+    readonly engine?: GuildEngine;
   }): void;
+  // Guild 3.0 model sources (PC-MODEL-001, PC-ROUTE-002). Rows hold names and addresses, never a key.
+  listModelSources(): readonly ModelSourceRecord[];
+  loadModelSource(sourceId: string): ModelSourceRecord | undefined;
+  /**
+   * Creates or updates a source. The confirmed host survives an edit of label, models or `enabled`
+   * and is cleared when the kind, base URL, key file or key variable changes. A model id may belong to
+   * one source only. `needsConfirmation` is true while the host is unconfirmed.
+   */
+  upsertModelSource(input: ModelSourceDraft): {
+    readonly source: ModelSourceRecord;
+    readonly needsConfirmation: boolean;
+  };
+  deleteModelSource(sourceId: string): void;
+  /**
+   * Binds the source to the host of its base URL after the main process showed the native dialog.
+   * `expectedRevision` is the revision the dialog was built from; an edit made meanwhile conflicts.
+   */
+  confirmModelSource(input: {
+    readonly sourceId: string;
+    readonly expectedRevision: number;
+  }): ModelSourceRecord;
+  // Per-workspace privacy preferences (PC-PRIV-001). A workspace without a row has the defaults.
+  loadWorkspacePrefs(workspaceId: string): WorkspacePrefsRecord;
+  saveWorkspacePrefs(input: {
+    readonly workspaceId: string;
+    readonly onlineReminderDismissed: boolean;
+  }): WorkspacePrefsRecord;
+  // Thinking provenance (D-058): the source that produced a thinking signature, by the signature's hash.
+  loadThinkingProvenance(hash: string): string | undefined;
+  /** First writer wins; a known hash is left alone. Prunes itself to about `THINKING_PROVENANCE_RETENTION` rows. */
+  saveThinkingProvenance(input: { readonly hash: string; readonly sourceId: string }): void;
+  /** Deletes all but the newest `keep` rows (default `THINKING_PROVENANCE_RETENTION`); returns the number deleted. */
+  pruneThinkingProvenance(keep?: number): number;
+  countThinkingProvenance(): number;
   // F4 Steer. The conversation entry's metadata is immutable, so delivery state lives in its own row.
   /** Records the intent before `_x.ai/interject` is sent (state `sending`). Idempotent. */
   beginInterjection(input: {
@@ -1402,6 +1502,31 @@ function parsedRuntimeSetting<T>(value: unknown, parse: (value: unknown) => T): 
   }
 }
 
+function parsedEngine(value: unknown): GuildEngine {
+  try {
+    return parseGuildEngine(value);
+  } catch (cause: unknown) {
+    throw persistenceError("domain_operation_rejected", cause);
+  }
+}
+
+const PROVENANCE_HASH = /^[0-9a-f]{16,64}$/u;
+
+function parsedProvenanceHash(value: unknown): string {
+  if (typeof value !== "string" || !PROVENANCE_HASH.test(value)) {
+    throw persistenceError("domain_operation_rejected");
+  }
+  return value;
+}
+
+function parsedModelSourceIdValue(value: unknown): string {
+  try {
+    return parseModelSourceId(value);
+  } catch (cause: unknown) {
+    throw persistenceError("domain_operation_rejected", cause);
+  }
+}
+
 function canonicalMetadataValue(
   value: unknown,
   depth: number,
@@ -1714,6 +1839,7 @@ class SqliteGuildPersistence implements GuildPersistence {
   #streamWalBytes = 0;
   #lastStreamActivityAtMs = 0;
   #checkpointTimer: ReturnType<typeof setTimeout> | undefined;
+  #provenanceWrites = 0;
 
   constructor(
     database: DatabaseSync,
@@ -2216,11 +2342,13 @@ class SqliteGuildPersistence implements GuildPersistence {
     readonly workspaceId: string;
     readonly title: string;
     readonly owningWindowId?: WindowId;
+    readonly engine?: GuildEngine;
   }): CreateConversationTaskResult {
     const taskId = parsedTaskId(input.taskId);
     const workspaceId = parsedWorkspaceId(input.workspaceId);
     const title = parsedTaskTitle(input.title);
     const owningWindowId = parsedWindowId(input.owningWindowId);
+    const engine = input.engine === undefined ? "grok" : parsedEngine(input.engine);
     return this.#immediate(() => {
       const existingTask = this.#database
         .prepare("SELECT owning_window_id FROM tasks WHERE task_id = ?")
@@ -2235,7 +2363,8 @@ class SqliteGuildPersistence implements GuildPersistence {
         if (
           storedWindowId !== owningWindowId ||
           metadata.workspaceId !== workspaceId ||
-          metadata.title !== title
+          metadata.title !== title ||
+          metadata.engine !== engine
         ) {
           throw persistenceError("aggregate_already_exists");
         }
@@ -2263,6 +2392,7 @@ class SqliteGuildPersistence implements GuildPersistence {
         title,
         createdAtMs: at,
         at,
+        engine,
       });
       const sessionBinding = createUnboundBinding(taskId);
       const encoded = encodeSessionBinding(sessionBinding);
@@ -2286,6 +2416,70 @@ class SqliteGuildPersistence implements GuildPersistence {
   loadTaskMetadata(taskIdInput: TaskId): TaskMetadataRecord {
     this.#assertOpen();
     return this.#requiredTaskMetadata(parsedTaskId(taskIdInput));
+  }
+
+  loadTaskEngine(taskIdInput: TaskId): GuildEngine {
+    this.#assertOpen();
+    return this.#requiredTaskMetadata(parsedTaskId(taskIdInput)).engine;
+  }
+
+  setTaskEngine(input: {
+    readonly taskId: TaskId;
+    readonly expectedRevision: number;
+    readonly engine: GuildEngine;
+  }): TaskMetadataRecord {
+    const taskId = parsedTaskId(input.taskId);
+    const expectedRevision = parsedRevision(input.expectedRevision);
+    const engine = parsedEngine(input.engine);
+    return this.#immediate(() => {
+      const current = this.#requiredTaskMetadata(taskId);
+      if (current.revision !== expectedRevision) {
+        throw persistenceError("persistence_cas_conflict");
+      }
+      if (current.disposition !== "active") {
+        throw persistenceError("domain_operation_rejected");
+      }
+      if (current.engine === engine) return current;
+      // PC-TASK-001: no silent rebinding. The engine is chosen before the first turn and then fixed.
+      if (
+        current.routedAtMs !== undefined ||
+        this.#database.prepare("SELECT 1 AS present FROM runs WHERE task_id = ? LIMIT 1").get(taskId) !== undefined
+      ) {
+        throw persistenceError("domain_operation_rejected");
+      }
+      // A model override was written for the other engine and means nothing on this one.
+      this.#database.prepare("DELETE FROM task_runtime_settings WHERE task_id = ?").run(taskId);
+      const updated = this.#database
+        .prepare(`
+          UPDATE task_metadata
+          SET engine = ?, revision = revision + 1, updated_at_ms = ?
+          WHERE task_id = ? AND revision = ? AND disposition = 'active'
+        `)
+        .run(engine, exactNow(), taskId, expectedRevision);
+      if (changes(updated.changes) !== 1) {
+        throw persistenceError("persistence_cas_conflict");
+      }
+      return this.#requiredTaskMetadata(taskId);
+    });
+  }
+
+  markTaskRouted(input: { readonly taskId: TaskId }): TaskMetadataRecord {
+    const taskId = parsedTaskId(input.taskId);
+    return this.#immediate(() => {
+      const current = this.#requireWritableConversationTask(taskId);
+      if (current.engine !== "claude") {
+        throw persistenceError("domain_operation_rejected");
+      }
+      if (current.routedAtMs !== undefined) return current;
+      // A bookkeeping marker like the activity time: it does not bump the revision other commands compare.
+      const updated = this.#database
+        .prepare("UPDATE task_metadata SET routed_at_ms = ? WHERE task_id = ? AND routed_at_ms IS NULL")
+        .run(Math.max(current.createdAtMs, exactNow()), taskId);
+      if (changes(updated.changes) !== 1) {
+        throw persistenceError("persistence_cas_conflict");
+      }
+      return this.#requiredTaskMetadata(taskId);
+    });
   }
 
   listTasks(input: {
@@ -3805,6 +3999,9 @@ class SqliteGuildPersistence implements GuildPersistence {
     readonly reasoningEffort?: GuildGrokReasoningEffort | null;
     readonly permissionMode?: GuildGrokPermissionMode;
     readonly startup?: GuildGrokStartupSettings;
+    readonly claudeModel?: string | null;
+    readonly claudeEffort?: string | null;
+    readonly claudePermissionMode?: GuildClaudePermissionMode;
     readonly sidebarWidth?: number;
     readonly browserSyncEnabled?: boolean;
     readonly nickname?: string;
@@ -3829,6 +4026,15 @@ class SqliteGuildPersistence implements GuildPersistence {
     const startup = input.startup === undefined
       ? undefined
       : parseGuildGrokStartupSettings(input.startup);
+    const claudeModel = input.claudeModel === undefined || input.claudeModel === null
+      ? input.claudeModel
+      : parseGuildModelId("claude", input.claudeModel);
+    const claudeEffort = input.claudeEffort === undefined || input.claudeEffort === null
+      ? input.claudeEffort
+      : parseGuildReasoningEffort("claude", input.claudeEffort);
+    const claudePermissionMode = input.claudePermissionMode === undefined
+      ? undefined
+      : parseGuildClaudePermissionMode(input.claudePermissionMode);
     const sidebarWidth = input.sidebarWidth === undefined
       ? undefined
       : parsedSidebarWidth(input.sidebarWidth);
@@ -3887,6 +4093,9 @@ class SqliteGuildPersistence implements GuildPersistence {
         reasoningEffort: reasoningEffort === undefined ? current.reasoningEffort : reasoningEffort,
         permissionMode: permissionMode ?? current.permissionMode,
         startup: startup ?? current.startup,
+        claudeModel: claudeModel === undefined ? current.claudeModel : claudeModel,
+        claudeEffort: claudeEffort === undefined ? current.claudeEffort : claudeEffort,
+        claudePermissionMode: claudePermissionMode ?? current.claudePermissionMode,
         sidebarWidth: sidebarWidth ?? current.sidebarWidth,
         browserSyncEnabled:
           input.browserSyncEnabled ?? current.browserSyncEnabled,
@@ -3912,6 +4121,9 @@ class SqliteGuildPersistence implements GuildPersistence {
         next.startup.planEnabled === current.startup.planEnabled &&
         next.startup.subagentsEnabled === current.startup.subagentsEnabled &&
         next.startup.maxTurns === current.startup.maxTurns &&
+        next.claudeModel === current.claudeModel &&
+        next.claudeEffort === current.claudeEffort &&
+        next.claudePermissionMode === current.claudePermissionMode &&
         next.sidebarWidth === current.sidebarWidth &&
         next.browserSyncEnabled === current.browserSyncEnabled &&
         next.nickname === current.nickname &&
@@ -3930,6 +4142,7 @@ class SqliteGuildPersistence implements GuildPersistence {
           UPDATE app_settings
           SET locale = ?, grok_model = ?, reasoning_effort = ?, permission_mode = ?,
               web_search_enabled = ?, plan_enabled = ?, subagents_enabled = ?, max_turns = ?,
+              claude_model = ?, claude_effort = ?, claude_permission_mode = ?,
               sidebar_width = ?, browser_sync_enabled = ?,
               nickname = ?, avatar_filename = ?, restore_last_task = ?,
               new_task_workspace_mode = ?, task_notifications_enabled = ?, last_active_task_id = ?,
@@ -3946,6 +4159,9 @@ class SqliteGuildPersistence implements GuildPersistence {
           next.startup.planEnabled ? 1 : 0,
           next.startup.subagentsEnabled ? 1 : 0,
           next.startup.maxTurns,
+          next.claudeModel ?? "",
+          next.claudeEffort ?? "",
+          next.claudePermissionMode,
           next.sidebarWidth,
           next.browserSyncEnabled ? 1 : 0,
           next.nickname,
@@ -3981,18 +4197,19 @@ class SqliteGuildPersistence implements GuildPersistence {
   }): TaskRuntimeSettingsRecord {
     const taskId = parsedTaskId(input.taskId);
     const expectedRevision = parsedRevision(input.expectedRevision, true);
-    const modelId = parsedRuntimeSetting(input.modelId, parseGuildGrokModel);
-    const reasoningEffort = parsedRuntimeSetting(
-      input.reasoningEffort,
-      parseGuildGrokReasoningEffort,
-    );
     const contextWindow = parsedRuntimeSetting(input.contextWindow, parseGuildGrokContextWindow);
     // An override with nothing to override is a delete (clearTaskRuntimeSettings).
-    if (modelId === null && reasoningEffort === null && contextWindow === null) {
+    if (input.modelId === null && input.reasoningEffort === null && contextWindow === null) {
       throw persistenceError("domain_operation_rejected");
     }
     return this.#immediate(() => {
-      this.#requiredTaskMetadata(taskId);
+      // The ids follow the grammar of the task's own engine (Grok: official grok-* only).
+      const { engine } = this.#requiredTaskMetadata(taskId);
+      const modelId = parsedRuntimeSetting(input.modelId, (value) => parseGuildModelId(engine, value));
+      const reasoningEffort = parsedRuntimeSetting(
+        input.reasoningEffort,
+        (value) => parseGuildReasoningEffort(engine, value),
+      );
       const existing = this.#selectTaskRuntimeSettings(taskId);
       if (expectedRevision === 0) {
         if (existing !== undefined) {
@@ -4052,17 +4269,20 @@ class SqliteGuildPersistence implements GuildPersistence {
   /**
    * The cache is advisory: a row that is missing, unparsable or no longer a valid catalog is
    * reported as absent, never as an integrity failure, and the next advertised list replaces it.
+   * One list is kept per engine.
    */
-  loadModelCatalogCache(): ModelCatalogCacheRecord | undefined {
+  loadModelCatalogCache(engineInput: GuildEngine = "grok"): ModelCatalogCacheRecord | undefined {
     this.#assertOpen();
+    const engine = parsedEngine(engineInput);
     const row = this.#database
-      .prepare("SELECT * FROM runtime_model_catalog WHERE singleton = 1")
-      .get();
+      .prepare("SELECT * FROM runtime_model_catalog WHERE engine = ?")
+      .get(engine);
     if (row === undefined) return undefined;
     try {
-      const catalog = freezeGrokModelCatalog(JSON.parse(exactText(row, "catalog_json")));
+      const catalog = freezeModelCatalog(engine, JSON.parse(exactText(row, "catalog_json")));
       const runtimeVersion = optionalText(row, "runtime_version");
       return freeze({
+        engine,
         catalog,
         ...(runtimeVersion === undefined ? {} : { runtimeVersion }),
         updatedAtMs: exactInteger(row, "updated_at_ms"),
@@ -4073,13 +4293,15 @@ class SqliteGuildPersistence implements GuildPersistence {
   }
 
   saveModelCatalogCache(input: {
-    readonly catalog: GrokModelCatalog;
+    readonly catalog: ModelCatalog;
     readonly runtimeVersion?: string;
+    readonly engine?: GuildEngine;
   }): void {
     this.#assertOpen();
+    const engine = input.engine === undefined ? "grok" : parsedEngine(input.engine);
     let catalogJson: string;
     try {
-      catalogJson = JSON.stringify(freezeGrokModelCatalog(input.catalog));
+      catalogJson = JSON.stringify(freezeModelCatalog(engine, input.catalog));
     } catch (cause: unknown) {
       throw persistenceError("domain_operation_rejected", cause);
     }
@@ -4091,8 +4313,8 @@ class SqliteGuildPersistence implements GuildPersistence {
       : boundedString(input.runtimeVersion, MAX_RUNTIME_VERSION_LENGTH);
     // The runtime re-advertises the same list on every start: an unchanged cache costs no write.
     const stored = this.#database
-      .prepare("SELECT catalog_json, runtime_version FROM runtime_model_catalog WHERE singleton = 1")
-      .get();
+      .prepare("SELECT catalog_json, runtime_version FROM runtime_model_catalog WHERE engine = ?")
+      .get(engine);
     if (
       stored !== undefined &&
       stored["catalog_json"] === catalogJson &&
@@ -4103,15 +4325,254 @@ class SqliteGuildPersistence implements GuildPersistence {
     this.#immediate(() => {
       this.#database
         .prepare(`
-          INSERT INTO runtime_model_catalog(singleton, catalog_json, runtime_version, updated_at_ms)
-          VALUES(1, ?, ?, ?)
-          ON CONFLICT(singleton) DO UPDATE SET
+          INSERT INTO runtime_model_catalog(engine, catalog_json, runtime_version, updated_at_ms)
+          VALUES(?, ?, ?, ?)
+          ON CONFLICT(engine) DO UPDATE SET
             catalog_json = excluded.catalog_json,
             runtime_version = excluded.runtime_version,
             updated_at_ms = excluded.updated_at_ms
         `)
-        .run(catalogJson, runtimeVersion, exactNow());
+        .run(engine, catalogJson, runtimeVersion, exactNow());
     });
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // Guild 3.0 model sources (PC-MODEL-001, PC-ROUTE-002)
+  // ---------------------------------------------------------------------------------------------
+
+  listModelSources(): readonly ModelSourceRecord[] {
+    this.#assertOpen();
+    return Object.freeze(
+      this.#database
+        .prepare("SELECT * FROM model_sources ORDER BY created_at_ms, rowid")
+        .all()
+        .map((row) => this.#decodeModelSourceRow(row)),
+    );
+  }
+
+  loadModelSource(sourceIdInput: string): ModelSourceRecord | undefined {
+    this.#assertOpen();
+    return this.#selectModelSource(parsedModelSourceIdValue(sourceIdInput));
+  }
+
+  upsertModelSource(input: ModelSourceDraft): {
+    readonly source: ModelSourceRecord;
+    readonly needsConfirmation: boolean;
+  } {
+    this.#assertOpen();
+    let draft: ModelSourceDraft;
+    try {
+      draft = parseModelSourceDraft(input);
+    } catch (cause: unknown) {
+      throw persistenceError("domain_operation_rejected", cause);
+    }
+    const modelsJson = JSON.stringify(draft.models);
+    if (modelsJson.length > MAX_MODEL_SOURCES_JSON_LENGTH) {
+      throw persistenceError("domain_operation_rejected");
+    }
+    return this.#immediate(() => {
+      const existing = this.#selectModelSource(draft.id);
+      // The router's registry maps a model id to exactly one source.
+      const taken = new Set<string>();
+      for (const row of this.#database
+        .prepare("SELECT source_id, models_json FROM model_sources WHERE source_id <> ?")
+        .all(draft.id)) {
+        for (const model of this.#decodeModelSourceModels(exactText(row, "models_json"))) {
+          taken.add(model.id);
+        }
+      }
+      if (draft.models.some((model) => taken.has(model.id))) {
+        throw persistenceError("domain_operation_rejected");
+      }
+      const at = exactNow();
+      if (existing === undefined) {
+        const count = exactInteger(
+          this.#database.prepare("SELECT count(*) AS total FROM model_sources").get() ?? {},
+          "total",
+        );
+        if (count >= MAX_MODEL_SOURCES) throw persistenceError("domain_operation_rejected");
+        this.#database
+          .prepare(`
+            INSERT INTO model_sources(
+              source_id, kind, label, base_url, key_file, key_variable, models_json,
+              enabled, confirmed_host, revision, created_at_ms, updated_at_ms
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, NULL, 1, ?, ?)
+          `)
+          .run(
+            draft.id,
+            draft.kind,
+            draft.label,
+            draft.baseUrl,
+            draft.keyFile,
+            draft.keyVariable,
+            modelsJson,
+            draft.enabled ? 1 : 0,
+            at,
+            at,
+          );
+        return freeze({ source: this.#requiredModelSource(draft.id), needsConfirmation: true });
+      }
+      // The confirmation was for this kind, address and key designation; any change voids it.
+      const trustChanged = existing.kind !== draft.kind ||
+        existing.baseUrl !== draft.baseUrl ||
+        existing.keyFile !== draft.keyFile ||
+        existing.keyVariable !== draft.keyVariable;
+      const confirmedHost = trustChanged ? null : existing.confirmedHost;
+      if (
+        !trustChanged &&
+        existing.label === draft.label &&
+        existing.enabled === draft.enabled &&
+        JSON.stringify(existing.models) === modelsJson
+      ) {
+        return freeze({ source: existing, needsConfirmation: existing.confirmedHost === null });
+      }
+      const updated = this.#database
+        .prepare(`
+          UPDATE model_sources
+          SET kind = ?, label = ?, base_url = ?, key_file = ?, key_variable = ?, models_json = ?,
+              enabled = ?, confirmed_host = ?, revision = revision + 1, updated_at_ms = ?
+          WHERE source_id = ? AND revision = ?
+        `)
+        .run(
+          draft.kind,
+          draft.label,
+          draft.baseUrl,
+          draft.keyFile,
+          draft.keyVariable,
+          modelsJson,
+          draft.enabled ? 1 : 0,
+          confirmedHost,
+          Math.max(at, existing.createdAtMs),
+          draft.id,
+          existing.revision,
+        );
+      if (changes(updated.changes) !== 1) {
+        throw persistenceError("persistence_cas_conflict");
+      }
+      const source = this.#requiredModelSource(draft.id);
+      return freeze({ source, needsConfirmation: source.confirmedHost === null });
+    });
+  }
+
+  deleteModelSource(sourceIdInput: string): void {
+    const sourceId = parsedModelSourceIdValue(sourceIdInput);
+    this.#immediate(() => {
+      const deleted = this.#database
+        .prepare("DELETE FROM model_sources WHERE source_id = ?")
+        .run(sourceId);
+      // thinking_provenance keeps the rows of a removed source on purpose: a signature that source
+      // produced must stay recognisable as foreign to every other model.
+      if (changes(deleted.changes) !== 1) throw persistenceError("aggregate_not_found");
+    });
+  }
+
+  confirmModelSource(input: {
+    readonly sourceId: string;
+    readonly expectedRevision: number;
+  }): ModelSourceRecord {
+    const sourceId = parsedModelSourceIdValue(input.sourceId);
+    const expectedRevision = parsedRevision(input.expectedRevision);
+    return this.#immediate(() => {
+      const current = this.#requiredModelSource(sourceId);
+      if (current.revision !== expectedRevision) {
+        throw persistenceError("persistence_cas_conflict");
+      }
+      const host = modelSourceHost(current.baseUrl);
+      if (current.confirmedHost === host) return current;
+      const updated = this.#database
+        .prepare(`
+          UPDATE model_sources
+          SET confirmed_host = ?, revision = revision + 1, updated_at_ms = ?
+          WHERE source_id = ? AND revision = ?
+        `)
+        .run(host, Math.max(exactNow(), current.createdAtMs), sourceId, expectedRevision);
+      if (changes(updated.changes) !== 1) {
+        throw persistenceError("persistence_cas_conflict");
+      }
+      return this.#requiredModelSource(sourceId);
+    });
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // Guild 3.0 workspace preferences (PC-PRIV-001) and thinking provenance (D-058)
+  // ---------------------------------------------------------------------------------------------
+
+  loadWorkspacePrefs(workspaceIdInput: string): WorkspacePrefsRecord {
+    this.#assertOpen();
+    const workspaceId = parsedWorkspaceId(workspaceIdInput);
+    this.#requiredWorkspace(workspaceId);
+    const row = this.#database
+      .prepare("SELECT * FROM workspace_prefs WHERE workspace_id = ?")
+      .get(workspaceId);
+    return row === undefined
+      ? freeze({ workspaceId, onlineReminderDismissed: false })
+      : this.#decodeWorkspacePrefsRow(row);
+  }
+
+  saveWorkspacePrefs(input: {
+    readonly workspaceId: string;
+    readonly onlineReminderDismissed: boolean;
+  }): WorkspacePrefsRecord {
+    const workspaceId = parsedWorkspaceId(input.workspaceId);
+    if (typeof input.onlineReminderDismissed !== "boolean") {
+      throw persistenceError("domain_operation_rejected");
+    }
+    const dismissed = input.onlineReminderDismissed;
+    return this.#immediate(() => {
+      this.#requiredWorkspace(workspaceId);
+      this.#database
+        .prepare(`
+          INSERT INTO workspace_prefs(workspace_id, online_reminder_dismissed)
+          VALUES(?, ?)
+          ON CONFLICT(workspace_id) DO UPDATE SET
+            online_reminder_dismissed = excluded.online_reminder_dismissed
+        `)
+        .run(workspaceId, dismissed ? 1 : 0);
+      return freeze({ workspaceId, onlineReminderDismissed: dismissed });
+    });
+  }
+
+  loadThinkingProvenance(hashInput: string): string | undefined {
+    this.#assertOpen();
+    const row = this.#database
+      .prepare("SELECT source_id FROM thinking_provenance WHERE hash = ?")
+      .get(parsedProvenanceHash(hashInput));
+    return row === undefined ? undefined : exactText(row, "source_id");
+  }
+
+  saveThinkingProvenance(input: { readonly hash: string; readonly sourceId: string }): void {
+    const hash = parsedProvenanceHash(input.hash);
+    const sourceId = boundedString(input.sourceId, 64);
+    // Written while a turn streams: it must not drop the live-write context or force a sync.
+    this.#immediate(() => {
+      this.#database
+        .prepare(`
+          INSERT INTO thinking_provenance(hash, source_id, created_at_ms)
+          VALUES(?, ?, ?)
+          ON CONFLICT(hash) DO NOTHING
+        `)
+        .run(hash, sourceId, exactNow());
+      this.#provenanceWrites += 1;
+      if (this.#provenanceWrites >= THINKING_PROVENANCE_PRUNE_EVERY) {
+        this.#provenanceWrites = 0;
+        this.#pruneThinkingProvenance(THINKING_PROVENANCE_RETENTION);
+      }
+    }, false, true);
+  }
+
+  pruneThinkingProvenance(keepInput: number = THINKING_PROVENANCE_RETENTION): number {
+    if (!Number.isSafeInteger(keepInput) || keepInput < 0) {
+      throw persistenceError("domain_operation_rejected");
+    }
+    return this.#immediate(() => this.#pruneThinkingProvenance(keepInput), false, true);
+  }
+
+  countThinkingProvenance(): number {
+    this.#assertOpen();
+    return exactInteger(
+      this.#database.prepare("SELECT count(*) AS total FROM thinking_provenance").get() ?? {},
+      "total",
+    );
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -5738,8 +6199,18 @@ class SqliteGuildPersistence implements GuildPersistence {
         throw persistenceError("aggregate_integrity_failed");
       }
     }
-    for (const row of this.#database.prepare("SELECT * FROM task_runtime_settings").all()) {
+    for (const row of this.#database.prepare(`
+      SELECT settings.*, metadata.engine AS task_engine
+      FROM task_runtime_settings AS settings
+      LEFT JOIN task_metadata AS metadata ON metadata.task_id = settings.task_id
+    `).all()) {
       this.#decodeTaskRuntimeSettingsRow(row);
+    }
+    for (const row of this.#database.prepare("SELECT * FROM model_sources").all()) {
+      this.#decodeModelSourceRow(row);
+    }
+    for (const row of this.#database.prepare("SELECT * FROM workspace_prefs").all()) {
+      this.#decodeWorkspacePrefsRow(row);
     }
     // runtime_model_catalog is a cache: a bad row is ignored on load, never an integrity failure.
     this.#requiredAppSettings();
@@ -6026,11 +6497,21 @@ class SqliteGuildPersistence implements GuildPersistence {
     ) {
       throw persistenceError("aggregate_integrity_failed");
     }
+    const engineText = exactText(row, "engine");
+    const routedAtMs = optionalInteger(row, "routed_at_ms");
+    if (
+      (engineText !== "grok" && engineText !== "claude") ||
+      (routedAtMs !== undefined && (routedAtMs < 0 || engineText !== "claude"))
+    ) {
+      throw persistenceError("aggregate_integrity_failed");
+    }
     return freeze({
       taskId: parsedId.value,
       workspaceId,
       title,
       pinned: exactInteger(row, "pinned") === 1,
+      engine: engineText,
+      routedAtMs,
       disposition: parsedDisposition(exactText(row, "disposition")),
       revision: exactInteger(row, "revision"),
       createdAtMs: exactInteger(row, "created_at_ms"),
@@ -6060,13 +6541,14 @@ class SqliteGuildPersistence implements GuildPersistence {
     readonly title: string;
     readonly createdAtMs: number;
     readonly at: number;
+    readonly engine?: GuildEngine;
   }): void {
     this.#database
       .prepare(`
         INSERT INTO task_metadata(
           task_id, workspace_id, title, disposition, revision, created_at_ms,
-          updated_at_ms, last_activity_at_ms, archived_at_ms, deleted_at_ms
-        ) VALUES(?, ?, ?, 'active', 1, ?, ?, ?, NULL, NULL)
+          updated_at_ms, last_activity_at_ms, archived_at_ms, deleted_at_ms, engine
+        ) VALUES(?, ?, ?, 'active', 1, ?, ?, ?, NULL, NULL, ?)
       `)
       .run(
         input.taskId,
@@ -6075,6 +6557,7 @@ class SqliteGuildPersistence implements GuildPersistence {
         input.createdAtMs,
         input.at,
         input.at,
+        input.engine ?? "grok",
       );
   }
 
@@ -6757,14 +7240,17 @@ class SqliteGuildPersistence implements GuildPersistence {
     const rawModelId = optionalText(row, "model_id");
     const rawReasoningEffort = optionalText(row, "reasoning_effort");
     const rawContextWindow = optionalInteger(row, "context_window");
+    // The row is read together with its task's engine (a task without metadata counts as Grok).
+    const rawEngine = optionalText(row, "task_engine") ?? "grok";
     let modelId: GuildGrokModel | null;
     let reasoningEffort: GuildGrokReasoningEffort | null;
     let contextWindow: number | null;
     try {
-      modelId = rawModelId === undefined ? null : parseGuildGrokModel(rawModelId);
+      const engine = parseGuildEngine(rawEngine);
+      modelId = rawModelId === undefined ? null : parseGuildModelId(engine, rawModelId);
       reasoningEffort = rawReasoningEffort === undefined
         ? null
-        : parseGuildGrokReasoningEffort(rawReasoningEffort);
+        : parseGuildReasoningEffort(engine, rawReasoningEffort);
       contextWindow = rawContextWindow === undefined
         ? null
         : parseGuildGrokContextWindow(rawContextWindow);
@@ -6908,9 +7394,95 @@ class SqliteGuildPersistence implements GuildPersistence {
     });
   }
 
+  #pruneThinkingProvenance(keep: number): number {
+    const deleted = this.#database
+      .prepare(`
+        DELETE FROM thinking_provenance
+        WHERE rowid IN (
+          SELECT rowid FROM thinking_provenance
+          ORDER BY created_at_ms DESC, rowid DESC
+          LIMIT -1 OFFSET ?
+        )
+      `)
+      .run(keep);
+    return changes(deleted.changes);
+  }
+
+  #decodeModelSourceModels(json: string): readonly ModelSourceModel[] {
+    try {
+      return parseModelSourceModels(JSON.parse(json) as unknown);
+    } catch (cause: unknown) {
+      throw persistenceError("aggregate_integrity_failed", cause);
+    }
+  }
+
+  #decodeModelSourceRow(row: SqlRow): ModelSourceRecord {
+    const enabled = exactInteger(row, "enabled");
+    if (enabled !== 0 && enabled !== 1) throw persistenceError("aggregate_integrity_failed");
+    let draft: ModelSourceDraft;
+    try {
+      draft = parseModelSourceDraft({
+        id: exactText(row, "source_id"),
+        kind: exactText(row, "kind"),
+        label: exactText(row, "label"),
+        baseUrl: exactText(row, "base_url"),
+        keyFile: optionalText(row, "key_file") ?? null,
+        keyVariable: optionalText(row, "key_variable") ?? null,
+        models: JSON.parse(exactText(row, "models_json")) as unknown,
+        enabled: enabled === 1,
+      });
+    } catch (cause: unknown) {
+      if (cause instanceof PersistenceError) throw cause;
+      throw persistenceError("aggregate_integrity_failed", cause);
+    }
+    // Stored values are already canonical, and a confirmation always names the current address.
+    const confirmedHost = optionalText(row, "confirmed_host") ?? null;
+    if (
+      draft.baseUrl !== exactText(row, "base_url") ||
+      draft.label !== exactText(row, "label") ||
+      (confirmedHost !== null && confirmedHost !== modelSourceHost(draft.baseUrl))
+    ) {
+      throw persistenceError("aggregate_integrity_failed");
+    }
+    return freeze({
+      ...draft,
+      confirmedHost,
+      revision: exactInteger(row, "revision"),
+      createdAtMs: exactInteger(row, "created_at_ms"),
+      updatedAtMs: exactInteger(row, "updated_at_ms"),
+    });
+  }
+
+  #selectModelSource(sourceId: string): ModelSourceRecord | undefined {
+    const row = this.#database
+      .prepare("SELECT * FROM model_sources WHERE source_id = ?")
+      .get(sourceId);
+    return row === undefined ? undefined : this.#decodeModelSourceRow(row);
+  }
+
+  #requiredModelSource(sourceId: string): ModelSourceRecord {
+    const source = this.#selectModelSource(sourceId);
+    if (source === undefined) throw persistenceError("aggregate_not_found");
+    return source;
+  }
+
+  #decodeWorkspacePrefsRow(row: SqlRow): WorkspacePrefsRecord {
+    const dismissed = exactInteger(row, "online_reminder_dismissed");
+    if (dismissed !== 0 && dismissed !== 1) throw persistenceError("aggregate_integrity_failed");
+    return freeze({
+      workspaceId: exactText(row, "workspace_id"),
+      onlineReminderDismissed: dismissed === 1,
+    });
+  }
+
   #selectTaskRuntimeSettings(taskId: TaskId): TaskRuntimeSettingsRecord | undefined {
     const row = this.#database
-      .prepare("SELECT * FROM task_runtime_settings WHERE task_id = ?")
+      .prepare(`
+        SELECT settings.*, metadata.engine AS task_engine
+        FROM task_runtime_settings AS settings
+        LEFT JOIN task_metadata AS metadata ON metadata.task_id = settings.task_id
+        WHERE settings.task_id = ?
+      `)
       .get(taskId);
     return row === undefined ? undefined : this.#decodeTaskRuntimeSettingsRow(row);
   }
@@ -6944,12 +7516,22 @@ class SqliteGuildPersistence implements GuildPersistence {
     let grokModel: GuildGrokModel | null;
     let reasoningEffort: GuildGrokReasoningEffort | null;
     let permissionMode: GuildGrokPermissionMode;
+    let claudeModel: string | null;
+    let claudeEffort: string | null;
+    let claudePermissionMode: GuildClaudePermissionMode;
     try {
       const storedModel = exactText(row, "grok_model");
       const storedEffort = exactText(row, "reasoning_effort");
       grokModel = storedModel === "" ? null : parseGuildGrokModel(storedModel);
       reasoningEffort = storedEffort === "" ? null : parseGuildGrokReasoningEffort(storedEffort);
       permissionMode = parseGuildGrokPermissionMode(exactText(row, "permission_mode"));
+      const storedClaudeModel = exactText(row, "claude_model");
+      const storedClaudeEffort = exactText(row, "claude_effort");
+      claudeModel = storedClaudeModel === "" ? null : parseGuildModelId("claude", storedClaudeModel);
+      claudeEffort = storedClaudeEffort === ""
+        ? null
+        : parseGuildReasoningEffort("claude", storedClaudeEffort);
+      claudePermissionMode = parseGuildClaudePermissionMode(exactText(row, "claude_permission_mode"));
     } catch (cause: unknown) {
       throw persistenceError("aggregate_integrity_failed", cause);
     }
@@ -7004,6 +7586,9 @@ class SqliteGuildPersistence implements GuildPersistence {
       reasoningEffort,
       permissionMode,
       startup,
+      claudeModel,
+      claudeEffort,
+      claudePermissionMode,
       sidebarWidth,
       browserSyncEnabled: browserSync === 1,
       nickname,
