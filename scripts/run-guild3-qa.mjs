@@ -13,11 +13,13 @@
  * Guild reads the key file itself. This script reads the two key values only to prove that no copy
  * of them landed in the data directory or the logs (in memory, booleans and counts only).
  *
- * Checks: A Grok queued turns, B Claude file task + restart/resume, C Opus -> DeepSeek, one way (the
- * Claude rows are disabled afterwards, the router refuses claude-* models and never sees a Claude
- * credential), D Local model, E browser pane + agent tools + take over (on a fresh native Claude task,
- * the checked one has left the subscription for good), F settings tabs, G reduced capability
- * (usage popover), H permission card lifecycle after a UI approval.
+ * Checks: A Grok queued turns, B Claude file task + restart/resume, C Opus -> DeepSeek -> Opus 5.5, two-way
+ * (the "Restarts" tags sit on the rows of the other mode, the switching status shows while the engine
+ * restarts, the way back runs a native process with no router variable and recalls the DeepSeek turn,
+ * and the router never serves Anthropic, a claude-* model or a Claude credential), D Opus -> Local model
+ * (cross-mode again, no Online reminder), E browser pane + agent tools + take over (on a fresh native
+ * Claude task), F settings tabs, G reduced capability (usage popover), H permission card lifecycle after
+ * a UI approval.
  * Environment: GUILD_QA_STAMP (reuse a run), GUILD_QA_ONLY=A,B (subset), GUILD_QA_KEEP_APP=1.
  *
  * Usage: node scripts/run-guild3-qa.mjs
@@ -420,9 +422,95 @@ async function pickModel(check, namePattern) {
     group: (group.querySelector(".guild-model-heading")?.textContent || "").trim(),
     rows: [...group.querySelectorAll(".guild-model-row")].map((row) => (row.querySelector("strong")?.textContent || row.textContent || "").trim()),
   }))`);
+  const tags = await readPickerTags();
   await shot(check, `picker-before-${namePattern.replace(/^\^\\s\*/u, "")}`);
   await clickDom(".guild-model-row", namePattern);
-  return { triggerBefore: trigger.text, groups: rows };
+  return { triggerBefore: trigger.text, groups: rows, tags };
+}
+
+/**
+ * What the open picker says about restarts (D-062): per group and row whether it carries the muted tag, that the tag
+ * is aria-hidden, the tooltip and the accessible description of the row, and the same for "Use default".
+ */
+const readPickerTags = () => cdp.evaluate(`(() => {
+  const described = (row) => {
+    const id = row.getAttribute("aria-describedby");
+    return id ? (document.getElementById(id)?.textContent || "").trim() : "";
+  };
+  const useDefault = document.querySelector(".guild-model-use-default");
+  return {
+    groups: [...document.querySelectorAll(".guild-model-group")].map((group) => ({
+      group: (group.querySelector(".guild-model-heading")?.textContent || "").trim(),
+      rows: [...group.querySelectorAll(".guild-model-row")].map((row) => {
+        const tag = row.querySelector(".guild-model-restart-tag");
+        return {
+          name: (row.querySelector("strong")?.textContent || "").trim(),
+          tagged: tag !== null,
+          tagText: tag === null ? "" : (tag.textContent || "").trim(),
+          tagAriaHidden: tag !== null && tag.getAttribute("aria-hidden") === "true",
+          title: row.getAttribute("title") || "",
+          description: described(row),
+          disabled: row.getAttribute("aria-disabled") === "true" || row.classList.contains("locked"),
+        };
+      }),
+    })),
+    useDefault: useDefault === null ? null : { tagged: useDefault.querySelector(".guild-model-restart-tag") !== null, title: useDefault.getAttribute("title") || "" },
+    groupNotes: document.querySelectorAll(".guild-model-group-note").length,
+  };
+})()`);
+
+const groupMode = (heading) => /online|local|在线|本地/iu.test(heading) ? "routed" : "native";
+
+/**
+ * The rows of the other mode carry the tag, the rows of the task's own mode do not, nothing is disabled and no note
+ * explains a lock (there is none any more).
+ */
+function assertRestartTags(tags, taskMode, label) {
+  const problems = [];
+  for (const group of tags.groups) {
+    const crosses = groupMode(group.group) !== taskMode;
+    for (const row of group.rows) {
+      if (row.tagged !== crosses) problems.push(`${group.group}/${row.name}: tagged=${row.tagged}, expected ${crosses}`);
+      if (row.disabled) problems.push(`${group.group}/${row.name}: disabled`);
+      if (crosses && !(row.tagText === "Restarts" || row.tagText === "需重启")) problems.push(`${group.group}/${row.name}: tag text ${JSON.stringify(row.tagText)}`);
+      if (crosses && !row.tagAriaHidden) problems.push(`${group.group}/${row.name}: tag is not aria-hidden`);
+      if (crosses && !/restarts? claude code|重启 claude code/iu.test(row.title)) problems.push(`${group.group}/${row.name}: no tooltip`);
+      if (crosses && !/restarts? claude code|重启 claude code/iu.test(row.description)) problems.push(`${group.group}/${row.name}: no accessible description`);
+    }
+  }
+  if (tags.groups.every((group) => group.rows.length === 0)) problems.push("the picker lists no row");
+  if (tags.groupNotes !== 0) problems.push("a lock note is still shown");
+  if (tags.useDefault !== null && tags.useDefault.tagged !== (taskMode === "routed")) problems.push(`Use default tagged=${tags.useDefault.tagged}`);
+  if (problems.length > 0) throw new Error(`restart tags wrong (${label}): ${safeText(problems.join("; "), 360)}`);
+}
+
+/**
+ * A cross-mode switch is running (D-062): the picker trigger spins and says Switching, and one status line above
+ * the composer hints names the target and says the engine restarts. Waits until the line is gone and fails if it
+ * turned into the failure message.
+ */
+async function observeSwitching(check, label, targetPattern) {
+  const line = await until("switching status line", async () => {
+    const value = await cdp.evaluate(`(() => {
+      const element = document.querySelector(".guild-composer-switch.switching");
+      return element ? { text: (element.textContent || "").trim(), role: element.getAttribute("role") } : null;
+    })()`);
+    return value ?? undefined;
+  }, { timeout: 40_000, interval: 100 });
+  const trigger = await cdp.evaluate(`({
+    text: (document.querySelector(".guild-model-picker-trigger")?.textContent || "").trim(),
+    spinner: document.querySelector(".guild-model-picker-trigger .guild-spin") !== null,
+  })`);
+  const screenshot = await shot(check, label);
+  const observed = { statusLine: safeText(line.text, 240), statusRole: line.role, triggerText: trigger.text, triggerSpinner: trigger.spinner, screenshot };
+  if (!new RegExp(targetPattern, "iu").test(line.text) || !/restart|重启/iu.test(line.text) || !/30.{1,3}90/u.test(line.text)) {
+    throw new Error(`the switching status line is wrong: ${JSON.stringify(observed)}`);
+  }
+  if (!/switching|切换中/iu.test(trigger.text) || !trigger.spinner) throw new Error(`the picker trigger does not show the switch: ${JSON.stringify(observed)}`);
+  await until("switching status line gone", async () => !(await domExists(".guild-composer-switch.switching")), { timeout: 240_000, interval: 400 });
+  const failure = await cdp.evaluate(`document.querySelector(".guild-composer-switch.failed")?.textContent?.trim() ?? null`);
+  if (failure !== null) throw new Error(`the switch failed: ${safeText(failure, 200)}`);
+  return observed;
 }
 
 async function waitSelection(taskId, modelPattern, { timeout = 120_000 } = {}) {
@@ -639,7 +727,6 @@ async function checkB(record) {
   if (!details.nativeNoRouterToken) throw new Error("native Claude session has an ANTHROPIC_AUTH_TOKEN");
   const engineStatus = turn.view.engineStatus ?? {};
   details.accountLabelPresent = typeof engineStatus.accountLabel === "string" && engineStatus.accountLabel.length > 0;
-  details.routedFlag = engineStatus.routed === true;
   const before = claudeTranscripts();
   details.transcriptsBeforeRestart = before.length;
 
@@ -678,39 +765,84 @@ async function checkB(record) {
   return details;
 }
 
+/** The Claude process the app runs for the task now, and what its environment says (booleans only). */
+function adapterEnvironment(pid) {
+  return {
+    pid,
+    baseUrlSet: processEnvHas(pid, "ANTHROPIC_BASE_URL"),
+    authTokenSet: processEnvHas(pid, "ANTHROPIC_AUTH_TOKEN"),
+    // Claude Code sends this throwaway token to the router, never its subscription token (D-061).
+    authTokenIsRouterToken: processEnvValueStartsWith(pid, "ANTHROPIC_AUTH_TOKEN", "guild-router-"),
+    apiKeySet: processEnvHas(pid, "ANTHROPIC_API_KEY"),
+    nonessentialTrafficOff: processEnvValueIs(pid, "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1"),
+    subagentOnRoutedModel: processEnvValueIs(pid, "CLAUDE_CODE_SUBAGENT_MODEL", "deepseek-v4-flash"),
+    smallFastOnRoutedModel: processEnvValueIs(pid, "ANTHROPIC_SMALL_FAST_MODEL", "deepseek-v4-flash"),
+    toolSearch: processEnvValueIs(pid, "ENABLE_TOOL_SEARCH", "true"),
+    captureOff: processEnvValueIs(pid, "OPENVIKING_AUTO_CAPTURE", "false"),
+  };
+}
+
+/** Waits for the app to run a Claude process other than `previousPid` (a mode switch replaced it). */
+async function waitForNewAdapter(previousPid) {
+  return until("a new Claude process after the switch", async () => {
+    const adapter = adapterProcess();
+    return adapter !== undefined && adapter.pid !== previousPid ? adapter : undefined;
+  }, { timeout: 120_000, interval: 500 });
+}
+
+function routerSummary() {
+  const events = routerEvents().filter((entry) => entry.event === "router.request");
+  const byModel = (pattern) => events.filter((entry) => pattern.test(String(entry.fields.model ?? "")));
+  const deepseek = byModel(/deepseek/iu);
+  const claudeModels = byModel(/^claude-/iu);
+  return {
+    requests: events.length,
+    deepseekRequests: deepseek.length,
+    deepseekAuthInAndReplaced: deepseek.filter((entry) => entry.fields.authIn === true && entry.fields.authReplaced === true).length,
+    deepseekFromOtherSource: deepseek.filter((entry) => entry.fields.source !== "deepseek").length,
+    deepseekOk: deepseek.filter((entry) => entry.fields.status === 200).length,
+    anthropicSourceRequests: events.filter((entry) => entry.fields.source === "anthropic").length,
+    claudeModelRequests: claudeModels.length,
+    claudeModelRequestsAnswered2xx: claudeModels.filter((entry) => entry.fields.status >= 200 && entry.fields.status < 300).length,
+    anthropicCredentialRejections: events.filter((entry) => entry.fields.outcome === "anthropic_credential_rejected").length,
+    thirdPartyWithoutKeyReplacement: events.filter((entry) => entry.fields.source !== "none" && entry.fields.authReplaced !== true && entry.fields.route === "messages").length,
+    unknownModelRejections: events.filter((entry) => entry.fields.outcome === "unknown_model").length,
+  };
+}
+
+async function closePicker() {
+  await cdp.evaluate(`document.querySelector(".guild-model-picker")?.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }))`);
+  await sleep(300);
+}
+
 async function checkC() {
   const taskId = state.claudeTaskId;
   await call("openTask", { taskId });
   const details = {};
+
+  // 1. Opus (native) -> DeepSeek (routed). The task has run on the subscription: the Online and Local rows carry the Restarts tag.
   const picked = await pickModel("C", "^\\s*DeepSeek V4 Flash");
   details.pickerGroups = picked.groups;
-  const dialog = await until("one-way and online reminder dialog", async () => (await domExists(".guild-online-reminder")) ? true : undefined, { timeout: 15_000 });
-  void dialog;
-  // The task has run on the subscription, so the first switch carries both messages in ONE dialog (D-061, PC-PRIV-001).
+  details.pickerTagsOnNativeTask = picked.tags;
+  assertRestartTags(picked.tags, "native", "native task, Online and Local rows");
+  // The Online reminder is the only dialog now: no one-way notice, no local-relay text.
+  await until("online reminder dialog", async () => (await domExists(".guild-online-reminder")) ? true : undefined, { timeout: 15_000 });
   details.reminderTitle = safeText(await domText(".guild-online-reminder .guild-dialog-header"), 160);
   details.reminderBody = safeText(await domText(".guild-online-reminder-body"), 600);
   details.dialogCount = await cdp.evaluate(`document.querySelectorAll(".guild-online-reminder").length`);
-  await shot("C", "one-way-and-online-reminder-dialog");
+  await shot("C", "online-reminder-dialog");
   if (details.dialogCount !== 1) throw new Error(`expected one dialog, found ${details.dialogCount}`);
-  if (!/switch back to a Claude subscription/iu.test(details.reminderTitle)) throw new Error("the dialog does not say the switch is one way");
-  if (!/local relay/iu.test(details.reminderBody) || !/DeepSeek/u.test(details.reminderBody)) throw new Error("the dialog lacks the one-way text or the vendor");
+  if (!/DeepSeek/u.test(details.reminderTitle) || !/CLAUDE\.md/u.test(details.reminderBody)) throw new Error("the dialog is not the Online reminder for DeepSeek");
+  if (/switch back to a Claude subscription|local relay|cannot go back|不能再切回/iu.test(`${details.reminderTitle} ${details.reminderBody}`)) throw new Error("the dialog still carries the one-way text");
+  const nativePid = adapterProcess()?.pid;
   await clickDom(".guild-online-reminder .guild-dialog-footer button.primary");
-  const routedView = await waitSelection(taskId, "deepseek-v4-flash", { timeout: 180_000 });
-  details.routedFlag = routedView.engineStatus?.routed === true;
-  const adapter = adapterProcess();
-  details.routedEnv = adapter === undefined ? "adapter missing" : {
-    baseUrlSet: processEnvHas(adapter.pid, "ANTHROPIC_BASE_URL"),
-    // Claude Code sends this throwaway token to the router, never its subscription token (D-061).
-    authTokenIsRouterToken: processEnvValueStartsWith(adapter.pid, "ANTHROPIC_AUTH_TOKEN", "guild-router-"),
-    noApiKey: !processEnvHas(adapter.pid, "ANTHROPIC_API_KEY"),
-    nonessentialTrafficOff: processEnvValueIs(adapter.pid, "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1"),
-    subagentOnRoutedModel: processEnvValueIs(adapter.pid, "CLAUDE_CODE_SUBAGENT_MODEL", "deepseek-v4-flash"),
-    smallFastOnRoutedModel: processEnvValueIs(adapter.pid, "ANTHROPIC_SMALL_FAST_MODEL", "deepseek-v4-flash"),
-    toolSearch: processEnvValueIs(adapter.pid, "ENABLE_TOOL_SEARCH", "true"),
-    captureOff: processEnvValueIs(adapter.pid, "OPENVIKING_AUTO_CAPTURE", "false"),
-  };
+  details.switchToDeepSeek = await observeSwitching("C", "switching-status-to-deepseek", "DeepSeek V4 Flash");
+  await waitSelection(taskId, "deepseek-v4-flash", { timeout: 180_000 });
+  details.routedMarkerLogged = readLines(join(dataDir, "diagnostics", "runtime.jsonl")).some((entry) => entry.event === "task_routed" && entry.taskId === taskId);
+  const routedAdapter = await waitForNewAdapter(nativePid);
+  details.routedEnv = adapterEnvironment(routedAdapter.pid);
   const env = details.routedEnv;
-  if (typeof env === "string" || !env.baseUrlSet || !env.authTokenIsRouterToken || !env.noApiKey || !env.nonessentialTrafficOff || !env.subagentOnRoutedModel || !env.smallFastOnRoutedModel) {
+  if (!env.baseUrlSet || !env.authTokenIsRouterToken || env.apiKeySet || !env.nonessentialTrafficOff || !env.subagentOnRoutedModel || !env.smallFastOnRoutedModel || !env.captureOff) {
     throw new Error(`the routed process environment is wrong: ${JSON.stringify(env)}`);
   }
   await shot("C", "deepseek-selected");
@@ -725,67 +857,85 @@ async function checkC() {
   if (!/DONE/u.test(reply)) throw new Error("DeepSeek reply lacks DONE");
   if (tools.length === 0 || !tools.some((item) => item.toolStatus === "completed")) throw new Error("DeepSeek turn used no completed tool");
 
-  // One way: the Claude rows are shown disabled with the note, a click on one changes nothing, and the main process refuses the choice.
+  // 2. On the routed task the Claude rows are ordinary rows again, tagged, and so is "Use default"; nothing is locked.
   await clickDom(".guild-model-picker-trigger");
   await until("model popover", () => domExists(".guild-model-popover"), { timeout: 10_000 });
   await sleep(300);
-  details.lockedClaudeRows = await cdp.evaluate(`document.querySelectorAll(".guild-model-row.locked[aria-disabled='true']").length`);
-  details.lockedClaudeNote = safeText(await domText(".guild-model-group-note"), 200);
-  await shot("C", "claude-rows-disabled-after-routing");
-  if (details.lockedClaudeRows === 0 || !/cannot go back to a Claude subscription/iu.test(details.lockedClaudeNote)) throw new Error("the Claude rows of a routed task are not disabled with the note");
-  await clickDom(".guild-model-row.locked");
-  await sleep(1500);
-  const stillRouted = await call("openTask", { taskId });
-  details.selectionAfterClickOnLockedRow = stillRouted.modelSelection.modelId;
-  if (stillRouted.modelSelection.modelId !== "deepseek-v4-flash") throw new Error("a click on a disabled Claude row changed the selection");
-  await cdp.evaluate(`document.querySelector(".guild-model-picker")?.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }))`);
-  const refused = await call("setTaskRuntimeSettings", { taskId, model: "opus", reasoningEffort: null });
-  details.mainRefusal = { status: refused.status, reason: refused.reason ?? null };
-  if (refused.status !== "refused" || refused.reason !== "claude_locked") throw new Error(`main did not refuse a Claude model for a routed task: ${JSON.stringify(details.mainRefusal)}`);
+  details.pickerTagsOnRoutedTask = await readPickerTags();
+  assertRestartTags(details.pickerTagsOnRoutedTask, "routed", "routed task, Claude rows");
+  await shot("C", "claude-rows-restart-tags-on-routed-task");
+  await closePicker();
 
-  // The conversation continues on the third-party model, with what the Claude turns said before the switch.
+  // 3. The conversation continues on the third-party model with what the Claude turns said, and DeepSeek makes up a code word.
   const recall = await sendAndWait("C", taskId, "Without using any tools: what does hello.txt contain? Answer in one short sentence.", { timeout: 360_000 });
   const recallReply = assistantTextOf(recall.view, recall.runId);
   details.recallReplyTail = safeText(recallReply.slice(-200), 200);
   if (!/\bhi\b/iu.test(recallReply)) throw new Error("DeepSeek did not recall hello.txt from the Claude turns");
+  const codeTurn = await sendAndWait("C", taskId, "Without using any tools, make up one random code word of eight lowercase letters and reply with exactly: CODE=<word>", { timeout: 360_000 });
+  const codeReply = assistantTextOf(codeTurn.view, codeTurn.runId);
+  const codeWord = /CODE=\s*([A-Za-z]{6,12})/u.exec(codeReply)?.[1]?.toLowerCase();
+  details.codeWordMadeByDeepSeek = codeWord !== undefined;
+  if (codeWord === undefined) throw new Error(`DeepSeek did not answer with CODE=<word>: ${safeText(codeReply.slice(-120), 120)}`);
+  const routerBeforeBack = routerSummary();
 
-  // Router log proof: only third-party sources; nothing went to Anthropic and no Claude credential ever reached the router.
-  const events = routerEvents().filter((entry) => entry.event === "router.request");
-  const byModel = (pattern) => events.filter((entry) => pattern.test(String(entry.fields.model ?? "")));
-  const deepseek = byModel(/deepseek/iu);
-  const claudeModels = byModel(/^claude-/iu);
-  details.router = {
-    requests: events.length,
-    deepseekRequests: deepseek.length,
-    deepseekAuthInAndReplaced: deepseek.filter((entry) => entry.fields.authIn === true && entry.fields.authReplaced === true).length,
-    deepseekFromOtherSource: deepseek.filter((entry) => entry.fields.source !== "deepseek").length,
-    deepseekOk: deepseek.filter((entry) => entry.fields.status === 200).length,
-    anthropicSourceRequests: events.filter((entry) => entry.fields.source === "anthropic").length,
-    claudeModelRequests: claudeModels.length,
-    claudeModelRequestsAnswered2xx: claudeModels.filter((entry) => entry.fields.status >= 200 && entry.fields.status < 300).length,
-    anthropicCredentialRejections: events.filter((entry) => entry.fields.outcome === "anthropic_credential_rejected").length,
-    thirdPartyWithoutKeyReplacement: events.filter((entry) => entry.fields.source !== "none" && entry.fields.authReplaced !== true && entry.fields.route === "messages").length,
-    unknownModelRejections: events.filter((entry) => entry.fields.outcome === "unknown_model").length,
-  };
-  const r = details.router;
+  // 4. DeepSeek (routed) -> Opus 5.5 (native): the process is replaced, runs with no router variable, and resumes the session.
+  const routedPid = adapterProcess()?.pid;
+  const back = await pickModel("C", "^\\s*Opus \\d");
+  details.pickerGroupsOnRoutedTask = back.groups;
+  details.switchBackToOpus = await observeSwitching("C", "switching-status-to-opus", "Opus");
+  await waitSelection(taskId, "opus", { timeout: 240_000 });
+  const nativeAdapter = await waitForNewAdapter(routedPid);
+  details.nativeEnvAfterSwitchBack = adapterEnvironment(nativeAdapter.pid);
+  const native = details.nativeEnvAfterSwitchBack;
+  // The dev capture hook of this script also sets the capture variable for native spawns; the marker path alone is covered by unit tests.
+  if (native.baseUrlSet || native.authTokenSet || native.apiKeySet || !native.captureOff) {
+    throw new Error(`the native process after the switch back is wrong: ${JSON.stringify(native)}`);
+  }
+  await shot("C", "opus-selected-after-switch-back");
+  const opusTurn = await sendAndWait("C", taskId, "Without using any tools: what eight-letter code word did the assistant make up in its CODE= reply earlier in this conversation? Reply with just that word, then OPUS-BACK-OK.", { timeout: 420_000 });
+  const opusReply = assistantTextOf(opusTurn.view, opusTurn.runId);
+  details.opusReplyTail = safeText(opusReply.slice(-200), 200);
+  details.opusRecalledDeepSeekCode = opusReply.toLowerCase().includes(codeWord);
+  details.opusSessionKept = !opusTurn.view.timeline.some((item) => item.kind === "notice" && item.noticeType === "session_restored");
+  await shot("C", "opus-recalls-deepseek-turn");
+  if (!details.opusRecalledDeepSeekCode) throw new Error("Opus did not recall the code word of the DeepSeek turn");
+  if (!details.opusSessionKept) throw new Error("the session was replaced, not resumed, by the switch back");
+
+  // 5. Router log proof: only third-party sources; nothing went to Anthropic, no claude-* model, no Claude credential, and
+  // the native Opus turn made no router request at all.
+  const r = routerSummary();
+  details.router = r;
+  details.routerRequestsDuringOpusTurn = r.requests - routerBeforeBack.requests;
   if (r.deepseekRequests === 0 || r.deepseekAuthInAndReplaced !== r.deepseekRequests) throw new Error(`DeepSeek requests lack authIn/authReplaced: ${JSON.stringify(r)}`);
   if (r.deepseekFromOtherSource !== 0) throw new Error("a DeepSeek model id was routed to another source");
   if (r.anthropicSourceRequests !== 0) throw new Error(`a request was served by Anthropic: ${JSON.stringify(r)}`);
-  if (r.claudeModelRequestsAnswered2xx !== 0) throw new Error(`a claude-* model request was served: ${JSON.stringify(r)}`);
+  if (r.claudeModelRequests !== 0) throw new Error(`a claude-* model request reached the router: ${JSON.stringify(r)}`);
   if (r.anthropicCredentialRejections !== 0) throw new Error(`a Claude credential reached the router: ${JSON.stringify(r)}`);
   if (r.thirdPartyWithoutKeyReplacement !== 0) throw new Error("a third-party request went out without key replacement");
+  if (details.routerRequestsDuringOpusTurn !== 0) throw new Error(`the native Opus turn made ${details.routerRequestsDuringOpusTurn} router requests`);
   return details;
 }
 
 async function checkD() {
+  // The task of check C is back on Opus 5.5 (native): the switch to the Local model crosses the boundary again.
   const taskId = state.claudeTaskId;
   await call("openTask", { taskId });
   const details = {};
-  await pickModel("D", "^\\s*Local Model 27B");
+  const nativePid = adapterProcess()?.pid;
+  const picked = await pickModel("D", "^\\s*Local Model 27B");
+  details.pickerTagsOnNativeTask = picked.tags;
+  assertRestartTags(picked.tags, "native", "native task, Online and Local rows");
   await sleep(1000);
   details.reminderShown = await domExists(".guild-online-reminder");
   if (details.reminderShown) throw new Error("a Local model asked for the Online reminder");
+  details.switchToLocal = await observeSwitching("D", "switching-status-to-local", "Local Model");
   await waitSelection(taskId, "local-27b-model", { timeout: 180_000 });
+  const routedAdapter = await waitForNewAdapter(nativePid);
+  const routedEnv = adapterEnvironment(routedAdapter.pid);
+  details.routedEnvForLocal = { baseUrlSet: routedEnv.baseUrlSet, authTokenIsRouterToken: routedEnv.authTokenIsRouterToken, apiKeySet: routedEnv.apiKeySet, captureOff: routedEnv.captureOff };
+  if (!routedEnv.baseUrlSet || !routedEnv.authTokenIsRouterToken || routedEnv.apiKeySet || !routedEnv.captureOff) {
+    throw new Error(`the routed process for the Local model is wrong: ${JSON.stringify(details.routedEnvForLocal)}`);
+  }
   await shot("D", "local-selected");
   const startedAt = Date.now();
   const turn = await sendAndWait("D", taskId, "Reply with exactly: LOCAL-QA-OK", { timeout: 420_000 });
@@ -806,8 +956,8 @@ async function checkD() {
 }
 
 async function checkE() {
-  // The browser tools belong to the Claude engine, not to routing. The task checked above has left the Claude
-  // subscription for good (D-061), so the agent drives the pane from a fresh native Claude task on Opus.
+  // The browser tools belong to the Claude engine, not to routing. The task of checks C and D runs on the Local model
+  // now, so the agent drives the pane from a fresh native Claude task on Opus.
   const created = await call("createTask", { workspaceId, engine: "claude" });
   const taskId = created.task.taskId;
   await call("openTask", { taskId });
@@ -1104,13 +1254,13 @@ async function main() {
   await runCheck("A", "Grok: two queued turns in one session", checkA);
   await runCheck("B", "Claude: file task, permission card, restart and resume", checkB);
   if (state.claudeTaskId === undefined || results.find((entry) => entry.id === "B")?.status !== "pass") {
-    for (const [id, title] of [["C", "Opus -> DeepSeek, one way"], ["D", "Local model"], ["E", "Browser pane"]]) {
+    for (const [id, title] of [["C", "Opus -> DeepSeek -> Opus 5.5, two-way"], ["D", "Opus -> Local model"], ["E", "Browser pane"]]) {
       skip(id, title, "blocked: check B did not pass");
     }
   } else {
     await runCheck("G1", "Reduced capability: usage popover (native session)", () => checkG("G1", "native"));
-    await runCheck("C", "Opus -> DeepSeek, one way: dialog, env, disabled Claude rows, router proof", checkC);
-    await runCheck("D", "Local Model 27B, no duplicated text", checkD);
+    await runCheck("C", "Opus -> DeepSeek -> Opus 5.5, two-way: Restarts tags, switching status, env, recall, router proof", checkC);
+    await runCheck("D", "Opus -> Local Model 27B (cross-mode, no Online reminder), no duplicated text", checkD);
     await runCheck("E", "Browser pane: navigate, agent tools, take over, resume", checkE);
   }
   await runCheck("F", "Settings: Engines and Model sources tabs", checkF);
