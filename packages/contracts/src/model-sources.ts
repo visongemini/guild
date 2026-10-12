@@ -278,7 +278,9 @@ export type ModelSourceTestRefusal =
   /** The key variable has no usable value in the key file. */
   | "key_unavailable"
   /** The address breaks a rule the router also enforces (a forbidden host or address, https for Online). */
-  | "address_not_allowed";
+  | "address_not_allowed"
+  /** The variable holds an Anthropic credential, which no model source may use. */
+  | "key_not_allowed";
 
 export type TestModelSourceResponse = Readonly<{
   id: string;

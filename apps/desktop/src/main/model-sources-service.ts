@@ -186,7 +186,11 @@ export function createModelSourcesService(options: ModelSourcesServiceOptions): 
       ...(port.timeoutMs === undefined ? {} : { timeoutMs: port.timeoutMs }),
       ...(port.logger === undefined ? {} : { logger: port.logger }),
     });
-    if ("refused" in probed) return refused(probed.refused === "source_not_confirmed" ? "not_confirmed" : "address_not_allowed");
+    if ("refused" in probed) {
+      return refused(probed.refused === "source_not_confirmed"
+        ? "not_confirmed"
+        : probed.refused === "anthropic_key_denied" ? "key_not_allowed" : "address_not_allowed");
+    }
     return Object.freeze({ id, results: Object.freeze(probed.models.map((entry) => Object.freeze({ modelId: entry.modelId, outcome: entry.outcome }))) });
   }
 
@@ -234,10 +238,13 @@ export function createModelSourcesService(options: ModelSourcesServiceOptions): 
       const port = options.connectionTest;
       if (port === undefined) return Promise.reject(failure("unavailable"));
       // One test per source at a time: a second click while it runs joins the first.
-      const running = tests.get(id);
+      // The key is the source at its current revision: an edit or a confirmation made while a test runs
+      // starts a new test of the new source instead of joining the one that used the old one.
+      const key = `${id}:${store.loadModelSource(id)?.revision ?? "none"}`;
+      const running = tests.get(key);
       if (running !== undefined) return running;
-      const operation = testFresh(id, port).finally(() => tests.delete(id));
-      tests.set(id, operation);
+      const operation = testFresh(id, port).finally(() => tests.delete(key));
+      tests.set(key, operation);
       return operation;
     },
 

@@ -109,6 +109,8 @@ export function ModelSourcesSettings({ messages, api, onChanged, initialSources,
   const [confirmingId, setConfirmingId] = useState<string>();
   const [deleteTargetId, setDeleteTargetId] = useState<string>();
   const [tests, setTests] = useState<Readonly<Record<string, SourceTestState>>>(initialTests ?? {});
+  /** Bumped whenever a source's result is forgotten: an answer that arrives for an older test is dropped. */
+  const testEpoch = useRef<Record<string, number>>({});
   const alive = useRef(true);
   const latestOnChanged = useRef(onChanged);
   latestOnChanged.current = onChanged;
@@ -180,20 +182,25 @@ export function ModelSourcesSettings({ messages, api, onChanged, initialSources,
   }
 
   /** A source that changed or went away has no result to show: what was tested is not what is stored now. */
-  const forgetTest = (id: string) => setTests((current) => {
-    if (!(id in current)) return current;
-    const { [id]: _gone, ...rest } = current;
-    return rest;
-  });
+  const forgetTest = (id: string) => {
+    testEpoch.current[id] = (testEpoch.current[id] ?? 0) + 1;
+    setTests((current) => {
+      if (!(id in current)) return current;
+      const { [id]: _gone, ...rest } = current;
+      return rest;
+    });
+  };
 
   async function runTest(source: ModelSourceProjection) {
     if (tests[source.id]?.state === "running") return;
     setTests((current) => ({ ...current, [source.id]: Object.freeze({ state: "running" as const }) }));
+    const epoch = testEpoch.current[source.id] ?? 0;
+    const stillWanted = () => alive.current && (testEpoch.current[source.id] ?? 0) === epoch;
     try {
       const response = await api.testModelSource({ id: source.id });
-      if (alive.current) setTests((current) => ({ ...current, [source.id]: Object.freeze({ state: "done" as const, response }) }));
+      if (stillWanted()) setTests((current) => ({ ...current, [source.id]: Object.freeze({ state: "done" as const, response }) }));
     } catch {
-      if (alive.current) setTests((current) => ({ ...current, [source.id]: Object.freeze({ state: "failed" as const }) }));
+      if (stillWanted()) setTests((current) => ({ ...current, [source.id]: Object.freeze({ state: "failed" as const }) }));
     }
   }
 
@@ -474,7 +481,7 @@ export function ModelSourcesSettings({ messages, api, onChanged, initialSources,
                       ? <><SpinnerGap size={13} className="guild-spin" aria-hidden="true" />{messages.sourcesTesting}</>
                       : messages.sourcesTest}</button>
                   )
-                  : <span className="guild-source-test-hint">{messages.sourcesTestNeedsConfirm}</span>}
+                  : <span className="guild-source-test-hint">{source.enabled ? messages.sourcesTestNeedsConfirm : messages.sourcesTestNeedsEnable}</span>}
                 <button type="button" className="guild-soft-button" onClick={() => { setNotice(undefined); setSaveFailure(undefined); setIssues([]); forgetTest(source.id); setForm(formFromSource(source)); }}>{messages.sourcesEdit}</button>
                 <button type="button" className="guild-soft-button" onClick={() => { setNotice(undefined); setDeleteTargetId(source.id); }}>{messages.delete}</button>
               </div>

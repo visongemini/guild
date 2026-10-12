@@ -1675,6 +1675,8 @@ type World = {
   onSpawn: ((input: Parameters<RuntimeFactory>[0]) => Promise<void>) | undefined;
   /** Called after a config option was applied on any adapter of the world. */
   onConfigOption: ((adapterLabel: string, configId: string, value: string | boolean) => Promise<void>) | undefined;
+  /** Called as a prompt reaches any adapter of the world, before it is answered. */
+  onPrompt: ((text: string) => void) | undefined;
 };
 
 type Harness = Awaited<ReturnType<typeof harness>>;
@@ -1737,7 +1739,7 @@ function bindRouter(router: ModelRouterHostPort | undefined, world: World): void
 }
 
 function newWorld(): World {
-  return { log: [], adapters: [], inputs: [], onSpawn: undefined, onConfigOption: undefined };
+  return { log: [], adapters: [], inputs: [], onSpawn: undefined, onConfigOption: undefined, onPrompt: undefined };
 }
 
 function engineFactory(world: World, specs: Partial<Record<GuildEngine, EngineSpec>>): RuntimeFactory {
@@ -1999,6 +2001,7 @@ class EngineFake implements RuntimeAdapterPort {
 
   async prompt(session: AcpV1AdapterSession, text: string): Promise<RuntimePromptTerminalPayload> {
     this.prompts.push(text);
+    this.world.onPrompt?.(text);
     this.note(`prompt:${text}`);
     const turnModel = sessionSelectionOf(this.options).modelId;
     if (turnModel !== undefined) {
@@ -2214,11 +2217,18 @@ describe("which model answered each turn [PC-CONV-001, PC-MODEL-001]", () => {
     return runs.map((runId, index) => [`turn ${index + 1}`, byRun.get(runId)]);
   };
 
-  it("names the model each Run started on, a source's label for a routed model, and keeps it across a restart", async () => {
+  it("names the model each Run started on, the routed model's own name, and keeps it across a restart", async () => {
     const router = new FakeRouterHost([DEEPSEEK, LOCAL_MODEL]);
-    const h = await harness({ modelRouterHost: router });
+    let store!: GuildPersistence;
+    const h = await harness({ modelRouterHost: router }, {}, (path) => {
+      store = openGuildPersistence({ path });
+      return store;
+    });
     const task = await h.service.createTask(h.workspaceId, undefined, "claude");
     const taskId = task.task.taskId;
+    // The label is written before the prompt reaches the engine, so a turn that dies at once still has its model.
+    const labelsAtPrompt: number[] = [];
+    h.world.onPrompt = () => { labelsAtPrompt.push(store.listRunModelLabels(taskId).length); };
 
     // The Default row stands for the model the adapter says (here its description), so that is the name.
     await h.send(taskId, "first");
@@ -2233,13 +2243,14 @@ describe("which model answered each turn [PC-CONV-001, PC-MODEL-001]", () => {
     await h.idle();
     assert.deepEqual(await labels(h, taskId), [["turn 1", "Opus 5.5"], ["turn 2", "sonnet"]]);
 
-    // A routed model is named by its source's label.
+    // A routed model is named by the model's own name; its source's label is only the picker's description of it.
     assert.equal((await h.service.setTaskRuntimeSettings({ taskId, model: "deepseek-v4-flash", reasoningEffort: null, contextWindow: null })).status, "applied");
     await h.send(taskId, "third");
     await h.completed(3);
     await h.idle();
     const expected: Array<[string, string | undefined]> = [["turn 1", "Opus 5.5"], ["turn 2", "sonnet"], ["turn 3", "DeepSeek V4 Flash"]];
     assert.deepEqual(await labels(h, taskId), expected);
+    assert.deepEqual(labelsAtPrompt, [1, 2, 3], "each turn's label existed when its prompt went out");
 
     // The record is persistent data, not session state: it is there after quitting and starting again.
     await h.restart({ modelRouterHost: router });

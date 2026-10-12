@@ -377,6 +377,8 @@ test("a connection test says per model what happened, in plain words, and a refu
   assert.match(refused, /<p class="guild-setting-help blocked" role="status">没找到密钥：请检查密钥文件和变量名。<\/p>/u);
   assert.doesNotMatch(refused, /guild-source-test-results/u);
   assert.match(sourcesMarkup({ deepseek: done([], "address_not_allowed") }), /这个地址不符合规则，没有发出请求。/u);
+  assert.match(sourcesMarkup({ deepseek: done([], "key_not_allowed") }), /这个变量里是 Anthropic 的密钥，模型源不能用它，没有发出请求。/u);
+  assert.match(sourcesMarkup({ deepseek: done([], "key_not_allowed") }, "en-US"), /Anthropic key, which a model source cannot use/u);
   assert.match(sourcesMarkup({ deepseek: { state: "failed" } }), /测试没能进行，请稍后再试。/u);
 });
 
@@ -385,6 +387,18 @@ test("while a source is being tested its button says so and cannot be pressed ag
   assert.match(running, /<button type="button" class="guild-soft-button" disabled="" aria-busy="true"><svg[^>]*class="guild-spin"[^>]*>.*?<\/svg>正在测试…<\/button>/su);
   assert.doesNotMatch(running, /guild-source-test-results/u);
   assert.match(sourcesMarkup(undefined), />测试连接<\/button>/u);
+});
+
+test("a source that cannot be tested says what to do first, and a disabled one is not told to confirm", () => {
+  const unconfirmed = sourcesMarkup(undefined, "zh-CN", [projectedSource({ confirmedHost: null })]);
+  assert.match(unconfirmed, /<span class="guild-source-test-hint">先确认这个地址，才能测试连接。<\/span>/u);
+  assert.doesNotMatch(unconfirmed, />测试连接<\/button>/u);
+  // Disabled sources offer no Confirm button, so the hint names turning the source on instead.
+  const disabled = sourcesMarkup(undefined, "zh-CN", [projectedSource({ confirmedHost: null, enabled: false })]);
+  assert.match(disabled, /<span class="guild-source-test-hint">这个来源已停用，启用并确认地址后才能测试连接。<\/span>/u);
+  assert.doesNotMatch(disabled, /先确认这个地址/u);
+  // A disabled source whose address is confirmed can still be tested.
+  assert.match(sourcesMarkup(undefined, "zh-CN", [projectedSource({ enabled: false })]), />测试连接<\/button>/u);
 });
 
 test("the test is asked of the main process only for the source that was clicked, and its results go when the source changes", async () => {
@@ -396,6 +410,12 @@ test("the test is asked of the main process only for the source that was clicked
     assert.match(body, /forgetTest\(/u, place);
   }
   assert.match(component, /forgetTest\(source\.id\); setForm\(formFromSource\(source\)\)/u, "editing forgets it too");
+  // An answer that was in flight when the source was forgotten is dropped instead of shown under the new source.
+  const forget = component.slice(component.indexOf("const forgetTest ="), component.indexOf("async function runTest("));
+  assert.match(forget, /testEpoch\.current\[id\] = \(testEpoch\.current\[id\] \?\? 0\) \+ 1;/u);
+  const run = component.slice(component.indexOf("async function runTest("), component.indexOf("async function remove("));
+  assert.match(run, /const epoch = testEpoch\.current\[source\.id\] \?\? 0;/u);
+  assert.equal((run.match(/if \(stillWanted\(\)\) setTests/gu) ?? []).length, 2, "both the answer and the failure check the epoch");
 });
 
 test("the Claude default-model list shows the default once, newest per family first, older ones apart, in Chinese", () => {

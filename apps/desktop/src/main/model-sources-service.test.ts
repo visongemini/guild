@@ -396,6 +396,29 @@ describe("model sources service: connection test", () => {
     assert.equal(h.sent.length, 0);
   });
 
+  it("says the key is the problem, not the address, when the variable holds an Anthropic credential", async (t) => {
+    const h = testHarness(t, undefined, { readKey: async () => ({ usable: true, key: "sk-ant-api03-abcdefghijklmnopqrstuv" }) });
+    await confirmed(h, online());
+    assert.deepEqual(await h.service.test("deepseek"), { id: "deepseek", refused: "key_not_allowed", results: [] });
+    assert.equal(h.sent.length, 0, "an Anthropic credential never leaves");
+  });
+
+  it("tests a disabled source that is confirmed, and a new revision starts its own test instead of joining the old one", async (t) => {
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const h = testHarness(t, async (request) => { if (String(request.init.body).includes('"model-a"')) await gate; return new Response("{}", { status: 200 }); });
+    await confirmed(h, online({ models: [{ id: "model-a", label: "A" }] }));
+    const old = h.service.test("deepseek");
+    // The source is edited (same address and key designation, so it stays confirmed) while the first test is out.
+    await h.service.upsert(online({ models: [{ id: "model-a", label: "A" }], enabled: false }));
+    const fresh = h.service.test("deepseek");
+    assert.notEqual(fresh, old, "the edited source is not tested by the old run");
+    release();
+    assert.deepEqual((await fresh).results.map((entry) => entry.outcome.kind), ["ok"], "a disabled source can be tested once confirmed");
+    assert.deepEqual((await old).results.map((entry) => entry.outcome.kind), ["ok"]);
+    assert.equal(h.sent.length, 2);
+  });
+
   it("tests a key-less Local source on loopback without a credential, over the direct transport kind", async (t) => {
     const h = testHarness(t);
     await confirmed(h, local());

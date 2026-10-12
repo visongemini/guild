@@ -50,7 +50,7 @@ export interface ProbeSourceOptions {
 const MODEL_ERROR_WORDS = /\bmodel\b/iu;
 const MODEL_ERROR_KIND = /not[ _-]?found|not[ _-]?exist|unknown|invalid|unsupported|no such|unavailable|does not|doesn't/iu;
 
-/** Whether an error body says the *model* is the problem. Reads only the standard `error.message` and `error.type`. */
+/** Whether an error body says the *model* is the problem: a `not_found_error`, or a message that names the model as unknown or missing. */
 export function bodyNamesMissingModel(raw: string): boolean {
   let parsed: unknown;
   try {
@@ -61,8 +61,10 @@ export function bodyNamesMissingModel(raw: string): boolean {
   const error = typeof parsed === "object" && parsed !== null ? (parsed as { error?: unknown }).error : undefined;
   if (typeof error !== "object" || error === null) return false;
   const { message, type } = error as { message?: unknown; type?: unknown };
-  const text = [message, type].filter((part): part is string => typeof part === "string").join(" ");
-  return type === "not_found_error" || (MODEL_ERROR_WORDS.test(text) && MODEL_ERROR_KIND.test(text));
+  if (type === "not_found_error") return true;
+  // The words are looked for in the message only: the standard type "invalid_request_error" would make any 400 that
+  // happens to mention a model (a token limit, a thinking mode) read as a missing model.
+  return typeof message === "string" && MODEL_ERROR_WORDS.test(message) && MODEL_ERROR_KIND.test(message);
 }
 
 async function boundedText(response: Response): Promise<string> {

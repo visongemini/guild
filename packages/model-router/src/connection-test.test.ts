@@ -151,6 +151,8 @@ describe("source connection test: each answer in plain categories", () => {
     assert.deepEqual(await one(() => json(422, { error: { message: "unknown model: gpt-9" } })), { kind: "model_not_found", status: 422 });
     assert.deepEqual(await one(() => json(400, { error: { type: "not_found_error", message: "x" } })), { kind: "model_not_found", status: 400 });
     assert.deepEqual(await one(() => json(400, { error: { message: "max_tokens must be at least 16" } })), { kind: "http_error", status: 400 });
+    // A vendor that refuses the probe's one-token limit is not saying the model is missing.
+    assert.deepEqual(await one(() => json(400, { error: { type: "invalid_request_error", message: "max_tokens: 1 is below the minimum of 16 for this model" } })), { kind: "http_error", status: 400 });
     assert.deepEqual(await one(() => new Response("<html>Bad Request</html>", { status: 400 })), { kind: "http_error", status: 400 });
   });
 
@@ -225,6 +227,10 @@ describe("error bodies that name a missing model", () => {
     assert.equal(bodyNamesMissingModel('{"error":{"message":"The model `x` does not exist"}}'), true);
     assert.equal(bodyNamesMissingModel('{"error":{"type":"not_found_error","message":"nope"}}'), true);
     assert.equal(bodyNamesMissingModel('{"error":{"message":"invalid x-api-key"}}'), false);
+    // The standard type word "invalid" must not turn any 400 that mentions a model into "no such model".
+    assert.equal(bodyNamesMissingModel('{"error":{"type":"invalid_request_error","message":"max_tokens: 1 is below the minimum of 16 for this model"}}'), false);
+    assert.equal(bodyNamesMissingModel('{"error":{"type":"invalid_request_error","message":"thinking is not enabled for this model"}}'), false);
+    assert.equal(bodyNamesMissingModel('{"error":{"type":"invalid_request_error","message":"Model Not Exist"}}'), true);
     assert.equal(bodyNamesMissingModel('{"message":"model not found"}'), false, "not under error");
     assert.equal(bodyNamesMissingModel("model not found"), false, "not JSON");
     assert.equal(bodyNamesMissingModel('{"error":"model not found"}'), false, "error is not an object");

@@ -252,9 +252,11 @@ created and never changes. Process topology stays one engine process per task (D
   only) and sends one `POST {baseUrl}/v1/messages` with `{model, max_tokens: 1, messages: [ping]}` per model
   (at most three at a time, 15 s timeout, `redirect: "manual"`, the Online proxied or Local direct transport
   of the router host). Each model answers with one of: ok and its latency; key wrong or no permission (401,
-  403); no such model (404, or a 400/422 whose error names the model); cannot connect; timeout; another status
-  code. Nothing is sent for an unconfirmed source or when the key variable has no value, and the answer
-  carries statuses only: never the key, a header or a response body. IPC `guild:v1:model-sources:test`.
+  403); no such model (404, a `not_found_error`, or a 400/422 whose error *message* says the model is unknown or
+  missing; a 400 about a token limit or a thinking mode stays its status code); cannot connect; timeout; another
+  status code. Nothing is sent, and the one reason is named, for an unconfirmed source, a key variable with no
+  value, an Anthropic key in the variable, or an address the rules forbid. The answer carries statuses only:
+  never the key, a header or a response body. IPC `guild:v1:model-sources:test`.
 - `GET /<token>/v1/models` returns the Online/Local models (Anthropic list format).
 - No OpenAI-protocol translation. Every supported backend speaks Anthropic Messages natively.
 - Router lifetime = Guild main process lifetime; it starts lazily on first routed session.

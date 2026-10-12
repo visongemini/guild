@@ -1165,8 +1165,9 @@ export function createLiveDesktopService(
 
   /**
    * The name the picker shows for the model a Run is about to start on: the catalog's display name, which for an
-   * Online or Local model is its source's label. The Claude Default row stands for a model and takes that model's
-   * name when the adapter says it; when it does not, the Run gets no label rather than a vague one.
+   * Online or Local model is the model's own label (its source's label is only the picker's description of it).
+   * The Claude Default row stands for a model and takes that model's name when the adapter says it; when it does
+   * not, the Run gets no label rather than a vague one.
    */
   function appliedModelLabel(taskId: TaskId, controller: RuntimeController): string | undefined {
     const modelId = appliedSelection(taskId, controller).modelId;

@@ -244,6 +244,7 @@ export type GuildMessages = WorkshopMessages & ChangeMessages & {
   readonly sourcesTesting: string;
   readonly sourcesTestHeading: string;
   readonly sourcesTestNeedsConfirm: string;
+  readonly sourcesTestNeedsEnable: string;
   readonly sourcesTestFailed: string;
   readonly sourcesProbeOutcome: (outcome: ModelProbeOutcome) => string;
   readonly sourcesTestRefusal: (reason: ModelSourceTestRefusal) => string;
@@ -825,6 +826,7 @@ const ZH_CN: GuildMessages = Object.freeze({
   sourcesTesting: "正在测试…",
   sourcesTestHeading: "连接测试结果",
   sourcesTestNeedsConfirm: "先确认这个地址，才能测试连接。",
+  sourcesTestNeedsEnable: "这个来源已停用，启用并确认地址后才能测试连接。",
   sourcesTestFailed: "测试没能进行，请稍后再试。",
   sourcesProbeOutcome: (outcome) => {
     switch (outcome.kind) {
@@ -840,6 +842,7 @@ const ZH_CN: GuildMessages = Object.freeze({
     not_confirmed: "先确认这个地址，才能测试连接。",
     key_unavailable: "没找到密钥：请检查密钥文件和变量名。",
     address_not_allowed: "这个地址不符合规则，没有发出请求。",
+    key_not_allowed: "这个变量里是 Anthropic 的密钥，模型源不能用它，没有发出请求。",
   })[reason],
   sourcesConfirm: "确认",
   sourcesConfirming: "等待你在系统窗口中确认…",
@@ -1395,6 +1398,7 @@ const EN_US: GuildMessages = Object.freeze({
   sourcesTesting: "Testing…",
   sourcesTestHeading: "Connection test results",
   sourcesTestNeedsConfirm: "Confirm this address first to test the connection.",
+  sourcesTestNeedsEnable: "This source is turned off; turn it on and confirm its address to test the connection.",
   sourcesTestFailed: "The test could not run. Try again in a moment.",
   sourcesProbeOutcome: (outcome) => {
     switch (outcome.kind) {
@@ -1410,6 +1414,7 @@ const EN_US: GuildMessages = Object.freeze({
     not_confirmed: "Confirm this address first to test the connection.",
     key_unavailable: "Key not found: check the key file and the variable name.",
     address_not_allowed: "This address breaks a rule, so no request was sent.",
+    key_not_allowed: "That variable holds an Anthropic key, which a model source cannot use; no request was sent.",
   })[reason],
   sourcesConfirm: "Confirm",
   sourcesConfirming: "Waiting for your confirmation in the system window…",
