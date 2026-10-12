@@ -441,7 +441,7 @@ test("the Claude group is unavailable when the status says so, or the Claude cat
   const refused = modelPickerView({ ...input, catalogs: emptyClaude, claudeState: "integrity_changed" });
   assert.equal(groupView(refused, "claude").empty?.kind, "claude_unavailable");
   assert.equal(groupView(refused, "claude").empty?.text, EN.claudeStatusIntegrityChanged);
-  assert.match(groupView(refused, "claude").empty?.text ?? "", /reinstall claude-agent-acp or restart Guild/u);
+  assert.match(groupView(refused, "claude").empty?.text ?? "", /restart Guild to accept updated engine files/u);
 });
 
 test("an empty Claude catalog offers Claude Code (default model), so a Claude task can still start (PC-ENG-001)", () => {

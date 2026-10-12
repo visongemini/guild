@@ -22,6 +22,7 @@ import {
   type PaneTimers,
   type PaneView,
 } from "./browser-pane.js";
+import { findBrowserMcpTool } from "./browser-mcp-tools.js";
 import { createBrowserPaneRegistry } from "./window-guards.js";
 
 // ---- fakes -----------------------------------------------------------------------------------
@@ -904,6 +905,79 @@ test("once a call has sent input, a navigation it caused does not cut the gestur
     await tool.send("Input.dispatchMouseEvent", { ...MOUSE, type: "mouseReleased" });
   });
   assert.deepEqual(sentTo(env, 0), ["DOM.getBoxModel", "Input.dispatchMouseEvent", "Input.dispatchMouseEvent"]);
+});
+
+test("pointer movement and wheel events do not end the page check: a navigation before the press aborts the click [PC-BROWSER-002]", async () => {
+  const env = setup();
+  await openTabs(env, 1);
+  await env.controller.command({ kind: "setVisible", visible: true });
+  const contents = env.views[0]!.contents;
+  contents.finishLoad("https://a.example/");
+  // The page moves on as soon as the pointer moves (a hover handler, a redirect, a timer).
+  contents.cdpHandler = async (method, params) => {
+    if (method === "Input.dispatchMouseEvent" && params?.["type"] === "mouseMoved") contents.finishLoad("https://b.example/");
+    return {};
+  };
+  const click = findBrowserMcpTool("click");
+  assert.ok(click);
+  const outcome = await env.controller.tools.runAgentTool((tool) => click.run({ x: 10, y: 20 }, tool).then(() => "clicked", (error: unknown) => error));
+  assert.equal(tabChanged(outcome), true);
+  const sent = contents.cdp.filter((entry) => entry.method.startsWith("Input."));
+  assert.deepEqual(sent.map((entry) => entry.params?.["type"]), ["mouseMoved"], "no press or release reached the new page");
+});
+
+test("only actionable input ends the page check; moving, wheel, release and key-up do not [PC-BROWSER-002]", async () => {
+  const mouse = (type: string): [string, Record<string, unknown>] => ["Input.dispatchMouseEvent", { ...MOUSE, type }];
+  const key = (type: string): [string, Record<string, unknown>] => ["Input.dispatchKeyEvent", { type, key: "a", code: "KeyA" }];
+  const cases: Array<{ first: [string, Record<string, unknown>]; actionable: boolean }> = [
+    { first: mouse("mouseMoved"), actionable: false },
+    { first: mouse("mouseWheel"), actionable: false },
+    { first: mouse("mouseReleased"), actionable: false },
+    { first: key("keyUp"), actionable: false },
+    { first: ["Input.dispatchTouchEvent", { type: "touchStart", touchPoints: [] }], actionable: false },
+    { first: mouse("mousePressed"), actionable: true },
+    { first: key("keyDown"), actionable: true },
+    { first: key("rawKeyDown"), actionable: true },
+    { first: key("char"), actionable: true },
+    { first: ["Input.insertText", { text: "x" }], actionable: true },
+  ];
+  for (const { first, actionable } of cases) {
+    const env = setup();
+    await openTabs(env, 1);
+    const contents = env.views[0]!.contents;
+    contents.finishLoad("https://a.example/");
+    const label = `${first[0]} ${String(first[1]["type"] ?? "")}`.trim();
+    await env.controller.tools.runAgentTool(async (tool) => {
+      await tool.send(first[0], first[1]);
+      contents.finishLoad("https://b.example/");
+      const next = tool.send("Input.dispatchMouseEvent", { ...MOUSE, type: "mousePressed" });
+      if (actionable) await next;
+      else await assert.rejects(next, tabChanged, label);
+    });
+    const sentAfter = contents.cdp.filter((entry) => entry.method === "Input.dispatchMouseEvent" && entry.params?.["type"] === "mousePressed");
+    // The first step is itself a press in one case; the second press reaches the page only after actionable input.
+    const firstWasPress = first[1]["type"] === "mousePressed" ? 1 : 0;
+    assert.equal(sentAfter.length, firstWasPress + (actionable ? 1 : 0), label);
+  }
+});
+
+test("a key press that the page answers with a navigation still delivers its key-up [PC-BROWSER-002]", async () => {
+  const env = setup();
+  await openTabs(env, 1);
+  await env.controller.command({ kind: "setVisible", visible: true });
+  const contents = env.views[0]!.contents;
+  contents.finishLoad("https://a.example/");
+  contents.cdpHandler = async (method, params) => {
+    if (method === "Input.dispatchKeyEvent" && params?.["type"] === "keyDown") contents.finishLoad("https://b.example/");
+    return {};
+  };
+  const key = findBrowserMcpTool("key");
+  assert.ok(key);
+  await env.controller.tools.runAgentTool((tool) => key.run({ key: "Enter" }, tool));
+  assert.deepEqual(
+    contents.cdp.filter((entry) => entry.method === "Input.dispatchKeyEvent").map((entry) => entry.params?.["type"]),
+    ["keyDown", "keyUp"],
+  );
 });
 
 test("calls made outside runAgentTool bind to the pane as it is when they are made", async () => {

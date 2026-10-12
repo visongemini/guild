@@ -758,7 +758,7 @@ describe("online and local credential rules", () => {
     assert.ok(lookups.includes("llm.tailnet.example"));
   });
 
-  it("allows https for local sources only on an IP literal or localhost", async (t) => {
+  it("allows https for local sources only on an IP literal, never on localhost or another name [PC-ROUTE-002]", async (t) => {
     const h = await startHarness(t, { lookup: async (host) => (host === "localhost" ? ["127.0.0.1"] : ["100.101.102.103"]) });
     const tls = (id: string, baseUrl: string): RouterSource => {
       const host = new URL(baseUrl).host;
@@ -768,21 +768,35 @@ describe("online and local credential rules", () => {
       tls("tls-ip", "https://127.0.0.1:9"),
       tls("tls-v6", "https://[::1]:9"),
       tls("tls-localhost", "https://localhost:9"),
+      tls("tls-localhost-upper", "https://LOCALHOST:9"),
       tls("tls-name", "https://llm.tailnet.example:9"),
     ]);
-    for (const id of ["tls-ip", "tls-v6", "tls-localhost"]) {
+    for (const id of ["tls-ip", "tls-v6"]) {
       assert.equal((await h.post("v1/messages", simpleBody(`${id}-model`))).status, 502, `${id}: policy passed; the connection itself fails`);
     }
-    assert.equal(h.calls.length, 3);
+    assert.equal(h.calls.length, 2);
 
-    const callsBefore = h.calls.length;
-    const response = await h.post("v1/messages", simpleBody("tls-name-model"));
-    assert.equal(response.status, 403);
-    const payload = (await response.json()) as { error: { type: string; message: string } };
-    assert.equal(payload.error.type, "permission_error");
-    assert.match(payload.error.message, /IP address or localhost/u);
-    assert.equal(h.calls.length, callsBefore, "a named https host must not be contacted");
-    assert.equal(h.requestLogs().at(-1)?.fields.outcome, "local_https_requires_ip");
+    for (const id of ["tls-localhost", "tls-localhost-upper", "tls-name"]) {
+      const callsBefore: number = h.calls.length;
+      const response = await h.post("v1/messages", simpleBody(`${id}-model`));
+      assert.equal(response.status, 403, id);
+      const payload = (await response.json()) as { error: { type: string; message: string } };
+      assert.equal(payload.error.type, "permission_error");
+      assert.match(payload.error.message, /requires an IP address/u);
+      assert.doesNotMatch(payload.error.message, /localhost/u, "localhost is no longer offered as an alternative");
+      assert.equal(h.calls.length, callsBefore, `${id}: a named https host must not be contacted`);
+      assert.equal(h.requestLogs().at(-1)?.fields.outcome, "local_https_requires_ip", id);
+    }
+  });
+
+  it("still allows http://localhost, rewritten to the loopback address it resolves to [PC-ROUTE-002]", async (t) => {
+    const h = await startHarness(t, { lookup: async (host) => (host === "localhost" ? ["127.0.0.1"] : []) });
+    h.router.updateSources([
+      { id: "http-localhost", kind: "local", label: "x", baseUrl: `http://localhost:${h.local.port}`, key: LOCAL_KEY, confirmedHost: `localhost:${h.local.port}`, models: [{ id: "http-localhost-model", label: "x" }] },
+    ]);
+    assert.equal((await h.post("v1/messages", simpleBody("http-localhost-model"))).status, 200);
+    assert.equal(h.calls.length, 1);
+    assert.match(h.calls[0]!.url, /^http:\/\/127\.0\.0\.1:/u, "the connection goes to the IP literal, not the name");
   });
 
   it("connects to the validated IP literal and never to the hostname (DNS rebinding) [PC-ROUTE-002]", async (t) => {

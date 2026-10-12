@@ -514,9 +514,10 @@ class RouterCore {
     }
     if (url.protocol !== "http:" && url.protocol !== "https:") return deny("source url is invalid", "invalid_source_url");
     const bare = bareHostname(url.hostname);
-    // A certificate name cannot match the IP literal a hostname is rewritten to.
-    if (url.protocol === "https:" && isIP(bare) === 0 && bare !== "localhost") {
-      return deny("local https requires an IP address or localhost", "local_https_requires_ip");
+    // A certificate name cannot match the IP literal a hostname is rewritten to, `localhost` included
+    // (it becomes 127.0.0.1 or ::1); only `http://localhost` can be rewritten safely.
+    if (url.protocol === "https:" && isIP(bare) === 0) {
+      return deny("local https requires an IP address", "local_https_requires_ip");
     }
     const address = await resolveAllowedLocalAddress(url.hostname, this.lookup);
     if (address === undefined) return deny("local source address is not allowed", "local_address_denied");

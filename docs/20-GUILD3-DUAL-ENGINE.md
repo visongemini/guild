@@ -59,12 +59,24 @@ created and never changes. Process topology stays one engine process per task (D
 - Executable pin: the user's `node` (Mach-O, existing pin) plus the adapter entry script path as
   `argv[0]`. Pin the adapter by package version (supported range `>=0.89.0 <0.90.0`) and a SHA-256
   over its installed `package.json` and `dist/` tree; mismatch refuses to start with a named error.
-  A failed pin check may be followed by one automatic re-locate, and only an update is accepted:
-  `node --version` differs, the adapter `package.json` version differs, or the `claude` real path
-  now is a new `versions/<ver>` file. The same version with other bytes (node SHA-256, adapter
-  fingerprint) is refused with `engine_integrity_changed`, nothing is executed, and the Claude
-  status reads "Claude engine files changed unexpectedly; reinstall claude-agent-acp or restart
-  Guild". The code is on the IPC failure allowlist; the next session that opens clears the state.
+  **A piece whose bytes differ from its pin is never executed to decide what to do about it.**
+  `node` is trusted on first use, once per app launch: the first supported node located in a launch is
+  pinned by real path and SHA-256, and from then on its hash is compared (the file is only read) before
+  anything runs it again, the `--version` probe included. A node that differs, moved or is gone is
+  refused with `engine_integrity_changed` without being run, by every later locate in that launch (the
+  engine probe, the warm-up, a new task process); a node update therefore takes effect on the next Guild
+  launch. A failed pin check may be followed by one automatic re-locate, and only an update is accepted:
+  the adapter `package.json` is read, and another package version is re-pinned while the same version
+  with another fingerprint is refused (reading executes nothing). The `claude` binary (about 200 MB) is
+  pinned by real path and version string, **not by hash**: a re-locate accepts another real path only when
+  it is `.../versions/<v>` with a `<v>` that differs from the pinned version (the directory name carries
+  the version, the new file is not run to decide), and refuses the same version at another path as well as
+  any path outside that layout. The same path is the same binary, so bytes changed in place under it are
+  not detected by Guild; the adapter runs it the way the user's own `claude` would run.
+  A Claude runtime whose pieces already differ when it is created is returned in the refused state and
+  never starts. The Claude status reads "Claude engine files changed unexpectedly; restart Guild to
+  accept updated engine files, or reinstall claude-agent-acp". The code is on the IPC failure allowlist;
+  the state clears when a later session opens with the pinned files back in place, or after a restart.
 - Locator: `claude-agent-acp` from `~/.npm-global/bin`, the user's PATH and Homebrew paths;
   `claude` from `~/.local/bin/claude` / PATH (Mach-O). `node` from PATH (>= 22).
 - Env (allowlist + Guild-owned values): PATH, HOME, USER, LOGNAME (claude looks up its Keychain login by account name; without USER it reports "not logged in" [WP-A smoke]), LANG/LC_*, TMPDIR, proxy vars, SSL vars,
@@ -117,8 +129,9 @@ created and never changes. Process topology stays one engine process per task (D
   every resolved address must be loopback or in 100.64.0.0/10 (Tailscale), and the request is then
   sent to the first validated address as an IP literal (IPv6 bracketed), never to the hostname, so
   a second DNS answer cannot reach the connection (DNS rebinding). Local https is allowed only when
-  the host is already an IP literal or `localhost` (a certificate name cannot match a rewritten IP);
-  any other https host answers 403 `local_https_requires_ip`. No `Host` header is set.
+  the host is already an IP literal (a certificate name cannot match a rewritten IP, `localhost` included);
+  any other https host, `https://localhost` among them, answers 403 `local_https_requires_ip`.
+  `http://localhost` stays allowed and is rewritten to the loopback address it resolves to. No `Host` header is set.
 - **Transport selection.** The router calls `fetchImpl(url, init, { sourceKind })` with the kind of the
   source it chose for that request. The Electron host uses the direct (no proxy) session for `local`
   and the proxied session otherwise, from that argument only, never from the URL or the live registry.
@@ -143,7 +156,8 @@ created and never changes. Process topology stays one engine process per task (D
 - **SSE normalizer** for Local sources: re-sequence content blocks so a block's events (deltas,
   `signature_delta`, `content_block_stop`) are emitted before any event of a higher index; buffer the
   higher block until the lower one stops.
-  The buffer is capped at 8 MiB of held event text and 64 waiting blocks; on overflow the router
+  The buffer is capped at 8 MiB of held event text and 64 waiting blocks (so at most 65 tracked blocks), checked before
+  every insertion, including a block start lower than every open block; on overflow the router
   aborts the upstream request, ends the client stream with an Anthropic-style SSE `error` event
   (`api_error`) and logs `router.stream_overflow` (route, source, limit).
 - `GET /<token>/v1/models` returns the Online/Local models (Anthropic list format).
@@ -180,8 +194,10 @@ created and never changes. Process topology stays one engine process per task (D
   "Take over") and the active tab and its page when it starts, and every step goes to that tab. Right
   before each CDP command and each navigation the call checks the generation (mismatch: the paused
   message) and that its tab is still open (else a tab-changed message). Input and screenshots also
-  need the bound tab to still be the shown one, and until a call has sent input, `DOM.*` and `Input.*`
-  steps need the page not to have navigated since the call began (a ref or coordinate belongs to that page).
+  need the bound tab to still be the shown one, and until a call has sent actionable input (a pressed mouse
+  button, a key going down or a typed character, inserted text; pointer movement and wheel events do not
+  count), `DOM.*` and `Input.*` steps need the page not to have navigated since the call began (a ref or
+  coordinate belongs to that page).
 
 ### 3.6 OpenViking (D-060)
 Claude engine: OpenViking on (no kill-switch env). Routed Claude sessions: `OPENVIKING_AUTO_CAPTURE=false`

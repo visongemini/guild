@@ -263,6 +263,74 @@ describe("SseBlockSequencer buffer limits [PC-ROUTE-003]", () => {
     assert.deepEqual(sequencer.finish(), []);
   });
 
+  it("counts a stream of ever-lower block starts like any other: no unbounded tracking [PC-ROUTE-003]", () => {
+    const sequencer = new SseBlockSequencer();
+    // Each start is lower than every open block, so it streams straight through; the blocks it
+    // displaces still wait behind it and count against the cap.
+    let emitted = 0;
+    let accepted = 0;
+    for (let index = 100_000; index > 0 && sequencer.overflow === undefined; index -= 1) {
+      emitted += sequencer.accept(start(index)).length;
+      accepted += 1;
+    }
+    assert.equal(sequencer.overflow, "blocks");
+    assert.equal(accepted, MAX_BUFFERED_BLOCKS + 2, "the 66th tracked block is the one that trips");
+    assert.equal(emitted, MAX_BUFFERED_BLOCKS + 1, "the tripping start is not forwarded");
+    assert.deepEqual(sequencer.accept(start(1)), []);
+    assert.deepEqual(sequencer.finish(), []);
+  });
+
+  it("stays fast when a hostile stream keeps sending lower block starts after the trip", () => {
+    const sequencer = new SseBlockSequencer();
+    const started = Date.now();
+    for (let index = 200_000; index > 0; index -= 1) sequencer.accept(start(index));
+    assert.equal(sequencer.overflow, "blocks");
+    assert.ok(Date.now() - started < 2_000, "a rescan of every tracked block per event would take far longer");
+  });
+
+  it("allows the block cap exactly: 65 tracked blocks, descending or ascending", () => {
+    for (const order of ["ascending", "descending"] as const) {
+      const sequencer = new SseBlockSequencer();
+      for (let n = 0; n <= MAX_BUFFERED_BLOCKS; n += 1) {
+        sequencer.accept(start(order === "ascending" ? n : 1_000 - n));
+      }
+      assert.equal(sequencer.overflow, undefined, order);
+      sequencer.accept(start(5_000));
+      assert.equal(sequencer.overflow, "blocks", order);
+    }
+  });
+
+  it("frees the block cap when blocks stop, so only what is open at once counts", () => {
+    const sequencer = new SseBlockSequencer();
+    for (let round = 0; round < 5; round += 1) {
+      const base = round * 100;
+      for (let index = base + 40; index >= base; index -= 1) sequencer.accept(start(index));
+      for (let index = base; index <= base + 40; index += 1) {
+        sequencer.accept(event({ type: "content_block_stop", index }));
+      }
+      assert.equal(sequencer.overflow, undefined, `round ${round}`);
+    }
+  });
+
+  it("checks the byte cap before holding: exactly the limit is held, one byte more is not", () => {
+    const sequencer = new SseBlockSequencer();
+    sequencer.accept(start(0));
+    sequencer.accept(start(1));
+    const held = Buffer.byteLength(start(1).raw);
+    const overhead = Buffer.byteLength(textDelta(1, 0).raw);
+    let total = held;
+    while (MAX_BUFFERED_BYTES - total > MIB + overhead) {
+      sequencer.accept(textDelta(1, MIB));
+      total += overhead + MIB;
+    }
+    const last = textDelta(1, MAX_BUFFERED_BYTES - total - overhead);
+    assert.equal(Buffer.byteLength(last.raw), MAX_BUFFERED_BYTES - total);
+    sequencer.accept(last);
+    assert.equal(sequencer.overflow, undefined, "exactly 8 MiB is within the limit");
+    sequencer.accept(textDelta(1, 0));
+    assert.equal(sequencer.overflow, "bytes");
+  });
+
   it("builds an Anthropic-style error event", () => {
     const text = sseErrorEvent("api_error", "too much");
     assert.equal(text, 'event: error\ndata: {"type":"error","error":{"type":"api_error","message":"too much"}}\n\n');

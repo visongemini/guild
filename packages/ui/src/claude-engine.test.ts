@@ -37,9 +37,10 @@ test("each status has its own line, and a not-logged-in Claude tells the person 
   assert.match(claudeStatusText(EN, { state: "unavailable" }), /Not available/u);
   assert.equal(
     claudeStatusText(EN, { state: "integrity_changed" }),
-    "Claude engine files changed unexpectedly; reinstall claude-agent-acp or restart Guild.",
+    "Claude engine files changed unexpectedly; restart Guild to accept updated engine files, or reinstall claude-agent-acp.",
   );
   assert.match(claudeStatusText(messagesFor("zh-CN"), { state: "integrity_changed" }), /claude-agent-acp/u);
+  assert.match(claudeStatusText(messagesFor("zh-CN"), { state: "integrity_changed" }), /重启 Guild 以接受更新后的引擎文件/u);
 });
 
 test("the permission mode of a Claude task is the live session mode, else the Settings default, else nothing", () => {
