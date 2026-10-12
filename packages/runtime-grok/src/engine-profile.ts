@@ -2,6 +2,7 @@ import { realpath } from "node:fs/promises";
 import { homedir, userInfo } from "node:os";
 import { isAbsolute, join } from "node:path";
 import type {
+  GuildEngine,
   GuildGrokPermissionMode,
   GuildGrokStartupSettings,
 } from "@guild/contracts";
@@ -22,9 +23,6 @@ import {
  * environment it may see, how its executable is pinned, whether Guild authenticates for it, which
  * ACP dialect it speaks and which Grok-only features exist for it (PC-FALLBACK-001).
  */
-
-// TODO(WP-B): replace with `GuildEngine` from @guild/contracts (same literal union).
-export type RuntimeEngine = "grok" | "claude";
 
 /** Wire differences between the official Grok agent and the Claude ACP adapter. */
 export type AcpDialect = "grok" | "claude";
@@ -106,7 +104,7 @@ export type EngineLaunchPlan = Readonly<{
 }>;
 
 export type EngineProfile = Readonly<{
-  engine: RuntimeEngine;
+  engine: GuildEngine;
   dialect: AcpDialect;
   pinStrategy: EnginePinStrategy;
   authPolicy: EngineAuthPolicy;
@@ -394,7 +392,7 @@ async function verifyClaudeExecutable(path: string): Promise<void> {
   }
 }
 
-function requireLaunch<E extends RuntimeEngine>(
+function requireLaunch<E extends GuildEngine>(
   launch: EngineLaunch,
   engine: E,
 ): Extract<EngineLaunch, { readonly engine: E }> {
@@ -404,6 +402,6 @@ function requireLaunch<E extends RuntimeEngine>(
   return launch as Extract<EngineLaunch, { readonly engine: E }>;
 }
 
-export function engineProfileFor(engine: RuntimeEngine): EngineProfile {
+export function engineProfileFor(engine: GuildEngine): EngineProfile {
   return engine === "claude" ? CLAUDE_ENGINE_PROFILE : GROK_ENGINE_PROFILE;
 }

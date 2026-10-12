@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { describe, it } from "node:test";
+import { modelCatalogEngineOf } from "@guild/contracts";
 import {
   AcpV1Adapter,
   AcpV1AdapterError,
@@ -395,7 +396,7 @@ describe("Claude dialect: sessions, catalog and start options", () => {
     const catalog = session.modelCatalog;
     assert.ok(catalog !== undefined);
     assert.equal(catalog.runtimeDefaultModelId, "default");
-    assert.equal((catalog as { engine?: string }).engine, "claude");
+    assert.equal(modelCatalogEngineOf(catalog), "claude");
     assert.deepEqual(
       catalog.models.map((model) => model.id),
       ["default", "opus", "fable", "sonnet", "haiku", "claude-sonnet-5", "claude-opus-5", "claude-fable-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-4-6"],
@@ -520,6 +521,12 @@ describe("Claude dialect: sessions, catalog and start options", () => {
     process.emitMessages({ jsonrpc: "2.0", id: request.id, result: { configOptions: options } });
     const applied = await changing;
     assert.equal(applied.find((option) => option.id === "mode")?.currentValue, "acceptEdits");
+    const before = process.frames.length;
+    await assert.rejects(
+      adapter.setPermissionMode(session, "yolo" as unknown as "default"),
+      hasAdapterCode("invalid_adapter_options"),
+    );
+    assert.equal(process.frames.length, before, "an unknown mode never reaches the adapter");
     await adapter.close();
   });
 });

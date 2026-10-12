@@ -7,9 +7,13 @@ import {
   ACP_TOOL_STATUSES,
   classifyStopReason,
   freezeGrokModelCatalog,
+  freezeModelCatalog,
   freezeRuntimePayload,
+  GUILD_CLAUDE_IDENTIFIER_LIMITS,
   GUILD_GROK_IDENTIFIER_LIMITS,
+  isClaudeModelId,
   isOfficialGrokModelId,
+  parseGuildClaudeReasoningEffort,
   parseGuildGrokReasoningEffort,
   RUNTIME_PAYLOAD_LIMITS,
   type AcpPermissionOptionKind,
@@ -20,6 +24,8 @@ import {
   type GrokModelDescriptor,
   type GrokReasoningEffortDescriptor,
   type JsonRpcCallbackId,
+  type ModelCatalog,
+  type ModelDescriptor,
   type RuntimeConfigOption,
   type RuntimeConfigSelectChoice,
   type RuntimeConfigSelectChoices,
@@ -687,72 +693,72 @@ function decodeModelDescriptor(entry: unknown): GrokModelDescriptor | undefined 
 }
 
 /**
- * A Grok-shaped catalog tagged with its engine. The tag makes `freezeGrokModelCatalog` reject it,
- * so a Claude catalog can never be stored in the Grok cache by mistake.
- */
-// TODO(WP-B): replace with the engine-keyed catalog type from @guild/contracts.
-export type ClaudeModelCatalog = GrokModelCatalog & Readonly<{ engine: "claude" }>;
-
-// TODO(WP-B): replace with the per-engine model id grammar (`parseGuildModelId`) from @guild/contracts.
-/** Claude model option values: aliases (`opus`), explicit ids (`claude-opus-4-8`) and routed ids (`name[1m]`). */
-const CLAUDE_MODEL_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:[\]-]{0,127}$/u;
-const CLAUDE_EFFORT_ID_PATTERN = /^[a-z][a-z0-9_-]{0,31}$/u;
-const CLAUDE_MAX_MODELS = 128;
-
-export function isClaudeModelId(id: string): boolean {
-  return CLAUDE_MODEL_ID_PATTERN.test(id);
-}
-
-/**
  * Builds the model catalog of a Claude session from its `model` (category `model`) and effort
  * (category `thought_level`) config options. The adapter rebuilds the effort list for every
  * selected model, so efforts are attached only to the model that is currently selected; call this
  * again with the options returned by `setConfigOption` or carried by `config_option_update`.
- * The result has the shape of the Grok catalog; the Claude runtime default is the selected model.
- * Returns `undefined` when no usable model option is present.
+ * Every model is in the `claude` picker group (routed Online / Local models are labelled by the
+ * caller); the engine's runtime default is the selected model. The result is validated by
+ * `freezeModelCatalog("claude", ...)`, so the Grok catalog validator refuses it. Returns
+ * `undefined` when no usable model option is present.
  */
-// TODO(WP-B): return the engine-keyed catalog type from @guild/contracts.
 export function deriveClaudeModelCatalog(
   options: readonly RuntimeConfigOption[],
-): ClaudeModelCatalog | undefined {
+): ModelCatalog | undefined {
   const modelOption = options.find((option) => option.type === "select" && option.category === "model");
   if (modelOption === undefined || modelOption.type !== "select") return undefined;
   const effortOption = options.find((option) => option.type === "select" && option.category === "thought_level");
+  const limits = GUILD_GROK_IDENTIFIER_LIMITS;
   const efforts: GrokReasoningEffortDescriptor[] = [];
   if (effortOption !== undefined && effortOption.type === "select") {
     for (const choice of flatChoices(effortOption.choices)) {
-      if (efforts.length >= GUILD_GROK_IDENTIFIER_LIMITS.maxEffortsPerModel) break;
-      if (!CLAUDE_EFFORT_ID_PATTERN.test(choice.value) || efforts.some((effort) => effort.id === choice.value)) continue;
-      const description = catalogText(choice.description, GUILD_GROK_IDENTIFIER_LIMITS.maxEffortDescriptionLength);
-      efforts.push(Object.freeze({
+      if (efforts.length >= limits.maxEffortsPerModel) break;
+      if (!isClaudeReasoningEffort(choice.value) || efforts.some((effort) => effort.id === choice.value)) continue;
+      const description = catalogText(choice.description, limits.maxEffortDescriptionLength);
+      efforts.push({
         id: choice.value,
-        label: catalogText(choice.name, GUILD_GROK_IDENTIFIER_LIMITS.maxEffortLabelLength) ?? choice.value,
+        label: catalogText(choice.name, limits.maxEffortLabelLength) ?? choice.value,
         ...(description === undefined ? {} : { description }),
         isDefault: choice.value === "default",
-      }));
+      });
     }
   }
-  const models: GrokModelDescriptor[] = [];
+  const models: ModelDescriptor[] = [];
   const seen = new Set<string>();
   for (const choice of flatChoices(modelOption.choices)) {
-    if (models.length >= CLAUDE_MAX_MODELS) break;
+    if (models.length >= GUILD_CLAUDE_IDENTIFIER_LIMITS.maxModels) break;
     if (!isClaudeModelId(choice.value) || seen.has(choice.value)) continue;
     seen.add(choice.value);
-    const description = catalogText(choice.description, GUILD_GROK_IDENTIFIER_LIMITS.maxDescriptionLength);
-    models.push(Object.freeze({
+    const description = catalogText(choice.description, limits.maxDescriptionLength);
+    models.push({
       id: choice.value,
-      name: catalogText(choice.name, GUILD_GROK_IDENTIFIER_LIMITS.maxNameLength) ?? choice.value,
+      name: catalogText(choice.name, limits.maxNameLength) ?? choice.value,
       ...(description === undefined ? {} : { description }),
-      reasoningEfforts: Object.freeze(choice.value === modelOption.currentValue ? [...efforts] : []),
-      contextWindows: Object.freeze([]),
-    }));
+      group: "claude",
+      reasoningEfforts: choice.value === modelOption.currentValue ? [...efforts] : [],
+      contextWindows: [],
+    });
   }
   if (models.length === 0) return undefined;
-  return Object.freeze({
-    engine: "claude" as const,
-    models: Object.freeze(models),
-    ...(seen.has(modelOption.currentValue) ? { runtimeDefaultModelId: modelOption.currentValue } : {}),
-  });
+  try {
+    return freezeModelCatalog("claude", {
+      engine: "claude",
+      models,
+      ...(seen.has(modelOption.currentValue) ? { runtimeDefaultModelId: modelOption.currentValue } : {}),
+    });
+  } catch {
+    // The catalog is advisory display data: a list the contracts refuse must not fault the session.
+    return undefined;
+  }
+}
+
+function isClaudeReasoningEffort(value: string): boolean {
+  try {
+    parseGuildClaudeReasoningEffort(value);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function flatChoices(choices: RuntimeConfigSelectChoices): readonly RuntimeConfigSelectChoice[] {

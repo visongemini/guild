@@ -3,10 +3,13 @@ import { types as nodeTypes } from "node:util";
 import {
   classifyStopReason,
   freezeRuntimePayload,
+  parseGuildClaudePermissionMode,
   parseGuildGrokContextWindow,
-  parseGuildGrokModel,
   parseGuildGrokReasoningEffort,
+  parseGuildModelId,
   type AcpPromptStopReason,
+  type GuildClaudePermissionMode,
+  type GuildEngine,
   type GuildGrokModel,
   type GuildGrokReasoningEffort,
   type RuntimePermissionRequestPayload,
@@ -62,7 +65,6 @@ import {
   GROK_ENGINE_PROFILE,
   type EngineFeatureFlags,
   type EngineProfile,
-  type RuntimeEngine,
 } from "./engine-profile.js";
 import {
   JsonRpcPeer,
@@ -585,7 +587,7 @@ export class AcpV1Adapter {
     return this.currentState;
   }
 
-  get engine(): RuntimeEngine {
+  get engine(): GuildEngine {
     return this.profile.engine;
   }
 
@@ -690,7 +692,7 @@ export class AcpV1Adapter {
     if (transport.activePrompt !== undefined) {
       throw new AcpV1AdapterError("overlapping_prompt");
     }
-    const exactModel = parseGuildGrokModel(model);
+    const exactModel = parseGuildModelId(this.profile.engine, model);
     const meta = {
       ...(options?.reasoningEffort === undefined
         ? {}
@@ -851,13 +853,19 @@ export class AcpV1Adapter {
    */
   async setPermissionMode(
     session: AcpV1AdapterSession,
-    mode: string,
+    mode: GuildClaudePermissionMode,
   ): Promise<readonly RuntimeConfigOption[]> {
     if (this.profile.dialect !== "claude") {
       throw new AcpV1AdapterError("unsupported_for_engine");
     }
+    let exactMode: GuildClaudePermissionMode;
+    try {
+      exactMode = parseGuildClaudePermissionMode(mode);
+    } catch {
+      throw new AcpV1AdapterError("invalid_adapter_options");
+    }
     const configId = session.configOptions?.find((option) => option.category === "mode")?.id ?? "mode";
-    return this.setConfigOption(session, configId, mode);
+    return this.setConfigOption(session, configId, exactMode);
   }
 
   async newSession(

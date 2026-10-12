@@ -1,7 +1,14 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { describe, it } from "node:test";
-import { freezeGrokModelCatalog, type RuntimeConfigOption } from "@guild/contracts";
+import {
+  freezeGrokModelCatalog,
+  freezeModelCatalog,
+  isClaudeModelId,
+  modelCatalogEngineOf,
+  modelGroupOf,
+  type RuntimeConfigOption,
+} from "@guild/contracts";
 import {
   AcpV1CodecError,
   decodeInitializeResult,
@@ -12,7 +19,6 @@ import {
   encodeInitializeParams,
   encodeNewSessionParams,
   encodeResumeSessionParams,
-  isClaudeModelId,
 } from "./acp-v1-codec.js";
 import {
   decodeClaudeAuthStatus,
@@ -117,9 +123,12 @@ describe("Claude dialect: session decoding and the model catalog", () => {
     assert.equal(decoded.configOptions?.length, 4);
     assert.equal(decoded.modelCatalog?.models.length, 12);
     assert.equal(decoded.modelCatalog?.runtimeDefaultModelId, "default");
-    assert.equal((decoded.modelCatalog as { engine?: string } | undefined)?.engine, "claude");
-    // The Grok catalog validator refuses a Claude catalog.
+    assert.ok(decoded.modelCatalog !== undefined);
+    assert.equal(modelCatalogEngineOf(decoded.modelCatalog), "claude");
+    assert.deepEqual(decoded.modelCatalog.models.map(modelGroupOf), Array(12).fill("claude"));
+    // The Grok catalog validator refuses a Claude catalog; the Claude one accepts its own output.
     assert.throws(() => freezeGrokModelCatalog(decoded.modelCatalog));
+    assert.deepEqual(freezeModelCatalog("claude", decoded.modelCatalog), decoded.modelCatalog);
     assert.equal(Object.isFrozen(decoded.modelCatalog), true);
     for (const model of decoded.modelCatalog?.models ?? []) {
       assert.equal(isClaudeModelId(model.id), true, model.id);

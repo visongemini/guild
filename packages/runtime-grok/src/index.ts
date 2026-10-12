@@ -26,7 +26,6 @@ export type {
   EngineProfile,
   EnvironmentPolicy,
   GrokLaunch,
-  RuntimeEngine,
 } from "./engine-profile.js";
 export * from "./grok-acp-profile.js";
 export * from "./json-rpc-peer.js";
