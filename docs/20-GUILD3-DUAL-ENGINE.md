@@ -245,6 +245,16 @@ created and never changes. Process topology stays one engine process per task (D
   every insertion, including a block start lower than every open block; on overflow the router
   aborts the upstream request, ends the client stream with an Anthropic-style SSE `error` event
   (`api_error`) and logs `router.stream_overflow` (route, source, limit).
+- **Connection test (D-063).** Settings > Model sources can test a source whose address is confirmed. The main
+  process reads the key as the router host does (the source's key file and variable), applies the same source
+  rules as a turn (`source-policy.ts`, shared with the router: host binding, never an Anthropic host or
+  `sk-ant-` key, Online https, Local loopback or 100.64.0.0/10 resolved once, https for Local on an IP literal
+  only) and sends one `POST {baseUrl}/v1/messages` with `{model, max_tokens: 1, messages: [ping]}` per model
+  (at most three at a time, 15 s timeout, `redirect: "manual"`, the Online proxied or Local direct transport
+  of the router host). Each model answers with one of: ok and its latency; key wrong or no permission (401,
+  403); no such model (404, or a 400/422 whose error names the model); cannot connect; timeout; another status
+  code. Nothing is sent for an unconfirmed source or when the key variable has no value, and the answer
+  carries statuses only: never the key, a header or a response body. IPC `guild:v1:model-sources:test`.
 - `GET /<token>/v1/models` returns the Online/Local models (Anthropic list format).
 - No OpenAI-protocol translation. Every supported backend speaks Anthropic Messages natively.
 - Router lifetime = Guild main process lifetime; it starts lazily on first routed session.
@@ -319,8 +329,15 @@ adapter reported, never a hard-coded list of models:
   complex and everyday work, Sonnet: speed and ability in balance, Haiku: fastest, for simple quick tasks,
   Fable: the hardest and longest tasks); a family it does not know keeps the adapter text, and so does
   every row in English.
-- **Efforts.** The Claude effort segment reads Default, Low, Medium, High, Extra high, Max. All wording
-  is localized in `packages/ui/src/locales.ts`.
+- **Efforts.** The Claude effort segment reads from the strongest down like Grok's: Default, Max, Extra high,
+  High, Medium, Low (the adapter lists them weakest first; an id the table does not know keeps the adapter's
+  order after the known ones). Settings > Engines lists the same way. All wording is localized in
+  `packages/ui/src/locales.ts`.
+- **Online and Local rows** show the context window their source states ("1M context") and, when the source
+  says the model accepts images, a muted "Supports images" on the same line.
+- **Settings default (3.0.2).** The control lists the adapter's own Default row once, as the localized
+  "Claude Code default" option, then the same newest-per-family rows with the same descriptions, and the older
+  models in a group.
 
 ## 4. New identifiers
 

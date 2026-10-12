@@ -1148,3 +1148,37 @@ Consequences
 - Requirement text of PC-MODEL-001, PC-ROUTE-002, PC-OV-001 and PC-PRIV-001 and the acceptance story AS-011 are
   updated in `requirements/requirements.yml`; `docs/20-GUILD3-DUAL-ENGINE.md` sections 1, 3.3, 3.6, 3.7 and 6
   follow this entry.
+
+## D-063 — Guild 3.0.2 UI polish: which model answered, a connection test, a Stop button that stops
+
+Date: 2026-10-13. Owner request ("make the UI more refined"). Implements PC-CONV-001, PC-MODEL-001, PC-SET-002,
+PC-ROUTE-002, PC-PERM-002, PC-A11Y-001 and PC-UI-003. No visual redesign: the warm-paper light theme, the dark
+theme, the icons and the accent colour are unchanged.
+
+Decisions
+- **Per-turn model attribution.** Schema v20 adds `run_model_labels` (one row per Run: the display name of the
+  model the Run started on, written after the engine applied the task's selection and before the prompt goes out).
+  Additive, forward-only: Guild 3.0.1 cannot open a database written by 3.0.2 (`schema_version_unsupported`),
+  like every earlier migration. The name is the catalog's (a source's label for an Online or Local model; for the
+  Claude Default row the model the adapter says it stands for, and no row when it says nothing). The task view
+  carries the labels of the Runs in its window; the footer of a finished turn shows "model - time" on one muted
+  line. A Run from before the table has no label and shows only the time.
+- **Connection test.** `guild:v1:model-sources:test`, see `docs/20-GUILD3-DUAL-ENGINE.md` 3.4. The probe lives in
+  `packages/model-router` and reuses the router's own source rules (extracted to `source-policy.ts`), headers and
+  transport, so a test can never reach a host or carry a key a real turn could not.
+- **The permission card's last button stops the turn.** It used to answer the pending request with ACP's
+  `cancelled` outcome while the turn was running. Checked on 2026-10-13 against both engines: under Grok that
+  closed the transport (`sink_fault`, the Run ended `interrupted` and the session was recovered); under Claude it
+  only aborted that tool call and the turn went on with another approach. It is now labeled "Stop this turn" and
+  calls `cancelRun`, the composer's stop path, which answers a pending request with `cancelled` while the Run is
+  cancelling and ends the turn as cancelled on both engines. The standard options are labeled by their ACP kind
+  in Chinese (allow once, allow for this session, reject, reject always) with the agent's text as the tooltip; an
+  "always" option is labeled "for this session" only when the agent's own text says session.
+- **One hero.** The welcome screen and the empty task render the same `GuildHero` (mascot, G-U-I-L-D, helper line),
+  so the mascot is placed in exactly one place (PC-UI-003).
+- **Result strip.** The "latest result" strip is not drawn for a completed run whose changed-files card is on
+  screen; it stays for every other case.
+
+Consequences
+- `requirements/requirements.yml` is unchanged: the statements already cover these behaviours; the commits cite
+  the requirement IDs.
