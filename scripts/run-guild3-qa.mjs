@@ -816,8 +816,12 @@ async function checkE() {
   if (chosen.status === "refused") throw new Error(`could not choose Opus for the browser task: ${chosen.reason}`);
 
   // Open the workbench, the Browser tab, and navigate through the address bar.
-  const expanded = await cdp.evaluate(`document.querySelector(".guild-workbench-trigger")?.getAttribute("aria-expanded")`);
-  if (expanded !== "true") await clickDom(".guild-workbench-trigger");
+  // Wait until the new task is the open one (the trigger is enabled), then open the workbench only if its tabs
+  // are not already showing: reading aria-expanded before the task opened could toggle an open workbench shut.
+  await until("task opened", async () => (await cdp.evaluate(`document.querySelector(".guild-workbench-trigger")?.disabled === false`)) ? true : undefined, { timeout: 15_000 });
+  await sleep(300);
+  if (!(await domExists(".guild-workbench-tabs"))) await clickDom(".guild-workbench-trigger");
+  await until("workbench tabs", async () => (await domExists(".guild-workbench-tabs")) ? true : undefined, { timeout: 15_000 });
   await clickDom(".guild-workbench-tabs [role='tab']", "Browser");
   await until("browser address bar", () => domExists(".guild-browser-address"), { timeout: 15_000 });
   await shot("E", "browser-tab-empty");

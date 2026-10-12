@@ -1044,8 +1044,8 @@ Decision
 - Throwaway token. Every start of a routed process gets `ANTHROPIC_AUTH_TOKEN=guild-router-<32 random hex
   characters>`, new for each launch, never logged and redacted from diagnostics, and never an
   `ANTHROPIC_API_KEY`. It also gets `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` and the routed model
-  applied at that start as `ANTHROPIC_DEFAULT_HAIKU_MODEL`, `ANTHROPIC_DEFAULT_SONNET_MODEL`,
-  `ANTHROPIC_DEFAULT_OPUS_MODEL`, `ANTHROPIC_SMALL_FAST_MODEL` and `CLAUDE_CODE_SUBAGENT_MODEL`, so Claude
+  applied at that start as `ANTHROPIC_SMALL_FAST_MODEL` and `CLAUDE_CODE_SUBAGENT_MODEL` (never the
+  `ANTHROPIC_DEFAULT_*_MODEL` variables: any of them makes the adapter drop that id from the modelPicker), so Claude
   Code's background requests (titles, summaries, compaction) and its subagents stay on the third-party
   source instead of asking for `claude-*` models. Native Claude sessions keep their environment unchanged
   (no base URL, no throwaway token).

@@ -8,21 +8,19 @@ import { newRoutedAuthToken, routedClaudeEnvironment } from "./routed-environmen
 const URL_WITH_TOKEN = "http://127.0.0.1:43120/0123456789abcdef0123456789abcdef/";
 
 describe("routed Claude environment", () => {
-  it("sets the throwaway token, the traffic flag and the routed model for every model family [D-061]", () => {
+  it("sets the throwaway token, the traffic flag and the routed model for background requests and subagents [D-061]", () => {
     const env = routedClaudeEnvironment({ baseUrl: URL_WITH_TOKEN, modelId: "deepseek-v4-flash" });
     assert.equal(env["ANTHROPIC_BASE_URL"], URL_WITH_TOKEN);
     assert.match(env["ANTHROPIC_AUTH_TOKEN"] ?? "", /^guild-router-[0-9a-f]{32}$/u);
     assert.equal(env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"], "1");
     assert.equal(env["ENABLE_TOOL_SEARCH"], "true");
     assert.equal(env["OPENVIKING_AUTO_CAPTURE"], "false");
-    for (const key of [
-      "ANTHROPIC_DEFAULT_HAIKU_MODEL",
-      "ANTHROPIC_DEFAULT_SONNET_MODEL",
-      "ANTHROPIC_DEFAULT_OPUS_MODEL",
-      "ANTHROPIC_SMALL_FAST_MODEL",
-      "CLAUDE_CODE_SUBAGENT_MODEL",
-    ]) {
+    for (const key of ["ANTHROPIC_SMALL_FAST_MODEL", "CLAUDE_CODE_SUBAGENT_MODEL"]) {
       assert.equal(env[key], "deepseek-v4-flash", key);
+    }
+    // Any default-model variable makes the adapter drop the routed id from the modelPicker (2026-10-12 live QA).
+    for (const key of ["ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL"]) {
+      assert.equal(Object.hasOwn(env, key), false, key);
     }
     assert.equal(Object.hasOwn(env, "ANTHROPIC_API_KEY"), false);
   });

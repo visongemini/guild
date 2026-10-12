@@ -3,9 +3,12 @@ import { randomBytes } from "node:crypto";
 /*
  * The per-spawn environment of a routed Claude process (docs/20 3.3, D-061). With a base URL alone Claude
  * Code sends its own subscription token to that URL; with an auth token it sends only that token. So a
- * routed process always gets a throwaway one, and the real login never reaches the router. The model
- * variables keep Claude Code's background requests (titles, summaries, compaction) and its subagents on the
- * routed model rather than on a claude-* model, which the router refuses. Never log any of these values.
+ * routed process always gets a throwaway one, and the real login never reaches the router. The two model
+ * variables keep Claude Code's background requests (titles, summaries) and its subagents on the routed model
+ * rather than on a claude-* model, which the router refuses. ANTHROPIC_DEFAULT_{OPUS,SONNET,HAIKU}_MODEL are
+ * deliberately not set: with any of them the adapter drops the same id from the session's modelPicker, so the
+ * routed model can no longer be selected (verified with claude-agent-acp 0.89.1 and Claude Code 2.1.296 on
+ * 2026-10-12). Never log any of these values.
  */
 
 /** A fresh throwaway auth token for one process start. */
@@ -30,9 +33,6 @@ export function routedClaudeEnvironment(input: Readonly<{
     ...(model === undefined
       ? {}
       : {
-          ANTHROPIC_DEFAULT_HAIKU_MODEL: model,
-          ANTHROPIC_DEFAULT_SONNET_MODEL: model,
-          ANTHROPIC_DEFAULT_OPUS_MODEL: model,
           ANTHROPIC_SMALL_FAST_MODEL: model,
           CLAUDE_CODE_SUBAGENT_MODEL: model,
         }),

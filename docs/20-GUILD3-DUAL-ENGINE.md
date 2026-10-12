@@ -136,8 +136,8 @@ created and never changes. Process topology stays one engine process per task (D
   subscription token to the router; with this token set it sends only the throwaway value);
   `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`; `ENABLE_TOOL_SEARCH=true`; `OPENVIKING_AUTO_CAPTURE=false`;
   and the routed model applied at that start (the task's selected Online/Local model; no variable when it
-  selects none) as `ANTHROPIC_DEFAULT_HAIKU_MODEL`, `ANTHROPIC_DEFAULT_SONNET_MODEL`,
-  `ANTHROPIC_DEFAULT_OPUS_MODEL`, `ANTHROPIC_SMALL_FAST_MODEL` and `CLAUDE_CODE_SUBAGENT_MODEL`, so
+  selects none) as `ANTHROPIC_SMALL_FAST_MODEL` and `CLAUDE_CODE_SUBAGENT_MODEL` (never the
+  `ANTHROPIC_DEFAULT_*_MODEL` variables: any of them makes the adapter drop that id from the modelPicker), so
   background requests (titles, summaries, compaction) and subagents stay on the third-party source.
   `ANTHROPIC_API_KEY` is never set (inherited `ANTHROPIC_*` stays stripped). The model variables follow the
   last (re)start: a switch between routed models of a live session is a plain `set_config_option`, so they

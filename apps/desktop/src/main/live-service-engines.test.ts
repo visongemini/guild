@@ -59,7 +59,7 @@ const LOCAL_MODEL: RoutedModelInfo = {
 
 /**
  * What a routed Claude process is spawned with (D-061): the router URL, a throwaway auth token that is never the
- * Claude login, no API key, no non-essential traffic, and every model family on the routed model applied then.
+ * Claude login, no API key, no non-essential traffic, and background requests and subagents on the routed model applied then.
  */
 function assertRoutedEnvironment(
   environment: Readonly<Record<string, string>> | undefined,
@@ -69,9 +69,6 @@ function assertRoutedEnvironment(
   const { ANTHROPIC_AUTH_TOKEN: token, ...rest } = environment;
   assert.match(token ?? "", /^guild-router-[0-9a-f]{32}$/u);
   const models = modelId === undefined ? {} : {
-    ANTHROPIC_DEFAULT_HAIKU_MODEL: modelId,
-    ANTHROPIC_DEFAULT_SONNET_MODEL: modelId,
-    ANTHROPIC_DEFAULT_OPUS_MODEL: modelId,
     ANTHROPIC_SMALL_FAST_MODEL: modelId,
     CLAUDE_CODE_SUBAGENT_MODEL: modelId,
   };
