@@ -9,6 +9,7 @@ import {
   createModelSourcesService,
   type HostConfirmationPrompt,
   type ModelSourcesService,
+  type ModelSourceTestPort,
 } from "./model-sources-service.js";
 
 // PC-ROUTE-002 (host binding by native confirmation), PC-MODEL-001, PC-PRIV-001.
@@ -296,5 +297,133 @@ describe("model sources service: workspace preferences [PC-PRIV-001]", () => {
     assert.equal((await h.service.getWorkspacePrefs({ workspaceId: one })).onlineReminderDismissed, true);
     assert.equal((await h.service.getWorkspacePrefs({ workspaceId: two })).onlineReminderDismissed, false);
     await assert.rejects(h.service.getWorkspacePrefs({ workspaceId: parse("workspace-9") }));
+  });
+});
+
+// The connection test (Guild 3.0.2): one one-token request per model, through the router's own rules and transport.
+describe("model sources service: connection test", () => {
+  const KEY = "sk-live-0123456789abcdef";
+  type Sent = { readonly url: string; readonly init: RequestInit; readonly sourceKind: string };
+
+  function testHarness(t: TestContext, answer: (sent: Sent) => Response | Promise<Response> = () => new Response("{}", { status: 200 }), port: Partial<ModelSourceTestPort> = {}) {
+    const dir = mkdtempSync(join(tmpdir(), "guild-model-source-test-"));
+    const store = openGuildPersistence({ path: join(dir, "guild.sqlite3") });
+    t.after(() => {
+      store.close();
+      rmSync(dir, { force: true, recursive: true });
+    });
+    const sent: Sent[] = [];
+    const keysRead: string[] = [];
+    const service = createModelSourcesService({
+      store,
+      defaultKeyFile: DEFAULT_KEY_FILE,
+      getLocale: async () => "en-US",
+      confirmHost: async () => true,
+      onChanged: () => undefined,
+      connectionTest: {
+        fetchImpl: async (url, init, context) => {
+          const request = { url, init, sourceKind: context.sourceKind };
+          sent.push(request);
+          return answer(request);
+        },
+        readKey: async (record) => {
+          keysRead.push(`${record.keyFile ?? DEFAULT_KEY_FILE}#${record.keyVariable ?? ""}`);
+          return record.keyVariable === null ? { usable: record.kind === "local" } : { usable: true, key: KEY };
+        },
+        lookup: async () => ["127.0.0.1"],
+        timeoutMs: 200,
+        ...port,
+      },
+    });
+    return { store, service, sent, keysRead };
+  }
+
+  const confirmed = async (h: ReturnType<typeof testHarness>, draft: ModelSourceDraft) => {
+    await h.service.upsert(draft);
+    return (await h.service.confirm(draft.id)).source;
+  };
+
+  it("probes each model of a confirmed source with the source's key and reports each answer [PC-ROUTE-002]", async (t) => {
+    const h = testHarness(t, (request) => {
+      const model = JSON.parse(String(request.init.body)).model as string;
+      return model === "deepseek-v4-pro" ? new Response('{"error":{"message":"Model Not Exist"}}', { status: 400 }) : new Response("{}", { status: 200 });
+    });
+    await confirmed(h, online({
+      keyFile: "/Users/tester/keys.env",
+      models: [{ id: "deepseek-v4-flash", label: "Flash" }, { id: "deepseek-v4-pro", label: "Pro" }],
+    }));
+    const response = await h.service.test("deepseek");
+    assert.equal(response.id, "deepseek");
+    assert.equal(response.refused, undefined);
+    assert.deepEqual(response.results.map((entry) => [entry.modelId, entry.outcome.kind]), [["deepseek-v4-flash", "ok"], ["deepseek-v4-pro", "model_not_found"]]);
+    assert.deepEqual(h.keysRead, ["/Users/tester/keys.env#DEEPSEEK_API_KEY"], "the key file and variable the source names, read once");
+    assert.equal(h.sent.length, 2);
+    for (const request of h.sent) {
+      assert.equal(request.url, "https://api.deepseek.com/anthropic/v1/messages");
+      assert.equal(request.sourceKind, "online");
+      assert.equal(request.init.redirect, "manual");
+      assert.equal((request.init.headers as Record<string, string>)["x-api-key"], KEY);
+    }
+    // The answer is a copy with statuses only: no key, no header, no body.
+    assert.equal(JSON.stringify(response).includes(KEY), false);
+    assert.equal(JSON.stringify(response).includes("Model Not Exist"), false);
+    assert.equal(Object.isFrozen(response), true);
+  });
+
+  it("makes no request for an unconfirmed source or after its address changed, and says so", async (t) => {
+    const h = testHarness(t);
+    await h.service.upsert(online());
+    assert.deepEqual(await h.service.test("deepseek"), { id: "deepseek", refused: "not_confirmed", results: [] });
+    await h.service.confirm("deepseek");
+    await h.service.upsert(online({ baseUrl: "https://api.other.example/anthropic" }));
+    assert.equal((await h.service.test("deepseek")).refused, "not_confirmed", "a new address needs its own confirmation");
+    assert.equal(h.sent.length, 0);
+    assert.equal(h.keysRead.length, 0, "not even the key file is opened");
+    assert.equal(await refusal(h.service.test("nope")), "model_source_not_found");
+  });
+
+  it("makes no request when the key variable has no usable value", async (t) => {
+    const h = testHarness(t, undefined, { readKey: async () => ({ usable: false }) });
+    await confirmed(h, online());
+    assert.deepEqual(await h.service.test("deepseek"), { id: "deepseek", refused: "key_unavailable", results: [] });
+    assert.equal(h.sent.length, 0);
+  });
+
+  it("holds every request to the router's rules: a Local address outside loopback and Tailscale is refused before any request", async (t) => {
+    const h = testHarness(t, undefined, { lookup: async () => ["192.168.1.9"] });
+    await confirmed(h, local({ baseUrl: "http://printer.lan:8081" }));
+    assert.deepEqual(await h.service.test("workstation"), { id: "workstation", refused: "address_not_allowed", results: [] });
+    assert.equal(h.sent.length, 0);
+  });
+
+  it("tests a key-less Local source on loopback without a credential, over the direct transport kind", async (t) => {
+    const h = testHarness(t);
+    await confirmed(h, local());
+    const response = await h.service.test("workstation");
+    assert.deepEqual(response.results.map((entry) => entry.outcome.kind), ["ok"]);
+    assert.equal(h.sent[0]!.url, "http://127.0.0.1:8081/v1/messages");
+    assert.equal(h.sent[0]!.sourceKind, "local");
+    assert.equal("x-api-key" in (h.sent[0]!.init.headers as Record<string, string>), false);
+  });
+
+  it("joins a second request for the same source while one is running, and reports a transport failure as an answer", async (t) => {
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const h = testHarness(t, async () => { await gate; throw new TypeError("fetch failed"); });
+    await confirmed(h, online());
+    const first = h.service.test("deepseek");
+    const second = h.service.test("deepseek");
+    assert.equal(first, second, "one test per source at a time");
+    release();
+    assert.deepEqual((await first).results.map((entry) => entry.outcome), [{ kind: "unreachable" }]);
+    assert.equal(h.sent.length, 1);
+    // Once it is over a new click starts a new test.
+    assert.notEqual(h.service.test("deepseek"), first);
+  });
+
+  it("is unavailable when the service was built without a transport", async (t) => {
+    const h = harness(t);
+    await h.service.upsert(online());
+    assert.equal(await refusal(h.service.test("deepseek")), "model_source_unavailable");
   });
 });

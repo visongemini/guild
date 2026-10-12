@@ -255,6 +255,38 @@ export type ConfirmModelSourceResponse = Readonly<{
   source: ModelSourceProjection;
 }>;
 
+export type TestModelSourceRequest = Readonly<{ id: string }>;
+
+/**
+ * What one model of a source answered to the connection test (a one-token request through the same rules and
+ * transport as a turn). Carries a status code at most: never a key, a header or any part of a response body.
+ */
+export type ModelProbeOutcome =
+  | Readonly<{ kind: "ok"; latencyMs: number }>
+  /** 401 or 403. */
+  | Readonly<{ kind: "key_rejected"; status: number }>
+  /** 404, or a 400 / 422 that says the model is unknown. */
+  | Readonly<{ kind: "model_not_found"; status: number }>
+  | Readonly<{ kind: "unreachable" }>
+  | Readonly<{ kind: "timeout" }>
+  | Readonly<{ kind: "http_error"; status: number }>;
+
+/** Why no request was made at all. */
+export type ModelSourceTestRefusal =
+  /** The source's address is not confirmed: the confirmation comes first. */
+  | "not_confirmed"
+  /** The key variable has no usable value in the key file. */
+  | "key_unavailable"
+  /** The address breaks a rule the router also enforces (a forbidden host or address, https for Online). */
+  | "address_not_allowed";
+
+export type TestModelSourceResponse = Readonly<{
+  id: string;
+  refused?: ModelSourceTestRefusal;
+  /** One entry per model of the source, in the source's order; empty when `refused`. */
+  results: readonly Readonly<{ modelId: string; outcome: ModelProbeOutcome }>[];
+}>;
+
 export function parseModelSourceIdRequest(input: unknown): Readonly<{ id: string }> {
   const record = exactRecord(input, ["id"]);
   return Object.freeze({ id: parseModelSourceId(record["id"]) });

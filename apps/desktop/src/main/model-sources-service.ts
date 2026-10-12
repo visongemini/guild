@@ -9,11 +9,17 @@ import {
   type ModelSourceDraft,
   type ModelSourceProjection,
   type SetWorkspacePrefsRequest,
+  type TestModelSourceResponse,
   type UpsertModelSourceResponse,
   type WorkspacePrefsProjection,
 } from "@guild/contracts";
 import type { GuildPersistence, ModelSourceRecord } from "@guild/persistence";
-import { ANTHROPIC_SOURCE_ID } from "@guild/model-router";
+import {
+  ANTHROPIC_SOURCE_ID,
+  probeSourceModels,
+  type RouterLogger,
+  type UpstreamFetch,
+} from "@guild/model-router";
 import { isReservedAnthropicModelId } from "./anthropic-model-ids.js";
 import { hostConfirmationPrompt, type HostConfirmationPrompt } from "./model-source-messages.js";
 
@@ -30,6 +36,19 @@ export type ModelSourcesStore = Pick<
   | "saveWorkspacePrefs"
 >;
 
+/**
+ * What the connection test runs on. The transport and the key reader are the router host's own (`createRouterFetch`,
+ * `readSourceKey`), so a test goes where, and with what, a real turn would; tests inject a fake transport.
+ */
+export type ModelSourceTestPort = {
+  readonly fetchImpl: UpstreamFetch;
+  readonly readKey: (record: ModelSourceRecord) => Promise<{ readonly usable: boolean; readonly key?: string }>;
+  /** DNS lookup of the Local address check; the router's default when absent. */
+  readonly lookup?: (host: string) => Promise<string[]>;
+  readonly timeoutMs?: number;
+  readonly logger?: RouterLogger;
+};
+
 export type ModelSourcesServiceOptions = {
   readonly store: ModelSourcesStore;
   /** Absolute path of the key file used by sources with `keyFile: null`; shown in the dialog. */
@@ -39,6 +58,8 @@ export type ModelSourcesServiceOptions = {
   readonly confirmHost: (prompt: HostConfirmationPrompt) => Promise<boolean>;
   /** Called after every mutation so the router host re-reads sources and keys. */
   readonly onChanged: () => void;
+  /** The connection test (`test`); a service without it answers `model_source_unavailable`. */
+  readonly connectionTest?: ModelSourceTestPort;
 };
 
 /** The model source and workspace preference operations behind the IPC channels. */
@@ -47,6 +68,8 @@ export interface ModelSourcesService {
   upsert(draft: ModelSourceDraft): Promise<UpsertModelSourceResponse>;
   remove(id: string): Promise<void>;
   confirm(id: string): Promise<ConfirmModelSourceResponse>;
+  /** One one-token request per model of a confirmed source, through the router's own rules and transport. */
+  test(id: string): Promise<TestModelSourceResponse>;
   getWorkspacePrefs(request: GetWorkspacePrefsRequest): Promise<WorkspacePrefsProjection>;
   setWorkspacePrefs(request: SetWorkspacePrefsRequest): Promise<WorkspacePrefsProjection>;
 }
@@ -137,6 +160,36 @@ export function createModelSourcesService(options: ModelSourcesServiceOptions): 
     return { status: "confirmed", source: project(confirmed) };
   }
 
+  const tests = new Map<string, Promise<TestModelSourceResponse>>();
+
+  async function testFresh(id: string, port: ModelSourceTestPort): Promise<TestModelSourceResponse> {
+    const record = store.loadModelSource(id);
+    if (record === undefined) throw failure("not_found");
+    const refused = (reason: NonNullable<TestModelSourceResponse["refused"]>): TestModelSourceResponse =>
+      Object.freeze({ id, refused: reason, results: Object.freeze([]) });
+    // Only the address the user confirmed is ever contacted, and only with the key that address was confirmed for.
+    if (record.confirmedHost === null || record.confirmedHost !== modelSourceHost(record.baseUrl)) return refused("not_confirmed");
+    const { usable, key } = await port.readKey(record);
+    if (!usable) return refused("key_unavailable");
+    const probed = await probeSourceModels({
+      source: {
+        id: record.id,
+        kind: record.kind,
+        label: record.label,
+        baseUrl: record.baseUrl,
+        ...(key === undefined ? {} : { key }),
+        confirmedHost: record.confirmedHost,
+        models: record.models.filter((model) => !isReservedAnthropicModelId(model.id)),
+      },
+      fetchImpl: port.fetchImpl,
+      ...(port.lookup === undefined ? {} : { lookup: port.lookup }),
+      ...(port.timeoutMs === undefined ? {} : { timeoutMs: port.timeoutMs }),
+      ...(port.logger === undefined ? {} : { logger: port.logger }),
+    });
+    if ("refused" in probed) return refused(probed.refused === "source_not_confirmed" ? "not_confirmed" : "address_not_allowed");
+    return Object.freeze({ id, results: Object.freeze(probed.models.map((entry) => Object.freeze({ modelId: entry.modelId, outcome: entry.outcome }))) });
+  }
+
   const service: ModelSourcesService = {
     list: async () => Object.freeze({ sources: Object.freeze(store.listModelSources().map(project)) }),
 
@@ -174,6 +227,17 @@ export function createModelSourcesService(options: ModelSourcesServiceOptions): 
       if (open !== undefined) return open;
       const operation = confirmFresh(id).finally(() => confirmations.delete(id));
       confirmations.set(id, operation);
+      return operation;
+    },
+
+    test: (id) => {
+      const port = options.connectionTest;
+      if (port === undefined) return Promise.reject(failure("unavailable"));
+      // One test per source at a time: a second click while it runs joins the first.
+      const running = tests.get(id);
+      if (running !== undefined) return running;
+      const operation = testFresh(id, port).finally(() => tests.delete(id));
+      tests.set(id, operation);
       return operation;
     },
 

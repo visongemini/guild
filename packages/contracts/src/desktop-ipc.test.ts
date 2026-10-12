@@ -890,7 +890,7 @@ test("model source requests carry no secret and no confirmation a renderer could
   assert.throws(() => parseDesktopRequest(DESKTOP_IPC_CHANNELS.upsertModelSource, { ...draft, confirmedHost: "api.deepseek.com" }), TypeError);
   assert.throws(() => parseDesktopRequest(DESKTOP_IPC_CHANNELS.upsertModelSource, { ...draft, baseUrl: "http://api.deepseek.com" }), TypeError);
   assert.throws(() => parseDesktopRequest(DESKTOP_IPC_CHANNELS.upsertModelSource, { ...draft, keyVariable: "sk-ant-api03-abcdefghijkl" }), TypeError);
-  for (const channel of [DESKTOP_IPC_CHANNELS.deleteModelSource, DESKTOP_IPC_CHANNELS.confirmModelSource]) {
+  for (const channel of [DESKTOP_IPC_CHANNELS.deleteModelSource, DESKTOP_IPC_CHANNELS.confirmModelSource, DESKTOP_IPC_CHANNELS.testModelSource]) {
     assert.deepEqual(parseDesktopRequest(channel, { id: "deepseek" }), { id: "deepseek" });
     for (const rejected of [
       {}, { id: "" }, { id: "a b" }, { id: 1 },
@@ -955,6 +955,7 @@ test("the Guild 3.0 channels are registered, unique invoke channels in the close
     DESKTOP_IPC_CHANNELS.upsertModelSource,
     DESKTOP_IPC_CHANNELS.deleteModelSource,
     DESKTOP_IPC_CHANNELS.confirmModelSource,
+    DESKTOP_IPC_CHANNELS.testModelSource,
     DESKTOP_IPC_CHANNELS.getWorkspacePrefs,
     DESKTOP_IPC_CHANNELS.setWorkspacePrefs,
     DESKTOP_IPC_CHANNELS.browserCommand,

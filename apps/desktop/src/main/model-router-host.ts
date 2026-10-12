@@ -54,6 +54,57 @@ const EMPTY_SNAPSHOT: Snapshot = {
 
 const ELECTRON_REDIRECT_CANCELLED = "Redirect was cancelled";
 
+/**
+ * The transport of every upstream request of a model source, the router's and the connection test's: Online goes
+ * through `fetchImpl` (the system proxy), Local through `directFetchImpl` when there is one, and no cookie ever
+ * comes back. The router decides the kind per request; a URL says nothing reliable (a Local request carries the
+ * validated IP, an Online URL may share an origin).
+ */
+export function createRouterFetch(options: Pick<ModelRouterHostOptions, "fetchImpl" | "directFetchImpl">): UpstreamFetch {
+  return async (input, init, context) => {
+    const transport = context.sourceKind === "local" && options.directFetchImpl !== undefined
+      ? options.directFetchImpl
+      : options.fetchImpl;
+    try {
+      // Cookies from a vendor must never come back on a later request.
+      return await transport(input, { ...init, credentials: "omit" });
+    } catch (error) {
+      // With redirect "manual" Electron's network stack rejects instead of returning the 3xx. Say
+      // what happened so the router logs a refused redirect, not an unreachable upstream.
+      if (error instanceof Error && error.message === ELECTRON_REDIRECT_CANCELLED) {
+        return new Response(null, { status: 307 });
+      }
+      throw error;
+    }
+  };
+}
+
+/**
+ * The key of a source, read from the user's env file exactly as the router reads it: the file the source names
+ * (else the default one) and the variable it names. A source without a variable is usable only when Local.
+ * Never logs or returns anything but the key itself, and only to the caller.
+ */
+export async function readSourceKey(
+  record: ModelSourceRecord,
+  defaultKeyFile: string,
+  log: RouterHostLog = () => undefined,
+): Promise<{ readonly usable: boolean; readonly key?: string }> {
+  if (record.keyVariable === null) {
+    // A key-less source is only legitimate on this computer or the user's own network.
+    return { usable: record.kind === "local" };
+  }
+  try {
+    const key = await readKeyFromEnvFile(record.keyFile ?? defaultKeyFile, record.keyVariable);
+    return key === undefined ? { usable: false } : { usable: true, key };
+  } catch (error) {
+    log("router_host.key_unreadable", {
+      sourceId: record.id,
+      errorName: error instanceof Error && /^[A-Za-z0-9_]{1,40}$/u.test(error.name) ? error.name : "Error",
+    });
+    return { usable: false };
+  }
+}
+
 export function createModelRouterHost(options: ModelRouterHostOptions): ModelRouterHost {
   const { store } = options;
   const log: RouterHostLog = (event, fields) => {
@@ -90,41 +141,9 @@ export function createModelRouterHost(options: ModelRouterHostOptions): ModelRou
     },
   };
 
-  const routerFetch: UpstreamFetch = async (input, init, context) => {
-    // The router decides the kind per request; the registry may have changed since, and a URL says
-    // nothing reliable (a Local request carries the validated IP, an Online URL may share an origin).
-    const transport = context.sourceKind === "local" && options.directFetchImpl !== undefined
-      ? options.directFetchImpl
-      : options.fetchImpl;
-    try {
-      // Cookies from a vendor must never come back on a later request.
-      return await transport(input, { ...init, credentials: "omit" });
-    } catch (error) {
-      // With redirect "manual" Electron's network stack rejects instead of returning the 3xx. Say
-      // what happened so the router logs a refused redirect, not an unreachable upstream.
-      if (error instanceof Error && error.message === ELECTRON_REDIRECT_CANCELLED) {
-        return new Response(null, { status: 307 });
-      }
-      throw error;
-    }
-  };
+  const routerFetch = createRouterFetch(options);
 
-  async function keyFor(record: ModelSourceRecord): Promise<{ readonly usable: boolean; readonly key?: string }> {
-    if (record.keyVariable === null) {
-      // A key-less source is only legitimate on this computer or the user's own network.
-      return { usable: record.kind === "local" };
-    }
-    try {
-      const key = await readKeyFromEnvFile(record.keyFile ?? options.defaultKeyFile, record.keyVariable);
-      return key === undefined ? { usable: false } : { usable: true, key };
-    } catch (error) {
-      log("router_host.key_unreadable", {
-        sourceId: record.id,
-        errorName: error instanceof Error && /^[A-Za-z0-9_]{1,40}$/u.test(error.name) ? error.name : "Error",
-      });
-      return { usable: false };
-    }
-  }
+  const keyFor = (record: ModelSourceRecord) => readSourceKey(record, options.defaultKeyFile, log);
 
   async function build(): Promise<Snapshot> {
     const sources: RouterSource[] = [];

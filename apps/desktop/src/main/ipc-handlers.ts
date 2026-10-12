@@ -178,6 +178,7 @@ export function registerDesktopIpc(
       return Object.freeze({});
     });
     handle(DESKTOP_IPC_CHANNELS.confirmModelSource, async (request) => modelSources.confirm(request.id));
+    handle(DESKTOP_IPC_CHANNELS.testModelSource, async (request) => modelSources.test(request.id));
     handle(DESKTOP_IPC_CHANNELS.getWorkspacePrefs, async (request) => modelSources.getWorkspacePrefs(request));
     handle(DESKTOP_IPC_CHANNELS.setWorkspacePrefs, async (request) => modelSources.setWorkspacePrefs(request));
   }

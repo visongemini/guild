@@ -19,7 +19,13 @@ import { resolveDevHooks } from "./dev-hooks.js";
 import { createElectronRouterFetches } from "./electron-router-fetch.js";
 import { registerDesktopIpc } from "./ipc-handlers.js";
 import { createLiveDesktopService } from "./live-service.js";
-import { createModelRouterHost, DEFAULT_KEY_FILE_UNDER_HOME, type ModelRouterHost } from "./model-router-host.js";
+import {
+  createModelRouterHost,
+  createRouterFetch,
+  DEFAULT_KEY_FILE_UNDER_HOME,
+  readSourceKey,
+  type ModelRouterHost,
+} from "./model-router-host.js";
 import { createModelSourcesService, type ModelSourcesService } from "./model-sources-service.js";
 import { RouterDiagnosticLog } from "./router-diagnostic-log.js";
 import { createGuildWindow } from "./window-security.js";
@@ -151,6 +157,13 @@ app.whenReady().then(async () => {
       },
       onChanged: () => {
         void routerHost.refresh();
+      },
+      connectionTest: {
+        fetchImpl: createRouterFetch({ fetchImpl: fetches.proxied, directFetchImpl: fetches.direct }),
+        readKey: (record) => readSourceKey(record, defaultKeyFile, (event, fields) => {
+          void log.append(event, fields).catch(() => undefined);
+        }),
+        logger: { info: (event, fields) => { void log.append(event, fields).catch(() => undefined); } },
       },
     });
     const bridge = createBrowserPaneBridge();

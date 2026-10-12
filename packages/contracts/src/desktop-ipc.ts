@@ -42,6 +42,8 @@ import {
   parseModelSourceIdRequest,
   type ConfirmModelSourceRequest,
   type ConfirmModelSourceResponse,
+  type TestModelSourceRequest,
+  type TestModelSourceResponse,
   type DeleteModelSourceRequest,
   type ListModelSourcesRequest,
   type ListModelSourcesResponse,
@@ -184,6 +186,7 @@ export const DESKTOP_IPC_CHANNELS = Object.freeze({
   upsertModelSource: "guild:v1:model-sources:upsert",
   deleteModelSource: "guild:v1:model-sources:delete",
   confirmModelSource: "guild:v1:model-sources:confirm",
+  testModelSource: "guild:v1:model-sources:test",
   getWorkspacePrefs: "guild:v1:workspace-prefs:get",
   setWorkspacePrefs: "guild:v1:workspace-prefs:set",
   browserCommand: "guild:v1:browser:command",
@@ -888,6 +891,7 @@ export type DesktopRequestByChannel = {
   readonly [DESKTOP_IPC_CHANNELS.upsertModelSource]: UpsertModelSourceRequest;
   readonly [DESKTOP_IPC_CHANNELS.deleteModelSource]: DeleteModelSourceRequest;
   readonly [DESKTOP_IPC_CHANNELS.confirmModelSource]: ConfirmModelSourceRequest;
+  readonly [DESKTOP_IPC_CHANNELS.testModelSource]: TestModelSourceRequest;
   readonly [DESKTOP_IPC_CHANNELS.getWorkspacePrefs]: GetWorkspacePrefsRequest;
   readonly [DESKTOP_IPC_CHANNELS.setWorkspacePrefs]: SetWorkspacePrefsRequest;
   readonly [DESKTOP_IPC_CHANNELS.browserCommand]: BrowserCommand;
@@ -946,6 +950,7 @@ export type DesktopResponseByChannel = {
   readonly [DESKTOP_IPC_CHANNELS.upsertModelSource]: UpsertModelSourceResponse;
   readonly [DESKTOP_IPC_CHANNELS.deleteModelSource]: EmptyDesktopResponse;
   readonly [DESKTOP_IPC_CHANNELS.confirmModelSource]: ConfirmModelSourceResponse;
+  readonly [DESKTOP_IPC_CHANNELS.testModelSource]: TestModelSourceResponse;
   readonly [DESKTOP_IPC_CHANNELS.getWorkspacePrefs]: WorkspacePrefsProjection;
   readonly [DESKTOP_IPC_CHANNELS.setWorkspacePrefs]: WorkspacePrefsProjection;
   readonly [DESKTOP_IPC_CHANNELS.browserCommand]: BrowserPaneProjection;
@@ -1073,6 +1078,9 @@ export type GuildRendererApi = Readonly<{
   readonly confirmModelSource: (
     request: ConfirmModelSourceRequest,
   ) => Promise<ConfirmModelSourceResponse>;
+  readonly testModelSource: (
+    request: TestModelSourceRequest,
+  ) => Promise<TestModelSourceResponse>;
   readonly getWorkspacePrefs: (
     request: GetWorkspacePrefsRequest,
   ) => Promise<WorkspacePrefsProjection>;
@@ -1285,6 +1293,7 @@ export function parseDesktopRequest<Channel extends DesktopInvokeChannel>(
       return parseModelSourceDraft(input) as DesktopRequestByChannel[Channel];
     case DESKTOP_IPC_CHANNELS.deleteModelSource:
     case DESKTOP_IPC_CHANNELS.confirmModelSource:
+    case DESKTOP_IPC_CHANNELS.testModelSource:
       return parseModelSourceIdRequest(input) as DesktopRequestByChannel[Channel];
     case DESKTOP_IPC_CHANNELS.getWorkspacePrefs: {
       const record = exactRecord(input, ["workspaceId"]);

@@ -90,5 +90,10 @@ export function createFixtureModelSources(): ModelSourcesService {
     getLocale: async () => "en-US",
     confirmHost: async () => true,
     onChanged: () => undefined,
+    // No network in the fixture: every model answers, one slower than the next.
+    connectionTest: {
+      fetchImpl: async () => new Response("{}", { status: 200 }),
+      readKey: async (record) => ({ usable: record.keyVariable !== null || record.kind === "local", key: "fixture-key" }),
+    },
   });
 }
