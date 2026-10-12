@@ -29,7 +29,9 @@ import {
 } from "@guild/runtime-grok";
 import { ClaudeLocatorError } from "./claude-locator.js";
 import type { BrowserMcpPort, ModelRouterHostPort, RoutedModelInfo } from "./engine-ports.js";
+import { openGuildPersistence, type GuildPersistence } from "@guild/persistence";
 import { createFixtureDesktopService } from "./fixture-service.js";
+import { toDesktopIpcFailure } from "./workspace-folder.js";
 import {
   createLiveDesktopService,
   type LiveDesktopServiceOptions,
@@ -221,6 +223,10 @@ describe("dual engine orchestration [PC-ENG-001, PC-MODEL-001]", () => {
     h.world.onSpawn = async () => {
       markedAtSpawn.push((await h.service.bootstrap()).activeTask?.engineStatus?.routed === true);
     };
+    const markedAtModel: boolean[] = [];
+    h.world.onConfigOption = async (_label, configId) => {
+      if (configId === "model") markedAtModel.push((await h.service.bootstrap()).activeTask?.engineStatus?.routed === true);
+    };
     const task = await h.service.createTask(h.workspaceId, undefined, "claude");
     await h.send(task.task.taskId, "native turn");
     await h.completed();
@@ -240,7 +246,8 @@ describe("dual engine orchestration [PC-ENG-001, PC-MODEL-001]", () => {
       .map((entry) => h.world.log.indexOf(entry));
     assert.ok(order.every((index) => index >= 0), `every step happened: ${order.join()}`);
     assert.deepEqual(order, [...order].sort((a, b) => a - b), "in that order");
-    assert.deepEqual(markedAtSpawn.slice(-1), [true], "the routed marker is durable before the routed process exists");
+    assert.deepEqual(markedAtSpawn.slice(-1), [false], "no marker while the routed process is only starting");
+    assert.deepEqual(markedAtModel, [false], "nor while it is taking the model: the marker follows the applied selection");
     assert.equal(h.world.adapters.length, 2);
     const routedEnvironment = {
       ANTHROPIC_BASE_URL: ROUTER_URL,
@@ -302,6 +309,10 @@ describe("dual engine orchestration [PC-ENG-001, PC-MODEL-001]", () => {
   it("starts a new task whose first model is routed through the router from its first process [docs/20 3.3]", async () => {
     const router = new FakeRouterHost([DEEPSEEK]);
     const h = await harness({ modelRouterHost: router });
+    const markedAtModel: boolean[] = [];
+    h.world.onConfigOption = async (_label, configId) => {
+      if (configId === "model") markedAtModel.push((await h.service.bootstrap()).activeTask?.engineStatus?.routed === true);
+    };
     const task = await h.service.createTask(h.workspaceId, undefined, "claude");
     const saved = await h.service.setTaskRuntimeSettings({
       taskId: task.task.taskId, model: "deepseek-v4-flash", reasoningEffort: null, contextWindow: null,
@@ -318,6 +329,7 @@ describe("dual engine orchestration [PC-ENG-001, PC-MODEL-001]", () => {
       [{ model: "deepseek-v4-flash", label: "DeepSeek V4 Flash" }],
     );
     assert.equal(h.world.adapters[0]!.log.includes("config:model=deepseek-v4-flash"), true);
+    assert.deepEqual(markedAtModel, [false], "the marker follows the applied model");
     assert.equal((await h.service.openTask(task.task.taskId)).engineStatus?.routed, true);
   });
 
@@ -360,13 +372,217 @@ describe("dual engine orchestration [PC-ENG-001, PC-MODEL-001]", () => {
     assert.equal(refused.task.modelSelection.source, "runtime", "nothing was stored");
     assert.equal(refused.task.engineStatus?.routed, undefined);
 
-    // A global default that names a routed model fails the start with a named code, never a native fallback.
+    // A routed task whose router is gone fails its start with a named code, never a native fallback.
     router.failStart = false;
-    await h.service.setClaudeSettings("deepseek-v4-flash", null, "default");
+    const routed = await h.service.setTaskRuntimeSettings({
+      taskId: task.task.taskId, model: "deepseek-v4-flash", reasoningEffort: null, contextWindow: null,
+    });
+    assert.equal(routed.status, "applied");
+    assert.equal(h.world.adapters.length, 2);
+    await h.idle();
     router.failStart = true;
+    await h.world.adapters[1]!.emitTransportInterrupted();
+    await eventually(async () => (await h.service.bootstrap()).activeTask?.sessionRecovery === "available");
     await assert.rejects(h.send(task.task.taskId, "again"), /^Error: model_router_unavailable$/u);
-    assert.equal(h.world.adapters.length, 1);
+    assert.equal(h.world.adapters.length, 2, "no native process is started for a routed task");
     assert.deepEqual(h.world.adapters[0]!.prompts, ["native"]);
+    assert.deepEqual(h.world.adapters[1]!.prompts, []);
+  });
+
+  it("joins the routed switch instead of racing it: prompts that arrive while the router starts run on the routed process [docs/20 3.3]", async () => {
+    const router = new FakeRouterHost([DEEPSEEK]);
+    const h = await harness({ modelRouterHost: router });
+    const markedAtModel: boolean[] = [];
+    h.world.onConfigOption = async (_label, configId) => {
+      if (configId === "model") markedAtModel.push((await h.service.bootstrap()).activeTask?.engineStatus?.routed === true);
+    };
+    const task = await h.service.createTask(h.workspaceId, undefined, "claude");
+    const taskId = task.task.taskId;
+    await h.send(taskId, "native");
+    await h.completed();
+    await h.idle();
+
+    // The command's own pre-check is the first router call; the switch's is the second, and it is held.
+    const gate = router.holdCall(router.calls + 2);
+    const switching = h.service.setTaskRuntimeSettings({
+      taskId, model: "deepseek-v4-flash", reasoningEffort: null, contextWindow: null,
+    });
+    await eventually(() => router.waiting);
+    const first = h.send(taskId, "first");
+    const second = h.send(taskId, "second");
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.deepEqual(h.world.adapters[0]!.prompts, ["native"], "nothing runs on the native process with a routed selection");
+    assert.equal(h.world.adapters.length, 1, "and the native process is not closed before the router is up");
+    assert.equal((await h.service.bootstrap()).activeTask?.engineStatus?.routed, undefined, "the task is not marked yet");
+
+    gate.open();
+    assert.equal((await switching).status, "applied");
+    await Promise.all([first, second]);
+    await h.completed(3);
+    await h.idle();
+    assert.deepEqual(h.world.adapters[0]!.prompts, ["native"]);
+    assert.deepEqual([...h.world.adapters[1]!.prompts].sort(), ["first", "second"]);
+    assert.equal(h.world.adapters.length, 2, "one switch, however many callers joined it");
+    assert.deepEqual(markedAtModel, [false], "the marker follows the applied model");
+    assert.equal((await h.service.openTask(taskId)).engineStatus?.routed, true);
+    const turnLog = h.world.adapters[1]!.log;
+    assert.ok(
+      turnLog.indexOf("config:model=deepseek-v4-flash") < turnLog.findIndex((entry) => entry.startsWith("prompt:")),
+      "the model is applied before the first turn of the routed process",
+    );
+  });
+
+  it("restarts a task marked routed that still has a native process at the next idle point, whatever Claude model it selects [docs/20 3.3]", async () => {
+    const router = new FakeRouterHost([DEEPSEEK]);
+    let store!: GuildPersistence;
+    const h = await harness({ modelRouterHost: router }, {}, (path) => {
+      store = openGuildPersistence({ path });
+      return store;
+    });
+    const task = await h.service.createTask(h.workspaceId, undefined, "claude");
+    const taskId = task.task.taskId;
+    await h.send(taskId, "native");
+    await h.completed();
+    await h.idle();
+    const opus = await h.service.setTaskRuntimeSettings({ taskId, model: "opus", reasoningEffort: null, contextWindow: null });
+    assert.equal(opus.status, "applied");
+    assert.equal(h.world.adapters.length, 1, "opus is a native model: no restart");
+
+    // A marker with no routed process behind it, as an earlier build could leave after a failed switch.
+    store.markTaskRouted({ taskId });
+    assert.equal((await h.service.openTask(taskId)).engineStatus?.routed, true);
+    await h.send(taskId, "after");
+    await h.completed(2);
+    assert.equal(h.world.adapters.length, 2);
+    assert.equal(h.world.adapters[0]!.state, "closed");
+    assert.deepEqual(h.world.inputs[1]!.extraEnvironment, {
+      ANTHROPIC_BASE_URL: ROUTER_URL, ENABLE_TOOL_SEARCH: "true", OPENVIKING_AUTO_CAPTURE: "false",
+    });
+    assert.deepEqual(h.world.adapters[0]!.prompts, ["native"]);
+    assert.deepEqual(h.world.adapters[1]!.prompts, ["after"]);
+    assert.equal(h.world.adapters[1]!.startCalls[0]!.kind, "resume");
+    assert.ok(h.world.adapters[1]!.log.includes("config:model=opus"), "the chosen Claude model is applied on the routed process");
+  });
+
+  it("refuses the prompt with model_selection_failed when the session cannot take the selected Claude model [docs/20 3.3]", async () => {
+    const h = await harness({}, { claude: { refuseModel: "opus" } });
+    const task = await h.service.createTask(h.workspaceId, undefined, "claude");
+    const taskId = task.task.taskId;
+    await h.send(taskId, "first");
+    await h.completed();
+    await h.idle();
+    await h.service.setClaudeSettings("opus", null, "default");
+    await h.send(taskId, "second");
+    const failed = await eventuallyValue(async () => {
+      const view = (await h.service.bootstrap()).activeTask;
+      return view?.timeline.some((item) =>
+        item.kind === "error" && /could not switch to the model|未能切换到这个任务选择的模型/u.test(item.text)) === true
+        ? view
+        : undefined;
+    });
+    assert.equal(failed.task.activeRunState, "failed");
+    assert.deepEqual(h.world.adapters[0]!.prompts, ["first"], "the turn never reached the agent on another model");
+    assert.equal(failed.modelSelection.modelId, "default", "the projection shows the model the session really runs");
+
+    // Switching the live session is refused the same way and never reported as applied.
+    await h.idle();
+    const refused = await h.service.setTaskRuntimeSettings({ taskId, model: "opus", reasoningEffort: null, contextWindow: null });
+    assert.equal(refused.status, "refused");
+    assert.equal((await h.service.openTask(taskId)).modelSelection.source, "global", "nothing was stored for the task");
+  });
+
+  it("fails the routed switch by name and does not mark the task when the routed process cannot take the model [docs/20 3.3]", async () => {
+    const router = new FakeRouterHost([DEEPSEEK]);
+    const h = await harness({ modelRouterHost: router }, { claude: { refuseModel: "deepseek-v4-flash" } });
+    const task = await h.service.createTask(h.workspaceId, undefined, "claude");
+    const taskId = task.task.taskId;
+    await h.send(taskId, "native");
+    await h.completed();
+    await h.idle();
+    const refused = await h.service.setTaskRuntimeSettings({
+      taskId, model: "deepseek-v4-flash", reasoningEffort: null, contextWindow: null,
+    });
+    assert.equal(refused.status, "refused", "the selection is never reported as applied");
+    assert.equal(refused.task.engineStatus?.routed, undefined, "and the task is not marked");
+    assert.equal(refused.task.modelSelection.source, "runtime", "the previous choice is back");
+    assert.equal(h.world.adapters.length, 2);
+    assert.equal(h.world.adapters[1]!.state, "closed", "the half-started routed process is closed");
+
+    // Native again for the next turn: the marker was never written.
+    await h.send(taskId, "again");
+    await h.completed(2);
+    assert.equal(h.world.adapters.length, 3);
+    assert.equal(h.world.inputs[2]!.extraEnvironment, undefined);
+    assert.deepEqual(h.world.adapters[2]!.prompts, ["again"]);
+    assert.equal((await h.service.openTask(taskId)).engineStatus?.routed, undefined);
+
+    // A task whose first model is routed surfaces the named code from its first send.
+    const fresh = await h.service.createTask(h.workspaceId, undefined, "claude");
+    const saved = await h.service.setTaskRuntimeSettings({
+      taskId: fresh.task.taskId, model: "deepseek-v4-flash", reasoningEffort: null, contextWindow: null,
+    });
+    assert.equal(saved.status, "saved");
+    await assert.rejects(h.send(fresh.task.taskId, "hi"), /^Error: model_selection_failed$/u);
+    assert.equal((await h.service.openTask(fresh.task.taskId)).engineStatus?.routed, undefined);
+    assert.deepEqual(h.world.adapters.at(-1)!.prompts, []);
+    assert.equal(h.world.adapters.at(-1)!.state, "closed");
+  });
+
+  it("gives the session/load fallback the routed picker and the browser server a resume gets [docs/20 3.3]", async () => {
+    const spec: EngineSpec = { mcpHttp: true, loadSession: true };
+    failingResumes.set(spec, 1);
+    const router = new FakeRouterHost([DEEPSEEK]);
+    const h = await harness({ modelRouterHost: router, browserMcp: new FakeBrowserMcp() }, { claude: spec });
+    const task = await h.service.createTask(h.workspaceId, undefined, "claude");
+    await h.service.setTaskRuntimeSettings({
+      taskId: task.task.taskId, model: "deepseek-v4-flash", reasoningEffort: null, contextWindow: null,
+    });
+    await h.send(task.task.taskId, "first");
+    await h.completed();
+    await h.world.adapters[0]!.emitTransportInterrupted();
+    await eventually(() => h.world.adapters.length === 2 && h.world.adapters[1]!.session !== undefined);
+    const calls = h.world.adapters[1]!.startCalls;
+    assert.deepEqual(calls.map((call) => call.kind), ["resume", "load"], "the resume failed and the load took over");
+    const server = { type: "http", name: "guild-browser", url: BROWSER_URL, headers: [] };
+    assert.deepEqual(calls[1]!.options?.mcpServers, [server]);
+    assert.deepEqual(calls[1]!.options?.claudeCodeOptions, {
+      settings: { modelPicker: { options: [{ model: "deepseek-v4-flash", label: "DeepSeek V4 Flash" }] } },
+    });
+    assert.deepEqual(calls[1]!.options, calls[0]!.options, "the same start options as the resume");
+    assert.deepEqual(h.world.inputs[1]!.extraEnvironment?.["ANTHROPIC_BASE_URL"], ROUTER_URL);
+  });
+
+  it("keeps a Grok task running when its pinned model is not offered [PC-MODEL-001]", async () => {
+    const h = await harness();
+    const task = await h.service.createTask(h.workspaceId);
+    const saved = await h.service.setTaskRuntimeSettings({
+      taskId: task.task.taskId, model: "grok-4.5", reasoningEffort: null, contextWindow: null,
+    });
+    assert.equal(saved.status, "saved");
+    await h.send(task.task.taskId, "hi");
+    await h.completed();
+    assert.deepEqual(h.world.adapters[0]!.prompts, ["hi"], "a refusal never blocks a Grok turn");
+    const view = await h.service.openTask(task.task.taskId);
+    assert.equal(view.timeline.some((item) => item.kind === "error"), false);
+  });
+
+  it("refuses an Online or Local model as the Claude global default with a named code [PC-MODEL-001]", async () => {
+    const router = new FakeRouterHost([DEEPSEEK, LOCAL_MODEL]);
+    const h = await harness({ modelRouterHost: router });
+    await assert.rejects(h.service.setClaudeSettings("deepseek-v4-flash", null, "default"), /^Error: claude_default_must_be_native$/u);
+    await assert.rejects(h.service.setClaudeSettings("local-27b-model", "high", "plan"), /^Error: claude_default_must_be_native$/u);
+    assert.equal((await h.service.bootstrap()).runtimeSettings.claude?.model, null, "nothing was stored");
+    // A native model still passes, also once a session has reported the adapter's list.
+    const task = await h.service.createTask(h.workspaceId, undefined, "claude");
+    await h.send(task.task.taskId, "x");
+    await h.completed();
+    await assert.rejects(h.service.setClaudeSettings("deepseek-v4-flash", null, "default"), /^Error: claude_default_must_be_native$/u);
+    await h.service.setClaudeSettings("opus", "high", "plan");
+    assert.equal((await h.service.bootstrap()).runtimeSettings.claude?.model, "opus");
+    // The named codes reach the renderer as they are.
+    for (const code of ["claude_default_must_be_native", "model_selection_failed", "model_router_unavailable"]) {
+      assert.equal(toDesktopIpcFailure(new Error(code)).message, code);
+    }
   });
 
   it("hands the browser MCP server only to agents that advertised HTTP MCP [PC-BROWSER-002]", async () => {
@@ -713,6 +929,10 @@ type EngineSpec = {
   /** The first N resumes answer "auth required": the login lapsed while Guild was closed. */
   readonly authRequiredOnResume?: number;
   readonly refuseMode?: boolean;
+  /** `set_config_option model=<this>` is refused although the session lists it. */
+  readonly refuseModel?: string;
+  /** `initialize` advertises `loadSession`; with `failingResumes` the fallback is exercised. */
+  readonly loadSession?: boolean;
 };
 
 type World = {
@@ -720,17 +940,24 @@ type World = {
   readonly adapters: EngineFake[];
   readonly inputs: Parameters<RuntimeFactory>[0][];
   onSpawn: ((input: Parameters<RuntimeFactory>[0]) => Promise<void>) | undefined;
+  /** Called after a config option was applied on any adapter of the world. */
+  onConfigOption: ((adapterLabel: string, configId: string, value: string | boolean) => Promise<void>) | undefined;
 };
 
 type Harness = Awaited<ReturnType<typeof harness>>;
 
 async function harness(
-  overrides: Partial<LiveDesktopServiceOptions> = {},
+  givenOverrides: Partial<LiveDesktopServiceOptions> = {},
   specs: Partial<Record<GuildEngine, EngineSpec>> = {},
+  /** Opens the store the service uses, for a test that must write to it directly. */
+  openStore?: (path: string) => GuildPersistence,
 ) {
   const root = await mkdtemp(join(tmpdir(), "guild-engines-"));
   const workspace = join(root, "Workspace");
   await mkdir(workspace);
+  const overrides: Partial<LiveDesktopServiceOptions> = openStore === undefined
+    ? givenOverrides
+    : { ...givenOverrides, persistence: openStore(join(root, "guild.sqlite3")) };
   let world = newWorld();
   bindRouter(overrides.modelRouterHost, world);
   const baseOptions = (): LiveDesktopServiceOptions => ({
@@ -775,7 +1002,7 @@ function bindRouter(router: ModelRouterHostPort | undefined, world: World): void
 }
 
 function newWorld(): World {
-  return { log: [], adapters: [], inputs: [], onSpawn: undefined };
+  return { log: [], adapters: [], inputs: [], onSpawn: undefined, onConfigOption: undefined };
 }
 
 function engineFactory(world: World, specs: Partial<Record<GuildEngine, EngineSpec>>): RuntimeFactory {
@@ -792,6 +1019,7 @@ function engineFactory(world: World, specs: Partial<Record<GuildEngine, EngineSp
       specs[input.engine] ?? {},
       world.log,
       `${input.engine}-${world.adapters.filter((candidate) => candidate.engine === input.engine).length + 1}`,
+      world,
     );
     world.adapters.push(adapter);
     return {
@@ -804,14 +1032,31 @@ function engineFactory(world: World, specs: Partial<Record<GuildEngine, EngineSp
 class FakeRouterHost implements ModelRouterHostPort {
   models: readonly RoutedModelInfo[];
   failStart = false;
+  /** Successful `ensureStarted` calls so far. */
+  calls = 0;
+  /** True while a held call waits for its gate. */
+  waiting = false;
+  private heldCall: { readonly at: number; readonly gate: Promise<void> } | undefined;
   readonly noted: string[][] = [];
   private readonly listeners = new Set<() => void>();
   constructor(models: readonly RoutedModelInfo[]) { this.models = models; }
   listRoutedModels(): readonly RoutedModelInfo[] { return this.models; }
   async ensureStarted(): Promise<{ readonly baseUrl: string }> {
     if (this.failStart) throw new Error(`cannot listen on ${ROUTER_URL}`);
+    this.calls += 1;
+    if (this.heldCall?.at === this.calls) {
+      this.waiting = true;
+      await this.heldCall.gate;
+      this.waiting = false;
+    }
     this.shared?.push("router.ensureStarted");
     return { baseUrl: ROUTER_URL };
+  }
+  /** The call with this number (counting from `calls`) waits until `open()`. */
+  holdCall(at: number): { open(): void } {
+    let open!: () => void;
+    this.heldCall = { at, gate: new Promise<void>((resolve) => { open = resolve; }) };
+    return { open };
   }
   noteAnthropicModels(ids: readonly string[]): void { this.noted.push([...ids]); }
   onChange(listener: () => void): () => void {
@@ -835,7 +1080,7 @@ class FakeBrowserMcp implements BrowserMcpPort {
 class EngineFake implements RuntimeAdapterPort {
   state = "created";
   readonly startCalls: Array<{
-    readonly kind: "new" | "resume";
+    readonly kind: "new" | "resume" | "load";
     readonly sessionId?: string;
     readonly options: AcpV1SessionStartOptions | undefined;
   }> = [];
@@ -857,6 +1102,7 @@ class EngineFake implements RuntimeAdapterPort {
     private readonly spec: EngineSpec,
     private readonly shared: string[],
     private readonly label: string,
+    private readonly world: World,
   ) {}
 
   get features(): EngineFeatureFlags {
@@ -876,7 +1122,7 @@ class EngineFake implements RuntimeAdapterPort {
     return Object.freeze({
       protocolVersion: 1,
       agentCapabilities: Object.freeze({
-        loadSession: false,
+        loadSession: this.spec.loadSession === true,
         resumeSession: true,
         prompt: Object.freeze({ image: false, audio: false, embeddedContext: false }),
       }),
@@ -927,9 +1173,13 @@ class EngineFake implements RuntimeAdapterPort {
     ) {
       throw new AcpV1ConfigOptionRefusedError("invalid_value", -32602);
     }
+    if (configId === "model" && value === this.spec.refuseModel) {
+      throw new AcpV1ConfigOptionRefusedError("invalid_value", -32602);
+    }
     this.note(`config:${configId}=${String(value)}`);
     this.options = Object.freeze(this.options.map((option) =>
       option.id === configId ? Object.freeze({ ...option, currentValue: value }) as RuntimeConfigOption : option));
+    await this.world.onConfigOption?.(this.label, configId, value);
     return this.options;
   }
 
@@ -956,11 +1206,19 @@ class EngineFake implements RuntimeAdapterPort {
       lapsedResumes.set(this.spec, lapsedResumes.get(this.spec)! - 1);
       throw new AcpV1AdapterError("auth_required");
     }
+    if (failingResumes.get(this.spec) !== undefined && failingResumes.get(this.spec)! > 0) {
+      failingResumes.set(this.spec, failingResumes.get(this.spec)! - 1);
+      throw new AcpV1AdapterError("operation_failed");
+    }
     return this.open("resume", sessionId, startOptions);
   }
 
-  async loadSession(): Promise<AcpV1AdapterSession> {
-    throw new Error("load is not advertised");
+  async loadSession(sessionId: string, _cwd?: string, startOptions?: AcpV1SessionStartOptions): Promise<AcpV1AdapterSession> {
+    if (this.spec.loadSession !== true) throw new Error("load is not advertised");
+    this.note("load");
+    this.startCalls.push({ kind: "load", sessionId, options: startOptions });
+    // The replay barrier is not needed by these tests: the session is established like a resume.
+    return this.open("resume", sessionId, startOptions);
   }
 
   private async open(
@@ -1098,6 +1356,8 @@ class EngineFake implements RuntimeAdapterPort {
 
 /** Remaining lapsed resumes per spec, shared by every adapter the factory builds from it. */
 const lapsedResumes = new WeakMap<EngineSpec, number>();
+/** Remaining resumes that fail with a plain operation failure, so the load fallback is tried. */
+const failingResumes = new WeakMap<EngineSpec, number>();
 
 function claudeOptions(models: readonly string[], previous: readonly RuntimeConfigOption[]): readonly RuntimeConfigOption[] {
   const current = (id: string, fallback: string): string => {
