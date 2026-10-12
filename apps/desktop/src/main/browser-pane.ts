@@ -49,6 +49,9 @@ export const BROWSER_PANE_PARTITION = "persist:guild-browser";
 /** The agent badge goes back to idle this long after the last tool call ended. */
 export const BROWSER_PANE_IDLE_DEBOUNCE_MS = 1_500;
 export const BROWSER_PANE_PAUSED_MESSAGE = "Paused by the user in Guild";
+/** A tool call was bound to a tab (and, before it sends input, to a page) that no longer holds. */
+export const BROWSER_PANE_TAB_CHANGED_MESSAGE =
+  "The browser tab changed while this tool was running (closed, switched or navigated), so nothing more was sent. Check the page with read_page, then try again.";
 
 /**
  * Web preferences of every pane tab: the docs/09 baseline plus the pane specifics. There is no
@@ -210,8 +213,12 @@ export type BrowserPaneToolSurface = Readonly<{
   /**
    * Runs one agent tool call. Rejects with the paused message when the user has taken over;
    * otherwise shows "operating" for as long as the call runs and returns to idle shortly after.
+   * `run` receives a surface bound to this call: it captures the control generation and the active
+   * tab when the call starts, sends every step to that tab, and refuses a step with the paused
+   * message when the user took over meanwhile, or with a tab-changed message when the tab was
+   * closed, a hidden tab would be asked for input, or the page navigated before input was sent.
    */
-  runAgentTool: <T>(run: () => Promise<T>) => Promise<T>;
+  runAgentTool: <T>(run: (surface: BrowserPaneToolSurface) => Promise<T>) => Promise<T>;
   /** Loads the URL in the active tab (opening a tab when there is none) and waits for the load. */
   navigate: (url: string) => Promise<BrowserPageInfo>;
   goBack: () => Promise<BrowserPageInfo>;
@@ -262,6 +269,24 @@ function ringPush<T>(buffer: RingBuffer<T>, item: T): void {
 
 type NetworkRecord = { method: string; url: string; status: number | undefined; failed: boolean };
 
+/** What one agent tool call is bound to when it starts. */
+type ToolCall = {
+  /** `controlGeneration` at the start; the user taking over bumps it and ends the call. */
+  readonly generation: number;
+  /** The tab active at the start (or, for a navigation with no tab, the tab it opened). */
+  tab: Tab | undefined;
+  /** The page of that tab at the start. */
+  page: { readonly url: string; readonly navEpoch: number } | undefined;
+  /** Set once the call sent input: its later steps finish that gesture on the page it validated. */
+  inputDispatched: boolean;
+};
+
+/** Chromium stalls these on a view it considers hidden (see `isOnScreen`). */
+const RENDER_DEPENDENT_METHOD = /^(?:Input\.|Page\.captureScreenshot$)/u;
+/** Steps that act on, or compute from, the page the call started on. */
+const PAGE_BOUND_METHOD = /^(?:DOM\.|Input\.)/u;
+const INPUT_METHOD = /^Input\./u;
+
 type Tab = {
   readonly id: string;
   readonly view: PaneView;
@@ -275,6 +300,8 @@ type Tab = {
   readonly firstLoadWaiters: Set<() => void>;
   attaching: Promise<void> | undefined;
   closed: boolean;
+  /** Counts main-frame navigations and render-process losses: a page the agent read may be gone. */
+  navEpoch: number;
   /** What was last pushed to the native view, so unchanged layout is not re-applied. */
   applied: { bounds: string; visible: boolean } | undefined;
 };
@@ -302,6 +329,8 @@ export function createBrowserPaneController(deps: BrowserPaneDeps): BrowserPaneC
   let bounds: BrowserPaneBounds = DEFAULT_BOUNDS;
   let visible = false;
   let agentControl: BrowserAgentControl = "idle";
+  /** Bumped on every take-over; a tool call that started under an older value is over. */
+  let controlGeneration = 0;
   let operatingCalls = 0;
   let idleTimer: unknown;
   let lastKey = "";
@@ -388,13 +417,14 @@ export function createBrowserPaneController(deps: BrowserPaneDeps): BrowserPaneC
     if (agentControl === "paused") throw new BrowserToolError(BROWSER_PANE_PAUSED_MESSAGE);
   }
 
-  async function runAgentTool<T>(run: () => Promise<T>): Promise<T> {
+  async function runAgentTool<T>(run: (surface: BrowserPaneToolSurface) => Promise<T>): Promise<T> {
     assertNotPaused();
+    const surface = boundSurface(beginCall());
     operatingCalls += 1;
     clearIdleTimer();
     setAgentControl("operating");
     try {
-      return await run();
+      return await run(surface);
     } finally {
       operatingCalls -= 1;
       if (operatingCalls === 0 && agentControl === "operating") scheduleIdle();
@@ -508,8 +538,15 @@ export function createBrowserPaneController(deps: BrowserPaneDeps): BrowserPaneC
     return tab.attaching;
   }
 
-  async function sendCdp(tab: Tab, method: string, params?: Record<string, unknown>): Promise<unknown> {
+  /** `beforeDispatch` runs after the debugger is ready, with nothing awaited between it and the send. */
+  async function sendCdp(
+    tab: Tab,
+    method: string,
+    params?: Record<string, unknown>,
+    beforeDispatch?: () => void,
+  ): Promise<unknown> {
     await ensureDebugger(tab);
+    beforeDispatch?.();
     return withTimeout(
       tab.contents.debugger.send(method, params),
       CDP_TIMEOUT_MS,
@@ -536,6 +573,7 @@ export function createBrowserPaneController(deps: BrowserPaneDeps): BrowserPaneC
       firstLoadWaiters: new Set(),
       attaching: undefined,
       closed: false,
+      navEpoch: 0,
       applied: undefined,
     };
     contents.setHandlers({
@@ -568,9 +606,13 @@ export function createBrowserPaneController(deps: BrowserPaneDeps): BrowserPaneC
         if (isMainFrame && errorCode !== -3) markFirstLoad(tab);
         emit();
       },
-      didNavigate: () => emit(),
+      didNavigate: () => {
+        tab.navEpoch += 1;
+        emit();
+      },
       titleUpdated: () => emit(),
       renderProcessGone: () => {
+        tab.navEpoch += 1;
         flush(tab.stopWaiters);
         emit();
       },
@@ -634,9 +676,10 @@ export function createBrowserPaneController(deps: BrowserPaneDeps): BrowserPaneC
   }
 
   /** Loads the address and resolves true when the load ended, false when it was still going after the timeout. */
-  async function load(tab: Tab, url: string): Promise<boolean> {
+  async function load(tab: Tab, url: string, beforeLoad?: () => void): Promise<boolean> {
     await settleInitialLoad(tab);
     if (tab.closed || tab.contents.isDestroyed()) throw new BrowserToolError("The tab was closed");
+    beforeLoad?.();
     try {
       await withTimeout(tab.contents.loadURL(url), LOAD_TIMEOUT_MS, "navigation_timeout");
       return true;
@@ -657,25 +700,87 @@ export function createBrowserPaneController(deps: BrowserPaneDeps): BrowserPaneC
     return tab;
   }
 
-  async function navigateTool(url: string): Promise<BrowserPageInfo> {
-    assertNotPaused();
+  // ---- tool calls: bound to the control generation, the tab and the page they started on -----
+
+  function urlOf(tab: Tab): string {
+    return tab.closed || tab.contents.isDestroyed() ? "about:blank" : tab.contents.getURL();
+  }
+
+  function bindTab(call: ToolCall, tab: Tab): Tab {
+    call.tab = tab;
+    call.page = { url: urlOf(tab), navEpoch: tab.navEpoch };
+    return tab;
+  }
+
+  function beginCall(): ToolCall {
+    const call: ToolCall = { generation: controlGeneration, tab: undefined, page: undefined, inputDispatched: false };
+    const tab = activeTab();
+    if (tab !== undefined) bindTab(call, tab);
+    return call;
+  }
+
+  /** The user took over after the call started: nothing more may be sent. */
+  function assertCallCurrent(call: ToolCall): void {
+    if (call.generation !== controlGeneration || agentControl === "paused") {
+      throw new BrowserToolError(BROWSER_PANE_PAUSED_MESSAGE);
+    }
+  }
+
+  function assertTabCurrent(call: ToolCall, tab: Tab): void {
+    assertCallCurrent(call);
+    if (tab.closed || tab.contents.isDestroyed()) throw new BrowserToolError(BROWSER_PANE_TAB_CHANGED_MESSAGE);
+  }
+
+  /** The check made immediately before one CDP command is dispatched. */
+  function assertStepAllowed(call: ToolCall, tab: Tab, method: string): void {
+    assertTabCurrent(call, tab);
+    // A tab the user switched away from is hidden for Chromium; input and screenshots would stall.
+    if (RENDER_DEPENDENT_METHOD.test(method) && tab.id !== activeTabId) {
+      throw new BrowserToolError(BROWSER_PANE_TAB_CHANGED_MESSAGE);
+    }
+    // Refs and coordinates were computed on the page the call started on; until input is sent, it must still be that page.
+    if (!call.inputDispatched && PAGE_BOUND_METHOD.test(method)) {
+      const page = call.page;
+      if (page === undefined || page.navEpoch !== tab.navEpoch || page.url !== urlOf(tab)) {
+        throw new BrowserToolError(BROWSER_PANE_TAB_CHANGED_MESSAGE);
+      }
+    }
+  }
+
+  async function sendFor(call: ToolCall, method: string, params?: Record<string, unknown>): Promise<unknown> {
+    assertCallCurrent(call);
+    const tab = call.tab ?? bindTab(call, requireActive());
+    assertTabCurrent(call, tab);
+    return sendCdp(tab, method, params, () => {
+      assertStepAllowed(call, tab, method);
+      if (INPUT_METHOD.test(method)) call.inputDispatched = true;
+    });
+  }
+
+  async function navigateFor(call: ToolCall, url: string): Promise<BrowserPageInfo> {
+    assertCallCurrent(call);
     if (!isPaneUrlAllowed(url)) {
       throw new BrowserToolError("This address cannot be opened: only http, https and about:blank are allowed.");
     }
-    const tab = activeTab() ?? openTab();
+    const tab = call.tab ?? activeTab() ?? openTab();
     if (tab === undefined) throw new BrowserToolError("The browser pane is not available.");
+    if (call.tab === undefined) bindTab(call, tab);
+    assertTabCurrent(call, tab);
     try {
-      const settled = await load(tab, url);
+      const settled = await load(tab, url, () => assertTabCurrent(call, tab));
       return pageInfo(tab, settled);
     } catch (error) {
+      // A take-over or a changed tab is a verdict about the call, not a failed navigation.
+      if (error instanceof BrowserToolError && (error.message === BROWSER_PANE_PAUSED_MESSAGE || error.message === BROWSER_PANE_TAB_CHANGED_MESSAGE)) throw error;
       const message = error instanceof Error ? error.message : "load failed";
       throw new BrowserToolError(`Navigation failed: ${boundedText(message, 200)}`);
     }
   }
 
-  async function historyTool(direction: "back" | "forward" | "reload"): Promise<BrowserPageInfo> {
-    assertNotPaused();
-    const tab = requireActive();
+  async function historyFor(call: ToolCall, direction: "back" | "forward" | "reload"): Promise<BrowserPageInfo> {
+    assertCallCurrent(call);
+    const tab = call.tab ?? bindTab(call, requireActive());
+    assertTabCurrent(call, tab);
     if (direction === "back") {
       if (!tab.contents.canGoBack()) throw new BrowserToolError("There is no previous page.");
       tab.contents.goBack();
@@ -690,29 +795,63 @@ export function createBrowserPaneController(deps: BrowserPaneDeps): BrowserPaneC
     return pageInfo(tab, settled);
   }
 
-  const tools: BrowserPaneToolSurface = Object.freeze({
-    runAgentTool,
-    navigate: navigateTool,
-    goBack: () => historyTool("back"),
-    goForward: () => historyTool("forward"),
-    reload: () => historyTool("reload"),
-    send: async (method: string, params?: Record<string, unknown>) => {
-      assertNotPaused();
-      return sendCdp(requireActive(), method, params);
-    },
+  function selectTabTool(tabId: string): boolean {
+    const tab = tabs.find((candidate) => candidate.id === tabId);
+    if (tab === undefined) return false;
+    activeTabId = tab.id;
+    applyLayout();
+    emit();
+    return true;
+  }
+
+  const sharedTools = {
     isOnScreen: () => visible,
     activeTab: () => {
       const tab = activeTab();
       return tab === undefined ? undefined : tabProjection(tab);
     },
     tabs: () => tabs.map(tabProjection),
-    selectTab: (tabId: string) => {
-      const tab = tabs.find((candidate) => candidate.id === tabId);
-      if (tab === undefined) return false;
-      activeTabId = tab.id;
-      applyLayout();
-      emit();
-      return true;
+    selectTab: selectTabTool,
+  };
+
+  /** The surface one tool call sees: every step goes to the tab the call started on. */
+  function boundSurface(call: ToolCall): BrowserPaneToolSurface {
+    return Object.freeze({
+      ...sharedTools,
+      runAgentTool,
+      navigate: (url: string) => navigateFor(call, url),
+      goBack: () => historyFor(call, "back"),
+      goForward: () => historyFor(call, "forward"),
+      reload: () => historyFor(call, "reload"),
+      send: (method: string, params?: Record<string, unknown>) => sendFor(call, method, params),
+      consoleMessages: () => [...((call.tab ?? activeTab())?.console.items ?? [])],
+      networkRequests: () => [...((call.tab ?? activeTab())?.network.values() ?? [])].map((record) => ({ ...record })),
+    });
+  }
+
+  /** Calls made outside `runAgentTool` bind to the pane as it is at that moment. */
+  const tools: BrowserPaneToolSurface = Object.freeze({
+    ...sharedTools,
+    runAgentTool,
+    navigate: async (url: string) => {
+      assertNotPaused();
+      return navigateFor(beginCall(), url);
+    },
+    goBack: async () => {
+      assertNotPaused();
+      return historyFor(beginCall(), "back");
+    },
+    goForward: async () => {
+      assertNotPaused();
+      return historyFor(beginCall(), "forward");
+    },
+    reload: async () => {
+      assertNotPaused();
+      return historyFor(beginCall(), "reload");
+    },
+    send: async (method: string, params?: Record<string, unknown>) => {
+      assertNotPaused();
+      return sendFor(beginCall(), method, params);
     },
     consoleMessages: () => [...(activeTab()?.console.items ?? [])],
     networkRequests: () => [...(activeTab()?.network.values() ?? [])].map((record) => ({ ...record })),
@@ -798,6 +937,7 @@ export function createBrowserPaneController(deps: BrowserPaneDeps): BrowserPaneC
         return { ok: true };
       }
       case "takeOver": {
+        controlGeneration += 1;
         clearIdleTimer();
         setAgentControl("paused");
         return { ok: true };

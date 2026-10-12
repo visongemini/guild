@@ -48,7 +48,7 @@ export function createBrowserPaneBridge(options: BrowserPaneBridgeOptions = {}):
 
   // Tool calls reach whichever pane is current when they run; with no window they fail with a message the model can read.
   const surface: BrowserPaneToolSurface = Object.freeze({
-    runAgentTool: <T>(run: () => Promise<T>): Promise<T> => (current === undefined ? unavailable<T>() : current.tools.runAgentTool(run)),
+    runAgentTool: <T>(run: (bound: BrowserPaneToolSurface) => Promise<T>): Promise<T> => (current === undefined ? unavailable<T>() : current.tools.runAgentTool(run)),
     navigate: (url: string) => (current === undefined ? unavailable<BrowserPageInfo>() : current.tools.navigate(url)),
     goBack: () => (current === undefined ? unavailable<BrowserPageInfo>() : current.tools.goBack()),
     goForward: () => (current === undefined ? unavailable<BrowserPageInfo>() : current.tools.goForward()),

@@ -19,7 +19,7 @@ function surfaceFake(options: { paused?: boolean; send?: BrowserPaneToolSurface[
       if (state.paused) throw new BrowserToolError(BROWSER_PANE_PAUSED_MESSAGE);
       order.push("operating");
       try {
-        return await run();
+        return await run(surface);
       } finally {
         order.push("done");
       }
@@ -102,6 +102,29 @@ test("tools/call runs the tool inside an agent operation and returns MCP content
     result: { content: [{ type: "text", text: 'Opened https://example.com/ in tab-1 title="T"' }] },
   });
   assert.deepEqual(order, ["operating", "navigate:https://example.com/", "done"]);
+});
+
+test("tools/call hands the tool the surface bound to that call, not the shared one", async () => {
+  const { surface } = surfaceFake();
+  const seen: string[] = [];
+  const bound: BrowserPaneToolSurface = {
+    ...surface,
+    navigate: async (url) => {
+      seen.push(`bound:${url}`);
+      return { tabId: "tab-1", url, title: "", loading: false };
+    },
+  };
+  const handle = createBrowserMcpHandler({
+    ...surface,
+    runAgentTool: (run) => run(bound),
+    navigate: async () => {
+      seen.push("shared");
+      throw new Error("the tool must use the bound surface");
+    },
+  });
+  const outcome = await handle(rpc(8, "tools/call", { name: "navigate", arguments: { url: "https://example.com/" } }));
+  assert.equal((outcome.body as { result: { isError?: boolean } }).result.isError, undefined);
+  assert.deepEqual(seen, ["bound:https://example.com/"]);
 });
 
 test("tool failures are MCP error results the model can read, not protocol errors", async () => {

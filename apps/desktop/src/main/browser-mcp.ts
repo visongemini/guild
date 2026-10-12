@@ -60,7 +60,7 @@ export function createBrowserMcpHandler(surface: BrowserPaneToolSurface): (messa
     if (rawArgs !== undefined && !isRecord(rawArgs)) return errorResult('Invalid arguments: "arguments" must be an object.');
     const args = rawArgs ?? {};
     try {
-      return await serialized(() => surface.runAgentTool(() => tool.run(args, surface)));
+      return await serialized(() => surface.runAgentTool((bound) => tool.run(args, bound)));
     } catch (error) {
       if (error instanceof BrowserToolError) return errorResult(error.message);
       const detail = error instanceof Error ? error.message : "unknown error";
