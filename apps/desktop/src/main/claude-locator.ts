@@ -78,14 +78,21 @@ export type LocatedClaudeEngine = Readonly<{
 export const MINIMUM_NODE_MAJOR = 22;
 
 /** The claude installer keeps every release at `.../versions/<ver>` and repoints the link. */
-const CLAUDE_VERSIONED_PATH = /[\\/]versions[\\/]\d+\.\d+\.\d+[^\\/]*$/u;
+const CLAUDE_VERSIONED_PATH = /[\\/]versions[\\/](\d+\.\d+\.\d+)[^\\/]*$/u;
+
+/** `<ver>` of a path that ends in `.../versions/<ver>`; the name alone carries the release. */
+export function claudeVersionFromPath(path: string): string | undefined {
+  return CLAUDE_VERSIONED_PATH.exec(path)?.[1];
+}
 
 /**
  * Decides whether a second locate may replace the first after a pin check failed (PC-ENG-002). The
  * node is never replaced within an app launch (it is trusted on first use, see `locateNode`); the
  * adapter may differ only by its package version, which is what an update changes: the same version
- * with another fingerprint is an unexpected change. Returns the first offending piece, or undefined
- * when re-pinning is allowed.
+ * with another fingerprint is an unexpected change. The claude binary is pinned by path and version
+ * (a 200 MB binary is not hashed): another real path is accepted only as a new release, that is
+ * `.../versions/<ver>` with a `<ver>` other than the pinned version. Returns the first offending
+ * piece, or undefined when re-pinning is allowed.
  */
 export function unexpectedEngineChange(
   before: LocatedClaudeEngine,
@@ -98,11 +105,12 @@ export function unexpectedEngineChange(
   ) {
     return "adapter";
   }
-  if (
-    before.claude.executablePath !== after.claude.executablePath &&
-    !CLAUDE_VERSIONED_PATH.test(after.claude.executablePath)
-  ) {
-    return "claude";
+  if (before.claude.executablePath !== after.claude.executablePath) {
+    // The release is read from the directory name, not from anything the new file says.
+    const release = claudeVersionFromPath(after.claude.executablePath);
+    if (release === undefined || release === before.claude.version || after.claude.version === before.claude.version) {
+      return "claude";
+    }
   }
   return undefined;
 }
@@ -246,10 +254,21 @@ export async function locateClaudeAdapter(options: ClaudeLocatorOptions = {}): P
     : new ClaudeLocatorError("adapter_version_unsupported", unsupported);
 }
 
-export async function locateClaudeBinary(options: ClaudeLocatorOptions = {}): Promise<LocatedClaudeBinary> {
+/**
+ * With `previous` (the binary of an earlier locate, after a failed pin check) nothing is run: the
+ * same real path is the same binary (it is pinned by path, not by hash), and another real path is
+ * judged by its name alone, see `acceptClaudeReplacement`.
+ */
+export async function locateClaudeBinary(
+  options: ClaudeLocatorOptions = {},
+  previous?: LocatedClaudeBinary,
+): Promise<LocatedClaudeBinary> {
   const context = resolveContext(options);
   for (const candidate of await findCandidates("claude", "claude", context)) {
     if (!(await isMachOExecutableFile(candidate))) continue;
+    if (previous !== undefined) {
+      return candidate === previous.executablePath ? previous : acceptClaudeReplacement(previous, candidate);
+    }
     const cached = await readCache(claudeCache, candidate);
     if (cached !== undefined) return cached;
     const version = /^(\d+\.\d+\.\d+)/u.exec(
@@ -266,12 +285,32 @@ export async function locateClaudeBinary(options: ClaudeLocatorOptions = {}): Pr
   throw new ClaudeLocatorError("claude_missing");
 }
 
-/** Locates all three pieces. Throws the first missing piece in the order node, adapter, claude. */
-export async function locateClaudeEngine(options: ClaudeLocatorOptions = {}): Promise<LocatedClaudeEngine> {
+/**
+ * A claude binary at another real path than the pinned one is accepted only as a new release:
+ * `.../versions/<ver>` with a `<ver>` that differs from the pinned version. The same version at
+ * another path, or a path outside the installer's layout, is refused. The new file is not run: the
+ * directory name carries the version.
+ */
+function acceptClaudeReplacement(previous: LocatedClaudeBinary, candidate: string): LocatedClaudeBinary {
+  const version = claudeVersionFromPath(candidate);
+  if (version === undefined || version === previous.version) throw new ClaudeEngineIntegrityError("claude");
+  return Object.freeze({ executablePath: candidate, version });
+}
+
+/**
+ * Locates all three pieces. Throws the first missing piece in the order node, adapter, claude.
+ * `previous` marks the re-locate after a failed pin check: the claude binary is then judged without
+ * being run (see `locateClaudeBinary`), the node is held to the launch's pin and the adapter is only
+ * read, so nothing that changed is executed before the caller compares the result.
+ */
+export async function locateClaudeEngine(
+  options: ClaudeLocatorOptions = {},
+  previous?: LocatedClaudeEngine,
+): Promise<LocatedClaudeEngine> {
   const [node, adapter, claude] = await Promise.allSettled([
     locateNode(options),
     locateClaudeAdapter(options),
-    locateClaudeBinary(options),
+    locateClaudeBinary(options, previous?.claude),
   ]);
   if (node.status === "rejected") throw node.reason;
   if (adapter.status === "rejected") throw adapter.reason;

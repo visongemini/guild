@@ -67,12 +67,16 @@ created and never changes. Process topology stays one engine process per task (D
   engine probe, the warm-up, a new task process); a node update therefore takes effect on the next Guild
   launch. A failed pin check may be followed by one automatic re-locate, and only an update is accepted:
   the adapter `package.json` is read, and another package version is re-pinned while the same version
-  with another fingerprint is refused (reading executes nothing); the `claude` real path may now be a
-  new `versions/<ver>` file. A Claude
-  runtime whose pieces already differ when it is created is returned in the refused state and never
-  starts. The Claude status reads "Claude engine files changed unexpectedly; restart Guild to accept
-  updated engine files, or reinstall claude-agent-acp". The code is on the IPC failure allowlist; the
-  state clears when a later session opens with the pinned files back in place, or after a restart.
+  with another fingerprint is refused (reading executes nothing). The `claude` binary (about 200 MB) is
+  pinned by real path and version string, **not by hash**: a re-locate accepts another real path only when
+  it is `.../versions/<v>` with a `<v>` that differs from the pinned version (the directory name carries
+  the version, the new file is not run to decide), and refuses the same version at another path as well as
+  any path outside that layout. The same path is the same binary, so bytes changed in place under it are
+  not detected by Guild; the adapter runs it the way the user's own `claude` would run.
+  A Claude runtime whose pieces already differ when it is created is returned in the refused state and
+  never starts. The Claude status reads "Claude engine files changed unexpectedly; restart Guild to
+  accept updated engine files, or reinstall claude-agent-acp". The code is on the IPC failure allowlist;
+  the state clears when a later session opens with the pinned files back in place, or after a restart.
 - Locator: `claude-agent-acp` from `~/.npm-global/bin`, the user's PATH and Homebrew paths;
   `claude` from `~/.local/bin/claude` / PATH (Mach-O). `node` from PATH (>= 22).
 - Env (allowlist + Guild-owned values): PATH, HOME, USER, LOGNAME (claude looks up its Keychain login by account name; without USER it reports "not logged in" [WP-A smoke]), LANG/LC_*, TMPDIR, proxy vars, SSL vars,

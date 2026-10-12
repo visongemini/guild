@@ -45,7 +45,8 @@ export type ClaudeRuntimeInput = Readonly<{
 }>;
 
 export type ClaudeRuntimeDependencies = Readonly<{
-  locate?: () => Promise<LocatedClaudeEngine>;
+  /** Locates the pieces; given the pieces of an earlier locate it is the re-locate after a failed pin. */
+  locate?: (previous?: LocatedClaudeEngine) => Promise<LocatedClaudeEngine>;
   invalidateLocatorCache?: () => void;
   createHost?: (options: EngineProcessHostOptions) => EngineProcessHost;
   baseEnvironment?: () => Promise<Readonly<Record<string, string | undefined>>>;
@@ -66,7 +67,7 @@ export async function createClaudeRuntime(
   input: ClaudeRuntimeInput,
   dependencies: ClaudeRuntimeDependencies = {},
 ): Promise<ClaudeRuntime> {
-  const locate = dependencies.locate ?? (() => locateClaudeEngine());
+  const locate = dependencies.locate ?? ((previous?: LocatedClaudeEngine) => locateClaudeEngine({}, previous));
   const baseEnvironment = await (dependencies.baseEnvironment ?? resolveOfficialGrokEnvironment)();
   let located: LocatedClaudeEngine;
   try {
@@ -108,9 +109,10 @@ export async function createClaudeRuntime(
     initial: buildHost(located),
     relocate: async () => {
       (dependencies.invalidateLocatorCache ?? invalidateClaudeLocatorCache)();
-      // The locator hashes the node (it is never run if it differs from the launch's pin) and only
-      // reads the adapter, so nothing that changed is executed before this comparison.
-      const relocated = await locate();
+      // The locator hashes the node (it is never run if it differs from the launch's pin), only reads
+      // the adapter and judges a new claude path by its name, so nothing that changed is executed
+      // before this comparison.
+      const relocated = await locate(located);
       // Same version, other bytes: not an update. Pinning whatever is on disk now would defeat the pin.
       const component = unexpectedEngineChange(located, relocated);
       if (component !== undefined) throw new ClaudeEngineIntegrityError(component);
@@ -143,8 +145,9 @@ class RefusedEngineProcess implements AcpV1ProcessPort {
  * The adapter's process port. When the first start fails its preflight because the adapter
  * package, the claude binary or the pinned node changed on disk, the locator cache is dropped
  * and the pieces are located once more, but only an update is accepted (a new adapter package
- * version, a new claude release); a changed node, or the same adapter version with other bytes,
- * raises `ClaudeEngineIntegrityError` and nothing is executed, on this start and every later one.
+ * version, a new claude release); a changed node, the same adapter version with other bytes, or the
+ * same claude version at another path raises `ClaudeEngineIntegrityError` and nothing is executed,
+ * on this start and every later one.
  * A second preflight failure is reported as it is. The first failure's event is withheld from
  * the adapter, which would otherwise treat it as a dead process.
  */

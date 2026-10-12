@@ -16,7 +16,12 @@ const SECOND_NODE_SHA = "b".repeat(64);
 function located(
   node: string,
   sha: string,
-  over: Readonly<{ nodeVersion?: string; adapterVersion?: string; fingerprint?: string }> = {},
+  over: Readonly<{
+    nodeVersion?: string;
+    adapterVersion?: string;
+    fingerprint?: string;
+    claude?: Readonly<{ executablePath: string; version: string }>;
+  }> = {},
 ): LocatedClaudeEngine {
   return Object.freeze({
     node: Object.freeze({ executablePath: node, sha256: sha, version: over.nodeVersion ?? "26.8.1" }),
@@ -26,9 +31,12 @@ function located(
       version: over.adapterVersion ?? "0.89.1",
       fingerprintSha256: over.fingerprint ?? "c".repeat(64),
     }),
-    claude: Object.freeze({ executablePath: "/opt/claude/bin/claude", version: "2.1.291" }),
+    claude: Object.freeze(over.claude ?? { executablePath: "/opt/claude/bin/claude", version: "2.1.291" }),
   });
 }
+
+const CLAUDE_RELEASE = (version: string, root = "/home/u/.local/share/claude") =>
+  ({ executablePath: `${root}/versions/${version}`, version });
 
 class FakeHost {
   readonly listeners = new Set<(event: ProcessHostEvent) => void>();
@@ -199,6 +207,37 @@ describe("Claude runtime process [PC-ENG-002]", () => {
       assert.equal(locates, 2, component);
       assert.equal(hosts.length, 1, `${component}: the unexpectedly changed files get no host`);
       assert.equal(runtime.refusedForIntegrity(), true, component);
+      await runtime.adapter.close().catch(() => undefined);
+    }
+  });
+
+  it("hands the pieces of the first locate to the re-locate and accepts a new claude release only [PC-ENG-002]", async () => {
+    const cases: Array<{ name: string; second: LocatedClaudeEngine; refused: boolean }> = [
+      { name: "new release", second: located("/usr/local/bin/node", NODE_SHA, { claude: CLAUDE_RELEASE("2.1.300") }), refused: false },
+      { name: "same release elsewhere", second: located("/usr/local/bin/node", NODE_SHA, { claude: CLAUDE_RELEASE("2.1.291", "/tmp/other") }), refused: true },
+      { name: "outside the layout", second: located("/usr/local/bin/node", NODE_SHA, { claude: { executablePath: "/tmp/evil/claude", version: "2.1.300" } }), refused: true },
+    ];
+    for (const { name, second, refused } of cases) {
+      const seen: Array<LocatedClaudeEngine | undefined> = [];
+      const hosts: EngineProcessHostOptions[] = [];
+      const first = located("/usr/local/bin/node", NODE_SHA, { claude: CLAUDE_RELEASE("2.1.291") });
+      const runtime = await createClaudeRuntime(
+        { adapterEpoch: 1, sink: {} as AcpV1AdapterSink, stagingRoot: "/tmp/staging", workingDirectory: "/tmp/work" },
+        {
+          locate: async (previous) => { seen.push(previous); return seen.length === 1 ? first : second; },
+          invalidateLocatorCache: () => undefined,
+          baseEnvironment: async () => ({ PATH: "/usr/bin" }),
+          createHost: (options) => {
+            hosts.push(options);
+            return asHost(new FakeHost(hosts.length === 1 ? { code: "claude_executable_invalid" } : { code: "working_directory_not_absolute" }));
+          },
+        },
+      );
+      await runtime.adapter.start().catch(() => undefined);
+      assert.deepEqual(seen, [undefined, first], `${name}: only the re-locate gets the earlier pieces`);
+      assert.equal(runtime.refusedForIntegrity(), refused, name);
+      assert.equal(hosts.length, refused ? 1 : 2, name);
+      if (!refused) assert.equal(hosts[1]!.launch.engine === "claude" && hosts[1]!.launch.claudeExecutablePath, "/home/u/.local/share/claude/versions/2.1.300");
       await runtime.adapter.close().catch(() => undefined);
     }
   });
