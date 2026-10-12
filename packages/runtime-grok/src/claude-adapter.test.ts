@@ -867,6 +867,37 @@ describe("Claude dialect: Grok-only features answer without a wire call (PC-FALL
     await adapter.close();
   });
 
+  it("resumes a native session whose model option names a routed id the list does not offer, without a protocol fault, and the next set_config_option fixes it [D-062]", async () => {
+    // The live failure of the switch back to Claude: the adapter restored deepseek-v4-flash from the transcript.
+    const process = new FakeProcess();
+    const sink = new RecordingSink();
+    const adapter = await startClaude(process, sink);
+    const recorded = fixtureSessionResult() as { configOptions: { id: string; currentValue: string }[] };
+    const strayOptions = recorded.configOptions.map((option) =>
+      option.id === "model" ? { ...option, currentValue: "deepseek-v4-flash" } : option);
+    const resuming = adapter.resumeSession("old-session", FIXTURE_CWD);
+    const resume = await waitForOutbound(process, ACP_V1_METHODS.sessionResume);
+    process.emitMessages({ jsonrpc: "2.0", id: resume.id, result: { ...recorded, configOptions: strayOptions } } as WireMessage);
+    const resumed = await resuming;
+    assert.equal(adapter.state, "ready", "the transport is not interrupted");
+    assert.equal(resumed.establishedBy, "resume");
+    const model = resumed.configOptions?.find((option) => option.category === "model");
+    assert.ok(model?.type === "select" && model.unlisted === true && model.currentValue === "deepseek-v4-flash");
+    assert.equal(resumed.modelCatalog?.models.some((entry) => entry.id === "deepseek-v4-flash"), false, "never a Claude model");
+    assert.equal(resumed.modelCatalog?.models.length, 12);
+    assert.equal(resumed.modelCatalog?.runtimeDefaultModelId, undefined);
+
+    // Guild then applies the selected Claude model: the answer lists it and the flag is gone.
+    const switching = adapter.setConfigOption(resumed, "model", "default");
+    const request = await waitForOutbound(process, ACP_V1_METHODS.sessionSetConfigOption);
+    const applied = strayOptions.map((option) => option.id === "model" ? { ...option, currentValue: "default" } : option);
+    process.emitMessages({ jsonrpc: "2.0", id: request.id, result: { configOptions: applied } });
+    const options = await switching;
+    const after = options.find((option) => option.category === "model");
+    assert.ok(after?.type === "select" && after.currentValue === "default" && !("unlisted" in after));
+    await adapter.close();
+  });
+
   it("switches the model with a plain set_config_option and re-derives the catalog from its result", async () => {
     const process = new FakeProcess();
     const adapter = await startClaude(process, new RecordingSink());

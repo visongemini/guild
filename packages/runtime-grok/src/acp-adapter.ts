@@ -742,7 +742,7 @@ export class AcpV1Adapter {
         ACP_V1_METHODS.sessionSetConfigOption,
         encodeSetSessionConfigOptionParams(transport.identity.sessionId, configId, value),
         this.timeouts.sessionMs,
-        (response) => this.decodeProtocol(() => decodeSetSessionConfigOptionResult(response)),
+        (response) => this.decodeProtocol(() => decodeSetSessionConfigOptionResult(response, this.profile.dialect)),
       );
       // The runtime also pushes a `config_option_update` snapshot for every change. Updates are
       // committed asynchronously, so one from an earlier change could land after this response
@@ -1478,6 +1478,7 @@ export class AcpV1Adapter {
           notification.params,
           sessionId,
           this.receiveTimestamp(),
+          this.profile.dialect,
         );
         if (
           update.type === "turn" ||
@@ -1509,6 +1510,7 @@ export class AcpV1Adapter {
         notification.params,
         session.identity.sessionId,
         this.receiveTimestamp(),
+        this.profile.dialect,
       );
       const operation = this.routeUpdate(session, update, promptIdOfSessionUpdate(notification.params));
       await operation;
@@ -1683,7 +1685,7 @@ export class AcpV1Adapter {
     if (activeRoots.length !== 1) return;
     let update: AcpV1DecodedUpdate;
     try {
-      update = decodeSessionUpdate(params, auxiliarySessionId, this.receiveTimestamp());
+      update = decodeSessionUpdate(params, auxiliarySessionId, this.receiveTimestamp(), this.profile.dialect);
     } catch {
       return;
     }

@@ -227,6 +227,12 @@ export type RuntimeConfigOption = RuntimeConfigOptionBase &
         readonly type: "select";
         readonly currentValue: string;
         readonly choices: RuntimeConfigSelectChoices;
+        /**
+         * `currentValue` is not one of `choices`. Only a Claude session's `model` option can say so: a session resumed
+         * after turns of another model comes back on the model of its last turn (an Online / Local id after routed
+         * turns) while a native session lists Claude's own models. Never a model the picker may offer or list.
+         */
+        readonly unlisted?: true;
       }
   );
 
@@ -556,7 +562,7 @@ function configOption(value: unknown, path: string): RuntimeConfigOption {
 
   exactKeys(
     rec,
-    ["category", "choices", "currentValue", "description", "id", "name", "type"],
+    ["category", "choices", "currentValue", "description", "id", "name", "type", "unlisted"],
     path,
     true,
   );
@@ -570,11 +576,15 @@ function configOption(value: unknown, path: string): RuntimeConfigOption {
       ? choices.options.map((option) => option.value)
       : choices.groups.flatMap((group) => group.options.map((option) => option.value));
   assertUnique(values, `${path}.choices.value`);
-  if (!values.includes(currentValue)) {
+  // `unlisted` says, and only says, that the value is not a choice (and only a model option may say it).
+  const unlisted = Object.hasOwn(rec, "unlisted");
+  if (unlisted && rec["unlisted"] !== true) throw new RuntimePayloadError("invalid_value", `${path}.unlisted`);
+  if (unlisted !== !values.includes(currentValue) || (unlisted && result["category"] !== "model")) {
     throw new RuntimePayloadError("invalid_value", `${path}.currentValue`);
   }
   result["currentValue"] = currentValue;
   result["choices"] = choices;
+  if (unlisted) result["unlisted"] = true;
   return result as RuntimeConfigOption;
 }
 

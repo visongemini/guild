@@ -1353,12 +1353,10 @@ export function createLiveDesktopService(
     previous: ReturnType<GuildPersistence["loadTaskRuntimeSettings"]>;
   }>;
 
-  /** The session runs on a model its own model list does not offer. */
+  /** The session runs on a model its own model list does not offer (the codec marks it `unlisted`). */
   function sessionModelUnoffered(options: readonly RuntimeConfigOption[]): boolean {
     const modelOption = selectionOptionsOf(options).model;
-    return modelOption !== undefined &&
-      typeof modelOption.currentValue === "string" &&
-      !optionOffers(modelOption, modelOption.currentValue);
+    return modelOption?.type === "select" && modelOption.unlisted === true;
   }
 
   /** Whether the session's own model list offers this model. */
