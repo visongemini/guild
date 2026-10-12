@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
+import { GUILD_BROWSER_LIMITS, type BrowserPaneProjection } from "@guild/contracts";
 import {
   BROWSER_PANE_COMMAND_LINE_SWITCHES,
   BROWSER_PANE_IDLE_DEBOUNCE_MS,
-  BROWSER_PANE_MAX_TABS,
   BROWSER_PANE_PARTITION,
   BROWSER_PANE_PAUSED_MESSAGE,
   BROWSER_PANE_WEB_PREFERENCES,
@@ -14,7 +14,6 @@ import {
   safeDownloadName,
   type BrowserPaneBounds,
   type BrowserPaneController,
-  type BrowserPaneProjection,
   type PaneContentsHandlers,
   type PaneDownload,
   type PaneNetworkEvent,
@@ -177,7 +176,7 @@ function setup(options: { registry?: ReturnType<typeof createBrowserPaneRegistry
 
 async function openTabs(env: ReturnType<typeof setup>, count: number): Promise<void> {
   for (let i = 0; i < count; i += 1) {
-    const result = await env.controller.command({ type: "newTab" });
+    const result = await env.controller.command({ kind: "newTab" });
     assert.deepEqual(result, { ok: true });
   }
   await env.flush();
@@ -187,7 +186,7 @@ async function openTabs(env: ReturnType<typeof setup>, count: number): Promise<v
 
 test("every tab is created with the fixed isolated preferences, the dedicated partition and no preload", async () => {
   assert.equal(BROWSER_PANE_PARTITION, "persist:guild-browser");
-  assert.equal(BROWSER_PANE_MAX_TABS, 5);
+  assert.equal(GUILD_BROWSER_LIMITS.maxTabs, 5);
   assert.deepEqual({ ...BROWSER_PANE_WEB_PREFERENCES }, {
     sandbox: true,
     contextIsolation: true,
@@ -238,16 +237,16 @@ test("up to five tabs open, the sixth is refused, and each tab id is registered 
   assert.equal(env.controller.projection().tabs.length, 5);
   assert.equal(env.registry.size(), 5);
   for (const view of env.views) assert.equal(env.registry.has(view.contents.id), true);
-  assert.deepEqual(await env.controller.command({ type: "newTab" }), { ok: false, reason: "tab_limit" });
+  assert.deepEqual(await env.controller.command({ kind: "newTab" }), { ok: false, reason: "tab_limit" });
   assert.equal(env.views.length, 5);
 
   const [first] = env.controller.projection().tabs;
   assert.ok(first);
-  assert.deepEqual(await env.controller.command({ type: "closeTab", tabId: first.id }), { ok: true });
+  assert.deepEqual(await env.controller.command({ kind: "closeTab", tabId: first.id }), { ok: true });
   assert.equal(env.registry.size(), 4);
   assert.equal(env.registry.has(env.views[0]!.contents.id), false);
   assert.equal(env.views[0]!.destroyed, true);
-  assert.deepEqual(await env.controller.command({ type: "newTab" }), { ok: true });
+  assert.deepEqual(await env.controller.command({ kind: "newTab" }), { ok: true });
   assert.equal(env.registry.size(), 5);
 });
 
@@ -259,36 +258,36 @@ test("a new tab becomes active; only the active tab is shown, and only while the
   assert.deepEqual(env.views.map((view) => view.visible), [false, false, false]);
   assert.equal(env.controller.tools.isOnScreen(), false);
 
-  await env.controller.command({ type: "setVisible", visible: true });
+  await env.controller.command({ kind: "setVisible", visible: true });
   assert.equal(env.controller.tools.isOnScreen(), true);
   assert.deepEqual(env.views.map((view) => view.visible), [false, false, true]);
 
-  assert.deepEqual(await env.controller.command({ type: "selectTab", tabId: ids[0]! }), { ok: true });
+  assert.deepEqual(await env.controller.command({ kind: "selectTab", tabId: ids[0]! }), { ok: true });
   assert.deepEqual(env.views.map((view) => view.visible), [true, false, false]);
-  assert.deepEqual(await env.controller.command({ type: "selectTab", tabId: "tab-99" }), { ok: false, reason: "unknown_tab" });
+  assert.deepEqual(await env.controller.command({ kind: "selectTab", tabId: "tab-99" }), { ok: false, reason: "unknown_tab" });
 
-  await env.controller.command({ type: "setVisible", visible: false });
+  await env.controller.command({ kind: "setVisible", visible: false });
   assert.deepEqual(env.views.map((view) => view.visible), [false, false, false]);
-  await env.controller.command({ type: "setVisible", visible: true });
+  await env.controller.command({ kind: "setVisible", visible: true });
 
-  await env.controller.command({ type: "selectTab", tabId: ids[1]! });
-  await env.controller.command({ type: "closeTab", tabId: ids[1]! });
+  await env.controller.command({ kind: "selectTab", tabId: ids[1]! });
+  await env.controller.command({ kind: "closeTab", tabId: ids[1]! });
   assert.equal(env.controller.projection().activeTabId, ids[2]);
-  await env.controller.command({ type: "closeTab", tabId: ids[2]! });
+  await env.controller.command({ kind: "closeTab", tabId: ids[2]! });
   assert.equal(env.controller.projection().activeTabId, ids[0]);
-  await env.controller.command({ type: "closeTab", tabId: ids[0]! });
+  await env.controller.command({ kind: "closeTab", tabId: ids[0]! });
   assert.equal(env.controller.projection().activeTabId, null);
-  assert.deepEqual(await env.controller.command({ type: "closeTab", tabId: ids[0]! }), { ok: false, reason: "unknown_tab" });
+  assert.deepEqual(await env.controller.command({ kind: "closeTab", tabId: ids[0]! }), { ok: false, reason: "unknown_tab" });
 });
 
 test("unchanged layout is not pushed to the native view again", async () => {
   const env = setup();
   await openTabs(env, 1);
-  await env.controller.command({ type: "setBounds", bounds: { x: 1, y: 2, width: 300, height: 400 } });
-  await env.controller.command({ type: "setVisible", visible: true });
+  await env.controller.command({ kind: "setBounds", x: 1, y: 2, width: 300, height: 400 });
+  await env.controller.command({ kind: "setVisible", visible: true });
   const calls = env.views[0]!.nativeCalls;
-  await env.controller.command({ type: "setBounds", bounds: { x: 1, y: 2, width: 300, height: 400 } });
-  await env.controller.command({ type: "setVisible", visible: true });
+  await env.controller.command({ kind: "setBounds", x: 1, y: 2, width: 300, height: 400 });
+  await env.controller.command({ kind: "setVisible", visible: true });
   assert.equal(env.views[0]!.nativeCalls, calls);
 });
 
@@ -296,7 +295,7 @@ test("setBounds rounds and applies to every tab; the default bounds are used unt
   const env = setup();
   await openTabs(env, 2);
   for (const view of env.views) assert.deepEqual(view.bounds, { x: 0, y: 0, width: 800, height: 600 });
-  assert.deepEqual(await env.controller.command({ type: "setBounds", bounds: { x: 10.4, y: 20.6, width: 300.5, height: 400.2 } }), { ok: true });
+  assert.deepEqual(await env.controller.command({ kind: "setBounds", x: 10.4, y: 20.6, width: 300.5, height: 400.2 }), { ok: true });
   for (const view of env.views) assert.deepEqual(view.bounds, { x: 10, y: 21, width: 301, height: 400 });
   for (const bounds of [
     { x: -1, y: 0, width: 10, height: 10 },
@@ -304,7 +303,7 @@ test("setBounds rounds and applies to every tab; the default bounds are used unt
     { x: 0, y: 0, width: 10, height: Number.POSITIVE_INFINITY },
     { x: 0, y: 0, width: 99_999, height: 10 },
   ]) {
-    assert.deepEqual(await env.controller.command({ type: "setBounds", bounds }), { ok: false, reason: "invalid_bounds" });
+    assert.deepEqual(await env.controller.command({ kind: "setBounds", ...bounds }), { ok: false, reason: "invalid_bounds" });
   }
   for (const view of env.views) assert.deepEqual(view.bounds, { x: 10, y: 21, width: 301, height: 400 });
 });
@@ -371,31 +370,31 @@ test("window.open becomes a new tab for http(s) while under the limit, and is dr
 
 test("user navigation validates the address in main and loads it in the active tab", async () => {
   const env = setup();
-  assert.deepEqual(await env.controller.command({ type: "navigate", url: "file:///etc/passwd" }), { ok: false, reason: "invalid_url" });
-  assert.deepEqual(await env.controller.command({ type: "navigate", url: "example.com" }), { ok: false, reason: "invalid_url" });
+  assert.deepEqual(await env.controller.command({ kind: "navigate", url: "file:///etc/passwd" }), { ok: false, reason: "invalid_url" });
+  assert.deepEqual(await env.controller.command({ kind: "navigate", url: "example.com" }), { ok: false, reason: "invalid_url" });
   assert.equal(env.views.length, 0);
-  assert.deepEqual(await env.controller.command({ type: "navigate", url: "https://example.com/" }), { ok: true });
+  assert.deepEqual(await env.controller.command({ kind: "navigate", url: "https://example.com/" }), { ok: true });
   await env.flush();
   assert.equal(env.views.length, 1);
   assert.deepEqual(env.views[0]!.contents.loads, ["about:blank", "https://example.com/"]);
-  assert.deepEqual(await env.controller.command({ type: "newTab", url: "javascript:1" }), { ok: false, reason: "invalid_url" });
-  assert.deepEqual(await env.controller.command({ type: "back" }), { ok: true });
+  assert.deepEqual(await env.controller.command({ kind: "newTab", url: "javascript:1" }), { ok: false, reason: "invalid_url" });
+  assert.deepEqual(await env.controller.command({ kind: "back" }), { ok: true });
 });
 
 test("back, forward, reload and stop act on the active tab only when they make sense", async () => {
   const env = setup();
-  assert.deepEqual(await env.controller.command({ type: "reload" }), { ok: false, reason: "no_tab" });
+  assert.deepEqual(await env.controller.command({ kind: "reload" }), { ok: false, reason: "no_tab" });
   await openTabs(env, 2);
   const contents = env.views[1]!.contents;
-  await env.controller.command({ type: "back" });
-  await env.controller.command({ type: "forward" });
+  await env.controller.command({ kind: "back" });
+  await env.controller.command({ kind: "forward" });
   assert.deepEqual(contents.actions, []);
   contents.back = true;
   contents.forward = true;
-  await env.controller.command({ type: "back" });
-  await env.controller.command({ type: "forward" });
-  await env.controller.command({ type: "reload" });
-  await env.controller.command({ type: "stop" });
+  await env.controller.command({ kind: "back" });
+  await env.controller.command({ kind: "forward" });
+  await env.controller.command({ kind: "reload" });
+  await env.controller.command({ kind: "stop" });
   assert.deepEqual(contents.actions, ["back", "forward", "reload", "stop"]);
   assert.deepEqual(env.views[0]!.contents.actions, []);
 });
@@ -406,7 +405,7 @@ test("the projection follows url, title, loading and history flags, and unchange
   const env = setup();
   const seen: BrowserPaneProjection[] = [];
   const unsubscribe = env.controller.subscribe((projection) => seen.push(projection));
-  await env.controller.command({ type: "navigate", url: "https://example.com/" });
+  await env.controller.command({ kind: "navigate", url: "https://example.com/" });
   await env.flush();
   const contents = env.views[0]!.contents;
   contents.title = "Example";
@@ -430,7 +429,7 @@ test("the projection follows url, title, loading and history flags, and unchange
 
 test("every tab starts at about:blank; the debugger attaches only after that first finished load", async () => {
   const env = setup({ holdLoads: true });
-  await env.controller.command({ type: "newTab" });
+  await env.controller.command({ kind: "newTab" });
   await env.flush();
   const contents = env.views[0]!.contents;
   assert.deepEqual(contents.loads, ["about:blank"]);
@@ -448,7 +447,7 @@ test("every tab starts at about:blank; the debugger attaches only after that fir
 
 test("the first real page is loaded only after the debugger is attached, so its requests and logs are seen", async () => {
   const env = setup({ holdLoads: true });
-  await env.controller.command({ type: "newTab", url: "https://example.com/first" });
+  await env.controller.command({ kind: "newTab", url: "https://example.com/first" });
   await env.flush();
   const contents = env.views[0]!.contents;
   assert.deepEqual(contents.loads, ["about:blank"]);
@@ -462,7 +461,7 @@ test("the first real page is loaded only after the debugger is attached, so its 
 
 test("a failed first load also unblocks the debugger so the error page can be inspected", async () => {
   const env = setup({ holdLoads: true });
-  await env.controller.command({ type: "newTab" });
+  await env.controller.command({ kind: "newTab" });
   const contents = env.views[0]!.contents;
   contents.handlers.didFailLoad({ errorCode: -3, errorDescription: "ERR_ABORTED", isMainFrame: true });
   contents.handlers.didFailLoad({ errorCode: -102, errorDescription: "ERR_CONNECTION_REFUSED", isMainFrame: false });
@@ -475,7 +474,7 @@ test("a failed first load also unblocks the debugger so the error page can be in
 
 test("CDP commands wait for the first load, and an unfinished first load times out", async () => {
   const env = setup({ holdLoads: true });
-  await env.controller.command({ type: "newTab" });
+  await env.controller.command({ kind: "newTab" });
   const contents = env.views[0]!.contents;
   let settled = false;
   const answer = env.controller.tools.send("Runtime.evaluate", { expression: "1" }).then(() => { settled = true; });
@@ -487,7 +486,7 @@ test("CDP commands wait for the first load, and an unfinished first load times o
   assert.deepEqual(contents.cdp.map((call) => call.method), ["Runtime.enable", "Runtime.evaluate"]);
 
   const stuck = setup({ holdLoads: true });
-  await stuck.controller.command({ type: "newTab" });
+  await stuck.controller.command({ kind: "newTab" });
   const waiting = stuck.controller.tools.send("Page.enable");
   await stuck.flush();
   stuck.timers.advance(20_000);
@@ -515,7 +514,7 @@ test("closing a tab detaches its debugger and destroys the view", async () => {
   await openTabs(env, 1);
   const contents = env.views[0]!.contents;
   assert.equal(contents.attached, true);
-  await env.controller.command({ type: "closeTab", tabId: "tab-1" });
+  await env.controller.command({ kind: "closeTab", tabId: "tab-1" });
   assert.equal(contents.attached, false);
   assert.equal(contents.detachCalls, 1);
   assert.equal(env.views[0]!.destroyed, true);
@@ -626,7 +625,7 @@ test("a failing tool still ends operating", async () => {
 test("Take over pauses the agent: every tool is refused until Resume agent", async () => {
   const env = setup();
   await openTabs(env, 1);
-  assert.deepEqual(await env.controller.command({ type: "takeOver" }), { ok: true });
+  assert.deepEqual(await env.controller.command({ kind: "takeOver" }), { ok: true });
   assert.equal(env.controller.projection().agentControl, "paused");
   await assert.rejects(env.controller.tools.runAgentTool(() => Promise.resolve(1)), (error: unknown) => error instanceof BrowserToolError && error.message === BROWSER_PANE_PAUSED_MESSAGE);
   await assert.rejects(env.controller.tools.navigate("https://example.com/"), new RegExp(BROWSER_PANE_PAUSED_MESSAGE, "u"));
@@ -634,8 +633,8 @@ test("Take over pauses the agent: every tool is refused until Resume agent", asy
   assert.equal(env.controller.projection().agentControl, "paused");
 
   // The user keeps full control of the pane itself.
-  assert.deepEqual(await env.controller.command({ type: "navigate", url: "https://example.com/mine" }), { ok: true });
-  assert.deepEqual(await env.controller.command({ type: "resumeAgent" }), { ok: true });
+  assert.deepEqual(await env.controller.command({ kind: "navigate", url: "https://example.com/mine" }), { ok: true });
+  assert.deepEqual(await env.controller.command({ kind: "resumeAgent" }), { ok: true });
   assert.equal(env.controller.projection().agentControl, "idle");
   assert.equal(await env.controller.tools.runAgentTool(() => Promise.resolve("ok")), "ok");
 });
@@ -644,12 +643,12 @@ test("taking over while a tool runs keeps the pane paused when that tool ends", 
   const env = setup();
   let release!: () => void;
   const running = env.controller.tools.runAgentTool(() => new Promise<void>((resolve) => { release = resolve; }));
-  await env.controller.command({ type: "takeOver" });
+  await env.controller.command({ kind: "takeOver" });
   release();
   await running;
   env.timers.advance(10_000);
   assert.equal(env.controller.projection().agentControl, "paused");
-  await env.controller.command({ type: "resumeAgent" });
+  await env.controller.command({ kind: "resumeAgent" });
   assert.equal(env.controller.projection().agentControl, "idle");
 });
 
@@ -744,6 +743,6 @@ test("dispose closes every tab, stops timers and refuses further commands", asyn
   assert.equal(env.registry.size(), 0);
   assert.equal(env.views.every((view) => view.destroyed), true);
   assert.equal(env.timers.size, 0);
-  assert.deepEqual(await env.controller.command({ type: "newTab" }), { ok: false, reason: "failed" });
+  assert.deepEqual(await env.controller.command({ kind: "newTab" }), { ok: false, reason: "failed" });
   env.controller.dispose();
 });

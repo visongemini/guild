@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import type { BrowserTabProjection } from "@guild/contracts";
 import {
   BROWSER_MCP_KEY_NAMES,
   BROWSER_MCP_TOOLS,
@@ -10,7 +11,6 @@ import {
 import {
   BROWSER_PANE_PAUSED_MESSAGE,
   BrowserToolError,
-  type BrowserPaneTabProjection,
   type BrowserPaneToolSurface,
 } from "./browser-pane.js";
 
@@ -18,7 +18,7 @@ type Cdp = { method: string; params: Record<string, unknown> | undefined };
 
 function fakeSurface(options: {
   respond?: (method: string, params: Record<string, unknown> | undefined) => unknown;
-  tabs?: BrowserPaneTabProjection[];
+  tabs?: BrowserTabProjection[];
   paused?: boolean;
   onScreen?: boolean;
 } = {}) {
@@ -79,7 +79,7 @@ function textOf(result: Awaited<ReturnType<typeof run>>): string {
   return first.text;
 }
 
-const tab = (id: string, patch: Partial<BrowserPaneTabProjection> = {}): BrowserPaneTabProjection => ({
+const tab = (id: string, patch: Partial<BrowserTabProjection> = {}): BrowserTabProjection => ({
   id, url: `https://example.com/${id}`, title: id, loading: false, canGoBack: false, canGoForward: false, ...patch,
 });
 
