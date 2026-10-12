@@ -47,6 +47,8 @@ import { WrenchIcon as Wrench } from "@phosphor-icons/react/Wrench";
 import { WarningCircleIcon as WarningCircle } from "@phosphor-icons/react/WarningCircle";
 import { XIcon as X } from "@phosphor-icons/react/X";
 import type {
+  BrowserCommand,
+  BrowserPaneProjection,
   GuildClaudePermissionMode,
   GuildEngine,
   GuildGrokModel,
@@ -127,6 +129,14 @@ import { messagesFor } from "./locales.js";
 import { continuousFooter } from "./continuous-display.js";
 import { ContinuousRoundRecord, ContinuousTaskCard, ContinuousCompletionRecord } from "./ContinuousTask.js";
 import { GrokControlCenter } from "./GrokControlCenter.js";
+import { BrowserPane } from "./BrowserPane.js";
+import {
+  EMPTY_BROWSER_PANE,
+  browserPaneHidden,
+  revealsBrowserTab,
+  useModalOverlayPresent,
+  type WorkbenchTab,
+} from "./browser-pane-view.js";
 import { claudeDefaultsView, claudePermissionModeOf, claudeStatusOf, claudeStatusText } from "./claude-engine.js";
 import { ModelPicker } from "./ModelPicker.js";
 import { ModelSourcesSettings } from "./ModelSourcesSettings.js";
@@ -276,7 +286,10 @@ export function GuildApp({ api }: GuildAppProps) {
   const [workbenchOpen, setWorkbenchOpen] = useState(false);
   const workbenchTrigger = useRef<HTMLButtonElement>(null);
   const workbenchPanel = useRef<HTMLElement>(null);
-  const [workbenchTab, setWorkbenchTab] = useState<"files" | "review">("files");
+  const [workbenchTab, setWorkbenchTab] = useState<WorkbenchTab>("files");
+  // The browser pane's state lives in main; this is the last snapshot it pushed (PC-BROWSER-001).
+  const [browserPane, setBrowserPane] = useState<BrowserPaneProjection>(EMPTY_BROWSER_PANE);
+  const previousAgentControl = useRef(EMPTY_BROWSER_PANE.agentControl);
   const [workbenchWidth, setWorkbenchWidth] = useState(() => readWorkbenchWidth(window.localStorage));
   const [contextMenu, setContextMenu] = useState<ContextMenu>();
   const [confirmDelete, setConfirmDelete] = useState(false);
@@ -546,6 +559,29 @@ export function GuildApp({ api }: GuildAppProps) {
     };
   }, [api, setProjection, streamOverlay]);
 
+  // Snapshots of the browser pane arrive whether or not its tab is on screen: an agent may start
+  // operating it while the person reads something else.
+  useEffect(() => api.onBrowserPaneChanged((next) => {
+    setBrowserPane((current) => replaceEqualDeep(current, next));
+  }), [api]);
+
+  // The pane's rendering tools refuse while it is hidden, so an agent that takes it over brings the tab forward, once.
+  useEffect(() => {
+    const previous = previousAgentControl.current;
+    previousAgentControl.current = browserPane.agentControl;
+    if (!revealsBrowserTab(previous, browserPane.agentControl)) return;
+    setWorkbenchTab("browser");
+    setWorkbenchOpen(true);
+  }, [browserPane.agentControl]);
+
+  // Every command answers with the new snapshot, which is also how the pane gets its first one.
+  const sendBrowserCommand = useCallback((command: BrowserCommand) => {
+    void api.browserCommand(command).then(
+      (next) => setBrowserPane((current) => replaceEqualDeep(current, next)),
+      () => undefined,
+    );
+  }, [api]);
+
   useEffect(() => {
     const taskId = projection?.activeTask?.task.taskId;
     setPromptAttachments(taskId === undefined
@@ -793,6 +829,12 @@ export function GuildApp({ api }: GuildAppProps) {
       ? Promise.reject(new Error("no_active_task"))
       : api.loadRunFileDiff({ taskId: openTaskIdForReset, runId, path }), [api, openTaskIdForReset]);
 
+  // Dialogs and menus owned by other components (worktree, the fullscreen image viewer) are found in the DOM, but only
+  // while the Browser tab is on screen: that is the only time a native view needs protecting from them.
+  const domOverlayOpen = useModalOverlayPresent(
+    workbenchOpen && projection?.activeTask !== undefined && workbenchTab === "browser",
+  );
+
   if (projection === undefined) {
     const loadingMessages = messagesFor(
       navigator.language.toLowerCase().startsWith("zh") ? "zh-CN" : "en-US",
@@ -885,7 +927,20 @@ export function GuildApp({ api }: GuildAppProps) {
   });
   const engineFixed = taskEngineFixed(activeTask, activeTask !== undefined && pendingSends.has(activeTask.task.taskId));
   const engineMarkers = hasMixedEngines(activeWorkspaces);
+  // The wordmark names the engine of the open task: the Grok runtime's version, or Claude Code's when the main process reports it.
+  const engineVersionLabel = activeEngine === "claude"
+    ? claudeStatus?.version === undefined ? undefined : `Claude Code ${claudeStatus.version}`
+    : projection.runtimeVersion;
   const claudeMode = claudePermissionModeOf(activeTask?.sessionModes, projection.runtimeSettings.claude?.permissionMode);
+  // The native browser view paints above the DOM: hidden under anything the page draws over it, and off its tab.
+  const browserHidden = browserPaneHidden({
+    workbenchOpen,
+    hasTask: activeTask !== undefined,
+    tab: workbenchTab,
+    overlayOpen: domOverlayOpen || accountOpen || settingsOpen || profileOpen || workspacePickerOpen ||
+      commandPaletteOpen || grokControlOpen || contextMenu !== undefined || rewindTarget !== undefined ||
+      onlineReminder !== undefined || discardConfirm || contextUsageOpen,
+  });
   const permissionPill = activeEngine === "claude"
     ? claudeMode === undefined
       ? undefined
@@ -2011,7 +2066,7 @@ export function GuildApp({ api }: GuildAppProps) {
         <div className="guild-wordmark">
           <img src={BANNY_ASSET_URL} alt="" />
           <span className="guild-wordmark-name">{messages.appName}</span>
-          {projection.runtimeVersion !== undefined && <small title={projection.runtimeVersion}>{projection.runtimeVersion}</small>}
+          {engineVersionLabel !== undefined && <small title={engineVersionLabel}>{engineVersionLabel}</small>}
         </div>
         <div className="guild-new-row">
           <button className="guild-new-task" type="button" disabled={busy} aria-keyshortcuts="Meta+N" onClick={() => void createTask()}>
@@ -2790,7 +2845,18 @@ export function GuildApp({ api }: GuildAppProps) {
           <div className="guild-workbench-tabs" role="tablist">
             <button type="button" role="tab" aria-selected={workbenchTab === "files"} className={workbenchTab === "files" ? "selected" : ""} onClick={() => setWorkbenchTab("files")}><Files size={15} />{messages.files}</button>
             <button type="button" role="tab" aria-selected={workbenchTab === "review"} className={workbenchTab === "review" ? "selected" : ""} onClick={() => setWorkbenchTab("review")}><GitDiff size={15} />{messages.review}<span>{visibleWorkbench?.diffs.length ?? 0}</span></button>
+            <button type="button" role="tab" aria-selected={workbenchTab === "browser"} className={workbenchTab === "browser" ? "selected" : ""} onClick={() => setWorkbenchTab("browser")}><Globe size={15} />{messages.browserPaneWorkbenchTab}</button>
           </div>
+          {workbenchTab === "browser" ? (
+            <div className="guild-workbench-body guild-workbench-browser">
+              <BrowserPane
+                projection={browserPane}
+                onCommand={sendBrowserCommand}
+                t={(key) => messages[key]}
+                hidden={browserHidden}
+              />
+            </div>
+          ) : (
           <div className="guild-workbench-body">
             {workbenchTab === "review" && runDiff !== undefined && runDiffCheckpoint !== undefined && (
               <RunDiffView
@@ -2833,6 +2899,7 @@ export function GuildApp({ api }: GuildAppProps) {
               </details>
             ))}
           </div>
+          )}
         </aside>
       )}
 

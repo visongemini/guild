@@ -145,3 +145,8 @@ test("the settings dialog is wide enough for five tabs and the stylesheet styles
   assert.match(cssBlock(".guild-source-chip.status.needs_confirmation"), /color:\s*var\(--guild-wait-text\)/u);
   assert.match(cssBlock(".guild-source-error"), /color:\s*var\(--guild-error-text\)/u);
 });
+
+test("the wordmark names the version of the engine the open task runs on", () => {
+  assert.match(app, /const engineVersionLabel = activeEngine === "claude"\s*\n\s*\? claudeStatus\?\.version === undefined \? undefined : `Claude Code \$\{claudeStatus\.version\}`\s*\n\s*: projection\.runtimeVersion;/u);
+  assert.match(app, /\{engineVersionLabel !== undefined && <small title=\{engineVersionLabel\}>\{engineVersionLabel\}<\/small>\}/u);
+});

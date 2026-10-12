@@ -825,12 +825,15 @@ span.guild-pill { cursor: default; }
 .guild-workbench-head strong { font-weight: 620; }
 .guild-workbench-head button { width: 28px; height: 28px; display: grid; place-items: center; border: 0; border-radius: var(--guild-r-sm); background: transparent; color: var(--guild-muted); cursor: pointer; -webkit-app-region: no-drag; }
 .guild-workbench-head button:hover { background: var(--guild-hover); color: var(--guild-text); }
-.guild-workbench-tabs { padding: 6px var(--guild-s2); display: grid; grid-template-columns: 1fr 1fr; gap: 2px; border-bottom: 1px solid var(--guild-line); }
+.guild-workbench-tabs { padding: 6px var(--guild-s2); display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 2px; border-bottom: 1px solid var(--guild-line); }
 .guild-workbench-tabs button { height: 32px; display: flex; align-items: center; justify-content: center; gap: 6px; border: 0; border-radius: var(--guild-r-sm); background: transparent; color: var(--guild-muted); font-size: var(--guild-fs-sm); font-weight: 500; cursor: pointer; transition: background-color var(--guild-dur-1) var(--guild-ease); }
 .guild-workbench-tabs button:hover { background: var(--guild-hover); }
 .guild-workbench-tabs button.selected { background: var(--guild-selected); color: var(--guild-text); font-weight: 600; }
 .guild-workbench-tabs button span { color: var(--guild-faint); font-size: var(--guild-fs-meta); font-variant-numeric: tabular-nums; }
 .guild-workbench-body { min-height: 0; padding: var(--guild-s3); overflow: auto; }
+/* The Browser tab: a definite-height box for the pane; the page itself is a native view drawn over the placeholder. */
+.guild-workbench-browser { display: grid; grid-template-rows: minmax(0, 1fr); overflow: hidden; }
+.guild-workbench-browser > .guild-browser { min-height: 0; }
 .guild-workbench-scope { display: flex; align-items: center; gap: var(--guild-s2); margin: 0 0 var(--guild-s3); font-size: var(--guild-fs-sm); color: var(--guild-muted); }
 .guild-workbench-scope select { min-width: 0; flex: 1; height: 32px; padding: 0 var(--guild-s2); border: 1px solid var(--guild-line-strong); border-radius: var(--guild-r-sm); background: var(--guild-surface); color: var(--guild-text); color-scheme: inherit; }
 .guild-workbench-evidence-help { margin: 0 0 var(--guild-s3); font-size: var(--guild-fs-sm); line-height: 1.6; color: var(--guild-muted); }
@@ -857,7 +860,7 @@ span.guild-pill { cursor: default; }
 .guild-review-item pre.after { background: color-mix(in srgb, var(--guild-add) 7%, var(--guild-surface)); }
 
 /* ------------------------------------------------------------------ browser pane */
-.guild-browser { min-width: 0; min-height: 0; height: 100%; display: grid; grid-template-rows: auto auto auto auto minmax(0,1fr); gap: var(--guild-s2); }
+.guild-browser { min-width: 0; min-height: 0; height: 100%; display: grid; grid-template-rows: auto auto auto minmax(0,1fr); gap: var(--guild-s2); }
 .guild-browser-tabs { min-width: 0; display: flex; align-items: center; gap: 2px; overflow-x: auto; }
 .guild-browser-tab { min-width: 0; max-width: 168px; height: 30px; display: flex; flex: 0 1 auto; align-items: center; border-radius: var(--guild-r-sm); background: transparent; color: var(--guild-muted); }
 .guild-browser-tab:hover { background: var(--guild-hover); }
