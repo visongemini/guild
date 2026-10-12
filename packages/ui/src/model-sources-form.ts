@@ -41,10 +41,13 @@ export function sourceHost(baseUrl: string): string | undefined {
  */
 export function sourceStatus(source: Pick<ModelSourceProjection, "enabled" | "baseUrl" | "confirmedHost">): SourceStatus {
   if (!source.enabled) return "disabled";
+  return sourceHostConfirmed(source) ? "confirmed" : "needs_confirmation";
+}
+
+/** The host the main process confirmed is the host of the current address (what a connection test needs, enabled or not). */
+export function sourceHostConfirmed(source: Pick<ModelSourceProjection, "baseUrl" | "confirmedHost">): boolean {
   const host = sourceHost(source.baseUrl);
-  return source.confirmedHost !== null && host !== undefined && source.confirmedHost === host
-    ? "confirmed"
-    : "needs_confirmation";
+  return source.confirmedHost !== null && host !== undefined && source.confirmedHost === host;
 }
 
 export type ModelRowForm = Readonly<{

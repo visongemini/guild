@@ -128,7 +128,10 @@ test("account usage opens as a sidebar-anchored non-modal popover", async () => 
   assert.doesNotMatch(source, /guild-dialog-backdrop[^]*guild-dialog-account[^]*messages\.usage/);
   assert.match(source, /ref=\{profileTriggerRef\}/);
   assert.match(source, /aria-haspopup="dialog"/);
-  assert.match(source, /if \(accountOpen\) accountFirstActionRef\.current\?\.focus\(\)/);
+  // Focus goes into the popover; the first action takes it (and its ring) only for a keyboard open, a mouse open lands on the popover.
+  assert.match(source, /\(accountOpenedByKeyboard\.current \? accountFirstActionRef\.current : accountPopoverRef\.current\)\?\.focus\(\)/);
+  assert.match(source, /accountOpenedByKeyboard\.current = event\.detail === 0;/);
+  assert.match(source, /ref=\{accountPopoverRef\}/);
   assert.match(source, /ref=\{accountFirstActionRef\}/);
   assert.match(source, /profileTriggerRef\.current\?\.focus\(\)/);
 });

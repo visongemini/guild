@@ -1,7 +1,8 @@
 import type { GrokModelDescriptor, GuildClaudePermissionMode, ModelCatalog } from "@guild/contracts";
 import { modelGroupOf } from "@guild/contracts/grok-models";
 import type { GuildMessages } from "./locales.js";
-import { effortsDescending, globalDefaultView } from "./model-picker.js";
+import { CLAUDE_DEFAULT_ROW_ID, claudeModelIdentity, splitOlderClaudeModels } from "./claude-model-families.js";
+import { MODEL_PICKER_SEPARATOR, effortsDescending, globalDefaultView } from "./model-picker.js";
 
 /*
  * What the renderer shows about the Claude engine itself: whether Claude Code can run, the account
@@ -82,6 +83,35 @@ export function claudeDefaultsView(input: {
     effortId: view.effortId,
     efforts: effortsDescending(view.efforts),
   });
+}
+
+export type ClaudeDefaultOption = Readonly<{ id: string; label: string }>;
+
+/**
+ * The model list of the default-model control in Settings, read the way the picker reads Claude's list: the
+ * adapter's own Default row is the control's one "default" option (so it never appears a second time, in the
+ * adapter's English), the newest model of each family comes first and the rest follow as older models, and a
+ * family is described by the same Chinese text as in the picker.
+ */
+export function claudeDefaultModelOptions(
+  messages: Pick<GuildMessages, "claudeModelDescription">,
+  catalog: ModelCatalog,
+): Readonly<{ current: readonly ClaudeDefaultOption[]; older: readonly ClaudeDefaultOption[] }> {
+  const rows = claudeNativeCatalog(catalog).models.filter((model) => model.id !== CLAUDE_DEFAULT_ROW_ID);
+  const { shown, older } = splitOlderClaudeModels(rows, () => false);
+  const option = (model: GrokModelDescriptor): ClaudeDefaultOption => {
+    const description = messages.claudeModelDescription(claudeModelIdentity(model).family, model.description);
+    return Object.freeze({
+      id: model.id,
+      label: description === undefined ? model.name : `${model.name}${MODEL_PICKER_SEPARATOR}${description}`,
+    });
+  };
+  return Object.freeze({ current: Object.freeze(shown.map(option)), older: Object.freeze(older.map(option)) });
+}
+
+/** The stored default as the control shows it: the adapter's Default row and no choice are the same "default" option. */
+export function claudeDefaultSelectValue(model: string | null): string {
+  return model === null || model === CLAUDE_DEFAULT_ROW_ID ? "" : model;
 }
 
 const CLAUDE_PERMISSION_MODES: readonly string[] = ["default", "acceptEdits", "plan", "auto", "bypassPermissions"];

@@ -49,7 +49,8 @@ export function OnlineReminderSetting({ messages, api, workspaceId, initialPrefs
     }
   }
 
-  return <div className="guild-settings-section guild-online-reminder-setting">
+  return <section className="guild-settings-block guild-online-reminder-setting" aria-labelledby="guild-privacy-online-heading">
+    <h3 className="guild-settings-heading" id="guild-privacy-online-heading">{messages.privacyOnlineHeading}</h3>
     <label className="guild-setting-toggle">
       <span>
         <strong>{messages.privacyOnlineReminder}</strong>
@@ -66,5 +67,5 @@ export function OnlineReminderSetting({ messages, api, workspaceId, initialPrefs
     </label>
     {workspaceId === undefined && <p className="guild-setting-help">{messages.privacyOnlineReminderNoWorkspace}</p>}
     {failed && <p className="guild-setting-help blocked" role="alert">{messages.privacyOnlineReminderFailed}</p>}
-  </div>;
+  </section>;
 }

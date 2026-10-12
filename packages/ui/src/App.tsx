@@ -131,7 +131,8 @@ import {
   type WorkbenchTab,
 } from "./browser-pane-view.js";
 import { applyModelSelectionChange } from "./apply-model-change.js";
-import { claudeDefaultsView, claudePermissionModeOf, claudeStatusOf, claudeStatusText } from "./claude-engine.js";
+import { claudeDefaultModelOptions, claudeDefaultSelectValue, claudeDefaultsView, claudePermissionModeOf, claudeStatusOf, claudeStatusText } from "./claude-engine.js";
+import { CLAUDE_DEFAULT_ROW_ID } from "./claude-model-families.js";
 import { ModelPicker } from "./ModelPicker.js";
 import { ModelSourcesSettings } from "./ModelSourcesSettings.js";
 import { OnlineReminderDialog } from "./OnlineReminderDialog.js";
@@ -271,6 +272,9 @@ export function GuildApp({ api }: GuildAppProps) {
   const [accountOpen, setAccountOpen] = useState(false);
   const profileTriggerRef = useRef<HTMLButtonElement>(null);
   const accountFirstActionRef = useRef<HTMLButtonElement>(null);
+  const accountPopoverRef = useRef<HTMLDivElement>(null);
+  /** The popover was opened from the keyboard (a click with no pointer has detail 0): only then does its first action show a focus ring. */
+  const accountOpenedByKeyboard = useRef(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [grokControlOpen, setGrokControlOpen] = useState(false);
   const grokControlTriggerRef = useRef<HTMLElement | null>(null);
@@ -746,7 +750,10 @@ export function GuildApp({ api }: GuildAppProps) {
   }, [projection?.workspaces]);
 
   useEffect(() => {
-    if (accountOpen) accountFirstActionRef.current?.focus();
+    if (!accountOpen) return;
+    // Focus moves into the popover so Escape and Tab work. A mouse open lands on the popover itself, which shows no
+    // ring; the first action takes the ring only for a keyboard open (:focus-visible), or on the first Tab.
+    (accountOpenedByKeyboard.current ? accountFirstActionRef.current : accountPopoverRef.current)?.focus();
   }, [accountOpen]);
 
   useEffect(() => {
@@ -928,6 +935,7 @@ export function GuildApp({ api }: GuildAppProps) {
     model: projection.runtimeSettings.claude?.model ?? null,
     reasoningEffort: projection.runtimeSettings.claude?.reasoningEffort ?? null,
   });
+  const claudeModelOptions = claudeDefaultModelOptions(baseMessages, claudeDefaults.catalog);
   const engineFixed = taskEngineFixed(activeTask, activeTask !== undefined && pendingSends.has(activeTask.task.taskId));
   const switchLine = modelSwitchLine(modelSwitch, activeTask?.task.taskId, baseMessages);
   const engineMarkers = hasMixedEngines(activeWorkspaces);
@@ -2162,8 +2170,10 @@ export function GuildApp({ api }: GuildAppProps) {
         <div className="guild-profile-bar">
           {accountOpen && (
             <div
+              ref={accountPopoverRef}
               className="guild-account-popover"
               id="guild-account-popover"
+              tabIndex={-1}
               role="dialog"
               aria-label={messages.usage}
               onPointerDown={(event) => event.stopPropagation()}
@@ -2221,7 +2231,8 @@ export function GuildApp({ api }: GuildAppProps) {
               <p className="guild-independent">{messages.independentNotice}</p>
             </div>
           )}
-          <button ref={profileTriggerRef} className="guild-profile" type="button" aria-haspopup="dialog" aria-expanded={accountOpen} aria-controls={accountOpen ? "guild-account-popover" : undefined} onPointerDown={(event) => event.stopPropagation()} onClick={() => {
+          <button ref={profileTriggerRef} className="guild-profile" type="button" aria-haspopup="dialog" aria-expanded={accountOpen} aria-controls={accountOpen ? "guild-account-popover" : undefined} onPointerDown={(event) => event.stopPropagation()} onClick={(event) => {
+            accountOpenedByKeyboard.current = event.detail === 0;
             setSettingsOpen(false);
             setWorkspacePickerOpen(false);
             const next = !accountOpen;
@@ -2862,7 +2873,7 @@ export function GuildApp({ api }: GuildAppProps) {
                 <div className="guild-workbench-label">{messages.filesTouched}</div>
                 {(visibleWorkbench?.files ?? []).length === 0 ? <p className="guild-workbench-empty">{messages.noFilesYet}<br />{messages.noEvidenceAction}</p> : (visibleWorkbench?.files ?? []).map((file) => (
                   <button className="guild-workbench-file" key={file.path} type="button" onClick={() => void openTaskResource("file", file.path)}>
-                    <FileText size={15} /><span>{file.displayPath}</span>{file.line !== undefined && <small>:{file.line}</small>}
+                    <FileText size={15} /><span>{file.displayPath}</span>{file.line !== undefined && file.line > 1 && <small title={messages.fileLineHelp}>{messages.fileLine(file.line)}</small>}
                   </button>
                 ))}
               </>
@@ -3080,7 +3091,7 @@ export function GuildApp({ api }: GuildAppProps) {
               <strong>{messages.settings}</strong>
               <button autoFocus type="button" className="guild-soft-button" onClick={() => setSettingsOpen(false)}>{messages.closeDialog}</button>
             </div>
-            <div className="guild-dialog-body">
+            <div className="guild-dialog-body guild-settings-body">
               <div className="guild-dialog-tabs" role="tablist">
                 {([
                   ["general", messages.settingsGeneral],
@@ -3346,7 +3357,7 @@ export function GuildApp({ api }: GuildAppProps) {
                           <label className="guild-setting-field">
                             <span className="guild-setting-label">{baseMessages.model}</span>
                             <select
-                              value={claude.model ?? ""}
+                              value={claudeDefaultSelectValue(claude.model)}
                               disabled={busy}
                               onChange={(event) => {
                                 const modelId = event.currentTarget.value;
@@ -3359,12 +3370,19 @@ export function GuildApp({ api }: GuildAppProps) {
                               }}
                             >
                               <option value="">{baseMessages.claudeDefaultModelOption}</option>
-                              {claudeDefaults.unlistedModelId !== undefined && (
+                              {claudeDefaults.unlistedModelId !== undefined && claudeDefaults.unlistedModelId !== CLAUDE_DEFAULT_ROW_ID && (
                                 <option value={claudeDefaults.unlistedModelId}>{claudeDefaults.unlistedModelId}</option>
                               )}
-                              {claudeDefaults.models.map((model) => (
-                                <option key={model.id} value={model.id}>{model.name}</option>
+                              {claudeModelOptions.current.map((option) => (
+                                <option key={option.id} value={option.id}>{option.label}</option>
                               ))}
+                              {claudeModelOptions.older.length > 0 && (
+                                <optgroup label={baseMessages.modelPickerOlderModels(claudeModelOptions.older.length)}>
+                                  {claudeModelOptions.older.map((option) => (
+                                    <option key={option.id} value={option.id}>{option.label}</option>
+                                  ))}
+                                </optgroup>
+                              )}
                             </select>
                           </label>
                           <label className="guild-setting-field">
@@ -3418,48 +3436,52 @@ export function GuildApp({ api }: GuildAppProps) {
               )}
               {settingsTab === "privacy" && (
                 <div id="guild-settings-panel-privacy" role="tabpanel" aria-labelledby="guild-settings-tab-privacy" className="guild-settings-panel">
-
-                  <p className="guild-setting-help">{messages.privacyBrowserSyncOff}</p>
+                  <section className="guild-settings-block" aria-labelledby="guild-privacy-browser-heading">
+                    <h3 className="guild-settings-heading" id="guild-privacy-browser-heading">{messages.privacyBrowserSyncHeading}</h3>
+                    <p className="guild-setting-help">{messages.privacyBrowserSyncOff}</p>
+                  </section>
                   <OnlineReminderSetting messages={baseMessages} api={api} workspaceId={activeTask?.task.workspaceId} />
-                  <div className="guild-settings-section guild-local-data-controls">
-                    <div>
-                      <strong>{messages.localData}</strong>
-                      <p className="guild-setting-help">{messages.localDataHelp}</p>
+                  <section className="guild-settings-block guild-local-data-controls" aria-labelledby="guild-privacy-data-heading">
+                    <h3 className="guild-settings-heading" id="guild-privacy-data-heading">{messages.localData}</h3>
+                    <p className="guild-setting-help">{messages.localDataHelp}</p>
+                    <div className="guild-settings-actions">
+                      <button type="button" className="guild-soft-button" onClick={() => void api.openUserData({})}>{messages.openDataDirectory}</button>
+                      <button type="button" className="guild-soft-button" disabled={backupStatus === "saving"} onClick={() => void backupUserData()}>
+                        {backupStatus === "saving" ? messages.backupSaving : messages.backupData}
+                      </button>
+                      <button type="button" className="guild-soft-button" disabled={busy || backupStatus === "saving" ||
+                        restoreStatus === "restoring" || restoreStatus === "restarting"} onClick={() => {
+                          setRestoreStatus("restoring");
+                          void persistCurrentDraft().then(() => api.restoreUserData({})).then((result) => {
+                            setRestoreStatus(result.status === "cancelled" ? "idle" : "restarting");
+                          }, () => setRestoreStatus("failed"));
+                        }}>{restoreStatus === "restoring" ? messages.backupRestoring : messages.backupRestore}</button>
+                      <button type="button" className="guild-soft-button" onClick={() => void api.openRuntimeDiagnostics({})}>{messages.openRuntimeDiagnostics}</button>
                     </div>
-                    <button type="button" className="guild-soft-button" onClick={() => void api.openUserData({})}>{messages.openDataDirectory}</button>
-                    <button type="button" className="guild-soft-button" disabled={backupStatus === "saving"} onClick={() => void backupUserData()}>
-                      {backupStatus === "saving" ? messages.backupSaving : messages.backupData}
-                    </button>
                     <p className="guild-setting-help">{messages.backupRestoreHelp}</p>
-                    <button type="button" className="guild-soft-button" disabled={busy || backupStatus === "saving" ||
-                      restoreStatus === "restoring" || restoreStatus === "restarting"} onClick={() => {
-                        setRestoreStatus("restoring");
-                        void persistCurrentDraft().then(() => api.restoreUserData({})).then((result) => {
-                          setRestoreStatus(result.status === "cancelled" ? "idle" : "restarting");
-                        }, () => setRestoreStatus("failed"));
-                      }}>{restoreStatus === "restoring" ? messages.backupRestoring : messages.backupRestore}</button>
                     {restoreStatus === "failed" && <p className="guild-setting-help blocked" role="alert">{messages.backupRestoreFailed}</p>}
                     {restoreStatus === "restarting" && <p className="guild-setting-help" role="status">{messages.backupRestored}</p>}
                     {backupStatus === "saved" && <p className="guild-setting-help success">{messages.backupSaved}</p>}
                     {backupStatus === "failed" && <p className="guild-setting-help blocked">{messages.backupFailed}</p>}
-                    <button type="button" className="guild-soft-button" onClick={() => void api.openRuntimeDiagnostics({})}>{messages.openRuntimeDiagnostics}</button>
-                  </div>
+                  </section>
                 </div>
               )}
               {settingsTab === "about" && (
                 <div id="guild-settings-panel-about" role="tabpanel" aria-labelledby="guild-settings-tab-about" className="guild-settings-panel guild-about-block">
                   <strong>{messages.appName}</strong>
-                  <div className="guild-account-meta"><span>{messages.version}</span><span>{projection.appVersion}</span></div>
-                  {projection.runtimeVersion !== undefined && (
-                    <div className="guild-account-meta"><span>Grok</span><span>{projection.runtimeVersion}</span></div>
-                  )}
-                  {claudeStatus?.version !== undefined && (
-                    <div className="guild-account-meta"><span>Claude Code</span><span>{claudeStatus.version}</span></div>
-                  )}
+                  <div className="guild-about-rows">
+                    <div className="guild-account-meta"><span>{messages.version}</span><span>{projection.appVersion}</span></div>
+                    {projection.runtimeVersion !== undefined && (
+                      <div className="guild-account-meta"><span>Grok</span><span>{projection.runtimeVersion}</span></div>
+                    )}
+                    {claudeStatus?.version !== undefined && (
+                      <div className="guild-account-meta"><span>Claude Code</span><span>{claudeStatus.version}</span></div>
+                    )}
+                  </div>
                   <p>{baseMessages.aboutRole}</p>
                   <p>{baseMessages.aboutCopyright}</p>
                   <p className="guild-independent">{baseMessages.independentNotice}</p>
-                  <button type="button" className="guild-soft-button" onClick={() => void api.openUserData({})}>{messages.openDataDirectory}</button>
+                  <button type="button" className="guild-soft-button guild-about-action" onClick={() => void api.openUserData({})}>{messages.openDataDirectory}</button>
                 </div>
               )}
             </div>

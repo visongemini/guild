@@ -1,4 +1,4 @@
-import type { AcpToolKind, GuildClaudePermissionMode, GuildEngine, GuildGrokManagementAction, GuildGrokPermissionMode, GuildLocale, GuildModelSwitchRefusalReason, GuildTaskActivity, ModelGroup } from "@guild/contracts";
+import type { AcpToolKind, GuildClaudePermissionMode, GuildEngine, GuildGrokManagementAction, GuildGrokPermissionMode, GuildLocale, GuildModelSwitchRefusalReason, GuildTaskActivity, ModelGroup, ModelProbeOutcome, ModelSourceTestRefusal } from "@guild/contracts";
 
 import { WORKSHOP_ZH, WORKSHOP_EN, type WorkshopMessages } from "./workshop-messages.js";
 import { createChangeMessages, type ChangeMessages } from "./change-messages.js";
@@ -130,7 +130,9 @@ export type GuildMessages = WorkshopMessages & ChangeMessages & {
   readonly taskStatusFailed: string;
   readonly taskStatusInterrupted: string;
   readonly taskStatusCancelled: string;
+  readonly privacyBrowserSyncHeading: string;
   readonly privacyBrowserSyncOff: string;
+  readonly privacyOnlineHeading: string;
   readonly privacyBrowserSyncHelp: string;
   readonly openDataDirectory: string;
   readonly backupData: string;
@@ -225,7 +227,6 @@ export type GuildMessages = WorkshopMessages & ChangeMessages & {
   readonly claudeStatusIntegrityChanged: string;
   readonly grokToolsGrokOnly: string;
   readonly sourcesIntro: string;
-  readonly sourcesKeyNotice: string;
   readonly sourcesLoading: string;
   readonly sourcesLoadFailed: string;
   readonly sourcesEmpty: string;
@@ -238,6 +239,14 @@ export type GuildMessages = WorkshopMessages & ChangeMessages & {
   readonly sourcesKindName: (kind: "online" | "local") => string;
   readonly sourcesStatusName: (status: "confirmed" | "needs_confirmation" | "disabled") => string;
   readonly sourcesModelCount: (count: number) => string;
+  /** The connection test (docs/20 3.4 transport and rules): the button, its states and what each answer says. */
+  readonly sourcesTest: string;
+  readonly sourcesTesting: string;
+  readonly sourcesTestHeading: string;
+  readonly sourcesTestNeedsConfirm: string;
+  readonly sourcesTestFailed: string;
+  readonly sourcesProbeOutcome: (outcome: ModelProbeOutcome) => string;
+  readonly sourcesTestRefusal: (reason: ModelSourceTestRefusal) => string;
   readonly sourcesConfirm: string;
   readonly sourcesConfirming: string;
   readonly sourcesConfirmHelp: (host: string, variable: string | null, kind: "online" | "local") => string;
@@ -247,6 +256,7 @@ export type GuildMessages = WorkshopMessages & ChangeMessages & {
   readonly sourcesNeedsConfirmationNotice: (label: string) => string;
   readonly sourcesFieldKind: string;
   readonly sourcesFieldLabel: string;
+  readonly sourcesLabelPlaceholder: string;
   readonly sourcesFieldBaseUrl: string;
   readonly sourcesBaseUrlHint: (kind: "online" | "local") => string;
   readonly sourcesFieldKeyFile: string;
@@ -259,6 +269,7 @@ export type GuildMessages = WorkshopMessages & ChangeMessages & {
   readonly sourcesModelId: string;
   readonly sourcesModelLabel: string;
   readonly sourcesModelContext: string;
+  readonly sourcesModelContextPlaceholder: string;
   readonly sourcesModelImages: string;
   readonly sourcesAddModel: string;
   readonly sourcesRemoveModel: (id: string) => string;
@@ -391,6 +402,9 @@ export type GuildMessages = WorkshopMessages & ChangeMessages & {
   readonly files: string;
   readonly review: string;
   readonly filesTouched: string;
+  /** The line a tool call last pointed at in a file, shown only past line 1 (the default start says nothing). */
+  readonly fileLine: (line: number) => string;
+  readonly fileLineHelp: string;
   readonly noFilesYet: string;
   readonly noChangesYet: string;
   readonly openTerminal: string;
@@ -685,7 +699,9 @@ const ZH_CN: GuildMessages = Object.freeze({
   taskStatusFailed: "任务失败",
   taskStatusInterrupted: "任务已中断",
   taskStatusCancelled: "任务已取消",
+  privacyBrowserSyncHeading: "浏览器登录同步",
   privacyBrowserSyncOff: "浏览器登录状态同步默认关闭，且当前不可用。",
+  privacyOnlineHeading: "在线模型",
   privacyBrowserSyncHelp: "Guild 不会在冷启动时访问浏览器数据或钥匙串。官方用量仍只通过官方 Grok 进程读取。",
   openDataDirectory: "打开 Guild 数据目录",
   backupData: "创建完整本地备份",
@@ -694,7 +710,7 @@ const ZH_CN: GuildMessages = Object.freeze({
   backupFailed: "备份未完成；原始数据没有被修改。",
   localData: "本地数据与诊断",
   localDataHelp: "对话、设置和诊断都只保存在这台 Mac。诊断不记录正常提示词与回复，错误输出会先脱敏凭据。",
-  aboutCopyright: "Copyright © 2026 BDV",
+  aboutCopyright: "版权所有 © 2026 BDV",
   aboutRole: "Guild 是调用官方 Grok 工具和 Claude Code 的本地单用户客户端。",
   closeDialog: "关闭",
   language: "语言",
@@ -793,7 +809,6 @@ const ZH_CN: GuildMessages = Object.freeze({
   claudeStatusIntegrityChanged: "Claude 引擎文件被意外改动，Guild 已拒绝运行。若是你刚更新了引擎，请重启 Guild 以接受更新后的引擎文件；否则请重新安装 claude-agent-acp。",
   grokToolsGrokOnly: "Grok 工具只用于 Grok 对话",
   sourcesIntro: "在线和本地模型会出现在 Claude 对话的模型选择里。Guild 只把请求发到你设置的地址；API 密钥留在你指定的文件里，Guild 不会显示、保存或记录它。",
-  sourcesKeyNotice: "这里只填密钥变量的名字，不要粘贴密钥本身。",
   sourcesLoading: "正在读取模型源…",
   sourcesLoadFailed: "无法读取模型源，请重试。",
   sourcesEmpty: "还没有模型源。",
@@ -806,6 +821,26 @@ const ZH_CN: GuildMessages = Object.freeze({
   sourcesKindName: (kind) => ({ online: "在线", local: "本地" })[kind],
   sourcesStatusName: (status) => ({ confirmed: "已确认", needs_confirmation: "待确认", disabled: "已停用" })[status],
   sourcesModelCount: (count) => `${count} 个模型`,
+  sourcesTest: "测试连接",
+  sourcesTesting: "正在测试…",
+  sourcesTestHeading: "连接测试结果",
+  sourcesTestNeedsConfirm: "先确认这个地址，才能测试连接。",
+  sourcesTestFailed: "测试没能进行，请稍后再试。",
+  sourcesProbeOutcome: (outcome) => {
+    switch (outcome.kind) {
+      case "ok": return `连通 · ${outcome.latencyMs < 1000 ? `${outcome.latencyMs} 毫秒` : `${(outcome.latencyMs / 1000).toFixed(1)} 秒`}`;
+      case "key_rejected": return "密钥不对或没权限";
+      case "model_not_found": return "找不到这个模型";
+      case "unreachable": return "连不上";
+      case "timeout": return "超时";
+      case "http_error": return `对方返回了状态码 ${outcome.status}`;
+    }
+  },
+  sourcesTestRefusal: (reason) => ({
+    not_confirmed: "先确认这个地址，才能测试连接。",
+    key_unavailable: "没找到密钥：请检查密钥文件和变量名。",
+    address_not_allowed: "这个地址不符合规则，没有发出请求。",
+  })[reason],
   sourcesConfirm: "确认",
   sourcesConfirming: "等待你在系统窗口中确认…",
   sourcesConfirmHelp: (host, variable, kind) => variable === null
@@ -819,6 +854,7 @@ const ZH_CN: GuildMessages = Object.freeze({
   sourcesNeedsConfirmationNotice: (label) => `「${label}」已保存，确认地址和密钥变量之后才能使用。`,
   sourcesFieldKind: "类型",
   sourcesFieldLabel: "名称",
+  sourcesLabelPlaceholder: "例如 DeepSeek",
   sourcesFieldBaseUrl: "接口地址",
   sourcesBaseUrlHint: (kind) => kind === "online"
     ? "在线模型源必须使用 https。"
@@ -828,11 +864,12 @@ const ZH_CN: GuildMessages = Object.freeze({
   sourcesKeyFileHint: "存放密钥的 env 文件的绝对路径。留空则使用默认文件。",
   sourcesFieldKeyVariable: "密钥变量名",
   sourcesKeyVariablePlaceholder: "例如 DEEPSEEK_API_KEY",
-  sourcesKeyVariableHint: "只填变量名。Guild 在后台从密钥文件读取它的值，不会显示或保存。",
+  sourcesKeyVariableHint: "只填变量名，例如 DEEPSEEK_API_KEY。Guild 从密钥文件读取它的值，不显示也不保存；不要把密钥本身粘贴到这里。",
   sourcesModels: "模型",
   sourcesModelId: "模型 ID",
   sourcesModelLabel: "显示名称",
-  sourcesModelContext: "上下文窗口",
+  sourcesModelContext: "上下文窗口（tokens）",
+  sourcesModelContextPlaceholder: "例如 1000000",
   sourcesModelImages: "支持图片",
   sourcesAddModel: "添加模型",
   sourcesRemoveModel: (id) => id.length === 0 ? "删除这一行" : `删除模型 ${id}`,
@@ -1008,6 +1045,8 @@ const ZH_CN: GuildMessages = Object.freeze({
   files: "文件",
   review: "审阅",
   filesTouched: "本任务涉及的文件",
+  fileLine: (line) => `第 ${line} 行`,
+  fileLineHelp: "最近一次读取或修改的位置",
   noFilesYet: "Grok 尚未报告文件位置。",
   noChangesYet: "Grok 尚未报告可审阅的变更。",
   openTerminal: "在工作区打开终端",
@@ -1230,7 +1269,9 @@ const EN_US: GuildMessages = Object.freeze({
   taskStatusFailed: "Task failed",
   taskStatusInterrupted: "Task interrupted",
   taskStatusCancelled: "Task cancelled",
+  privacyBrowserSyncHeading: "Browser login sync",
   privacyBrowserSyncOff: "Browser login sync stays off and is not available yet.",
+  privacyOnlineHeading: "Online models",
   privacyBrowserSyncHelp: "Guild will not read browser data or the keychain on cold start. Official usage still comes only from the official Grok process.",
   openDataDirectory: "Open Guild data folder",
   backupData: "Create complete local backup",
@@ -1338,7 +1379,6 @@ const EN_US: GuildMessages = Object.freeze({
   claudeStatusIntegrityChanged: "Claude engine files changed unexpectedly; restart Guild to accept updated engine files, or reinstall claude-agent-acp.",
   grokToolsGrokOnly: "Grok tools are for Grok conversations",
   sourcesIntro: "Online and Local models appear in the picker of Claude conversations. Guild only sends requests to the address you set. API keys stay in the file you name; Guild never shows, stores or logs them.",
-  sourcesKeyNotice: "Enter only the name of the key variable, never the key itself.",
   sourcesLoading: "Loading model sources…",
   sourcesLoadFailed: "Model sources could not be loaded. Try again.",
   sourcesEmpty: "No model sources yet.",
@@ -1351,6 +1391,26 @@ const EN_US: GuildMessages = Object.freeze({
   sourcesKindName: (kind) => ({ online: "Online", local: "Local" })[kind],
   sourcesStatusName: (status) => ({ confirmed: "Confirmed", needs_confirmation: "Needs confirmation", disabled: "Disabled" })[status],
   sourcesModelCount: (count) => `${count} ${count === 1 ? "model" : "models"}`,
+  sourcesTest: "Test connection",
+  sourcesTesting: "Testing…",
+  sourcesTestHeading: "Connection test results",
+  sourcesTestNeedsConfirm: "Confirm this address first to test the connection.",
+  sourcesTestFailed: "The test could not run. Try again in a moment.",
+  sourcesProbeOutcome: (outcome) => {
+    switch (outcome.kind) {
+      case "ok": return `Connected · ${outcome.latencyMs < 1000 ? `${outcome.latencyMs} ms` : `${(outcome.latencyMs / 1000).toFixed(1)} s`}`;
+      case "key_rejected": return "The key is wrong or has no access";
+      case "model_not_found": return "Model not found";
+      case "unreachable": return "Can't connect";
+      case "timeout": return "Timed out";
+      case "http_error": return `The server answered with status ${outcome.status}`;
+    }
+  },
+  sourcesTestRefusal: (reason) => ({
+    not_confirmed: "Confirm this address first to test the connection.",
+    key_unavailable: "Key not found: check the key file and the variable name.",
+    address_not_allowed: "This address breaks a rule, so no request was sent.",
+  })[reason],
   sourcesConfirm: "Confirm",
   sourcesConfirming: "Waiting for your confirmation in the system window…",
   sourcesConfirmHelp: (host, variable, kind) => variable === null
@@ -1364,6 +1424,7 @@ const EN_US: GuildMessages = Object.freeze({
   sourcesNeedsConfirmationNotice: (label) => `“${label}” is saved. Confirm its address and key variable before it can be used.`,
   sourcesFieldKind: "Type",
   sourcesFieldLabel: "Name",
+  sourcesLabelPlaceholder: "For example, DeepSeek",
   sourcesFieldBaseUrl: "Base URL",
   sourcesBaseUrlHint: (kind) => kind === "online"
     ? "Online sources must use https."
@@ -1373,11 +1434,12 @@ const EN_US: GuildMessages = Object.freeze({
   sourcesKeyFileHint: "Absolute path of the env file that holds the key. Leave empty to use the default file.",
   sourcesFieldKeyVariable: "Key variable",
   sourcesKeyVariablePlaceholder: "e.g. DEEPSEEK_API_KEY",
-  sourcesKeyVariableHint: "Only the variable name. Guild reads its value from the key file in the background and never shows or saves it.",
+  sourcesKeyVariableHint: "Enter only the variable name, for example DEEPSEEK_API_KEY. Guild reads its value from the key file and neither shows nor saves it; never paste the key itself here.",
   sourcesModels: "Models",
   sourcesModelId: "Model ID",
   sourcesModelLabel: "Display name",
-  sourcesModelContext: "Context window",
+  sourcesModelContext: "Context window (tokens)",
+  sourcesModelContextPlaceholder: "e.g. 1000000",
   sourcesModelImages: "Images",
   sourcesAddModel: "Add model",
   sourcesRemoveModel: (id) => id.length === 0 ? "Remove this row" : `Remove model ${id}`,
@@ -1546,6 +1608,8 @@ const EN_US: GuildMessages = Object.freeze({
   files: "Files",
   review: "Review",
   filesTouched: "Files involved in this task",
+  fileLine: (line) => `line ${line}`,
+  fileLineHelp: "Where the last read or edit happened",
   noFilesYet: "Grok has not reported any file locations yet.",
   noChangesYet: "Grok has not reported any changes to review yet.",
   openTerminal: "Open terminal in workspace",

@@ -145,6 +145,7 @@ const noopApi = {
   upsertModelSource: async () => { throw new Error("not called"); },
   deleteModelSource: async () => { throw new Error("not called"); },
   confirmModelSource: async () => { throw new Error("not called"); },
+  testModelSource: async () => { throw new Error("not called"); },
 };
 const render = (props: Partial<Parameters<typeof ModelSourcesSettings>[0]> = {}, messages = EN) => renderToStaticMarkup(
   <ModelSourcesSettings messages={messages} api={noopApi as never} onChanged={() => undefined} {...props} />,
@@ -157,8 +158,15 @@ test("the list shows each source with its type and status chip, its host and mod
   assert.match(markup, /<strong>DeepSeek<\/strong><span class="guild-source-chip kind online">Online<\/span><span class="guild-source-chip status confirmed">Confirmed<\/span>/u);
   assert.match(markup, /<strong>llama\.cpp<\/strong><span class="guild-source-chip kind local">Local<\/span><span class="guild-source-chip status needs_confirmation">Needs confirmation<\/span>/u);
   assert.match(markup, /<strong>Parked<\/strong>[^]*?guild-source-chip status disabled">Disabled</u);
-  assert.match(markup, /<code title="https:\/\/api\.example\.com\/anthropic">api\.example\.com<\/code><span>2 models<\/span>/u);
-  assert.match(markup, /<code title="http:\/\/127\.0\.0\.1:8080">127\.0\.0\.1:8080<\/code><span>1 model<\/span>/u);
+  assert.match(markup, /<code title="https:\/\/api\.example\.com\/anthropic">api\.example\.com<\/code>/u);
+  assert.match(markup, /<code title="http:\/\/127\.0\.0\.1:8080">127\.0\.0\.1:8080<\/code>/u);
+  // The models are named as chips (with the id as the tooltip); the count is only the group's accessible name.
+  assert.match(markup, /<ul class="guild-source-model-chips" aria-label="2 models"><li class="guild-source-chip model" title="model-a">Model A<\/li><li class="guild-source-chip model" title="model-b">Model B<\/li><\/ul>/u);
+  assert.match(markup, /<ul class="guild-source-model-chips" aria-label="1 model"><li class="guild-source-chip model" title="local-a">Local A<\/li><\/ul>/u);
+  assert.doesNotMatch(markup, /<span>\d+ models?<\/span>/u);
+  // A confirmed source can be tested (enabled or not); one that is not confirmed says to confirm first instead of offering the button.
+  assert.equal(markup.match(/>Test connection<\/button>/gu)?.length, 2, "the confirmed DeepSeek and the confirmed-but-parked one");
+  assert.equal(markup.match(/class="guild-source-test-hint">Confirm this address first to test the connection\.<\/span>/gu)?.length, 1, "only llama.cpp");
   // Only the source that needs it offers Confirm, with the host and (when there is one) the variable named.
   assert.equal(markup.match(/>Confirm<\/button>/gu)?.length, 1);
   assert.match(markup, /Guild will open a system window asking you to confirm that requests may be sent to 127\.0\.0\.1:8080\./u);
@@ -191,8 +199,13 @@ test("the add form has every field, explains where keys live, and takes no key v
   assert.match(markup, /Online sources must use https\./u);
   assert.match(markup, /placeholder="~\/\.config\/guild\/keys\.env"/u);
   assert.match(markup, /Leave empty to use the default file\./u);
-  assert.match(markup, /Guild reads its value from the key file in the background and never shows or saves it\. Enter only the name of the key variable, never the key itself\./u);
-  for (const column of ["Model ID", "Display name", "Context window", "Images"]) assert.ok(markup.includes(`>${column}</span>`), column);
+  // One sentence, said once: the variable name, an example, and that Guild neither shows nor saves the value.
+  assert.match(markup, /Enter only the variable name, for example DEEPSEEK_API_KEY\. Guild reads its value from the key file and neither shows nor saves it; never paste the key itself here\./u);
+  assert.equal(markup.match(/never paste the key itself|never the key itself/gu)?.length, 1);
+  // Name and context window say what to type, and the window names its unit.
+  assert.match(markup, /placeholder="For example, DeepSeek"/u);
+  assert.match(markup, /placeholder="e\.g\. 1000000"/u);
+  for (const column of ["Model ID", "Display name", "Context window (tokens)", "Images"]) assert.ok(markup.includes(`>${column}</span>`), column);
   assert.match(markup, />Add model<\/button>/u);
   assert.match(markup, /aria-label="Enabled" aria-pressed="true"/u);
   assert.match(markup, />Cancel<\/button>/u);
@@ -297,7 +310,7 @@ test("the Name carries a reserved-name refusal, the repeated rows carry the dupl
 
   const reservedName = show(failure("reserved_id", "label"));
   assert.match(reservedName, /id="([^"]+)-label-error" role="alert">This name is reserved for Claude&#x27;s own models\. Choose a different name\.<\/p>/u);
-  assert.match(reservedName, /<input type="text" maxLength="80" autoComplete="off" aria-invalid="true" aria-describedby="[^"]+-label-error" value="DeepSeek"\/>/u);
+  assert.match(reservedName, /<input type="text" maxLength="80" placeholder="For example, DeepSeek" autoComplete="off" aria-invalid="true" aria-describedby="[^"]+-label-error" value="DeepSeek"\/>/u);
   // Nothing else is flagged.
   assert.equal(reservedName.match(/class="guild-source-error"/gu)?.length, 1);
 

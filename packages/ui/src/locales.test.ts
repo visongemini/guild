@@ -84,7 +84,7 @@ test("Guild 3.0 strings exist, are non-empty and mention no undefined in both ca
       messages.claudeStatusReady(undefined), messages.claudeStatusReady("Claude Max"), messages.claudeStatusNotFound,
       messages.claudeStatusNotLoggedIn, messages.claudeStatusUnavailable, messages.claudeStatusIntegrityChanged, messages.grokToolsGrokOnly,
       messages.usageClaudeHeading, messages.usageClaudeAccountUnknown, messages.usageClaudeQuota,
-      messages.sourcesIntro, messages.sourcesKeyNotice, messages.sourcesLoading, messages.sourcesLoadFailed, messages.sourcesEmpty,
+      messages.sourcesIntro, messages.sourcesLoading, messages.sourcesLoadFailed, messages.sourcesEmpty,
       messages.sourcesAdd, messages.sourcesEdit, messages.sourcesEditTitle, messages.sourcesAddTitle,
       messages.sourcesDeleteConfirm("L"), messages.sourcesDeleteFailed, messages.sourcesConfirm, messages.sourcesConfirming,
       messages.sourcesConfirmHelp("h", "V", "online"), messages.sourcesConfirmHelp("h", "V", "local"), messages.sourcesConfirmHelp("h", null, "local"), messages.sourcesConfirmedNotice,

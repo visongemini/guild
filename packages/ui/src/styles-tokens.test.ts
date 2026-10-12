@@ -66,6 +66,12 @@ function composite(top: { rgb: Rgb; alpha: number }, bottom: Rgb): Rgb {
   return [0, 1, 2].map((i) => Math.round(top.rgb[i]! * top.alpha + bottom[i]! * (1 - top.alpha))) as unknown as Rgb;
 }
 
+/** `color-mix(in srgb, text N%, panel)`: `percent` of `top` over `bottom`. */
+function mixInto(top: Rgb, bottom: Rgb, percent: string): Rgb {
+  const share = Number.parseFloat(percent) / 100;
+  return [0, 1, 2].map((i) => Math.round(top[i]! * share + bottom[i]! * (1 - share))) as unknown as Rgb;
+}
+
 function luminance([r, g, b]: Rgb): number {
   const channel = (value: number) => {
     const c = value / 255;
@@ -98,6 +104,9 @@ for (const [theme, block] of [["light", light], ["dark", dark]] as const) {
       hoverOnPanel: composite(parseColor(get("--guild-hover")), panel),
       selectedOnPanel: composite(parseColor(get("--guild-selected")), panel),
       selectedOnCanvas: composite(parseColor(get("--guild-selected")), solid("--guild-canvas")),
+      // The sidebar rows: text mixed into the panel by the row percentages (hover is lighter than selected).
+      rowHover: mixInto(solid("--guild-text"), panel, get("--guild-row-hover-pct")),
+      rowSelected: mixInto(solid("--guild-text"), panel, get("--guild-row-selected-pct")),
     };
     const texts = ["--guild-text", "--guild-muted", "--guild-faint", "--guild-accent-text", "--guild-wait-text", "--guild-error-text", "--guild-ok-text"];
     for (const token of texts) {

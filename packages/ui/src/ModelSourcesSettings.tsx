@@ -1,4 +1,4 @@
-import type { GuildRendererApi, ModelSourceKind, ModelSourceProjection } from "@guild/contracts";
+import type { GuildRendererApi, ModelSourceKind, ModelSourceProjection, TestModelSourceResponse } from "@guild/contracts";
 import { InfoIcon as Info } from "@phosphor-icons/react/Info";
 import { PlusIcon as Plus } from "@phosphor-icons/react/Plus";
 import { SpinnerGapIcon as SpinnerGap } from "@phosphor-icons/react/SpinnerGap";
@@ -12,6 +12,7 @@ import {
   formFromSource,
   SOURCE_LIMITS,
   sourceHost,
+  sourceHostConfirmed,
   sourceSaveFailureOf,
   sourceStatus,
   validateSourceForm,
@@ -23,8 +24,14 @@ import {
 
 type SourcesApi = Pick<
   GuildRendererApi,
-  "listModelSources" | "upsertModelSource" | "deleteModelSource" | "confirmModelSource"
+  "listModelSources" | "upsertModelSource" | "deleteModelSource" | "confirmModelSource" | "testModelSource"
 >;
+
+/** The connection test of one source: running, answered (per model, or refused as a whole), or not able to run. */
+export type SourceTestState =
+  | Readonly<{ state: "running" }>
+  | Readonly<{ state: "done"; response: TestModelSourceResponse }>
+  | Readonly<{ state: "failed" }>;
 
 export type SourcesNotice =
   | Readonly<{ kind: "needs_confirmation"; label: string }>
@@ -44,6 +51,7 @@ export type ModelSourcesSettingsProps = Readonly<{
   initialIssues?: readonly SourceIssue[];
   initialSaveFailure?: SourceSaveFailure;
   initialNotice?: SourcesNotice;
+  initialTests?: Readonly<Record<string, SourceTestState>>;
 }>;
 
 const BASE_URL_PLACEHOLDER: Readonly<Record<ModelSourceKind, string>> = Object.freeze({
@@ -61,13 +69,36 @@ function noticeText(messages: GuildMessages, notice: SourcesNotice): string {
   }
 }
 
+/** What the connection test found, under the source it tested: one line per model, or the one reason nothing was sent. */
+function SourceTestResult({ messages, source, test }: {
+  readonly messages: GuildMessages;
+  readonly source: ModelSourceProjection;
+  readonly test: SourceTestState | undefined;
+}) {
+  if (test === undefined || test.state === "running") return null;
+  if (test.state === "failed") return <p className="guild-setting-help blocked" role="status">{messages.sourcesTestFailed}</p>;
+  const { response } = test;
+  if (response.refused !== undefined) {
+    return <p className="guild-setting-help blocked" role="status">{messages.sourcesTestRefusal(response.refused)}</p>;
+  }
+  const labelOf = (modelId: string) => source.models.find((model) => model.id === modelId)?.label ?? modelId;
+  return <ul className="guild-source-test-results" role="status" aria-label={messages.sourcesTestHeading}>
+    {response.results.map((entry) => (
+      <li key={entry.modelId} className={entry.outcome.kind === "ok" ? "ok" : "bad"}>
+        <span className="guild-source-test-model" title={entry.modelId}>{labelOf(entry.modelId)}</span>
+        <span className="guild-source-test-outcome">{messages.sourcesProbeOutcome(entry.outcome)}</span>
+      </li>
+    ))}
+  </ul>;
+}
+
 /**
  * The Model sources tab (PC-MODEL-001): the Online and Local endpoints whose models join the Claude
  * picker. It names a key file and a variable inside it, never a key: no field accepts or shows a
  * secret. A new or changed address needs the user's confirmation in a native window owned by the main
  * process; this tab only asks for it and waits for the answer.
  */
-export function ModelSourcesSettings({ messages, api, onChanged, initialSources, initialForm, initialIssues, initialSaveFailure, initialNotice }: ModelSourcesSettingsProps) {
+export function ModelSourcesSettings({ messages, api, onChanged, initialSources, initialForm, initialIssues, initialSaveFailure, initialNotice, initialTests }: ModelSourcesSettingsProps) {
   const [sources, setSources] = useState<readonly ModelSourceProjection[] | undefined>(initialSources);
   const [loadFailed, setLoadFailed] = useState(false);
   const [form, setForm] = useState<SourceForm | undefined>(initialForm);
@@ -77,6 +108,7 @@ export function ModelSourcesSettings({ messages, api, onChanged, initialSources,
   const [notice, setNotice] = useState<SourcesNotice | undefined>(initialNotice);
   const [confirmingId, setConfirmingId] = useState<string>();
   const [deleteTargetId, setDeleteTargetId] = useState<string>();
+  const [tests, setTests] = useState<Readonly<Record<string, SourceTestState>>>(initialTests ?? {});
   const alive = useRef(true);
   const latestOnChanged = useRef(onChanged);
   latestOnChanged.current = onChanged;
@@ -111,6 +143,7 @@ export function ModelSourcesSettings({ messages, api, onChanged, initialSources,
       if (!alive.current) return;
       await load();
       if (!alive.current) return;
+      forgetTest(response.source.id);
       setForm(undefined);
       setIssues([]);
       setNotice(response.needsConfirmation
@@ -136,6 +169,7 @@ export function ModelSourcesSettings({ messages, api, onChanged, initialSources,
       const response = await api.confirmModelSource({ id: source.id });
       if (!alive.current) return;
       setNotice(Object.freeze({ kind: response.status === "confirmed" ? "confirmed" : "cancelled" }));
+      forgetTest(source.id);
       await load();
       latestOnChanged.current();
     } catch {
@@ -145,11 +179,30 @@ export function ModelSourcesSettings({ messages, api, onChanged, initialSources,
     }
   }
 
+  /** A source that changed or went away has no result to show: what was tested is not what is stored now. */
+  const forgetTest = (id: string) => setTests((current) => {
+    if (!(id in current)) return current;
+    const { [id]: _gone, ...rest } = current;
+    return rest;
+  });
+
+  async function runTest(source: ModelSourceProjection) {
+    if (tests[source.id]?.state === "running") return;
+    setTests((current) => ({ ...current, [source.id]: Object.freeze({ state: "running" as const }) }));
+    try {
+      const response = await api.testModelSource({ id: source.id });
+      if (alive.current) setTests((current) => ({ ...current, [source.id]: Object.freeze({ state: "done" as const, response }) }));
+    } catch {
+      if (alive.current) setTests((current) => ({ ...current, [source.id]: Object.freeze({ state: "failed" as const }) }));
+    }
+  }
+
   async function remove(source: ModelSourceProjection) {
     setNotice(undefined);
     try {
       await api.deleteModelSource({ id: source.id });
       if (!alive.current) return;
+      forgetTest(source.id);
       setDeleteTargetId(undefined);
       await load();
       latestOnChanged.current();
@@ -205,6 +258,7 @@ export function ModelSourcesSettings({ messages, api, onChanged, initialSources,
           type="text"
           value={form.label}
           maxLength={80}
+          placeholder={messages.sourcesLabelPlaceholder}
           autoComplete="off"
           aria-invalid={labelIssue !== undefined || labelFailure !== undefined || undefined}
           aria-describedby={labelIssue === undefined && labelFailure === undefined ? undefined : `${fieldId}-label-error`}
@@ -257,7 +311,7 @@ export function ModelSourcesSettings({ messages, api, onChanged, initialSources,
           aria-describedby={`${fieldId}-variable-hint${variableIssue === undefined ? "" : ` ${fieldId}-variable-error`}`}
           onChange={(event) => patchForm({ keyVariable: event.currentTarget.value })}
         />
-        <small className="guild-setting-help" id={`${fieldId}-variable-hint`}>{messages.sourcesKeyVariableHint} {messages.sourcesKeyNotice}</small>
+        <small className="guild-setting-help" id={`${fieldId}-variable-hint`}>{messages.sourcesKeyVariableHint}</small>
         {errorOf(`${fieldId}-variable-error`, variableIssue)}
       </label>
       <div className="guild-setting-label guild-source-field-label">{messages.sourcesModels}</div>
@@ -301,6 +355,7 @@ export function ModelSourcesSettings({ messages, api, onChanged, initialSources,
                 type="text"
                 inputMode="numeric"
                 value={row.contextWindow}
+                placeholder={messages.sourcesModelContextPlaceholder}
                 autoComplete="off"
                 aria-label={`${messages.sourcesModelContext} ${index + 1}`}
                 aria-invalid={contextIssue !== undefined || undefined}
@@ -379,8 +434,12 @@ export function ModelSourcesSettings({ messages, api, onChanged, initialSources,
             </div>
             <div className="guild-source-meta">
               <code title={source.baseUrl}>{host}</code>
-              <span>{messages.sourcesModelCount(source.models.length)}</span>
             </div>
+            <ul className="guild-source-model-chips" aria-label={messages.sourcesModelCount(source.models.length)}>
+              {source.models.map((model) => (
+                <li key={model.id} className="guild-source-chip model" title={model.id}>{model.label}</li>
+              ))}
+            </ul>
             {status === "needs_confirmation" && <p className="guild-setting-help">{messages.sourcesConfirmHelp(host, source.keyVariable, source.kind)}</p>}
             {deleting ? (
               <div className="guild-source-delete" role="alertdialog" aria-label={messages.sourcesDeleteConfirm(source.label)}>
@@ -403,10 +462,24 @@ export function ModelSourcesSettings({ messages, api, onChanged, initialSources,
                     ? <><SpinnerGap size={13} className="guild-spin" aria-hidden="true" />{messages.sourcesConfirming}</>
                     : messages.sourcesConfirm}</button>
                 )}
-                <button type="button" className="guild-soft-button" onClick={() => { setNotice(undefined); setSaveFailure(undefined); setIssues([]); setForm(formFromSource(source)); }}>{messages.sourcesEdit}</button>
+                {sourceHostConfirmed(source)
+                  ? (
+                    <button
+                      type="button"
+                      className="guild-soft-button"
+                      disabled={tests[source.id]?.state === "running"}
+                      aria-busy={tests[source.id]?.state === "running" || undefined}
+                      onClick={() => void runTest(source)}
+                    >{tests[source.id]?.state === "running"
+                      ? <><SpinnerGap size={13} className="guild-spin" aria-hidden="true" />{messages.sourcesTesting}</>
+                      : messages.sourcesTest}</button>
+                  )
+                  : <span className="guild-source-test-hint">{messages.sourcesTestNeedsConfirm}</span>}
+                <button type="button" className="guild-soft-button" onClick={() => { setNotice(undefined); setSaveFailure(undefined); setIssues([]); forgetTest(source.id); setForm(formFromSource(source)); }}>{messages.sourcesEdit}</button>
                 <button type="button" className="guild-soft-button" onClick={() => { setNotice(undefined); setDeleteTargetId(source.id); }}>{messages.delete}</button>
               </div>
             )}
+            <SourceTestResult messages={messages} source={source} test={tests[source.id]} />
           </li>;
         })}
       </ul>
