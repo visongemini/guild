@@ -1,4 +1,4 @@
-import type { AcpToolKind, GuildGrokManagementAction, GuildGrokPermissionMode, GuildLocale, GuildModelSwitchRefusalReason, GuildTaskActivity } from "@guild/contracts";
+import type { AcpToolKind, GuildClaudePermissionMode, GuildEngine, GuildGrokManagementAction, GuildGrokPermissionMode, GuildLocale, GuildModelSwitchRefusalReason, GuildTaskActivity, ModelGroup } from "@guild/contracts";
 
 import { WORKSHOP_ZH, WORKSHOP_EN, type WorkshopMessages } from "./workshop-messages.js";
 import { createChangeMessages, type ChangeMessages } from "./change-messages.js";
@@ -163,6 +163,91 @@ export type GuildMessages = WorkshopMessages & ChangeMessages & {
   readonly modelPickerNoEfforts: string;
   readonly modelPickerSaved: string;
   readonly modelPickerRefused: (reason: GuildModelSwitchRefusalReason) => string;
+  // Guild 3.0 grouped picker (PC-MODEL-001)
+  readonly modelGroupName: (group: ModelGroup) => string;
+  readonly modelPickerGroupEmpty: (group: "online" | "local") => string;
+  readonly modelPickerOpenModelSources: string;
+  readonly modelPickerClaudeUnavailable: string;
+  readonly modelPickerClaudeUnavailableHelp: string;
+  readonly modelPickerClaudeNotStarted: string;
+  readonly modelPickerEngineNote: string;
+  readonly taskEngineName: (engine: GuildEngine) => string;
+  readonly taskEngineMarkerTitle: (engine: GuildEngine) => string;
+  // Online-model reminder (PC-PRIV-001)
+  readonly onlineReminderTitle: (vendor: string) => string;
+  readonly onlineReminderLead: (vendor: string) => string;
+  readonly onlineReminderItemClaudeMd: string;
+  readonly onlineReminderItemMemory: string;
+  readonly onlineReminderItemConversation: string;
+  readonly onlineReminderItemBrowser: string;
+  readonly onlineReminderDontRemind: string;
+  readonly onlineReminderSwitch: string;
+  readonly privacyOnlineReminder: string;
+  readonly privacyOnlineReminderHelp: string;
+  readonly privacyOnlineReminderNoWorkspace: string;
+  readonly privacyOnlineReminderFailed: string;
+  // Settings: Engines and Model sources (PC-SET-002)
+  readonly settingsEngines: string;
+  readonly settingsModelSources: string;
+  readonly settingsClaude: string;
+  readonly enginesClaudeIntro: string;
+  readonly claudeDefaultModelOption: string;
+  readonly claudePermissionModeName: (mode: GuildClaudePermissionMode) => string;
+  readonly claudePermissionModeHelp: (mode: GuildClaudePermissionMode) => string;
+  readonly claudeSettingsHelp: string;
+  readonly claudeSettingsFailed: string;
+  readonly claudeStatusLabel: string;
+  readonly claudeStatusReady: (account: string | undefined) => string;
+  readonly claudeStatusNotFound: string;
+  readonly claudeStatusNotLoggedIn: string;
+  readonly claudeStatusUnavailable: string;
+  readonly grokToolsGrokOnly: string;
+  readonly sourcesIntro: string;
+  readonly sourcesKeyNotice: string;
+  readonly sourcesLoading: string;
+  readonly sourcesLoadFailed: string;
+  readonly sourcesEmpty: string;
+  readonly sourcesAdd: string;
+  readonly sourcesEdit: string;
+  readonly sourcesEditTitle: string;
+  readonly sourcesAddTitle: string;
+  readonly sourcesDeleteConfirm: (label: string) => string;
+  readonly sourcesDeleteFailed: string;
+  readonly sourcesKindName: (kind: "online" | "local") => string;
+  readonly sourcesStatusName: (status: "confirmed" | "needs_confirmation" | "disabled") => string;
+  readonly sourcesModelCount: (count: number) => string;
+  readonly sourcesConfirm: string;
+  readonly sourcesConfirming: string;
+  readonly sourcesConfirmHelp: (host: string, variable: string | null) => string;
+  readonly sourcesConfirmedNotice: string;
+  readonly sourcesConfirmCancelled: string;
+  readonly sourcesConfirmFailed: string;
+  readonly sourcesNeedsConfirmationNotice: (label: string) => string;
+  readonly sourcesFieldKind: string;
+  readonly sourcesFieldLabel: string;
+  readonly sourcesFieldBaseUrl: string;
+  readonly sourcesBaseUrlHint: (kind: "online" | "local") => string;
+  readonly sourcesFieldKeyFile: string;
+  readonly sourcesKeyFilePlaceholder: string;
+  readonly sourcesKeyFileHint: string;
+  readonly sourcesFieldKeyVariable: string;
+  readonly sourcesKeyVariablePlaceholder: string;
+  readonly sourcesKeyVariableHint: string;
+  readonly sourcesModels: string;
+  readonly sourcesModelId: string;
+  readonly sourcesModelLabel: string;
+  readonly sourcesModelContext: string;
+  readonly sourcesModelImages: string;
+  readonly sourcesAddModel: string;
+  readonly sourcesRemoveModel: (id: string) => string;
+  readonly sourcesEnabled: string;
+  readonly sourcesSaving: string;
+  readonly sourcesSaveFailed: string;
+  readonly sourcesInvalid: (problem: "label" | "base_url" | "base_url_https" | "key_file" | "key_variable" | "key_variable_secret" | "models" | "model_id" | "model_duplicate" | "model_label" | "model_context") => string;
+  // Claude usage popover (PC-ENG-001)
+  readonly usageClaudeHeading: string;
+  readonly usageClaudeAccountUnknown: string;
+  readonly usageClaudeQuota: string;
   readonly runDuration: (seconds: number) => string;
   readonly runPhaseStartingRuntime: string;
   readonly runPhaseOpeningSession: string;
@@ -580,7 +665,7 @@ const ZH_CN: GuildMessages = Object.freeze({
   localData: "本地数据与诊断",
   localDataHelp: "对话、设置和诊断都只保存在这台 Mac。诊断不记录正常提示词与回复，错误输出会先脱敏凭据。",
   aboutCopyright: "Copyright © 2026 BDV",
-  aboutRole: "Guild 是调用官方 Grok 工具的本地单用户客户端。",
+  aboutRole: "Guild 是调用官方 Grok 工具和 Claude Code 的本地单用户客户端。",
   closeDialog: "关闭",
   language: "语言",
   model: "模型",
@@ -615,6 +700,117 @@ const ZH_CN: GuildMessages = Object.freeze({
     unsupported_value: "Grok 目前没有为这个任务提供该选项，已保留你之前的选择。",
     unavailable: "Grok 暂时无法切换，已保留你之前的选择。",
   })[reason],
+  modelGroupName: (group) => ({ grok: "Grok", claude: "Claude（订阅）", online: "在线", local: "本地" })[group],
+  modelPickerGroupEmpty: (group) => group === "online"
+    ? "没有在线模型，请在「设置 › 模型源」中添加"
+    : "没有本地模型，请在「设置 › 模型源」中添加",
+  modelPickerOpenModelSources: "打开模型源设置",
+  modelPickerClaudeUnavailable: "未找到 Claude Code，或尚未登录",
+  modelPickerClaudeUnavailableHelp: "请先安装 Claude Code，并在终端运行一次 claude 完成登录。",
+  modelPickerClaudeNotStarted: "Claude 启动后才会显示可选的模型。",
+  modelPickerEngineNote: "第一条消息选的模型，决定这个对话用 Grok 还是 Claude，之后不能更换。",
+  taskEngineName: (engine) => ({ grok: "Grok", claude: "Claude" })[engine],
+  taskEngineMarkerTitle: (engine) => ({ grok: "Grok 对话", claude: "Claude Code 对话" })[engine],
+  onlineReminderTitle: (vendor) => `要把这段对话发给「${vendor}」吗？`,
+  onlineReminderLead: (vendor) => `「${vendor}」是在线模型。切换后，下面这些内容会发送给它的服务商：`,
+  onlineReminderItemClaudeMd: "CLAUDE.md",
+  onlineReminderItemMemory: "记忆",
+  onlineReminderItemConversation: "本次对话",
+  onlineReminderItemBrowser: "对话中出现的网页文字和截图",
+  onlineReminderDontRemind: "在此工作区不再提醒",
+  onlineReminderSwitch: "切换",
+  privacyOnlineReminder: "发给在线模型前先提醒我",
+  privacyOnlineReminderHelp: "在此工作区的对话里第一次使用在线模型时，先确认一次。本地模型和 Claude 订阅模型不会提醒。",
+  privacyOnlineReminderNoWorkspace: "打开一个对话后，才能修改它所在工作区的这项设置。",
+  privacyOnlineReminderFailed: "这项设置没有保存，请重试。",
+  settingsEngines: "引擎",
+  settingsModelSources: "模型源",
+  settingsClaude: "Claude",
+  enginesClaudeIntro: "Claude Code 通过这台 Mac 上已安装的适配器和 claude 程序运行，使用你自己的 Claude 登录。Guild 不会读取这个登录。",
+  claudeDefaultModelOption: "Claude Code 默认（推荐）",
+  claudePermissionModeName: (mode) => ({
+    default: "按需询问",
+    acceptEdits: "自动接受编辑",
+    plan: "仅规划",
+    auto: "自动",
+    bypassPermissions: "完全授权",
+  })[mode],
+  claudePermissionModeHelp: (mode) => ({
+    default: "每次编辑文件或运行命令前都先询问你。",
+    acceptEdits: "文件编辑自动通过，运行命令仍会询问。",
+    plan: "只读和规划，不修改文件，也不运行命令。",
+    auto: "由 Claude Code 判断哪些操作需要你确认。",
+    bypassPermissions: "不再逐次询问，工具会直接在此设备上运行；只在你信任的工作区使用。",
+  })[mode],
+  claudeSettingsHelp: "新的 Claude 对话从这里的设置开始，正在运行的一轮不会被改动。",
+  claudeSettingsFailed: "Claude 设置没有保存，请重试。",
+  claudeStatusLabel: "状态",
+  claudeStatusReady: (account) => account === undefined ? "已就绪" : `已就绪 · ${account}`,
+  claudeStatusNotFound: "没有找到 Claude Code。请先安装，并确认适配器和 claude 程序都在这台 Mac 上。",
+  claudeStatusNotLoggedIn: "尚未登录。请在终端运行一次 claude 完成登录。",
+  claudeStatusUnavailable: "暂时无法使用，稍后再试。",
+  grokToolsGrokOnly: "Grok 工具只用于 Grok 对话",
+  sourcesIntro: "在线和本地模型会出现在 Claude 对话的模型选择里。Guild 只把请求发到你设置的地址；API 密钥留在你指定的文件里，Guild 不会显示、保存或记录它。",
+  sourcesKeyNotice: "这里只填密钥变量的名字，不要粘贴密钥本身。",
+  sourcesLoading: "正在读取模型源…",
+  sourcesLoadFailed: "无法读取模型源，请重试。",
+  sourcesEmpty: "还没有模型源。",
+  sourcesAdd: "添加模型源",
+  sourcesEdit: "编辑",
+  sourcesEditTitle: "编辑模型源",
+  sourcesAddTitle: "添加模型源",
+  sourcesDeleteConfirm: (label) => `删除「${label}」？它的模型会从选择列表中消失，密钥文件不会被改动。`,
+  sourcesDeleteFailed: "没有删除成功，请重试。",
+  sourcesKindName: (kind) => ({ online: "在线", local: "本地" })[kind],
+  sourcesStatusName: (status) => ({ confirmed: "已确认", needs_confirmation: "待确认", disabled: "已停用" })[status],
+  sourcesModelCount: (count) => `${count} 个模型`,
+  sourcesConfirm: "确认",
+  sourcesConfirming: "等待你在系统窗口中确认…",
+  sourcesConfirmHelp: (host, variable) => variable === null
+    ? `Guild 会弹出系统窗口，请你确认可以向 ${host} 发送请求。`
+    : `Guild 会弹出系统窗口，请你确认变量 ${variable} 里的密钥可以发送到 ${host}。`,
+  sourcesConfirmedNotice: "已确认。",
+  sourcesConfirmCancelled: "没有确认，这个模型源暂时不能使用。",
+  sourcesConfirmFailed: "确认没有完成，请重试。",
+  sourcesNeedsConfirmationNotice: (label) => `「${label}」已保存，确认地址和密钥变量之后才能使用。`,
+  sourcesFieldKind: "类型",
+  sourcesFieldLabel: "名称",
+  sourcesFieldBaseUrl: "接口地址",
+  sourcesBaseUrlHint: (kind) => kind === "online"
+    ? "在线模型源必须使用 https。"
+    : "本地模型源可以用 http 或 https，地址必须在这台 Mac 或你的 Tailscale 网络内。",
+  sourcesFieldKeyFile: "密钥文件",
+  sourcesKeyFilePlaceholder: "~/.config/guild/keys.env",
+  sourcesKeyFileHint: "存放密钥的 env 文件的绝对路径。留空则使用默认文件。",
+  sourcesFieldKeyVariable: "密钥变量名",
+  sourcesKeyVariablePlaceholder: "例如 DEEPSEEK_API_KEY",
+  sourcesKeyVariableHint: "只填变量名。Guild 在后台从密钥文件读取它的值，不会显示或保存。",
+  sourcesModels: "模型",
+  sourcesModelId: "模型 ID",
+  sourcesModelLabel: "显示名称",
+  sourcesModelContext: "上下文窗口",
+  sourcesModelImages: "支持图片",
+  sourcesAddModel: "添加模型",
+  sourcesRemoveModel: (id) => id.length === 0 ? "删除这一行" : `删除模型 ${id}`,
+  sourcesEnabled: "启用",
+  sourcesSaving: "正在保存…",
+  sourcesSaveFailed: "没有保存成功，请检查各项内容后重试。",
+  sourcesInvalid: (problem) => ({
+    label: "请填写名称。",
+    base_url: "请填写完整的接口地址，例如 https://api.example.com/anthropic。",
+    base_url_https: "在线模型源必须使用 https。",
+    key_file: "密钥文件需要绝对路径（以 / 开头），或者留空。",
+    key_variable: "请填写密钥变量名，只能用大写字母、数字和下划线。",
+    key_variable_secret: "这里要填变量的名字，不是密钥本身。",
+    models: "至少添加一个模型。",
+    model_id: "模型 ID 只能包含字母、数字和 . _ : [ ] -，且以字母或数字开头。",
+    model_duplicate: "模型 ID 不能重复。",
+    model_label: "请给每个模型填写显示名称。",
+    model_context: "上下文窗口需要是正整数，或者留空。",
+  })[problem],
+  usageClaudeHeading: "Claude 订阅",
+  usageClaudeAccountUnknown: "账户信息暂不可用",
+  usageClaudeQuota: "额度：由 Claude Code 管理",
   runDuration: (seconds) => seconds < 60
     ? `${seconds} 秒`
     : seconds < 3_600
@@ -661,7 +857,7 @@ const ZH_CN: GuildMessages = Object.freeze({
   usageResetsAt: (date) => `${date} 重置`,
   viewOfficialUsage: "在 Grok 查看官方用量",
   version: "版本",
-  independentNotice: "Guild 是独立客户端，与 xAI 无隶属关系。",
+  independentNotice: "Guild 是独立客户端，与 xAI、Anthropic 均无隶属关系。",
   recovered: "上次未正常退出，状态已恢复",
   today: "今天",
   yesterday: "昨天",
@@ -989,7 +1185,7 @@ const EN_US: GuildMessages = Object.freeze({
   localData: "Local data and diagnostics",
   localDataHelp: "Chats, settings, and diagnostics stay on this Mac. Diagnostics omit normal prompts and replies, and redact credentials from error output.",
   aboutCopyright: "Copyright © 2026 BDV",
-  aboutRole: "Guild is a local single-user client that calls the official Grok tools.",
+  aboutRole: "Guild is a local single-user client that calls the official Grok tools and Claude Code.",
   closeDialog: "Close",
   language: "Language",
   model: "Model",
@@ -1024,6 +1220,117 @@ const EN_US: GuildMessages = Object.freeze({
     unsupported_value: "Grok does not offer that option for this task right now. Your previous selection was kept.",
     unavailable: "Grok could not switch right now. Your previous selection was kept.",
   })[reason],
+  modelGroupName: (group) => ({ grok: "Grok", claude: "Claude", online: "Online", local: "Local" })[group],
+  modelPickerGroupEmpty: (group) => group === "online"
+    ? "No online models — add one in Settings › Model sources"
+    : "No local models — add one in Settings › Model sources",
+  modelPickerOpenModelSources: "Open Model sources",
+  modelPickerClaudeUnavailable: "Claude Code not found or not logged in",
+  modelPickerClaudeUnavailableHelp: "Install Claude Code, then run `claude` once in Terminal and log in.",
+  modelPickerClaudeNotStarted: "Model choices appear once Claude has started.",
+  modelPickerEngineNote: "The model you pick for the first message decides whether this conversation runs on Grok or Claude. It cannot change afterwards.",
+  taskEngineName: (engine) => ({ grok: "Grok", claude: "Claude" })[engine],
+  taskEngineMarkerTitle: (engine) => ({ grok: "Grok conversation", claude: "Claude Code conversation" })[engine],
+  onlineReminderTitle: (vendor) => `Send this conversation to ${vendor}?`,
+  onlineReminderLead: (vendor) => `${vendor} is an online model. If you switch, these are sent to its vendor:`,
+  onlineReminderItemClaudeMd: "CLAUDE.md",
+  onlineReminderItemMemory: "Memory",
+  onlineReminderItemConversation: "This conversation",
+  onlineReminderItemBrowser: "Text and screenshots of web pages in this conversation",
+  onlineReminderDontRemind: "Don't remind me again in this workspace",
+  onlineReminderSwitch: "Switch",
+  privacyOnlineReminder: "Remind me before sending to an online model",
+  privacyOnlineReminderHelp: "Asks once, the first time a conversation in this workspace uses an online model. Local models and your Claude subscription never ask.",
+  privacyOnlineReminderNoWorkspace: "Open a conversation to change this for its workspace.",
+  privacyOnlineReminderFailed: "That setting was not saved. Try again.",
+  settingsEngines: "Engines",
+  settingsModelSources: "Model sources",
+  settingsClaude: "Claude",
+  enginesClaudeIntro: "Claude Code runs through the adapter and claude program installed on this Mac, using your own Claude login. Guild never reads that login.",
+  claudeDefaultModelOption: "Claude Code default (recommended)",
+  claudePermissionModeName: (mode) => ({
+    default: "Ask as needed",
+    acceptEdits: "Accept edits",
+    plan: "Plan only",
+    auto: "Automatic",
+    bypassPermissions: "Full access",
+  })[mode],
+  claudePermissionModeHelp: (mode) => ({
+    default: "Asks before every file edit and command.",
+    acceptEdits: "File edits go through automatically; commands still ask.",
+    plan: "Read and plan only. No file changes and no commands.",
+    auto: "Claude Code decides which actions need your approval.",
+    bypassPermissions: "Never asks. Tools run on this device right away; use it only in workspaces you trust.",
+  })[mode],
+  claudeSettingsHelp: "New Claude conversations start from these settings. A turn that is already running is never changed.",
+  claudeSettingsFailed: "The Claude settings were not saved. Try again.",
+  claudeStatusLabel: "Status",
+  claudeStatusReady: (account) => account === undefined ? "Ready" : `Ready · ${account}`,
+  claudeStatusNotFound: "Claude Code was not found. Install it and make sure the adapter and the claude program are on this Mac.",
+  claudeStatusNotLoggedIn: "Not logged in. Run `claude` once in Terminal and log in.",
+  claudeStatusUnavailable: "Not available right now. Try again in a moment.",
+  grokToolsGrokOnly: "Grok tools are for Grok conversations",
+  sourcesIntro: "Online and Local models appear in the picker of Claude conversations. Guild only sends requests to the address you set. API keys stay in the file you name; Guild never shows, stores or logs them.",
+  sourcesKeyNotice: "Enter only the name of the key variable, never the key itself.",
+  sourcesLoading: "Loading model sources…",
+  sourcesLoadFailed: "Model sources could not be loaded. Try again.",
+  sourcesEmpty: "No model sources yet.",
+  sourcesAdd: "Add model source",
+  sourcesEdit: "Edit",
+  sourcesEditTitle: "Edit model source",
+  sourcesAddTitle: "Add model source",
+  sourcesDeleteConfirm: (label) => `Delete “${label}”? Its models leave the picker. The key file is not touched.`,
+  sourcesDeleteFailed: "It could not be deleted. Try again.",
+  sourcesKindName: (kind) => ({ online: "Online", local: "Local" })[kind],
+  sourcesStatusName: (status) => ({ confirmed: "Confirmed", needs_confirmation: "Needs confirmation", disabled: "Disabled" })[status],
+  sourcesModelCount: (count) => `${count} ${count === 1 ? "model" : "models"}`,
+  sourcesConfirm: "Confirm",
+  sourcesConfirming: "Waiting for your confirmation in the system window…",
+  sourcesConfirmHelp: (host, variable) => variable === null
+    ? `Guild will open a system window asking you to confirm that requests may be sent to ${host}.`
+    : `Guild will open a system window asking you to confirm that the key in ${variable} may be sent to ${host}.`,
+  sourcesConfirmedNotice: "Confirmed.",
+  sourcesConfirmCancelled: "Not confirmed. The source cannot be used yet.",
+  sourcesConfirmFailed: "The confirmation did not finish. Try again.",
+  sourcesNeedsConfirmationNotice: (label) => `“${label}” is saved. Confirm its address and key variable before it can be used.`,
+  sourcesFieldKind: "Type",
+  sourcesFieldLabel: "Name",
+  sourcesFieldBaseUrl: "Base URL",
+  sourcesBaseUrlHint: (kind) => kind === "online"
+    ? "Online sources must use https."
+    : "Local sources may use http or https and must be on this Mac or your Tailscale network.",
+  sourcesFieldKeyFile: "Key file",
+  sourcesKeyFilePlaceholder: "~/.config/guild/keys.env",
+  sourcesKeyFileHint: "Absolute path of the env file that holds the key. Leave empty to use the default file.",
+  sourcesFieldKeyVariable: "Key variable",
+  sourcesKeyVariablePlaceholder: "e.g. DEEPSEEK_API_KEY",
+  sourcesKeyVariableHint: "Only the variable name. Guild reads its value from the key file in the background and never shows or saves it.",
+  sourcesModels: "Models",
+  sourcesModelId: "Model ID",
+  sourcesModelLabel: "Display name",
+  sourcesModelContext: "Context window",
+  sourcesModelImages: "Images",
+  sourcesAddModel: "Add model",
+  sourcesRemoveModel: (id) => id.length === 0 ? "Remove this row" : `Remove model ${id}`,
+  sourcesEnabled: "Enabled",
+  sourcesSaving: "Saving…",
+  sourcesSaveFailed: "It could not be saved. Check the fields and try again.",
+  sourcesInvalid: (problem) => ({
+    label: "Enter a name.",
+    base_url: "Enter a full base URL, for example https://api.example.com/anthropic.",
+    base_url_https: "Online sources must use https.",
+    key_file: "The key file needs an absolute path (starting with /), or leave it empty.",
+    key_variable: "Enter the key variable name, using capital letters, digits and underscores only.",
+    key_variable_secret: "Enter the name of the variable, not the key itself.",
+    models: "Add at least one model.",
+    model_id: "A model ID may contain letters, digits and . _ : [ ] - and starts with a letter or digit.",
+    model_duplicate: "Model IDs must be unique.",
+    model_label: "Give every model a display name.",
+    model_context: "The context window must be a positive whole number, or empty.",
+  })[problem],
+  usageClaudeHeading: "Claude subscription",
+  usageClaudeAccountUnknown: "Account details are not available yet",
+  usageClaudeQuota: "Quota: managed by Claude Code",
   runDuration: (seconds) => seconds < 60
     ? `${seconds}s`
     : seconds < 3_600
@@ -1063,7 +1370,7 @@ const EN_US: GuildMessages = Object.freeze({
   usageResetsAt: (date) => `Resets ${date}`,
   viewOfficialUsage: "View official usage in Grok",
   version: "Version",
-  independentNotice: "Guild is an independent client and is not affiliated with xAI.",
+  independentNotice: "Guild is an independent client and is not affiliated with xAI or Anthropic.",
   recovered: "State recovered after an unclean shutdown",
   today: "Today",
   yesterday: "Yesterday",
@@ -1247,6 +1554,104 @@ export const LOCALES: Readonly<Record<GuildLocale, GuildMessages>> = Object.free
   "en-US": EN_US,
 });
 
-export function messagesFor(locale: GuildLocale): GuildMessages {
-  return LOCALES[locale];
+/*
+ * Claude-engine wording (PC-ENG-001). The catalogs above name Grok wherever the product talks about "the runtime".
+ * A Claude task shows these replacements for the strings of its own conversation (connecting, waiting, usage,
+ * commands, files, rewind); everything else, including the Grok settings and tools, keeps the Grok text.
+ * Each builder gets the base catalog so a function-valued entry can delegate for the cases that do not change.
+ */
+const CLAUDE_ZH = (base: GuildMessages): Partial<GuildMessages> => ({
+  connectingRuntime: "正在连接 Claude…",
+  runPreparing: "正在准备 Claude",
+  runWaitingForGrok: "Claude 已接收，等待响应",
+  terminalOutputUnavailable: "当前 Claude 会话没有提供可显示的终端正文。",
+  modelPickerScopeRuntime: "使用 Claude 的默认设置",
+  modelPickerRefused: (reason) => ({
+    incompatible_agent: base.modelPickerRefused("incompatible_agent"),
+    unsupported_value: "Claude Code 目前没有为这个任务提供该选项，已保留你之前的选择。",
+    unavailable: "Claude Code 暂时无法切换，已保留你之前的选择。",
+  })[reason],
+  runPhaseStartingRuntime: "正在启动 Claude",
+  runPhasePromptSentSlow: "已发送 · Claude 尚未接手",
+  latestResultNoChanges: "Claude 未报告文件或差异证据",
+  recoveryNoticeRestored: "现在可以继续使用这个 Claude 会话",
+  runtimeUnavailable: "Claude 运行时暂时不可用",
+  sessionReplacementTitle: "原 Claude 会话无法继续",
+  permissionHelp: "权限决定 Claude 何时需要确认。提升权限前，先确认当前项目和要执行的操作。",
+  evidenceHelp: "这里显示 Claude 在对话中报告的文件和改动，不代表完整的磁盘或 Git 状态。",
+  noEvidenceAction: "可以打开项目文件夹检查实际文件，或让 Claude 检查改动并报告结果。",
+  noFilesYet: "Claude 尚未报告文件位置。",
+  noChangesYet: "Claude 尚未报告可审阅的变更。",
+  contextUsageUnavailable: "尚未收到 Claude 的上下文用量；首次回传通常在首轮回复后出现",
+  contextUsageUnavailableCompact: "等待 Claude 首次回传用量",
+  slashCommands: "Claude 命令",
+  commandSending: "正在发送给 Claude",
+  commandWaiting: "Claude 已接收，正在等待状态回传",
+  commandRunning: "Claude 正在处理",
+  commandPaletteGroup: (group) => ({ navigation: "导航与设置", tasks: "任务", commands: "当前 Claude 会话命令" })[group],
+  branchMessageHelp: "复制截至此处的本地对话快照，并启动新的 Claude 会话",
+  convertToSteerHelp: "不打断当前这一轮，把这条直接告诉 Claude",
+  rewindFilesOnlyBody: (reason) => reason === "unsupported"
+    ? "Claude Code 目前不能退回对话，所以只能把文件还原到这一轮之前。对话记录保持不变，这一轮的提问也不会放回输入框。"
+    : "Claude Code 暂时不能退回对话，现在只能把文件还原到这一轮之前。对话记录保持不变，这一轮的提问也不会放回输入框。",
+  rewindDisabledReason: (reason) => reason === "runtime_unavailable"
+    ? "Claude Code 暂时不可用，稍后再试"
+    : base.rewindDisabledReason(reason),
+  rewindRefused: (reason) => base.rewindRefused(reason).replaceAll("Grok", "Claude Code"),
+});
+
+const CLAUDE_EN = (base: GuildMessages): Partial<GuildMessages> => ({
+  connectingRuntime: "Connecting to Claude\u2026",
+  runPreparing: "Preparing Claude",
+  runWaitingForGrok: "Claude received it; waiting for a response",
+  terminalOutputUnavailable: "This Claude session did not provide terminal output to show.",
+  modelPickerScopeRuntime: "Using Claude's default",
+  modelPickerRefused: (reason) => ({
+    incompatible_agent: base.modelPickerRefused("incompatible_agent"),
+    unsupported_value: "Claude Code does not offer that option for this task right now. Your previous selection was kept.",
+    unavailable: "Claude Code could not switch right now. Your previous selection was kept.",
+  })[reason],
+  runPhaseStartingRuntime: "Starting Claude",
+  runPhasePromptSentSlow: "Sent \u00b7 Claude has not picked it up yet",
+  latestResultNoChanges: "Claude reported no file or diff evidence",
+  recoveryNoticeRestored: "You can keep using this Claude session now",
+  runtimeUnavailable: "The Claude runtime is unavailable right now",
+  sessionReplacementTitle: "The original Claude session cannot continue",
+  permissionHelp: "Permissions decide when Claude needs confirmation. Check the project and intended actions before granting more access.",
+  evidenceHelp: "Files and changes reported by Claude in this conversation. This is not a complete disk or Git status.",
+  noEvidenceAction: "Open the project folder to inspect files, or ask Claude to check and report the changes.",
+  noFilesYet: "Claude has not reported any file locations yet.",
+  noChangesYet: "Claude has not reported any changes to review yet.",
+  contextUsageUnavailable: "Waiting for Claude's context usage; the first report usually arrives after the first response",
+  contextUsageUnavailableCompact: "Waiting for Claude's first usage report",
+  slashCommands: "Claude commands",
+  commandSending: "Sending to Claude",
+  commandWaiting: "Claude received it; waiting for a status update",
+  commandRunning: "Claude is working",
+  commandPaletteGroup: (group) => ({ navigation: "Navigation and settings", tasks: "Tasks", commands: "Current Claude session commands" })[group],
+  branchMessageHelp: "Copy the local transcript snapshot through this message and start a new Claude session",
+  convertToSteerHelp: "Tell Claude this now without interrupting the current turn",
+  rewindFilesOnlyBody: (reason) => reason === "unsupported"
+    ? "Claude Code cannot rewind the conversation, so only the files go back to before this turn. The conversation stays as it is and the prompt is not put back in the composer."
+    : "Claude Code cannot rewind the conversation right now, so only the files go back to before this turn. The conversation stays as it is and the prompt is not put back in the composer.",
+  rewindDisabledReason: (reason) => reason === "runtime_unavailable"
+    ? "Claude Code is unavailable right now. Try again in a moment"
+    : base.rewindDisabledReason(reason),
+  rewindRefused: (reason) => base.rewindRefused(reason).replaceAll("Grok", "Claude Code"),
+});
+
+const CLAUDE_LOCALES: Readonly<Record<GuildLocale, GuildMessages>> = Object.freeze({
+  "zh-CN": Object.freeze({ ...ZH_CN, ...CLAUDE_ZH(ZH_CN) }),
+  "en-US": Object.freeze({ ...EN_US, ...CLAUDE_EN(EN_US) }),
+});
+
+/** The keys a Claude task words differently from the base catalog (for tests and review). */
+export function claudeOverrideKeys(locale: GuildLocale): readonly string[] {
+  const overrides = locale === "zh-CN" ? CLAUDE_ZH(ZH_CN) : CLAUDE_EN(EN_US);
+  return Object.freeze(Object.keys(overrides).sort());
+}
+
+/** The catalog for a locale; a Claude-engine task gets its own wording for the strings that name the runtime. */
+export function messagesFor(locale: GuildLocale, engine: GuildEngine = "grok"): GuildMessages {
+  return engine === "claude" ? CLAUDE_LOCALES[locale] : LOCALES[locale];
 }

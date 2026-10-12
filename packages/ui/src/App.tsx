@@ -47,6 +47,10 @@ import { WrenchIcon as Wrench } from "@phosphor-icons/react/Wrench";
 import { WarningCircleIcon as WarningCircle } from "@phosphor-icons/react/WarningCircle";
 import { XIcon as X } from "@phosphor-icons/react/X";
 import type {
+  BrowserCommand,
+  BrowserPaneProjection,
+  GuildClaudePermissionMode,
+  GuildEngine,
   GuildGrokModel,
   GuildGrokPermissionMode,
   GuildGrokReasoningEffort,
@@ -76,6 +80,7 @@ import {
   nicknameInitial,
   parseGuildNickname,
 } from "@guild/contracts/desktop-ipc";
+import { modelGroupOf } from "@guild/contracts/grok-models";
 import {
   createContext,
   memo,
@@ -123,7 +128,21 @@ import { messagesFor } from "./locales.js";
 import { continuousFooter } from "./continuous-display.js";
 import { ContinuousRoundRecord, ContinuousTaskCard, ContinuousCompletionRecord } from "./ContinuousTask.js";
 import { GrokControlCenter } from "./GrokControlCenter.js";
+import { BrowserPane } from "./BrowserPane.js";
+import {
+  EMPTY_BROWSER_PANE,
+  browserPaneHidden,
+  revealsBrowserTab,
+  useModalOverlayPresent,
+  type WorkbenchTab,
+} from "./browser-pane-view.js";
+import { claudeDefaultsView, claudePermissionModeOf, claudeStatusOf, claudeStatusText } from "./claude-engine.js";
 import { ModelPicker } from "./ModelPicker.js";
+import { ModelSourcesSettings } from "./ModelSourcesSettings.js";
+import { OnlineReminderDialog } from "./OnlineReminderDialog.js";
+import { OnlineReminderSetting } from "./OnlineReminderSetting.js";
+import { onlineReminderNeeded, vendorLabelFor } from "./online-reminder.js";
+import { hasMixedEngines, taskEngineFixed, taskEngineOf } from "./task-engine.js";
 import { RewindDialog } from "./RewindDialog.js";
 import { RunChangesCard, type RunCardData } from "./RunChangesCard.js";
 import { RunDiffView } from "./RunDiffView.js";
@@ -136,6 +155,7 @@ import { cardAnchors, latestChangedRun } from "./run-changes.js";
 import { composerEnterAction, steerButtonState } from "./steer.js";
 import {
   globalDefaultView,
+  modelCatalogsOf,
   modelPickerView,
   selectionAfterModelChange,
   type ModelSelectionChange,
@@ -200,8 +220,10 @@ type ContextMenu =
   | { readonly type: "task"; readonly task: TaskSummaryProjection; readonly x: number; readonly y: number };
 
 type UiError = "bootstrap" | "message" | "operation" | "recovery" | "runtime" | "workspace";
-type SettingsTab = "general" | "grok" | "privacy" | "about";
-const SETTINGS_TABS: readonly SettingsTab[] = Object.freeze(["general", "grok", "privacy", "about"]);
+type SettingsTab = "general" | "engines" | "sources" | "privacy" | "about";
+const SETTINGS_TABS: readonly SettingsTab[] = Object.freeze(["general", "engines", "sources", "privacy", "about"]);
+type OnlineReminderRequest = Readonly<{ vendorLabel: string }>;
+type OnlineReminderAnswer = Readonly<{ confirmed: boolean; dontRemindAgain: boolean }>;
 type ProfileAvatarDraft =
   | { readonly type: "keep" }
   | { readonly type: "reset" }
@@ -263,7 +285,10 @@ export function GuildApp({ api }: GuildAppProps) {
   const [workbenchOpen, setWorkbenchOpen] = useState(false);
   const workbenchTrigger = useRef<HTMLButtonElement>(null);
   const workbenchPanel = useRef<HTMLElement>(null);
-  const [workbenchTab, setWorkbenchTab] = useState<"files" | "review">("files");
+  const [workbenchTab, setWorkbenchTab] = useState<WorkbenchTab>("files");
+  // The browser pane's state lives in main; this is the last snapshot it pushed (PC-BROWSER-001).
+  const [browserPane, setBrowserPane] = useState<BrowserPaneProjection>(EMPTY_BROWSER_PANE);
+  const previousAgentControl = useRef(EMPTY_BROWSER_PANE.agentControl);
   const [workbenchWidth, setWorkbenchWidth] = useState(() => readWorkbenchWidth(window.localStorage));
   const [contextMenu, setContextMenu] = useState<ContextMenu>();
   const [confirmDelete, setConfirmDelete] = useState(false);
@@ -271,6 +296,11 @@ export function GuildApp({ api }: GuildAppProps) {
   const [renameDraft, setRenameDraft] = useState("");
   const [renameError, setRenameError] = useState(false);
   const [contextUsageOpen, setContextUsageOpen] = useState(false);
+  // The Online-model reminder (PC-PRIV-001): the open dialog, the way to answer it, and the tasks already asked in this window.
+  const [onlineReminder, setOnlineReminder] = useState<OnlineReminderRequest>();
+  const onlineReminderAnswer = useRef<((answer: OnlineReminderAnswer) => void) | undefined>(undefined);
+  const onlineRemindedTaskIds = useRef<Set<string>>(new Set());
+  const [claudeSettingsFailed, setClaudeSettingsFailed] = useState(false);
   const [rewindTarget, setRewindTarget] = useState<{ readonly runId: RunId }>();
   const rewindReturnFocus = useRef<HTMLElement | null>(null);
   const [runDiff, setRunDiff] = useState<{ readonly runId: RunId; readonly path: string | undefined }>();
@@ -528,6 +558,29 @@ export function GuildApp({ api }: GuildAppProps) {
     };
   }, [api, setProjection, streamOverlay]);
 
+  // Snapshots of the browser pane arrive whether or not its tab is on screen: an agent may start
+  // operating it while the person reads something else.
+  useEffect(() => api.onBrowserPaneChanged((next) => {
+    setBrowserPane((current) => replaceEqualDeep(current, next));
+  }), [api]);
+
+  // The pane's rendering tools refuse while it is hidden, so an agent that takes it over brings the tab forward, once.
+  useEffect(() => {
+    const previous = previousAgentControl.current;
+    previousAgentControl.current = browserPane.agentControl;
+    if (!revealsBrowserTab(previous, browserPane.agentControl)) return;
+    setWorkbenchTab("browser");
+    setWorkbenchOpen(true);
+  }, [browserPane.agentControl]);
+
+  // Every command answers with the new snapshot, which is also how the pane gets its first one.
+  const sendBrowserCommand = useCallback((command: BrowserCommand) => {
+    void api.browserCommand(command).then(
+      (next) => setBrowserPane((current) => replaceEqualDeep(current, next)),
+      () => undefined,
+    );
+  }, [api]);
+
   useEffect(() => {
     const taskId = projection?.activeTask?.task.taskId;
     setPromptAttachments(taskId === undefined
@@ -775,6 +828,12 @@ export function GuildApp({ api }: GuildAppProps) {
       ? Promise.reject(new Error("no_active_task"))
       : api.loadRunFileDiff({ taskId: openTaskIdForReset, runId, path }), [api, openTaskIdForReset]);
 
+  // Dialogs and menus owned by other components (worktree, the fullscreen image viewer) are found in the DOM, but only
+  // while the Browser tab is on screen: that is the only time a native view needs protecting from them.
+  const domOverlayOpen = useModalOverlayPresent(
+    workbenchOpen && projection?.activeTask !== undefined && workbenchTab === "browser",
+  );
+
   if (projection === undefined) {
     const loadingMessages = messagesFor(
       navigator.language.toLowerCase().startsWith("zh") ? "zh-CN" : "en-US",
@@ -790,8 +849,11 @@ export function GuildApp({ api }: GuildAppProps) {
     return <div className="guild-loading" aria-label={loadingMessages.loading}><SpinnerGap size={22} className="guild-spin" /></div>;
   }
 
-  const messages = messagesFor(projection.locale);
   const activeTask = projection.activeTask;
+  // PC-ENG-001: the conversation speaks of the engine the task runs on; settings and tools keep the Grok wording.
+  const activeEngine = taskEngineOf(activeTask?.task);
+  const baseMessages = messagesFor(projection.locale);
+  const messages = messagesFor(projection.locale, activeEngine);
   const visibleWorkbench = workbenchScope === "latest" ? activeTask?.recentResult?.workbench : activeTask?.workbench;
   const latestInterruptedUserSequence = [...activeTimeline].reverse().find((item) =>
     item.kind === "user" && item.status === "interrupted")?.sequence;
@@ -854,12 +916,43 @@ export function GuildApp({ api }: GuildAppProps) {
     : latestAssistant?.kind === "assistant"
       ? continuousFooter(latestAssistant.text)?.body ?? latestAssistant.text : "";
   const contextWindow = contextWindowView(activeTask?.contextWindow, projection.locale);
-  const modelCatalog = projection.runtimeSettings.modelCatalog;
-  // The names the active task will use next; the global default when no task is open.
+  const modelCatalogs = modelCatalogsOf(projection.runtimeSettings);
+  const modelCatalog = modelCatalogs.grok;
+  const claudeStatus = claudeStatusOf(projection.runtimeSettings.claude);
+  const claudeDefaults = claudeDefaultsView({
+    catalog: modelCatalogs.claude,
+    model: projection.runtimeSettings.claude?.model ?? null,
+    reasoningEffort: projection.runtimeSettings.claude?.reasoningEffort ?? null,
+  });
+  const engineFixed = taskEngineFixed(activeTask, activeTask !== undefined && pendingSends.has(activeTask.task.taskId));
+  const engineMarkers = hasMixedEngines(activeWorkspaces);
+  // The wordmark names the engine of the open task: the Grok runtime's version, or Claude Code's when the main process reports it.
+  const engineVersionLabel = activeEngine === "claude"
+    ? claudeStatus?.version === undefined ? undefined : `Claude Code ${claudeStatus.version}`
+    : projection.runtimeVersion;
+  const claudeMode = claudePermissionModeOf(activeTask?.sessionModes, projection.runtimeSettings.claude?.permissionMode);
+  // The native browser view paints above the DOM: hidden under anything the page draws over it, and off its tab.
+  const browserHidden = browserPaneHidden({
+    workbenchOpen,
+    hasTask: activeTask !== undefined,
+    tab: workbenchTab,
+    overlayOpen: domOverlayOpen || accountOpen || settingsOpen || profileOpen || workspacePickerOpen ||
+      commandPaletteOpen || grokControlOpen || contextMenu !== undefined || rewindTarget !== undefined ||
+      onlineReminder !== undefined || discardConfirm || contextUsageOpen,
+  });
+  const permissionPill = activeEngine === "claude"
+    ? claudeMode === undefined
+      ? undefined
+      : { warn: claudeMode === "bypassPermissions", label: messages.claudePermissionModeName(claudeMode) }
+    : {
+        warn: projection.runtimeSettings.permissionMode === "bypassPermissions",
+        label: messages.permissionModeName(projection.runtimeSettings.permissionMode),
+      };
+  // The names the active task will use next (a Grok task; the Control Center is Grok's); the global default when no Grok task is open.
   const runtimeModelView = modelPickerView({
-    messages,
+    messages: baseMessages,
     catalog: modelCatalog,
-    selection: activeTask?.modelSelection ?? Object.freeze({
+    selection: (activeEngine === "grok" ? activeTask?.modelSelection : undefined) ?? Object.freeze({
       modelId: projection.runtimeSettings.model,
       reasoningEffort: projection.runtimeSettings.reasoningEffort,
       source: projection.runtimeSettings.model === null ? "runtime" : "global",
@@ -891,6 +984,7 @@ export function GuildApp({ api }: GuildAppProps) {
   const visibleSlashCommands = slashCommandCatalogue(
     activeTask?.availableCommands ?? Object.freeze([]),
     projection.locale,
+    activeEngine,
   );
   const commandNeedle = commandPaletteQuery.trim().toLocaleLowerCase(projection.locale);
   const commandPaletteItems: readonly CommandPaletteItem[] = ([
@@ -915,10 +1009,16 @@ export function GuildApp({ api }: GuildAppProps) {
       run: () => { closeCommandPalette(); openSettings("general"); },
     },
     {
-      id: "navigation-settings-grok",
+      id: "navigation-settings-engines",
       group: "navigation",
-      label: `${messages.settings} · ${messages.settingsGrok}`,
-      run: () => { closeCommandPalette(); openSettings("grok"); },
+      label: `${messages.settings} · ${messages.settingsEngines}`,
+      run: () => { closeCommandPalette(); openSettings("engines"); },
+    },
+    {
+      id: "navigation-settings-sources",
+      group: "navigation",
+      label: `${messages.settings} · ${messages.settingsModelSources}`,
+      run: () => { closeCommandPalette(); openSettings("sources"); },
     },
     {
       id: "navigation-settings-privacy",
@@ -926,13 +1026,14 @@ export function GuildApp({ api }: GuildAppProps) {
       label: `${messages.settings} · ${messages.settingsPrivacy}`,
       run: () => { closeCommandPalette(); openSettings("privacy"); },
     },
-    {
+    // The Grok Control Center administers the Grok runtime: offered for Grok conversations only.
+    ...(activeEngine === "grok" ? [{
       id: "navigation-grok-center",
-      group: "navigation",
-      label: messages.manageGrokBuild,
-      detail: messages.officialSessionCapabilities,
+      group: "navigation" as const,
+      label: baseMessages.manageGrokBuild,
+      detail: baseMessages.officialSessionCapabilities,
       run: () => { closeCommandPalette(); openGrokControlCenter(); },
-    },
+    }] : []),
     ...activeWorkspaces.flatMap((workspace) => workspace.tasks
       .filter((task) => !task.archived)
       .map((task): CommandPaletteItem => ({
@@ -1430,9 +1531,19 @@ export function GuildApp({ api }: GuildAppProps) {
 
   // Deliberately outside run(): the picker shows its own pending state and inline notice, and a
   // model switch must not block the rest of the window or raise the global error banner.
-  async function applyTaskRuntimeSettings(change: ModelSelectionChange): Promise<SetTaskRuntimeSettingsResponse> {
-    const taskId = projection?.activeTask?.task.taskId;
-    if (taskId === undefined) throw new Error("no_active_task");
+  async function applyTaskRuntimeSettings(change: ModelSelectionChange): Promise<SetTaskRuntimeSettingsResponse | undefined> {
+    const task = projection?.activeTask;
+    if (task === undefined) throw new Error("no_active_task");
+    const taskId = task.task.taskId;
+    // PC-PRIV-001: the first switch to an Online model in this conversation says what goes to the vendor.
+    if (change.group === "online" && !(await confirmOnlineSwitch(task, change.model))) return undefined;
+    // PC-ENG-001: a task that has not run yet may still choose its engine; the first turn fixes it.
+    if (change.engine !== undefined && change.engine !== taskEngineOf(task.task)) {
+      const moved = await api.setTaskEngine({ taskId, engine: change.engine });
+      setProjection((current) => current === undefined || current.activeTask?.task.taskId !== taskId
+        ? current
+        : withTaskSummary({ ...current, activeTask: moved }, moved.task));
+    }
     const response = await api.setTaskRuntimeSettings({
       taskId,
       model: change.model,
@@ -1445,6 +1556,56 @@ export function GuildApp({ api }: GuildAppProps) {
     return response;
   }
 
+  /** True when the switch may go ahead: no reminder is due, or the user accepted it (and maybe silenced it). */
+  async function confirmOnlineSwitch(task: TaskViewProjection, modelId: string | null): Promise<boolean> {
+    const taskId = task.task.taskId;
+    const currentModel = (taskEngineOf(task.task) === "claude" ? modelCatalogs.claude : modelCatalogs.grok)
+      .models.find((model) => model.id === task.modelSelection.modelId);
+    const target = modelCatalogs.claude.models.find((model) => model.id === modelId);
+    const currentGroup = currentModel === undefined ? undefined : modelGroupOf(currentModel);
+    const handledBefore = onlineRemindedTaskIds.current.has(taskId);
+    let dismissed = false;
+    if (!handledBefore && currentGroup !== "online") {
+      try {
+        dismissed = (await api.getWorkspacePrefs({ workspaceId: task.task.workspaceId })).onlineReminderDismissed;
+      } catch {
+        // Unknown means not silenced: ask.
+      }
+    }
+    if (!onlineReminderNeeded({
+      targetGroup: "online",
+      currentGroup,
+      alreadyHandledForTask: handledBefore,
+      dismissedForWorkspace: dismissed,
+    })) {
+      onlineRemindedTaskIds.current.add(taskId);
+      return true;
+    }
+    let vendorLabel = target?.name ?? modelId ?? "";
+    try {
+      vendorLabel = vendorLabelFor(modelId ?? "", (await api.listModelSources()).sources, target?.name);
+    } catch {
+      // The model's own name stands in for the vendor.
+    }
+    const answer = await new Promise<OnlineReminderAnswer>((resolve) => {
+      onlineReminderAnswer.current = resolve;
+      setOnlineReminder(Object.freeze({ vendorLabel }));
+    });
+    setOnlineReminder(undefined);
+    onlineReminderAnswer.current = undefined;
+    window.queueMicrotask(() => document.querySelector<HTMLElement>(".guild-model-picker-trigger")?.focus());
+    if (!answer.confirmed) return false;
+    onlineRemindedTaskIds.current.add(taskId);
+    if (answer.dontRemindAgain) {
+      try {
+        await api.setWorkspacePrefs({ workspaceId: task.task.workspaceId, onlineReminderDismissed: true });
+      } catch {
+        // The switch itself was confirmed; the reminder will simply ask again next time.
+      }
+    }
+    return true;
+  }
+
   async function setSessionConfigOption(configId: string, value: string | boolean) {
     const taskId = projection?.activeTask?.task.taskId;
     if (taskId === undefined) return;
@@ -1452,6 +1613,33 @@ export function GuildApp({ api }: GuildAppProps) {
       const task = await api.setSessionConfigOption({ taskId, configId, value });
       setProjection((current) => current === undefined ? current : { ...current, activeTask: task });
     });
+  }
+
+  async function setClaudeSettings(
+    model: string | null,
+    reasoningEffort: string | null,
+    permissionMode: GuildClaudePermissionMode,
+  ) {
+    setClaudeSettingsFailed(false);
+    await run(async () => {
+      try {
+        setProjection(await api.setClaudeSettings({ model, reasoningEffort, permissionMode }));
+      } catch {
+        setClaudeSettingsFailed(true);
+      }
+    });
+  }
+
+  /** The Claude catalog depends on the model sources; re-read the settings after they change. */
+  async function refreshRuntimeSettings() {
+    try {
+      const next = await api.bootstrap();
+      setProjection((current) => current === undefined
+        ? current
+        : { ...current, runtimeSettings: next.runtimeSettings });
+    } catch {
+      // The next pushed projection carries the catalog.
+    }
   }
 
   function beginRenameTask() {
@@ -1878,7 +2066,7 @@ export function GuildApp({ api }: GuildAppProps) {
         <div className="guild-wordmark">
           <img src={BANNY_ASSET_URL} alt="" />
           <span className="guild-wordmark-name">{messages.appName}</span>
-          {projection.runtimeVersion !== undefined && <small title={projection.runtimeVersion}>{projection.runtimeVersion}</small>}
+          {engineVersionLabel !== undefined && <small title={engineVersionLabel}>{engineVersionLabel}</small>}
         </div>
         <div className="guild-new-row">
           <button className="guild-new-task" type="button" disabled={busy} aria-keyshortcuts="Meta+N" onClick={() => void createTask()}>
@@ -1959,6 +2147,7 @@ export function GuildApp({ api }: GuildAppProps) {
               bannyDropTargetId={bannyDropTargetId}
               pendingTaskIds={pendingTaskIds}
               unreadTaskIds={unreadTaskIds}
+              engineMarkers={engineMarkers}
               locale={projection.locale}
               onToggle={stableHandlers.onToggleWorkspace}
               onOpenTask={stableHandlers.onOpenTask}
@@ -2017,23 +2206,38 @@ export function GuildApp({ api }: GuildAppProps) {
               <div className="guild-account-actions">
                 <button ref={accountFirstActionRef} type="button" onClick={() => openProfileEditor()}><PencilSimple size={16} />{messages.editProfile}</button>
               </div>
-              <div className="guild-usage-card">
-                <span>{messages.usage}</span>
-                {projection.usage.status === "loading" ? (
-                  <p className="guild-usage-loading"><SpinnerGap size={13} className="guild-spin" />{messages.usageLoading}</p>
-                ) : projection.usage.status === "unavailable" ? (
-                  <p>{messages.usageUnavailable}</p>
-                ) : (
-                  <div className="guild-usage-values">
-                    <strong>{projection.usage.usedLabel}</strong>
-                    {projection.usage.limitLabel !== undefined && <span>{projection.usage.limitLabel}</span>}
-                    {projection.usage.resetsAtIso !== undefined && (
-                      <span>{messages.usageResetsAt(formatUsageDate(projection.usage.resetsAtIso, projection.locale))}</span>
-                    )}
-                  </div>
-                )}
-                <button className="guild-usage-link" type="button" onClick={() => void openExternal("https://grok.com/?_s=usage")}>{messages.viewOfficialUsage}</button>
-              </div>
+              {activeEngine === "claude" ? (
+                <div className="guild-usage-card guild-usage-card-claude">
+                  <span>{messages.usageClaudeHeading}</span>
+                  {claudeStatus?.accountLabel === undefined
+                    ? <p>{messages.usageClaudeAccountUnknown}</p>
+                    : <div className="guild-usage-values"><strong>{claudeStatus.accountLabel}</strong></div>}
+                  <p>{!contextWindow.available
+                    ? messages.contextUsageUnavailableCompact
+                    : contextWindow.hasSize
+                      ? messages.contextUsageLabel(contextWindow.usedLabel, contextWindow.sizeLabel, contextWindow.percent)
+                      : messages.contextUsageUsedOnly(contextWindow.usedLabel)}</p>
+                  <p>{messages.usageClaudeQuota}</p>
+                </div>
+              ) : (
+                <div className="guild-usage-card">
+                  <span>{messages.usage}</span>
+                  {projection.usage.status === "loading" ? (
+                    <p className="guild-usage-loading"><SpinnerGap size={13} className="guild-spin" />{messages.usageLoading}</p>
+                  ) : projection.usage.status === "unavailable" ? (
+                    <p>{messages.usageUnavailable}</p>
+                  ) : (
+                    <div className="guild-usage-values">
+                      <strong>{projection.usage.usedLabel}</strong>
+                      {projection.usage.limitLabel !== undefined && <span>{projection.usage.limitLabel}</span>}
+                      {projection.usage.resetsAtIso !== undefined && (
+                        <span>{messages.usageResetsAt(formatUsageDate(projection.usage.resetsAtIso, projection.locale))}</span>
+                      )}
+                    </div>
+                  )}
+                  <button className="guild-usage-link" type="button" onClick={() => void openExternal("https://grok.com/?_s=usage")}>{messages.viewOfficialUsage}</button>
+                </div>
+              )}
               <div className="guild-account-meta"><span>{messages.version}</span><span>{projection.appVersion}</span></div>
               <p className="guild-independent">{messages.independentNotice}</p>
             </div>
@@ -2043,18 +2247,26 @@ export function GuildApp({ api }: GuildAppProps) {
             setWorkspacePickerOpen(false);
             const next = !accountOpen;
             setAccountOpen(next);
-            if (next) {
+            // The quota read goes through the Grok runtime; a Claude conversation's quota is Claude Code's own.
+            if (next && activeEngine === "grok") {
               void refreshUsage();
             }
           }}>
             <AvatarMark nickname={projection.profile.nickname} grantUrl={projection.profile.avatarGrantUrl} />
             <span className="guild-profile-text">
               <strong>{projection.profile.nickname}</strong>
-              {projection.usage.status === "available" && <small>{projection.usage.usedLabel}</small>}
+              {activeEngine === "grok" && projection.usage.status === "available" && <small>{projection.usage.usedLabel}</small>}
             </span>
           </button>
           <div className="guild-sidebar-utilities">
-            <button className="guild-icon-button" type="button" title={messages.tools} aria-label={messages.tools} onClick={openGrokControlCenter}><Wrench size={16} /></button>
+            <button
+              className="guild-icon-button"
+              type="button"
+              title={activeEngine === "grok" ? messages.tools : messages.grokToolsGrokOnly}
+              aria-label={messages.tools}
+              disabled={activeEngine !== "grok"}
+              onClick={openGrokControlCenter}
+            ><Wrench size={16} /></button>
             <button className="guild-icon-button guild-profile-settings" type="button" title={messages.settings} aria-label={messages.settings} onClick={() => openSettings()}><GearSix size={16} /></button>
           </div>
         </div>
@@ -2231,6 +2443,7 @@ export function GuildApp({ api }: GuildAppProps) {
               runStatus={commandStatus === undefined ? runStatus : undefined}
               runPhase={commandStatus === undefined ? activeTask.runPhase : undefined}
               locale={projection.locale}
+              engine={activeEngine}
               recentResult={activeTask.recentResult}
               continuousTask={activeTask.continuousTask}
               runCheckpoints={activeTask.runCheckpoints}
@@ -2247,7 +2460,7 @@ export function GuildApp({ api }: GuildAppProps) {
               onRewind={stableHandlers.onRewind}
             />
           )}
-          {commandStatus !== undefined && <CommandStatusLine status={commandStatus} locale={projection.locale} />}
+          {commandStatus !== undefined && <CommandStatusLine status={commandStatus} locale={projection.locale} engine={activeEngine} />}
           {activeTask?.recentResult !== undefined && !restoredNoticeCoversLatestResult &&
             (activeTask.recentResult.state !== "completed" || activeTask.recentResult.workbench.files.length > 0 ||
               activeTask.recentResult.workbench.diffs.length > 0) && (
@@ -2490,17 +2703,19 @@ export function GuildApp({ api }: GuildAppProps) {
                 <FolderSimple size={14} aria-hidden="true" />
                 <span>{activeTask === undefined ? messages.chooseWorkspace : workspaceName(projection.workspaces, activeTask.task.workspaceId, messages.workspaceFallback)}</span>
               </span>
-              <button
-                type="button"
-                className={`guild-pill guild-permission-pill ${projection.runtimeSettings.permissionMode === "bypassPermissions" ? "warn" : ""}`}
-                title={messages.permissionHelp}
-                onClick={() => openSettings("grok")}
-              >
-                {projection.runtimeSettings.permissionMode === "bypassPermissions"
-                  ? <ShieldWarning size={14} aria-hidden="true" />
-                  : <ShieldCheck size={14} aria-hidden="true" />}
-                {messages.permissionModeName(projection.runtimeSettings.permissionMode)}
-              </button>
+              {permissionPill !== undefined && (
+                <button
+                  type="button"
+                  className={`guild-pill guild-permission-pill ${permissionPill.warn ? "warn" : ""}`}
+                  title={messages.permissionHelp}
+                  onClick={() => openSettings("engines")}
+                >
+                  {permissionPill.warn
+                    ? <ShieldWarning size={14} aria-hidden="true" />
+                    : <ShieldCheck size={14} aria-hidden="true" />}
+                  {permissionPill.label}
+                </button>
+              )}
               <button
                 type="button"
                 className={`guild-pill guild-continuous-toggle ${continuousMode ? "selected" : ""}`}
@@ -2548,9 +2763,13 @@ export function GuildApp({ api }: GuildAppProps) {
               <ModelPicker
                 key={activeTask?.task.taskId ?? "no-task"}
                 messages={messages}
-                catalog={modelCatalog}
+                catalogs={modelCatalogs}
                 selection={activeTask?.modelSelection}
+                taskEngine={activeEngine}
+                engineFixed={engineFixed}
+                {...(claudeStatus === undefined ? {} : { claudeState: claudeStatus.state })}
                 onApply={applyTaskRuntimeSettings}
+                onOpenModelSources={() => openSettings("sources")}
               />
               {steerButton.visible && (
                 <button
@@ -2626,7 +2845,18 @@ export function GuildApp({ api }: GuildAppProps) {
           <div className="guild-workbench-tabs" role="tablist">
             <button type="button" role="tab" aria-selected={workbenchTab === "files"} className={workbenchTab === "files" ? "selected" : ""} onClick={() => setWorkbenchTab("files")}><Files size={15} />{messages.files}</button>
             <button type="button" role="tab" aria-selected={workbenchTab === "review"} className={workbenchTab === "review" ? "selected" : ""} onClick={() => setWorkbenchTab("review")}><GitDiff size={15} />{messages.review}<span>{visibleWorkbench?.diffs.length ?? 0}</span></button>
+            <button type="button" role="tab" aria-selected={workbenchTab === "browser"} className={workbenchTab === "browser" ? "selected" : ""} onClick={() => setWorkbenchTab("browser")}><Globe size={15} />{messages.browserPaneWorkbenchTab}</button>
           </div>
+          {workbenchTab === "browser" ? (
+            <div className="guild-workbench-body guild-workbench-browser">
+              <BrowserPane
+                projection={browserPane}
+                onCommand={sendBrowserCommand}
+                t={(key) => messages[key]}
+                hidden={browserHidden}
+              />
+            </div>
+          ) : (
           <div className="guild-workbench-body">
             {workbenchTab === "review" && runDiff !== undefined && runDiffCheckpoint !== undefined && (
               <RunDiffView
@@ -2669,6 +2899,7 @@ export function GuildApp({ api }: GuildAppProps) {
               </details>
             ))}
           </div>
+          )}
         </aside>
       )}
 
@@ -2852,7 +3083,7 @@ export function GuildApp({ api }: GuildAppProps) {
           onClose={closeGrokControlCenter}
           onOpenSessionSettings={() => {
             setGrokControlOpen(false);
-            openSettings("grok");
+            openSettings("engines");
           }}
           onRunCommand={async (command, input) => {
             const text = `/${command.name}${input.trim().length === 0 ? "" : ` ${input.trim()}`}`;
@@ -2864,7 +3095,7 @@ export function GuildApp({ api }: GuildAppProps) {
 
       {settingsOpen && (
         <div className="guild-dialog-backdrop" role="presentation" onPointerDown={() => setSettingsOpen(false)}>
-          <div className="guild-dialog" role="dialog" aria-modal="true" aria-label={messages.settings} onPointerDown={(event) => event.stopPropagation()} onKeyDown={(event) => handleDialogKeyDown(event, () => setSettingsOpen(false))}>
+          <div className="guild-dialog guild-dialog-settings" role="dialog" aria-modal="true" aria-label={messages.settings} onPointerDown={(event) => event.stopPropagation()} onKeyDown={(event) => handleDialogKeyDown(event, () => setSettingsOpen(false))}>
             <div className="guild-dialog-header">
               <strong>{messages.settings}</strong>
               <button autoFocus type="button" className="guild-soft-button" onClick={() => setSettingsOpen(false)}>{messages.closeDialog}</button>
@@ -2873,7 +3104,8 @@ export function GuildApp({ api }: GuildAppProps) {
               <div className="guild-dialog-tabs" role="tablist">
                 {([
                   ["general", messages.settingsGeneral],
-                  ["grok", messages.settingsGrok],
+                  ["engines", messages.settingsEngines],
+                  ["sources", messages.settingsModelSources],
                   ["privacy", messages.settingsPrivacy],
                   ["about", messages.settingsAbout],
                 ] as const).map(([tab, label]) => (
@@ -2953,8 +3185,9 @@ export function GuildApp({ api }: GuildAppProps) {
                   </div>
                 </div>
               )}
-              {settingsTab === "grok" && (
-                <div id="guild-settings-panel-grok" role="tabpanel" aria-labelledby="guild-settings-tab-grok" className="guild-settings-panel">
+              {settingsTab === "engines" && (
+                <div id="guild-settings-panel-engines" role="tabpanel" aria-labelledby="guild-settings-tab-engines" className="guild-settings-panel">
+                  <h3 className="guild-engine-heading">{baseMessages.settingsGrok}</h3>
                   <p className="guild-setting-scope"><Info size={13} />{messages.currentTaskScope}</p>
                   <label className="guild-setting-field">
                     <span className="guild-setting-label">{messages.model}</span>
@@ -3011,7 +3244,7 @@ export function GuildApp({ api }: GuildAppProps) {
                   </label>
                   <div className="guild-settings-section">
                     <div className="guild-setting-label">{messages.permissionMode}</div>
-                    <p className="guild-setting-help">{messages.permissionHelp}</p>
+                    <p className="guild-setting-help">{baseMessages.permissionHelp}</p>
                     <div className="guild-segmented guild-permission-grid">
                       {projection.runtimeSettings.availablePermissionModes.map((mode) => (
                         <button
@@ -3084,6 +3317,8 @@ export function GuildApp({ api }: GuildAppProps) {
                     <div className="guild-setting-label">{messages.officialSessionCapabilities}</div>
                     {activeTask === undefined ? (
                       <p className="guild-setting-help">{messages.startTaskForCapabilities}</p>
+                    ) : activeEngine !== "grok" ? (
+                      <p className="guild-setting-help">{messages.grokToolsGrokOnly}</p>
                     ) : (
                       <>
                         {activeTask.sessionModes !== null && (
@@ -3113,14 +3348,99 @@ export function GuildApp({ api }: GuildAppProps) {
                           ))}
                       </>
                     )}
-                    <button type="button" className="guild-soft-button guild-open-control-center" onClick={openGrokControlCenter}>{messages.manageGrokBuild}</button>
+                    <button type="button" className="guild-soft-button guild-open-control-center" disabled={activeEngine !== "grok"} onClick={openGrokControlCenter}>{messages.manageGrokBuild}</button>
                   </div>
+                  <div className="guild-settings-section guild-engine-claude">
+                    <h3 className="guild-engine-heading" id="guild-engine-claude-heading">{baseMessages.settingsClaude}</h3>
+                    <p className="guild-setting-help">{baseMessages.enginesClaudeIntro}</p>
+                    {claudeStatus !== undefined && (
+                      <p className={`guild-engine-status ${claudeStatus.state}`} role="status">
+                        <span>{baseMessages.claudeStatusLabel}</span>
+                        <strong>{claudeStatusText(baseMessages, claudeStatus)}</strong>
+                      </p>
+                    )}
+                    {projection.runtimeSettings.claude !== undefined && (() => {
+                      const claude = projection.runtimeSettings.claude;
+                      return (
+                        <>
+                          <label className="guild-setting-field">
+                            <span className="guild-setting-label">{baseMessages.model}</span>
+                            <select
+                              value={claude.model ?? ""}
+                              disabled={busy}
+                              onChange={(event) => {
+                                const modelId = event.currentTarget.value;
+                                if (modelId === "") {
+                                  void setClaudeSettings(null, null, claude.permissionMode);
+                                  return;
+                                }
+                                const change = selectionAfterModelChange(claudeDefaults.catalog, modelId, claude.reasoningEffort);
+                                void setClaudeSettings(change.model, change.reasoningEffort, claude.permissionMode);
+                              }}
+                            >
+                              <option value="">{baseMessages.claudeDefaultModelOption}</option>
+                              {claudeDefaults.unlistedModelId !== undefined && (
+                                <option value={claudeDefaults.unlistedModelId}>{claudeDefaults.unlistedModelId}</option>
+                              )}
+                              {claudeDefaults.models.map((model) => (
+                                <option key={model.id} value={model.id}>{model.name}</option>
+                              ))}
+                            </select>
+                          </label>
+                          <label className="guild-setting-field">
+                            <span className="guild-setting-label">{baseMessages.reasoningEffort}</span>
+                            <select
+                              value={claudeDefaults.effortId ?? ""}
+                              disabled={busy || claudeDefaults.efforts.length === 0}
+                              onChange={(event) => void setClaudeSettings(claude.model, event.currentTarget.value, claude.permissionMode)}
+                            >
+                              {claudeDefaults.efforts.length === 0 && (
+                                <option value="">{baseMessages.reasoningFollowsRuntimeDefault}</option>
+                              )}
+                              {claudeDefaults.efforts.map((effort) => (
+                                <option key={effort.id} value={effort.id}>
+                                  {baseMessages.reasoningEffortName(effort.id, effort.label)}
+                                </option>
+                              ))}
+                            </select>
+                          </label>
+                          <div className="guild-settings-section">
+                            <div className="guild-setting-label" id="guild-claude-mode-label">{baseMessages.permissionMode}</div>
+                            <div className="guild-claude-modes" role="radiogroup" aria-labelledby="guild-claude-mode-label">
+                              {claude.availablePermissionModes.map((mode) => (
+                                <button
+                                  key={mode}
+                                  type="button"
+                                  role="radio"
+                                  aria-checked={claude.permissionMode === mode}
+                                  className={`guild-claude-mode${claude.permissionMode === mode ? " selected" : ""}${mode === "bypassPermissions" ? " warn" : ""}`}
+                                  disabled={busy}
+                                  onClick={() => void setClaudeSettings(claude.model, claude.reasoningEffort, mode)}
+                                >
+                                  <strong>{baseMessages.claudePermissionModeName(mode)}</strong>
+                                  <small>{baseMessages.claudePermissionModeHelp(mode)}</small>
+                                </button>
+                              ))}
+                            </div>
+                          </div>
+                          <p className="guild-setting-help">{baseMessages.claudeSettingsHelp}</p>
+                          {claudeSettingsFailed && <p className="guild-setting-help blocked" role="alert">{baseMessages.claudeSettingsFailed}</p>}
+                        </>
+                      );
+                    })()}
+                  </div>
+                </div>
+              )}
+              {settingsTab === "sources" && (
+                <div id="guild-settings-panel-sources" role="tabpanel" aria-labelledby="guild-settings-tab-sources" className="guild-settings-panel">
+                  <ModelSourcesSettings messages={baseMessages} api={api} onChanged={() => void refreshRuntimeSettings()} />
                 </div>
               )}
               {settingsTab === "privacy" && (
                 <div id="guild-settings-panel-privacy" role="tabpanel" aria-labelledby="guild-settings-tab-privacy" className="guild-settings-panel">
 
                   <p className="guild-setting-help">{messages.privacyBrowserSyncOff}</p>
+                  <OnlineReminderSetting messages={baseMessages} api={api} workspaceId={activeTask?.task.workspaceId} />
                   <div className="guild-settings-section guild-local-data-controls">
                     <div>
                       <strong>{messages.localData}</strong>
@@ -3153,9 +3473,12 @@ export function GuildApp({ api }: GuildAppProps) {
                   {projection.runtimeVersion !== undefined && (
                     <div className="guild-account-meta"><span>Grok</span><span>{projection.runtimeVersion}</span></div>
                   )}
-                  <p>{messages.aboutRole}</p>
-                  <p>{messages.aboutCopyright}</p>
-                  <p className="guild-independent">{messages.independentNotice}</p>
+                  {claudeStatus?.version !== undefined && (
+                    <div className="guild-account-meta"><span>Claude Code</span><span>{claudeStatus.version}</span></div>
+                  )}
+                  <p>{baseMessages.aboutRole}</p>
+                  <p>{baseMessages.aboutCopyright}</p>
+                  <p className="guild-independent">{baseMessages.independentNotice}</p>
                   <button type="button" className="guild-soft-button" onClick={() => void api.openUserData({})}>{messages.openDataDirectory}</button>
                 </div>
               )}
@@ -3211,6 +3534,16 @@ export function GuildApp({ api }: GuildAppProps) {
             </div>
           </div>
         </div>
+      )}
+
+      {onlineReminder !== undefined && (
+        <OnlineReminderDialog
+          messages={baseMessages}
+          vendorLabel={onlineReminder.vendorLabel}
+          onCancel={() => onlineReminderAnswer.current?.({ confirmed: false, dontRemindAgain: false })}
+          onSwitch={(dontRemindAgain) => onlineReminderAnswer.current?.({ confirmed: true, dontRemindAgain })}
+          onDialogKeyDown={handleDialogKeyDown}
+        />
       )}
 
       {rewindTarget !== undefined && activeTask !== undefined && (
@@ -3358,6 +3691,16 @@ function moveSettingsTabFocus(
   queueMicrotask(() => document.getElementById(`guild-settings-tab-${nextTab}`)?.focus());
 }
 
+/** The sidebar row follows a task whose own summary changed (for example its engine) without waiting for the next pushed projection. */
+function withTaskSummary(projection: DesktopBootstrapProjection, summary: TaskSummaryProjection): DesktopBootstrapProjection {
+  return {
+    ...projection,
+    workspaces: projection.workspaces.map((workspace) => workspace.workspaceId !== summary.workspaceId
+      ? workspace
+      : { ...workspace, tasks: workspace.tasks.map((task) => task.taskId === summary.taskId ? summary : task) }),
+  };
+}
+
 function isLiveRunState(state: TaskSummaryProjection["activeRunState"] | undefined): boolean {
   return state !== undefined && !["completed", "failed", "cancelled", "interrupted"].includes(state);
 }
@@ -3366,7 +3709,7 @@ function isTaskManagementBlocked(task: TaskSummaryProjection): boolean {
   return isLiveRunState(task.activeRunState) || (task.queuedTurnCount ?? 0) > 0;
 }
 
-export const WorkspaceTree = memo(function WorkspaceTree({ workspace, expanded, activeTaskId, bannySeatTaskId, bannyDragging, bannyDropTargetId, pendingTaskIds, unreadTaskIds, locale, onToggle, onOpenTask, onNewTask, onBannyDragStart, onBannyDragEnd, onBannyDropTarget, onBannyDrop, onPinTask, onArchiveTask, onContextMenu }: {
+export const WorkspaceTree = memo(function WorkspaceTree({ workspace, expanded, activeTaskId, bannySeatTaskId, bannyDragging, bannyDropTargetId, pendingTaskIds, unreadTaskIds, engineMarkers = false, locale, onToggle, onOpenTask, onNewTask, onBannyDragStart, onBannyDragEnd, onBannyDropTarget, onBannyDrop, onPinTask, onArchiveTask, onContextMenu }: {
   readonly workspace: WorkspaceProjection;
   readonly expanded: boolean;
   readonly activeTaskId?: string;
@@ -3375,6 +3718,8 @@ export const WorkspaceTree = memo(function WorkspaceTree({ workspace, expanded, 
   readonly bannyDropTargetId?: string;
   readonly pendingTaskIds: ReadonlySet<string>;
   readonly unreadTaskIds: ReadonlySet<string>;
+  /** True while both engines are in use: every row then carries its engine's monogram. */
+  readonly engineMarkers?: boolean;
   readonly locale: GuildLocale;
   readonly onToggle: (workspaceId: WorkspaceProjection["workspaceId"]) => void;
   readonly onOpenTask: (taskId: TaskSummaryProjection["taskId"]) => void;
@@ -3474,6 +3819,12 @@ export const WorkspaceTree = memo(function WorkspaceTree({ workspace, expanded, 
                   {task.pinned && (
                     <span className="guild-task-pin" title={messages.pinned}>
                       <PushPinSimple size={11} weight="fill" />
+                    </span>
+                  )}
+                  {engineMarkers && (
+                    <span className={`guild-task-engine ${taskEngineOf(task)}`} title={messages.taskEngineMarkerTitle(taskEngineOf(task))}>
+                      <span aria-hidden="true">{messages.taskEngineName(taskEngineOf(task)).charAt(0)}</span>
+                      <span className="guild-sr-only">{messages.taskEngineMarkerTitle(taskEngineOf(task))}</span>
                     </span>
                   )}
                   {status === "running"
@@ -3592,6 +3943,8 @@ type TimelineProps = {
   /** Phase of the running turn; replaces the legacy status line while present. */
   readonly runPhase?: RunPhaseProjection;
   readonly locale: GuildLocale;
+  /** Engine of the task: the connecting and waiting lines name it. Grok when absent. */
+  readonly engine?: GuildEngine;
   readonly recentResult?: TaskViewProjection["recentResult"];
   readonly continuousTask?: TaskViewProjection["continuousTask"];
   /** Changed-file summaries of the runs in the loaded window; each finished run with changes gets a card. */
@@ -3605,8 +3958,8 @@ type TimelineProps = {
 /** The newest groups always render fully so growth and scrolling at the bottom stay exact. */
 const LIVE_TAIL_GROUPS = 3;
 
-export const Timeline = memo(function Timeline({ items, pendingUserText, runStatus, runPhase, locale, recentResult, continuousTask, runCheckpoints, rewind, highlightedSequence, running, onOpenExternal, onPermissionDecision, onBranch, onRetryToDraft, onOpenRuntimeDiagnostics, onViewRunDiff, onRewind }: TimelineProps) {
-  const messages = messagesFor(locale);
+export const Timeline = memo(function Timeline({ items, pendingUserText, runStatus, runPhase, locale, engine = "grok", recentResult, continuousTask, runCheckpoints, rewind, highlightedSequence, running, onOpenExternal, onPermissionDecision, onBranch, onRetryToDraft, onOpenRuntimeDiagnostics, onViewRunDiff, onRewind }: TimelineProps) {
+  const messages = messagesFor(locale, engine);
   const groups = useMemo(() => groupTimeline(items), [items]);
   const handlers = useMemo(() => Object.freeze({
     onOpenExternal, onPermissionDecision, onBranch, onRetryToDraft, onOpenRuntimeDiagnostics, onViewRunDiff, onRewind,
@@ -3699,12 +4052,13 @@ export const Timeline = memo(function Timeline({ items, pendingUserText, runStat
       <SpinnerGap size={12} className="guild-spin" aria-label={messages.connectingRuntime} />
     </article>
   )}{runPhase !== undefined
-    ? <RunPhaseLine projection={runPhase} locale={locale} />
-    : runStatus !== undefined && <RunStatusLine status={runStatus} locale={locale} />}</div>;
+    ? <RunPhaseLine projection={runPhase} locale={locale} engine={engine} />
+    : runStatus !== undefined && <RunStatusLine status={runStatus} locale={locale} engine={engine} />}</div>;
 }, (previous, next) =>
   previous.items === next.items &&
   previous.pendingUserText === next.pendingUserText &&
   previous.locale === next.locale &&
+  previous.engine === next.engine &&
   previous.recentResult === next.recentResult &&
   previous.continuousTask === next.continuousTask &&
   previous.runCheckpoints === next.runCheckpoints &&
@@ -3893,11 +4247,12 @@ function ThoughtCopy({ thoughts }: { readonly thoughts: readonly ThoughtItem[] }
   return <p className="guild-thought-copy">{text}</p>;
 }
 
-function RunStatusLine({ status, locale }: {
+function RunStatusLine({ status, locale, engine }: {
   readonly status: VisibleRunStatus;
   readonly locale: GuildLocale;
+  readonly engine: GuildEngine;
 }) {
-  const messages = messagesFor(locale);
+  const messages = messagesFor(locale, engine);
   const [nowMs, setNowMs] = useState(() => Date.now());
   useEffect(() => {
     const update = () => setNowMs(Date.now());
@@ -3921,11 +4276,12 @@ function RunStatusLine({ status, locale }: {
   </div>;
 }
 
-function CommandStatusLine({ status, locale }: {
+function CommandStatusLine({ status, locale, engine }: {
   readonly status: SlashCommandStatus;
   readonly locale: GuildLocale;
+  readonly engine: GuildEngine;
 }) {
-  const messages = messagesFor(locale);
+  const messages = messagesFor(locale, engine);
   const detail = commandStatusText(status, messages);
   const active = !["completed", "failed", "cancelled", "interrupted"].includes(status.runState);
   return <div className={`guild-command-status ${active ? "active" : status.runState}`} role="status" aria-live="polite">

@@ -1,4 +1,4 @@
-import type { GuildLocale, RuntimeCommand } from "@guild/contracts";
+import type { GuildEngine, GuildLocale, RuntimeCommand } from "@guild/contracts";
 
 /**
  * PC-CONV-001 / D-023: instant, versioned fallback for Grok 1.0.13 core commands.
@@ -46,12 +46,21 @@ export function bundledSlashCommands(locale: GuildLocale): readonly RuntimeComma
   return BUNDLED_SLASH_COMMANDS[locale];
 }
 
+/**
+ * The commands to offer: the session's own list once it arrived. Until then only a Grok task shows
+ * the bundled Grok snapshot; a Claude task shows nothing rather than another engine's commands
+ * (PC-ENG-001), and its list appears as soon as the adapter publishes it.
+ */
 export function slashCommandCatalogue(
   officialCommands: readonly RuntimeCommand[],
   locale: GuildLocale,
+  engine: GuildEngine = "grok",
 ): readonly RuntimeCommand[] {
-  return officialCommands.length > 0 ? officialCommands : bundledSlashCommands(locale);
+  if (officialCommands.length > 0) return officialCommands;
+  return engine === "grok" ? bundledSlashCommands(locale) : EMPTY_COMMANDS;
 }
+
+const EMPTY_COMMANDS: readonly RuntimeCommand[] = Object.freeze([]);
 
 export function slashCommandQuery(draft: string): string | undefined {
   const match = /^\/([^\s/]*)$/u.exec(draft);

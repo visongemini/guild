@@ -44,3 +44,18 @@ describe("slash command composer", () => {
     assert.equal(bundled.some((command) => command.name === "ai-kids-lesson"), false);
   });
 });
+
+describe("slash catalogue per engine (PC-ENG-001)", () => {
+  it("shows the bundled Grok snapshot only for a Grok task", () => {
+    assert.deepEqual(slashCommandCatalogue([], "en-US"), bundledSlashCommands("en-US"));
+    assert.deepEqual(slashCommandCatalogue([], "en-US", "grok"), bundledSlashCommands("en-US"));
+    assert.deepEqual(slashCommandCatalogue([], "zh-CN", "claude"), []);
+    assert.deepEqual(slashCommandCatalogue([], "en-US", "claude"), []);
+  });
+
+  it("shows the session's own list for either engine as soon as it arrives", () => {
+    assert.equal(slashCommandCatalogue(commands, "en-US", "claude"), commands);
+    assert.equal(slashCommandCatalogue(commands, "en-US", "grok"), commands);
+    assert.deepEqual(matchingSlashCommands(slashCommandCatalogue([], "en-US", "claude"), "/co"), []);
+  });
+});

@@ -1,21 +1,32 @@
 import type {
   GrokModelCatalog,
   GrokModelDescriptor,
+  GuildEngine,
   GuildModelSwitchRefusalReason,
+  ModelCatalog,
+  ModelGroup,
+  RuntimeSettingsProjection,
   SetTaskRuntimeSettingsResponse,
   TaskModelSelectionProjection,
 } from "@guild/contracts";
 import {
+  EMPTY_CLAUDE_MODEL_CATALOG,
+  EMPTY_GROK_MODEL_CATALOG,
   defaultReasoningEffortOf,
   grokModelById,
+  modelGroupOf,
   modelSupportsReasoningEffort,
 } from "@guild/contracts/grok-models";
+import type { ClaudeStatusState } from "./claude-engine.js";
 import type { GuildMessages } from "./locales.js";
 
 /*
  * Pure view-model for the composer model picker and the Settings default-model control.
- * The model list, names, descriptions, efforts and context windows all come from the catalog the
- * official runtime advertised; nothing here knows a model id.
+ * The model list, names, descriptions, efforts and context windows all come from the catalogs the
+ * engines advertised (and the model sources the user configured); nothing here knows a model id.
+ * Guild 3.0 (PC-MODEL-001): the picker is grouped Grok / Claude / Online / Local. A task that already
+ * has a Run is bound to its engine and shows only that engine's groups; a task without a Run shows
+ * every group, and choosing a model of the other engine moves the task to that engine first.
  */
 
 /** Middle dot used between the model name and the effort label. */
@@ -25,6 +36,10 @@ export type ModelSelectionChange = Readonly<{
   /** `null` with a `null` effort clears the task override. */
   model: string | null;
   reasoningEffort: string | null;
+  /** Picker group of the chosen model; the Online reminder keys on it. Absent for a cleared override. */
+  group?: ModelGroup;
+  /** Set only when the task must move to this engine before the model can apply (task has no Run yet). */
+  engine?: GuildEngine;
 }>;
 
 export const CLEAR_MODEL_OVERRIDE: ModelSelectionChange = Object.freeze({
@@ -131,6 +146,10 @@ export type ModelRowView = Readonly<{
   selected: boolean;
   /** Roving tab stop: the selected row, else the first one. */
   tabStop: boolean;
+  /** Picker group the row sits in. */
+  group: ModelGroup;
+  /** Engine the model belongs to: Grok for the Grok group, Claude for Claude, Online and Local. */
+  engine: GuildEngine;
 }>;
 
 export type EffortChoiceView = Readonly<{
@@ -142,6 +161,54 @@ export type EffortChoiceView = Readonly<{
   tabStop: boolean;
 }>;
 
+/** Why a group lists no model, and what the user can do about it. */
+export type ModelGroupEmptyView = Readonly<{
+  kind: "not_started" | "claude_unavailable" | "no_sources";
+  text: string;
+  help?: string;
+  /** Online and Local: the way out is the Model sources settings tab. */
+  action?: "open_model_sources";
+}>;
+
+export type ModelGroupView = Readonly<{
+  group: ModelGroup;
+  label: string;
+  models: readonly ModelRowView[];
+  /** Present exactly when `models` is empty. */
+  empty?: ModelGroupEmptyView;
+}>;
+
+/** The two catalogs the picker draws from; the Claude one also carries the Online and Local models. */
+export type ModelPickerCatalogs = Readonly<{
+  grok: GrokModelCatalog;
+  claude: ModelCatalog;
+}>;
+
+/** `modelCatalogs` from the engines, falling back to the single Grok `modelCatalog` while an older main process supplies only that. */
+export function modelCatalogsOf(
+  runtimeSettings: Pick<RuntimeSettingsProjection, "modelCatalog" | "modelCatalogs">,
+): ModelPickerCatalogs {
+  return Object.freeze({
+    grok: runtimeSettings.modelCatalogs?.grok ?? runtimeSettings.modelCatalog,
+    claude: runtimeSettings.modelCatalogs?.claude ?? EMPTY_CLAUDE_MODEL_CATALOG,
+  });
+}
+
+const GROUPS_OF_ENGINE: Readonly<Record<GuildEngine, readonly ModelGroup[]>> = Object.freeze({
+  grok: Object.freeze(["grok"] as const),
+  claude: Object.freeze(["claude", "online", "local"] as const),
+});
+const ALL_GROUPS: readonly ModelGroup[] = Object.freeze(["grok", "claude", "online", "local"] as const);
+
+/** Groups an open picker lists, in display order: the task's own engine once it has a Run, otherwise all four. */
+export function visibleModelGroups(engine: GuildEngine, engineFixed: boolean): readonly ModelGroup[] {
+  return engineFixed ? GROUPS_OF_ENGINE[engine] : ALL_GROUPS;
+}
+
+export function engineOfGroup(group: ModelGroup): GuildEngine {
+  return group === "grok" ? "grok" : "claude";
+}
+
 export type ModelPickerView = Readonly<{
   modelName: string;
   /** Undefined when no effort applies (unknown selection or a model without efforts). */
@@ -152,13 +219,23 @@ export type ModelPickerView = Readonly<{
   title: string;
   ariaLabel: string;
   disabledReason: PickerDisabledReason | undefined;
+  /** One visible group and no model in it: the popover shows that group's hint and nothing else. */
   catalogEmpty: boolean;
+  /** Visible groups in display order, each with its rows or the reason it has none. */
+  groups: readonly ModelGroupView[];
+  /** Group headings are shown only when more than one group is visible. */
+  showGroupHeadings: boolean;
+  /** Every row of every visible group, in order (the keyboard and the tab stop walk this list). */
   models: readonly ModelRowView[];
   efforts: readonly EffortChoiceView[];
+  /** False for an Online or Local model whose catalog entry lists no effort: the control is hidden. */
+  showEfforts: boolean;
   selectedModelId: string | null;
   selectedEffortId: string | null;
   /** The "Use default" footer exists only while the task carries its own override. */
   showUseDefault: boolean;
+  /** Said while the task can still choose its engine: the first message fixes it. */
+  engineNote: string | undefined;
 }>;
 
 export function effortDisplayLabel(
@@ -169,17 +246,68 @@ export function effortDisplayLabel(
   return messages.reasoningEffortName(effortId, officialLabel);
 }
 
+function groupEmptyView(
+  messages: GuildMessages,
+  group: ModelGroup,
+  claudeAvailable: boolean,
+  claudeState: ClaudeStatusState | undefined,
+): ModelGroupEmptyView {
+  if (group === "online" || group === "local") {
+    return Object.freeze({
+      kind: "no_sources",
+      text: messages.modelPickerGroupEmpty(group),
+      action: "open_model_sources",
+    });
+  }
+  if (group === "claude" && !claudeAvailable) {
+    // "Not found or not logged in" is only true when nothing says otherwise; a Claude Code that is
+    // installed but cannot run (for example an unsupported adapter) gets the generic wording.
+    return claudeState === "unavailable"
+      ? Object.freeze({ kind: "claude_unavailable", text: messages.claudeStatusUnavailable })
+      : Object.freeze({
+          kind: "claude_unavailable",
+          text: messages.modelPickerClaudeUnavailable,
+          help: messages.modelPickerClaudeUnavailableHelp,
+        });
+  }
+  return Object.freeze({
+    kind: "not_started",
+    text: group === "claude" ? messages.modelPickerClaudeNotStarted : messages.modelPickerEmpty,
+  });
+}
+
 export function modelPickerView(input: {
   readonly messages: GuildMessages;
-  readonly catalog: GrokModelCatalog;
+  /** Legacy single catalog: the Grok catalog of a Grok-only picker. Ignored when `catalogs` is given. */
+  readonly catalog?: GrokModelCatalog;
+  readonly catalogs?: ModelPickerCatalogs;
   readonly selection: TaskModelSelectionProjection | undefined;
   readonly pending?: boolean;
+  /** Engine of the task; Grok when absent. */
+  readonly taskEngine?: GuildEngine;
+  /** True once the task has a Run: the picker then lists only the task's engine. Default true. */
+  readonly engineFixed?: boolean;
+  /**
+   * Claude Code's state, when the main process reports one. Without it the Claude group reads as
+   * unavailable exactly while the Claude catalog is empty.
+   */
+  readonly claudeState?: ClaudeStatusState;
 }): ModelPickerView {
-  const { messages, catalog, selection } = input;
+  const { messages, selection } = input;
+  const catalogs: ModelPickerCatalogs = input.catalogs ?? Object.freeze({
+    grok: input.catalog ?? EMPTY_GROK_MODEL_CATALOG,
+    claude: EMPTY_CLAUDE_MODEL_CATALOG,
+  });
+  const taskEngine = input.taskEngine ?? "grok";
+  const engineFixed = input.engineFixed ?? true;
+  const claudeAvailable = input.claudeState === undefined
+    ? catalogs.claude.models.length > 0
+    : input.claudeState === "ready";
+  const catalog = catalogs[taskEngine];
   const model = catalogModelById(catalog, selection?.modelId);
   const modelId = selection?.modelId ?? null;
   const modelName = model?.name ?? modelId ?? messages.modelDefaultName;
-  // An effort the task has not pinned is the model's own default, which is what Grok will use.
+  // An effort the task has not pinned is the model's own default, which is what the engine will use.
   const effortId = selection === undefined
     ? null
     : selection.reasoningEffort ?? (model === undefined ? null : modelDefaultEffort(model));
@@ -203,22 +331,44 @@ export function modelPickerView(input: {
       : disabledReason === "pending"
         ? messages.modelPickerDisabledPending
         : undefined;
-  const models = catalog.models.map((candidate, index): ModelRowView => {
+
+  const visible = visibleModelGroups(taskEngine, engineFixed);
+  const rowOf = (candidate: GrokModelDescriptor, group: ModelGroup): Omit<ModelRowView, "tabStop"> => {
     const contextSizes = formatContextWindows(candidate.contextWindows);
-    const selected = candidate.id === modelId;
+    const engine = engineOfGroup(group);
     // The price tag always follows the runtime's own statement, whatever language the description is shown in.
     const priceMultiplier = officialPriceMultiplier(candidate.description);
     const description = messages.modelDescription(candidate.id, candidate.description);
-    return Object.freeze({
+    return {
       id: candidate.id,
       name: candidate.name,
       ...(description === undefined ? {} : { description }),
       ...(priceMultiplier === undefined ? {} : { priceMultiplier }),
       ...(contextSizes === undefined ? {} : { contextLabel: messages.modelPickerContext(contextSizes) }),
-      selected,
-      tabStop: model === undefined ? index === 0 : selected,
+      selected: engine === taskEngine && candidate.id === modelId,
+      group,
+      engine,
+    };
+  };
+  const rowsOfGroup = (group: ModelGroup): Omit<ModelRowView, "tabStop">[] =>
+    (group === "grok" ? catalogs.grok : catalogs.claude).models
+      .filter((candidate) => modelGroupOf(candidate) === group)
+      .map((candidate) => rowOf(candidate, group));
+  const rawGroups = visible.map((group) => ({ group, rows: rowsOfGroup(group) }));
+  const allRows = rawGroups.flatMap((entry) => entry.rows);
+  // One roving tab stop: the selected row, else the first one.
+  const tabStopIndex = Math.max(0, allRows.findIndex((row) => row.selected));
+  let flatIndex = 0;
+  const groups = rawGroups.map((entry): ModelGroupView => {
+    const models = entry.rows.map((row) => Object.freeze({ ...row, tabStop: flatIndex++ === tabStopIndex }));
+    return Object.freeze({
+      group: entry.group,
+      label: messages.modelGroupName(entry.group),
+      models: Object.freeze(models),
+      ...(models.length === 0 ? { empty: groupEmptyView(messages, entry.group, claudeAvailable, input.claudeState) } : {}),
     });
   });
+  const models = groups.flatMap((entry) => entry.models);
   const efforts = (model?.reasoningEfforts ?? []).map((candidate, index): EffortChoiceView => {
     const selected = candidate.id === effortId;
     return Object.freeze({
@@ -230,6 +380,10 @@ export function modelPickerView(input: {
       tabStop: modelOffersEffort(model, effortId) ? selected : index === 0,
     });
   });
+  const selectedGroup = model === undefined ? undefined : modelGroupOf(model);
+  const showEfforts = !(
+    (selectedGroup === "online" || selectedGroup === "local") && efforts.length === 0
+  );
   return Object.freeze({
     modelName,
     effortLabel,
@@ -238,12 +392,35 @@ export function modelPickerView(input: {
     title: disabledText === undefined ? scopeText : `${scopeText}${MODEL_PICKER_SEPARATOR}${disabledText}`,
     ariaLabel: messages.modelPickerAria(triggerText, scopeText, disabledText),
     disabledReason,
-    catalogEmpty: catalog.models.length === 0,
+    catalogEmpty: groups.length === 1 && models.length === 0,
+    groups: Object.freeze(groups),
+    showGroupHeadings: groups.length > 1,
     models: Object.freeze(models),
     efforts: Object.freeze(efforts),
+    showEfforts,
     selectedModelId: modelId,
     selectedEffortId: effortId,
     showUseDefault: selection?.source === "task",
+    engineNote: !engineFixed && groups.length > 1 ? messages.modelPickerEngineNote : undefined,
+  });
+}
+
+/**
+ * The change to submit when the user picks `row`: the model with the effort rules of its own catalog,
+ * its group (the Online reminder keys on it), and the engine to move the task to when the row belongs
+ * to the other engine than the task's.
+ */
+export function selectionForRow(
+  catalogs: ModelPickerCatalogs,
+  row: Pick<ModelRowView, "id" | "group" | "engine">,
+  currentEffort: string | null,
+  taskEngine: GuildEngine,
+): ModelSelectionChange {
+  const change = selectionAfterModelChange(catalogs[row.engine], row.id, currentEffort);
+  return Object.freeze({
+    ...change,
+    group: row.group,
+    ...(row.engine === taskEngine ? {} : { engine: row.engine }),
   });
 }
 
@@ -277,8 +454,9 @@ export type PickerNotice =
   | Readonly<{ kind: "refused"; reason: GuildModelSwitchRefusalReason }>
   | Readonly<{ kind: "failed" }>;
 
-/** The note to show after a response; an applied switch needs none. */
-export function noticeForResponse(response: SetTaskRuntimeSettingsResponse): PickerNotice | undefined {
+/** The note to show after a response; an applied switch needs none, and neither does a switch the user cancelled (`undefined`). */
+export function noticeForResponse(response: SetTaskRuntimeSettingsResponse | undefined): PickerNotice | undefined {
+  if (response === undefined) return undefined;
   if (response.status === "refused") return Object.freeze({ kind: "refused", reason: response.reason });
   if (response.status === "saved") return Object.freeze({ kind: "saved" });
   return undefined;

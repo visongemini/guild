@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
-import type { SetTaskRuntimeSettingsResponse, TaskModelSelectionProjection } from "@guild/contracts";
+import { EMPTY_CLAUDE_MODEL_CATALOG, freezeModelCatalog, type GrokModelCatalog, type SetTaskRuntimeSettingsResponse, type TaskModelSelectionProjection } from "@guild/contracts";
 import { renderToStaticMarkup } from "react-dom/server";
 import { messagesFor } from "./locales.js";
-import { REAL_CATALOG } from "./model-catalog.fixture.js";
+import { CLAUDE_CATALOG, REAL_CATALOG } from "./model-catalog.fixture.js";
 import { ModelPicker, type ModelPickerProps } from "./ModelPicker.js";
 
 const EN = messagesFor("en-US");
@@ -19,13 +19,17 @@ function selection(
   return Object.freeze({ modelId, reasoningEffort, source, canChange });
 }
 
+const grokOnly = (grok: GrokModelCatalog) => Object.freeze({ grok, claude: EMPTY_CLAUDE_MODEL_CATALOG });
+
 function render(props: Partial<ModelPickerProps> = {}): string {
   return renderToStaticMarkup(
     <ModelPicker
       messages={EN}
-      catalog={REAL_CATALOG}
+      catalogs={grokOnly(REAL_CATALOG)}
       selection={selection("grok-4.7-build-fast", "high")}
-      onApply={async (): Promise<SetTaskRuntimeSettingsResponse> => { throw new Error("not called"); }}
+      taskEngine="grok"
+      engineFixed
+      onApply={async (): Promise<SetTaskRuntimeSettingsResponse | undefined> => { throw new Error("not called"); }}
       {...props}
     />,
   );
@@ -106,7 +110,7 @@ test("Use default exists only while the task carries its own override", () => {
 test("an empty catalog opens to a single hint and no choices", () => {
   const markup = render({
     initialOpen: true,
-    catalog: { models: [] },
+    catalogs: grokOnly({ models: [] }),
     selection: selection(null, null, "runtime"),
   });
   assert.match(markup, /Model choices appear once Grok has started\./u);
@@ -161,4 +165,116 @@ test("the popover keys, focus return and pointer handling are wired in the compo
   assert.match(applied, /current\.activeTask\?\.task\.taskId !== response\.task\.task\.taskId/u);
   // A new task gets a new picker, so a pending request or notice never leaks across tasks.
   assert.match(app, /<ModelPicker\s+key=\{activeTask\?\.task\.taskId/u);
+});
+
+// ---- Guild 3.0 grouped picker (PC-MODEL-001)
+
+const claudeCatalogs = Object.freeze({ grok: REAL_CATALOG, claude: CLAUDE_CATALOG });
+const renderClaude = (props: Partial<ModelPickerProps> = {}) => render({
+  catalogs: claudeCatalogs,
+  selection: selection("opus", "high"),
+  taskEngine: "claude",
+  engineFixed: true,
+  initialOpen: true,
+  onOpenModelSources: () => undefined,
+  ...props,
+});
+
+test("a Claude task's open picker is one listbox of labelled groups: Claude, Online, Local", () => {
+  const markup = renderClaude();
+  assert.equal(markup.match(/role="listbox"/gu)?.length, 1);
+  assert.equal(markup.match(/role="group"/gu)?.length, 3);
+  for (const label of ["Claude", "Online", "Local"]) {
+    assert.match(markup, new RegExp(`<div id="[^"]+-group-${label.toLowerCase()}" class="guild-model-heading guild-model-group-heading">${label}</div>`, "u"));
+  }
+  // Each group is named by its own heading.
+  for (const group of ["claude", "online", "local"]) {
+    const labelledBy = markup.match(new RegExp(`role="group" aria-labelledby="([^"]+-group-${group})"`, "u"))?.[1];
+    assert.ok(labelledBy !== undefined, `${group} group is labelled`);
+    assert.ok(markup.includes(`id="${labelledBy}"`), `${group} heading exists`);
+  }
+  assert.doesNotMatch(markup, /<strong>Grok 4\.7<\/strong>/u);
+  assert.equal(markup.match(/role="option"/gu)?.length, 6);
+  assert.match(markup, /<strong>DeepSeek V4 Flash<\/strong>/u);
+  assert.match(markup, /<strong>Local 27B<\/strong>/u);
+  // The one selected row is the one tab stop, in the Claude group.
+  assert.equal(markup.match(/aria-selected="true"/gu)?.length, 1);
+  assert.match(markup.match(/<button[^>]*aria-selected="true"[^>]*>/u)?.[0] ?? "", /tabindex="0"/u);
+  // The "Model" heading would only repeat the group headings.
+  assert.doesNotMatch(markup, /class="guild-model-heading">Model</u);
+  // A Claude task has fixed its engine, so there is no note about choosing it.
+  assert.doesNotMatch(markup, /guild-model-engine-note/u);
+});
+
+test("a new task's picker offers the Grok group next to the others and explains that the first message fixes the engine", () => {
+  const markup = renderClaude({
+    selection: selection("grok-4.7", "high", "runtime"),
+    taskEngine: "grok",
+    engineFixed: false,
+  });
+  assert.equal(markup.match(/role="group"/gu)?.length, 4);
+  assert.match(markup, />Grok<\/div>/u);
+  assert.match(markup, /<strong>Grok 4\.7 Fast<\/strong>/u);
+  assert.match(markup, /<strong>Opus<\/strong>/u);
+  assert.match(markup, /class="guild-model-footnote guild-model-engine-note">The model you pick for the first message decides whether this conversation runs on Grok or Claude\./u);
+  const zh = renderClaude({ messages: ZH, selection: selection("grok-4.7", "high", "runtime"), taskEngine: "grok", engineFixed: false });
+  assert.match(zh, />Claude（订阅）<\/div>/u);
+  assert.match(zh, />在线<\/div>/u);
+  assert.match(zh, />本地<\/div>/u);
+});
+
+test("a Grok task that already ran renders exactly as before: no visible heading, the old list", () => {
+  const markup = render({ initialOpen: true });
+  assert.match(markup, /<div class="guild-model-heading">Model<\/div>/u);
+  assert.match(markup, /role="group" aria-labelledby="[^"]+-group-grok"><div id="[^"]+-group-grok" class="guild-sr-only">Grok<\/div>/u);
+  assert.equal(markup.match(/guild-model-group-heading/gu), null);
+  assert.equal(markup.match(/role="option"/gu)?.length, 4);
+});
+
+test("an empty Online group shows the hint and a button that opens Model sources", () => {
+  const onlyClaude = freezeModelCatalog("claude", {
+    models: [{ id: "opus", name: "Opus", group: "claude", reasoningEfforts: [], contextWindows: [] }],
+  });
+  const markup = renderClaude({ catalogs: { grok: REAL_CATALOG, claude: onlyClaude }, claudeState: "ready" });
+  assert.match(markup, /<div class="guild-model-hint"><p>No online models — add one in Settings › Model sources<\/p><\/div>/u);
+  assert.match(markup, /<div class="guild-model-hint"><p>No local models — add one in Settings › Model sources<\/p><\/div>/u);
+  assert.equal(markup.match(/class="guild-model-action"/gu)?.length, 2);
+  assert.match(markup, /<button type="button" role="option" aria-selected="false" tabindex="-1" class="guild-model-action">Open Model sources<\/button>/u);
+  // Without a way to open settings the hint stays and the button goes.
+  assert.doesNotMatch(renderClaude({ catalogs: { grok: REAL_CATALOG, claude: onlyClaude }, onOpenModelSources: undefined as never }), /guild-model-action/u);
+});
+
+test("the Claude group says Claude Code is not found or not logged in, with what to do", () => {
+  const markup = renderClaude({
+    catalogs: { grok: REAL_CATALOG, claude: EMPTY_CLAUDE_MODEL_CATALOG },
+    selection: selection(null, null, "runtime"),
+  });
+  assert.match(markup, /<p>Claude Code not found or not logged in<\/p><small>Install Claude Code, then run `claude` once in Terminal and log in\.<\/small>/u);
+  assert.match(markup, /No online models/u);
+});
+
+test("an Online model without efforts has no effort control; one with efforts keeps it", () => {
+  const flash = renderClaude({ selection: selection("deepseek-v4-flash", null) });
+  assert.doesNotMatch(flash, /role="radiogroup"/u);
+  assert.doesNotMatch(flash, />Reasoning effort</u);
+  assert.match(flash, /class="guild-model-footnote"/u);
+  const reasoner = renderClaude({ selection: selection("deepseek-v4-reasoner", null) });
+  assert.match(reasoner, /role="radiogroup"/u);
+  assert.equal(reasoner.match(/role="radio"/gu)?.length, 2);
+  const opus = renderClaude();
+  assert.equal(opus.match(/role="radio"/gu)?.length, 6);
+});
+
+test("a locked picker still renders no popover for a Claude task", () => {
+  const markup = renderClaude({ selection: selection("opus", "high", "task", false) });
+  assert.doesNotMatch(markup, /guild-model-popover/u);
+  assert.match(markup, /<span>Opus · High<\/span>/u);
+});
+
+test("the grouped picker keeps arrow-key navigation over every option and opens Model sources from its action", async () => {
+  const source = await readFile(new URL("../src/ModelPicker.tsx", import.meta.url), "utf8");
+  assert.match(source, /moveFocus\(event, '\[role="option"\]', "vertical"\)/u);
+  assert.match(source, /role="group" aria-labelledby=\{headingId\}/u);
+  assert.match(source, /setOpen\(false\);\s*onOpenModelSources\(\);/u);
+  assert.match(source, /selectionForRow\(catalogs, row, view\.selectedEffortId, taskEngine\)/u);
 });
