@@ -874,6 +874,24 @@ async function checkC() {
   details.pickerTagsOnRoutedTask = await readPickerTags();
   assertRestartTags(details.pickerTagsOnRoutedTask, "routed", "routed task, Claude rows");
   await shot("C", "claude-rows-restart-tags-on-routed-task");
+  // D-064: a routed process lists a poorer set of Claude models (a bare Default row, no older models); only the native
+  // process sets the Claude group, so on the routed task it still shows what the native process reported.
+  details.claudeGroupOnRoutedTask = await cdp.evaluate(`(() => {
+    const group = [...document.querySelectorAll(".guild-model-group")].find((candidate) => /claude/iu.test(candidate.querySelector(".guild-model-heading")?.textContent || ""));
+    if (!group) return null;
+    return {
+      rows: [...group.querySelectorAll(".guild-model-row")].map((row) => (row.querySelector("strong")?.textContent || "").trim()),
+      older: (group.querySelector(".guild-model-older")?.textContent || "").trim() || null,
+    };
+  })()`);
+  const claudeGroup = details.claudeGroupOnRoutedTask;
+  if (claudeGroup === null) throw new Error("the picker has no Claude group on the routed task");
+  if (!claudeGroup.rows.some((name) => /^(?:默认|Default)\s*[（(][^()（）]+[)）]$/u.test(name))) {
+    throw new Error(`the Claude default row lost its model name on the routed task: ${JSON.stringify(claudeGroup.rows)}`);
+  }
+  if (claudeGroup.older === null || !/^(?:更早的模型|Older models)/iu.test(claudeGroup.older)) {
+    throw new Error(`the Claude group lost its older-models expander on the routed task: ${JSON.stringify(claudeGroup)}`);
+  }
   await closePicker();
 
   // 3. The conversation continues on the third-party model with what the Claude turns said, and DeepSeek makes up a code word.
