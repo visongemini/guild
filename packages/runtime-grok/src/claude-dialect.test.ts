@@ -18,6 +18,7 @@ import {
   deriveClaudeModelCatalog,
   encodeInitializeParams,
   encodeNewSessionParams,
+  encodeLoadSessionParams,
   encodeResumeSessionParams,
 } from "./acp-v1-codec.js";
 import {
@@ -222,6 +223,12 @@ describe("Claude dialect: session start encoding", () => {
     assert.deepEqual(
       encodeResumeSessionParams("s-1", "/tmp/project", undefined, "claude"),
       { sessionId: "s-1", cwd: "/tmp/project", mcpServers: [] },
+    );
+    // session/load is the resume fallback and carries the same start options.
+    const server = { type: "http" as const, name: "guild-browser", url: "http://127.0.0.1:1234/t/mcp", headers: [] };
+    assert.deepEqual(
+      encodeLoadSessionParams("s-1", "/tmp/project", { claudeCodeOptions: options, mcpServers: [server] }, "claude"),
+      { sessionId: "s-1", cwd: "/tmp/project", mcpServers: [server], _meta: { claudeCode: { options } } },
     );
     assert.throws(
       () => encodeNewSessionParams("/tmp/project", { claudeCodeOptions: { n: Number.NaN } }, "claude"),

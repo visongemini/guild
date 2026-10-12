@@ -335,11 +335,14 @@ export function encodeResumeSessionParams(
 export function encodeLoadSessionParams(
   sessionId: string,
   cwd: string,
+  options?: AcpV1SessionStartOptions,
+  dialect: AcpDialect = "grok",
 ): Readonly<Record<string, unknown>> {
   return deepFreeze({
     sessionId: identifier(sessionId, "$.sessionId"),
     cwd: canonicalAbsolutePath(cwd, "$.cwd"),
-    mcpServers: [],
+    mcpServers: encodeMcpServers(options),
+    ...sessionStartMeta(options, dialect),
   });
 }
 

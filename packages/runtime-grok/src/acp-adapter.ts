@@ -964,11 +964,16 @@ export class AcpV1Adapter {
     }
   }
 
-  async loadSession(sessionId: string, cwd: string): Promise<AcpV1AdapterSession> {
+  async loadSession(
+    sessionId: string,
+    cwd: string,
+    startOptions?: AcpV1SessionStartOptions,
+  ): Promise<AcpV1AdapterSession> {
     const initialized = this.requireInitialized();
     if (!initialized.agentCapabilities.loadSession) {
       throw new AcpV1AdapterError("capability_not_advertised");
     }
+    this.assertSessionStartOptions(initialized, startOptions);
     const identity = sessionIdentity(this.adapterEpoch, sessionId);
     this.assertSessionIdAvailable(identity.sessionId);
     let barrier: AcpV1ReplayBarrier;
@@ -986,7 +991,7 @@ export class AcpV1Adapter {
     try {
       const decoded = await this.request(
         ACP_V1_METHODS.sessionLoad,
-        encodeLoadSessionParams(identity.sessionId, cwd),
+        encodeLoadSessionParams(identity.sessionId, cwd, startOptions, this.profile.dialect),
         this.timeouts.sessionMs,
         (response) => {
           const state = this.decodeProtocol(() => decodeLoadSessionResult(response, this.profile.dialect));
