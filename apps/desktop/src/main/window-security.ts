@@ -1,6 +1,11 @@
-import { BrowserWindow, screen, type Session, type WebContents } from "electron";
-import { isTrustedGuildAppUrl } from "./guild-url.js";
+import { BrowserWindow, screen } from "electron";
+import { denyPermissions, hardenWebContents } from "./window-guards.js";
 import { fitInitialWindowBounds } from "./window-bounds.js";
+
+// The guards live in window-guards.ts so they can be unit-tested without Electron. Guild's own
+// window uses them exactly as before; browser-pane tabs get their policy from BrowserPaneController
+// and are recognised only by the id registry in window-guards.ts.
+export { browserPaneRegistry, isBrowserPaneContents, isTrustedGuildSender } from "./window-guards.js";
 
 export function createGuildWindow(
   preloadPath: string,
@@ -50,26 +55,4 @@ export function createGuildWindow(
 
 function boundedDiagnostic(value: string): string {
   return value.replace(/[\r\n]+/gu, " ").slice(0, 500);
-}
-
-export function isTrustedGuildSender(window: BrowserWindow, sender: WebContents, frameUrl: string): boolean {
-  if (sender !== window.webContents || sender.isDestroyed()) return false;
-  try {
-    const url = new URL(frameUrl);
-    return isTrustedGuildAppUrl(url) && (url.pathname === "/" || url.pathname === "/index.html");
-  } catch {
-    return false;
-  }
-}
-
-function hardenWebContents(contents: WebContents): void {
-  contents.on("will-navigate", (event) => event.preventDefault());
-  contents.on("will-frame-navigate", (event) => event.preventDefault());
-  contents.on("will-attach-webview", (event) => event.preventDefault());
-  contents.setWindowOpenHandler(() => ({ action: "deny" }));
-}
-
-function denyPermissions(session: Session): void {
-  session.setPermissionCheckHandler(() => false);
-  session.setPermissionRequestHandler((_contents, _permission, callback) => callback(false));
 }
