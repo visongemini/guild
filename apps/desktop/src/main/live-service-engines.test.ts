@@ -1333,6 +1333,69 @@ describe("dual engine orchestration [PC-ENG-001, PC-MODEL-001]", () => {
     assert.equal(grokTask.engineStatus, undefined);
   });
 
+  it("keeps the subscription's account label in either mode: a routed process reports its throwaway identity and none of it is shown [D-062]", async () => {
+    const router = new FakeRouterHost([DEEPSEEK]);
+    const h = await harness({ modelRouterHost: router });
+    const claudeReport = async () => {
+      const bootstrap = await h.service.bootstrap();
+      return { settings: bootstrap.runtimeSettings.claude, task: bootstrap.activeTask?.engineStatus };
+    };
+    const task = await h.service.createTask(h.workspaceId, undefined, "claude");
+    const taskId = task.task.taskId;
+    await h.send(taskId, "native");
+    await h.completed();
+    h.world.adapters[0]!.emitAuthStatus({ kind: "account", label: "Claude Max", plan: "max" });
+    await eventually(async () => (await claudeReport()).settings?.accountLabel === "Claude Max");
+    await h.idle();
+
+    // The routed process authenticates with the throwaway token; whatever it says about itself is not the subscription.
+    const switched = await h.service.setTaskRuntimeSettings({ taskId, model: "deepseek-v4-flash", reasoningEffort: null, contextWindow: null });
+    assert.equal(switched.status, "applied");
+    const routed = h.world.adapters[1]!;
+    for (const status of [
+      { kind: "api_key", label: "Anthropic API key" },
+      { kind: "gateway", label: "Custom model gateway" },
+      { kind: "none", label: "Not logged in" },
+    ]) {
+      routed.emitAuthStatus(status);
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      const report = await claudeReport();
+      assert.equal(report.settings?.accountLabel, "Claude Max", status.kind);
+      assert.equal(report.settings?.status, "ready", `${status.kind} does not turn into a login prompt`);
+      assert.deepEqual(report.task, { accountLabel: "Claude Max" }, status.kind);
+    }
+
+    // And back: the native process is the one that reports the subscription.
+    await h.idle();
+    assert.equal((await h.service.setTaskRuntimeSettings({ taskId, model: "opus", reasoningEffort: null, contextWindow: null })).status, "applied");
+    h.world.adapters[2]!.emitAuthStatus({ kind: "account", label: "Claude Pro", plan: "pro" });
+    await eventually(async () => (await claudeReport()).settings?.accountLabel === "Claude Pro");
+    h.world.adapters[2]!.emitAuthStatus({ kind: "none", label: "Not logged in" });
+    await eventually(async () => (await claudeReport()).settings?.status === "not_logged_in", );
+    h.world.adapters[2]!.emitAuthStatus({ kind: "account", label: "Claude Max", plan: "max" });
+    await eventually(async () => (await claudeReport()).settings?.accountLabel === "Claude Max");
+  });
+
+  it("shows no account label rather than a throwaway-derived one when only a routed process has started since Guild opened [D-062]", async () => {
+    const router = new FakeRouterHost([DEEPSEEK]);
+    const h = await harness({ modelRouterHost: router });
+    const task = await h.service.createTask(h.workspaceId, undefined, "claude");
+    const taskId = task.task.taskId;
+    await h.service.setTaskRuntimeSettings({ taskId, model: "deepseek-v4-flash", reasoningEffort: null, contextWindow: null });
+    await h.send(taskId, "routed first");
+    await h.completed();
+    await h.idle();
+    const restarted = await h.restart();
+    await h.service.openTask(taskId);
+    await eventually(() => restarted.adapters.length === 1 && restarted.adapters[0]!.session !== undefined);
+    assertRoutedEnvironment(restarted.inputs[0]!.extraEnvironment, "deepseek-v4-flash");
+    restarted.adapters[0]!.emitAuthStatus({ kind: "api_key", label: "Anthropic API key" });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const report = (await h.service.bootstrap()).runtimeSettings.claude;
+    assert.equal(report?.accountLabel, undefined, "unknown, not a label from the throwaway token");
+    assert.notEqual(report?.status, "not_logged_in");
+  });
+
   it("maps Steer to the Claude steering request and queues what it cannot inject [docs/20 3.8]", async () => {
     // injected
     const injected = await harness();
