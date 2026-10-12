@@ -835,8 +835,10 @@ Decision
 - Binding. `task_metadata.engine` (`grok` | `claude`, default `grok`) is set when the task's first
   turn is created and never changes (PC-TASK-001: no silent rebinding). A new task's model picker
   shows the Grok group next to the Claude groups; the group chosen for the first turn fixes the
-  engine. Inside a Claude task the picker switches between turns among Claude (subscription), Online
-  and Local models (D-058).
+  engine. While Claude Code lists no model yet (a first run) the Claude group offers "Claude Code
+  (default model)", which moves the task to Claude and follows Claude Code's own default, unless
+  Claude Code is not found. Inside a Claude task the picker switches between turns among Claude
+  (subscription), Online and Local models (D-058).
 - Topology. One engine process per active task, as D-008.
 - Claude process. The executable pin is the user's `node` (existing Mach-O pin) plus the adapter
   entry script as `argv[0]`. The adapter is pinned by package version (supported range
@@ -851,8 +853,8 @@ Decision
   file for them and never calls `authenticate`. The `claude` binary uses its own login. If the adapter
   advertises auth methods and the first session fails with auth required, Guild shows the named
   reduced state "Run `claude` once in Terminal and log in".
-- Reduced capability (PC-FALLBACK-001). Steer falls back to queue and rewind to files only (the
-  existing -32601 fallbacks). The usage panel shows context usage from `usage_update` and the quota
+- Reduced capability (PC-FALLBACK-001). Steer injects through `_session/steering` and queues only on
+  `promptRequired`; rewind falls back to files only (the existing -32601 fallback). The usage panel shows context usage from `usage_update` and the quota
   as "Managed by Claude Code". The Grok control center and the Grok slash snapshot belong to the Grok
   engine only. The phase line shows generic phases only.
 - Independence. Guild states that it is independent from xAI and from Anthropic.
@@ -903,7 +905,9 @@ Decision
   the renderer or logs. Logs carry model, source id, status and booleans, never credential or header
   values.
 - Host binding. Adding a source or changing its base URL or key variable requires a native
-  confirmation dialog in main that names the variable and the host. A key is sent only to the host it
+  confirmation dialog in main that names the variable and the host (for an Online source it also says
+  that Claude task conversations go to that host; a keyless source exists for Local only, and an
+  Online source without a key variable is refused). A key is sent only to the host it
   was confirmed for; a renderer request alone cannot activate a change. Online sources are https only.
   Local sources are http or https, and resolved IPs must be loopback or in 100.64.0.0/10 (Tailscale),
   checked before connecting.
@@ -921,10 +925,12 @@ Decision
   event of a higher index.
 - No OpenAI translation. Every supported backend speaks Anthropic Messages natively; the router does
   not translate protocols.
-- Online-model reminder (PC-PRIV-001). The first time a session switches to an Online model Guild
-  asks for confirmation, stating that CLAUDE.md, memory, the conversation and browser page text or
-  screenshots in the conversation will be sent to the vendor. The option "Don't remind me again in
-  this workspace" persists per workspace. Local and Claude models never remind.
+- Online-model reminder (PC-PRIV-001). The first time a conversation switches to an Online model of a
+  vendor (a model source) Guild asks for confirmation, stating that CLAUDE.md, memory, the
+  conversation and browser page text or screenshots in the conversation will be sent to that vendor.
+  The agreement is remembered per conversation and per vendor, so Online A, then Claude, then Online B
+  asks again for B. The option "Don't remind me again in this workspace" persists per workspace and
+  silences every reminder. Local and Claude models never remind.
 
 Consequences
 - The gateway clause of PC-SEC-001 is narrowed, not dropped: a shared or externally reachable gateway
@@ -965,8 +971,8 @@ Decision
   `network_requests`, `tabs_list`, `tab_select`. There is no `eval` tool.
 - Wiring. The server is passed to engines in `mcpServers` of `session/new` and `session/resume` as an
   HTTP server named `guild-browser`: always for Claude, and for Grok only if its `initialize`
-  advertises `mcpCapabilities.http`. Every tool call goes through the engine's normal permission flow
-  and appears as a permission card.
+  advertises `mcpCapabilities.http`. Every tool call follows the engine's permission mode: it appears
+  as a permission card unless the mode or an "always allow" choice already permits it.
 
 Consequences
 - `docs/09-ELECTRON-SECURITY-PROFILE.md` documents the split; docs/01 drops "general-purpose browser"
