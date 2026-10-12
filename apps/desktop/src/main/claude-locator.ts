@@ -108,7 +108,12 @@ export function unexpectedEngineChange(
   if (before.claude.executablePath !== after.claude.executablePath) {
     // The release is read from the directory name, not from anything the new file says.
     const release = claudeVersionFromPath(after.claude.executablePath);
-    if (release === undefined || release === before.claude.version || after.claude.version === before.claude.version) {
+    if (
+      release === undefined ||
+      release === before.claude.version ||
+      after.claude.version === before.claude.version ||
+      dirname(before.claude.executablePath) !== dirname(after.claude.executablePath)
+    ) {
       return "claude";
     }
   }
@@ -293,8 +298,19 @@ export async function locateClaudeBinary(
  */
 function acceptClaudeReplacement(previous: LocatedClaudeBinary, candidate: string): LocatedClaudeBinary {
   const version = claudeVersionFromPath(candidate);
-  if (version === undefined || version === previous.version) throw new ClaudeEngineIntegrityError("claude");
+  if (
+    version === undefined ||
+    version === previous.version ||
+    !sameVersionsDirectory(previous.executablePath, candidate)
+  ) {
+    throw new ClaudeEngineIntegrityError("claude");
+  }
   return Object.freeze({ executablePath: candidate, version });
+}
+
+/** A new release lands next to the pinned one, in the installer's own `versions` directory. */
+function sameVersionsDirectory(pinned: string, candidate: string): boolean {
+  return dirname(pinned) === dirname(candidate);
 }
 
 /**

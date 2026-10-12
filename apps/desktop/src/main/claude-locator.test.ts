@@ -609,6 +609,8 @@ describe("Claude locator: what a re-locate may replace [PC-ENG-002]", () => {
     assert.equal(unexpectedEngineChange(base, changed({ claude: { executablePath: "/home/u/.local/share/claude/versions/2.1.300", version: "2.1.291" } })), "claude");
     // A different release in the same layout is an update.
     assert.equal(unexpectedEngineChange(base, changed({ claude: { executablePath: "/home/u/.local/share/claude/versions/2.1.300", version: "2.1.300" } })), undefined);
+    // A "new release" outside the pinned versions directory is not the installer's update.
+    assert.equal(unexpectedEngineChange(base, changed({ claude: { executablePath: "/tmp/x/versions/9.9.9", version: "9.9.9" } })), "claude");
     assert.equal(unexpectedEngineChange(base, changed({ claude: { executablePath: "/home/u/.local/share/claude/versions/2.1.200", version: "2.1.200" } })), undefined);
     // A claude binary that stays where it was is not a path change (it is pinned by path, not by hash).
     assert.equal(unexpectedEngineChange(base, changed({ claude: { version: "2.1.292" } })), undefined);

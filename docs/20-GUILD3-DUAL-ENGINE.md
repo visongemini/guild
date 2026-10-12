@@ -69,7 +69,7 @@ created and never changes. Process topology stays one engine process per task (D
   the adapter `package.json` is read, and another package version is re-pinned while the same version
   with another fingerprint is refused (reading executes nothing). The `claude` binary (about 200 MB) is
   pinned by real path and version string, **not by hash**: a re-locate accepts another real path only when
-  it is `.../versions/<v>` with a `<v>` that differs from the pinned version (the directory name carries
+  it is `.../versions/<v>` in the same `versions` directory as the pinned binary, with a `<v>` that differs from the pinned version (the directory name carries
   the version, the new file is not run to decide), and refuses the same version at another path as well as
   any path outside that layout. The same path is the same binary, so bytes changed in place under it are
   not detected by Guild; the adapter runs it the way the user's own `claude` would run.
