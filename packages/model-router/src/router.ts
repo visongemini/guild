@@ -12,7 +12,7 @@ import { isJsonObject, type JsonObject } from "./json.js";
 import { bareHostname, defaultLookup, resolveAllowedLocalAddress, type HostLookup } from "./network-policy.js";
 import { ProvenanceRecorder, sanitizeThinking } from "./provenance.js";
 import { createRegistry, type SourceRegistry } from "./registry.js";
-import { SseBlockSequencer, SseParser } from "./sse.js";
+import { SseBlockSequencer, SseParser, sseErrorEvent, type SseOverflow } from "./sse.js";
 import {
   ANTHROPIC_BASE_URL,
   ANTHROPIC_SOURCE_ID,
@@ -35,6 +35,7 @@ const LOG_MODEL_LENGTH = 128;
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "::1"]);
 const MODEL_CREATED_AT = "2026-01-01T00:00:00Z";
 const KEEP_ALIVE_MS = 60_000;
+const STREAM_OVERFLOW_MESSAGE = "model router stream buffer limit exceeded";
 
 type LogFields = Record<string, string | number | boolean>;
 type Route = "models" | "messages" | "count_tokens";
@@ -63,6 +64,12 @@ interface UpstreamPlan {
 interface Transform {
   push(chunk: Uint8Array): Piece[];
   end(): Piece[];
+  /**
+   * Set once the transform gave up on the upstream stream because it would have to buffer too
+   * much. Its last pieces already carry the client-facing error event; the pump must abort the
+   * upstream and end the response.
+   */
+  overflow?(): SseOverflow | undefined;
 }
 
 function errorCodeOf(error: unknown): string {
@@ -205,14 +212,17 @@ function normalizingTransform(recorder: ProvenanceRecorder): Transform {
   const run = (events: ReturnType<SseParser["push"]>): Piece[] => {
     const out: Piece[] = [];
     for (const event of events) {
+      if (sequencer.overflow !== undefined) break;
       if (event.json !== undefined) recorder.observeEvent(event.json);
-      out.push(...sequencer.accept(event));
+      for (const piece of sequencer.accept(event)) out.push(piece);
+      if (sequencer.overflow !== undefined) out.push(sseErrorEvent("api_error", STREAM_OVERFLOW_MESSAGE));
     }
     return out;
   };
   return {
     push: (chunk) => run(parser.push(chunk)),
-    end: () => [...run(parser.end()), ...sequencer.finish()],
+    end: () => (sequencer.overflow !== undefined ? [] : [...run(parser.end()), ...sequencer.finish()]),
+    overflow: () => sequencer.overflow,
   };
 }
 
@@ -563,17 +573,32 @@ class RouterCore {
       return;
     }
     const recorder = new ProvenanceRecorder(this.store, plan.source.id);
-    await this.pump(res, upstream.body, chooseTransform(upstream, plan.source, recorder), controller.signal, ctx);
+    await this.pump(res, upstream.body, chooseTransform(upstream, plan.source, recorder), controller, ctx);
   }
 
   private async pump(
     res: ServerResponse,
     body: ReadableStream<Uint8Array>,
     transform: Transform,
-    signal: AbortSignal,
+    controller: AbortController,
     ctx: RequestContext,
   ): Promise<void> {
+    const signal = controller.signal;
     const reader = body.getReader();
+    // The client already has the error event: stop the upstream and close the response.
+    const endOnOverflow = async (): Promise<boolean> => {
+      const overflow = transform.overflow?.();
+      if (overflow === undefined) return false;
+      controller.abort();
+      await reader.cancel().catch(() => undefined);
+      this.log("router.stream_overflow", {
+        route: String(ctx.fields.route),
+        source: String(ctx.fields.source),
+        limit: overflow,
+      });
+      res.end();
+      return true;
+    };
     try {
       for (;;) {
         const { done, value } = await reader.read();
@@ -584,10 +609,12 @@ class RouterCore {
             return;
           }
         }
+        if (await endOnOverflow()) return;
       }
       for (const piece of transform.end()) {
         if (!(await writePiece(res, piece))) return;
       }
+      if (await endOnOverflow()) return;
       res.end();
     } catch (error) {
       if (signal.aborted) return;

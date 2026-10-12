@@ -1203,6 +1203,36 @@ describe("streaming", () => {
     await within(closed.promise, 5000, "the upstream to observe the disconnect");
   });
 
+  it("aborts the upstream and ends the client stream with an SSE error when local buffering overflows [PC-ROUTE-003]", { timeout: 30000 }, async (t) => {
+    const closed = deferred();
+    // llama.cpp-style order, but the open thinking block never stops while the text block floods.
+    const flood: FakeHandler = async (_request, res) => {
+      res.on("close", () => closed.resolve());
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write(sseEvent(MESSAGE_START));
+      res.write(sseEvent({ type: "content_block_start", index: 0, content_block: { type: "thinking", thinking: "", signature: "" } }));
+      res.write(sseEvent({ type: "content_block_start", index: 1, content_block: { type: "text", text: "" } }));
+      const chunk = sseEvent({ type: "content_block_delta", index: 1, delta: { type: "text_delta", text: "x".repeat(1024 * 1024) } });
+      for (let i = 0; i < 64 && !res.destroyed; i += 1) {
+        res.write(chunk);
+        await sleep(2);
+      }
+    };
+    const h = await startHarness(t, { local: flood });
+    const response = await h.post("v1/messages", { ...simpleBody("local-27b"), stream: true });
+    assert.equal(response.status, 200);
+    const text = await within(response.text(), 20000, "the client stream to end");
+    await within(closed.promise, 5000, "the upstream to observe the abort");
+
+    // Events of the open block went out; the held text block did not; the stream ends with an error event.
+    assert.match(text, /message_start/u);
+    assert.match(text, /"index":0/u);
+    assert.ok(!text.includes("text_delta"), "buffered events are dropped, not forwarded out of order");
+    assert.ok(text.endsWith('event: error\ndata: {"type":"error","error":{"type":"api_error","message":"model router stream buffer limit exceeded"}}\n\n'));
+    const logged = h.logs.find((entry) => entry.event === "router.stream_overflow");
+    assert.deepEqual(logged?.fields, { route: "messages", source: "local-1", limit: "bytes" });
+  });
+
   it("terminates the client stream when the upstream stream breaks", { timeout: 15000 }, async (t) => {
     const h = await startHarness(t, {
       online: (_request, res) => {

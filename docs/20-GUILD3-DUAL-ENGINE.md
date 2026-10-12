@@ -133,6 +133,9 @@ created and never changes. Process topology stays one engine process per task (D
 - **SSE normalizer** for Local sources: re-sequence content blocks so a block's events (deltas,
   `signature_delta`, `content_block_stop`) are emitted before any event of a higher index; buffer the
   higher block until the lower one stops.
+  The buffer is capped at 8 MiB of held event text and 64 waiting blocks; on overflow the router
+  aborts the upstream request, ends the client stream with an Anthropic-style SSE `error` event
+  (`api_error`) and logs `router.stream_overflow` (route, source, limit).
 - `GET /<token>/v1/models` returns the Online/Local models (Anthropic list format).
 - No OpenAI-protocol translation. Every supported backend speaks Anthropic Messages natively.
 - Router lifetime = Guild main process lifetime; it starts lazily on first routed session.
