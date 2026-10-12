@@ -8,7 +8,10 @@ import {
   GUILD_API_VERSION,
   GUILD_PROMPT_ATTACHMENT_LIMIT,
   GUILD_PROMPT_ATTACHMENT_MAX_BYTES,
+  EMPTY_CLAUDE_MODEL_CATALOG,
   EMPTY_GROK_MODEL_CATALOG,
+  GUILD_CLAUDE_IDENTIFIER_LIMITS,
+  GUILD_CLAUDE_PERMISSION_MODES,
   GUILD_GROK_PERMISSION_MODES,
   canonicalGuildExternalUrl,
   createRuntimeTurnEvent,
@@ -30,15 +33,26 @@ import {
   parseGuildNewTaskWorkspaceMode,
   parseContinuousFooter,
   defaultReasoningEffortOf,
+  freezeModelCatalog,
   grokModelById,
+  isClaudeModelId,
+  modelCatalogEngineOf,
   modelSupportsReasoningEffort,
+  parseGuildClaudePermissionMode,
+  parseGuildClaudeReasoningEffort,
+  parseGuildModelId,
   resolveEffectiveSelection,
+  runtimeDefaultModelOf,
+  selectionOptionsOf,
   sessionSelectionOf,
   type AdapterEpoch,
   type AcpToolKind,
   type AcpToolStatus,
   type DesktopBootstrapProjection,
+  type EngineStatusProjection,
   type GrokModelCatalog,
+  type GuildClaudePermissionMode,
+  type GuildEngine,
   type GuildLocale,
   type GuildGrokModel,
   type GuildGrokPermissionMode,
@@ -47,6 +61,8 @@ import {
   type GuildTaskActivity,
   type GuildModelSwitchRefusalReason,
   type IdempotencyKey,
+  type ModelCatalog,
+  type ModelDescriptor,
   type OfficialUsageProjection,
   type PermissionIdentity,
   type RunId,
@@ -127,21 +143,29 @@ import {
   AcpV1Adapter,
   AcpV1AdapterError,
   GrokProcessHost,
+  deriveClaudeModelCatalog,
+  engineProfileFor,
   type AcpV1AdapterInterruptionReason,
   type AcpV1AdapterInterruptionDiagnostic,
   type AcpV1AdapterSession,
   type AcpV1AdapterSink,
   type AcpV1DecodedUpdate,
+  type AcpV1HttpMcpServer,
   type AcpV1InitializeResult,
   type AcpV1OfficialBillingSnapshot,
   type AcpV1SessionStartOptions,
   type AcpV1SessionState,
+  type AcpV1SteerResult,
+  type EngineFeatureFlags,
+  type EngineSignal,
   type JsonRpcInboundResponseWriteReceipt,
   type JsonRpcWriteReceipt,
   type JsonValue,
   type XaiExtensionOutcome,
 } from "@guild/runtime-grok";
 import type { DesktopApplicationService } from "./application-service.js";
+import { createClaudeRuntime } from "./claude-runtime.js";
+import type { BrowserMcpPort, ModelRouterHostPort, RoutedModelInfo } from "./engine-ports.js";
 import {
   GuildAvatarError,
   inspectAvatarBytes,
@@ -155,11 +179,15 @@ import {
 import { warmOfficialGrokRuntime } from "./runtime-warmup.js";
 import {
   applyRuntimeSelection,
+  optionOffers,
   refusalReasonOf,
   type RuntimeSelectionOutcome,
 } from "./model-selection.js";
 import {
+  CLAUDE_LOGIN_REQUIRED,
+  MODEL_ROUTER_UNAVAILABLE,
   SESSION_RECOVERY_CONTEXT_REQUIRED,
+  TASK_ENGINE_LOCKED,
   assertWorkspaceFolderExists,
 } from "./workspace-folder.js";
 import {
@@ -230,6 +258,9 @@ export type WorkspaceChooser = () => Promise<string | undefined>;
 
 export type RuntimeAdapterPort = {
   readonly state: string;
+  /** Engine the process belongs to (PC-ENG-001); decides which Grok-only features are offered. */
+  readonly engine: GuildEngine;
+  readonly features: EngineFeatureFlags;
   start(): Promise<AcpV1InitializeResult>;
   authenticate(methodId: string): Promise<void>;
   officialBilling(): Promise<AcpV1OfficialBillingSnapshot>;
@@ -271,21 +302,43 @@ export type RuntimeAdapterPort = {
     params: Readonly<Record<string, unknown>>,
     options?: { readonly timeoutMs?: number },
   ): Promise<XaiExtensionOutcome<JsonValue>>;
+  /**
+   * Claude Steer (`_session/steering`). `unsupported` means no request was made, or the agent
+   * answered -32601; `promptRequired` means no turn was running and nothing was sent.
+   */
+  steer(
+    session: AcpV1AdapterSession,
+    text: string,
+    options?: { readonly timeoutMs?: number },
+  ): Promise<AcpV1SteerResult>;
+  /** Claude applies the permission mode as a config option after the session opens. */
+  setPermissionMode(
+    session: AcpV1AdapterSession,
+    mode: GuildClaudePermissionMode,
+  ): Promise<readonly RuntimeConfigOption[]>;
   /** Local stdio round trip; `false` means the process no longer answers. Never closes the adapter. */
   probeLiveness(timeoutMs: number): Promise<boolean>;
   close(): Promise<void>;
 };
 
 export type RuntimeFactory = (input: {
+  /** Engine of the task the process is for (PC-ENG-001). */
+  readonly engine: GuildEngine;
   readonly adapterEpoch: AdapterEpoch;
   readonly sink: AcpV1AdapterSink;
   readonly stagingRoot: string;
   readonly workingDirectory: string;
-  /** Process-level settings only: the model and effort are applied per session after it opens. */
+  /** Grok process-level settings only: the model and effort are applied per session after it opens. */
   readonly runtimeSettings: {
     readonly permissionMode: GuildGrokPermissionMode;
     readonly startup: GuildGrokStartupSettings;
   };
+  /**
+   * Claude only: the per-spawn variables of a routed task (docs/20 3.3). Present for every process
+   * start of a routed task and never for a native one. The `ANTHROPIC_BASE_URL` value carries the
+   * router token: never log it.
+   */
+  readonly extraEnvironment?: Readonly<Record<string, string>>;
 }) => Promise<{ readonly adapter: RuntimeAdapterPort; readonly runtimeVersion?: string }>;
 
 export type LiveDesktopServiceOptions = {
@@ -315,6 +368,10 @@ export type LiveDesktopServiceOptions = {
   readonly openWorkspaceTerminal?: (path: string) => Promise<void>;
   readonly openTaskFile?: (path: string) => Promise<void>;
   readonly runtimeFactory?: RuntimeFactory;
+  /** Online / Local models behind the loopback router (docs/20 3.3, 3.4). Absent: Claude tasks stay native. */
+  readonly modelRouterHost?: ModelRouterHostPort;
+  /** Loopback browser MCP server handed to engines that advertise HTTP MCP (docs/20 3.5). */
+  readonly browserMcp?: BrowserMcpPort;
   readonly usageFetcher?: (signal: AbortSignal) => Promise<AcpV1OfficialBillingSnapshot>;
   readonly managementRunner?: (input: {
     readonly request: RunGrokManagementRequest;
@@ -351,6 +408,10 @@ type PendingPermission = {
 };
 
 type RuntimeController = {
+  /** Engine of the task: fixed for the life of the task (PC-ENG-001). */
+  readonly engine: GuildEngine;
+  /** Online / Local model ids Guild put in the session's `modelPicker`; they are not Claude's own models. */
+  pickerModelIds: ReadonlySet<string>;
   adapter: RuntimeAdapterPort | undefined;
   adapterEpoch: AdapterEpoch | undefined;
   lastAllocatedAdapterEpoch: AdapterEpoch | undefined;
@@ -552,6 +613,15 @@ export function createLiveDesktopService(
   // Last model list the official runtime advertised. Seeded from the local cache so the picker has
   // choices before any process starts; replaced whenever a runtime advertises a different list.
   let modelCatalog: GrokModelCatalog = store.loadModelCatalogCache()?.catalog ?? EMPTY_GROK_MODEL_CATALOG;
+  // Claude's own models, the same way; the router's Online and Local ones are added when projected.
+  let claudeNativeCatalog: ModelCatalog = store.loadModelCatalogCache("claude")?.catalog ?? EMPTY_CLAUDE_MODEL_CATALOG;
+  let claudeCatalogMemo: { readonly native: ModelCatalog; readonly key: string; readonly value: ModelCatalog } | undefined;
+  let reportedAnthropicModelKey = "";
+  let claudeRuntimeVersion: string | undefined;
+  // What the Claude engine last said about its login. Account-level: one login serves every Claude task.
+  let claudeAuth: Readonly<{ kind: string; label?: string }> | undefined;
+  const modelRouterHost = options.modelRouterHost;
+  const browserMcp = options.browserMcp;
   let usageSnapshot: AcpV1OfficialBillingSnapshot | undefined;
   let usageFetchedAtMs = 0;
   let usageLoading = false;
@@ -607,6 +677,9 @@ export function createLiveDesktopService(
     // Locate, stage and first-execute the official binary off the critical path.
     void warmOfficialGrokRuntime(options.stagingRoot).catch(() => undefined);
   }
+
+  // Sources added, confirmed, edited, disabled or deleted change what the Claude picker offers.
+  const unsubscribeRouterChanges = modelRouterHost?.onChange(() => schedulePublish());
 
   let maintenance = false;
   function assertOpen(): void {
@@ -681,6 +754,8 @@ export function createLiveDesktopService(
 
   function noteModelCatalog(catalog: GrokModelCatalog | undefined): void {
     if (catalog === undefined || catalog.models.length === 0) return;
+    // The Grok list is Grok's alone; a Claude session's list goes through noteClaudeNativeCatalog.
+    if (modelCatalogEngineOf(catalog) !== "grok") return;
     if (JSON.stringify(catalog) === JSON.stringify(modelCatalog)) return;
     modelCatalog = catalog;
     try {
@@ -694,12 +769,156 @@ export function createLiveDesktopService(
     schedulePhasePublish();
   }
 
+  function engineOfTask(taskId: TaskId): GuildEngine {
+    try {
+      return store.loadTaskEngine(taskId);
+    } catch {
+      return "grok";
+    }
+  }
+
+  /** Online and Local models that are enabled and confirmed right now; a faulty host lists none. */
+  function routedModels(): readonly RoutedModelInfo[] {
+    try {
+      return modelRouterHost?.listRoutedModels() ?? [];
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Claude's own models as the adapter reported them (group `claude`). The adapter's `model` option
+   * also lists whatever Guild put in the session's `modelPicker`, so those ids are dropped here: they
+   * belong to the router's sources, not to the Claude subscription. Efforts are only reported for the
+   * model that is selected, so the ones seen for a model earlier are kept.
+   */
+  function noteClaudeNativeCatalog(
+    derived: ModelCatalog | undefined,
+    pickerModelIds: ReadonlySet<string>,
+  ): void {
+    if (derived === undefined) return;
+    const routedIds = new Set(routedModels().map((model) => model.id));
+    const previousById = new Map(claudeNativeCatalog.models.map((model) => [model.id, model]));
+    const models = derived.models
+      .filter((model) => !pickerModelIds.has(model.id) && !routedIds.has(model.id))
+      .map((model) => model.reasoningEfforts.length > 0
+        ? model
+        : Object.freeze({ ...model, reasoningEfforts: previousById.get(model.id)?.reasoningEfforts ?? model.reasoningEfforts }));
+    if (models.length === 0) return;
+    const ids = models.map((model) => model.id);
+    // "default" is the adapter's own pick; the session's current model would move with every switch.
+    const runtimeDefaultModelId = [
+      ids.includes("default") ? "default" : undefined,
+      claudeNativeCatalog.runtimeDefaultModelId,
+      derived.runtimeDefaultModelId,
+    ].find((candidate) => candidate !== undefined && ids.includes(candidate));
+    let next: ModelCatalog;
+    try {
+      next = freezeModelCatalog("claude", {
+        engine: "claude",
+        models,
+        ...(runtimeDefaultModelId === undefined ? {} : { runtimeDefaultModelId }),
+      });
+    } catch {
+      return;
+    }
+    const key = ids.join("\0");
+    if (key !== reportedAnthropicModelKey) {
+      reportedAnthropicModelKey = key;
+      try {
+        modelRouterHost?.noteAnthropicModels(ids);
+      } catch {
+        // The router's registry also learns models from its own traffic; this only seeds it.
+      }
+    }
+    if (JSON.stringify(next) === JSON.stringify(claudeNativeCatalog)) return;
+    claudeNativeCatalog = next;
+    try {
+      store.saveModelCatalogCache({
+        engine: "claude",
+        catalog: next,
+        ...(claudeRuntimeVersion === undefined ? {} : { runtimeVersion: claudeRuntimeVersion.slice(0, 128) }),
+      });
+    } catch {
+      // The cache only lets the picker show choices before a runtime starts.
+    }
+    schedulePhasePublish();
+  }
+
+  /**
+   * What the Claude picker offers (PC-MODEL-001): the adapter's own models plus the router's Online
+   * and Local ones, each labelled with its group. Memoized: the projection is rebuilt on every publish.
+   */
+  function claudeCatalogProjection(): ModelCatalog {
+    const routed = routedModels();
+    if (routed.length === 0) return claudeNativeCatalog;
+    const key = routed.map((model) => `${model.id}\0${model.label}\0${model.group}\0${model.sourceLabel}\0${model.contextWindow ?? ""}`).join("\n");
+    if (claudeCatalogMemo?.native === claudeNativeCatalog && claudeCatalogMemo.key === key) {
+      return claudeCatalogMemo.value;
+    }
+    const seen = new Set(claudeNativeCatalog.models.map((model) => model.id));
+    const extra: ModelDescriptor[] = [];
+    for (const model of routed) {
+      if (seen.has(model.id) || !isClaudeModelId(model.id)) continue;
+      seen.add(model.id);
+      const description = model.sourceLabel.trim().slice(0, 512);
+      extra.push(Object.freeze({
+        id: model.id,
+        name: model.label.trim().slice(0, 128) || model.id,
+        ...(description.length === 0 ? {} : { description }),
+        group: model.group,
+        reasoningEfforts: Object.freeze([]),
+        contextWindows: Object.freeze(
+          model.contextWindow !== undefined && Number.isSafeInteger(model.contextWindow) &&
+            model.contextWindow >= 1 && model.contextWindow <= 100_000_000
+            ? [model.contextWindow]
+            : [],
+        ),
+      }));
+    }
+    let value = claudeNativeCatalog;
+    try {
+      value = freezeModelCatalog("claude", {
+        engine: "claude",
+        models: [...claudeNativeCatalog.models, ...extra].slice(0, GUILD_CLAUDE_IDENTIFIER_LIMITS.maxModels),
+        ...(claudeNativeCatalog.runtimeDefaultModelId === undefined
+          ? {}
+          : { runtimeDefaultModelId: claudeNativeCatalog.runtimeDefaultModelId }),
+      });
+    } catch {
+      // A list the contracts refuse falls back to the adapter's own models.
+    }
+    claudeCatalogMemo = { native: claudeNativeCatalog, key, value };
+    return value;
+  }
+
+  function catalogOfEngine(engine: GuildEngine): ModelCatalog {
+    return engine === "claude" ? claudeCatalogProjection() : modelCatalog;
+  }
+
+  /** The one place a session's config options are stored, so a Claude model list is never missed. */
+  function applySessionOptions(controller: RuntimeController, options: readonly RuntimeConfigOption[]): void {
+    controller.sessionConfigOptions = options;
+    if (controller.engine === "claude") {
+      noteClaudeNativeCatalog(deriveClaudeModelCatalog(options), controller.pickerModelIds);
+    }
+  }
+
   /** Task override, then the global default, then the runtime default (a catalog fact, not a setting). */
   function desiredSelection(taskId: TaskId, settings = store.loadAppSettings()): Readonly<{
     selection: ReturnType<typeof resolveEffectiveSelection>;
     contextWindow: number | null;
   }> {
     const override = readOncePerBuild(`rts:${taskId}`, () => store.loadTaskRuntimeSettings(taskId));
+    if (readOncePerBuild(`engine:${taskId}`, () => engineOfTask(taskId)) === "claude") {
+      return Object.freeze({
+        selection: resolveClaudeSelection(
+          override === undefined ? undefined : { modelId: override.modelId, reasoningEffort: override.reasoningEffort },
+          { modelId: settings.claudeModel, reasoningEffort: settings.claudeEffort },
+        ),
+        contextWindow: null,
+      });
+    }
     return Object.freeze({
       selection: resolveEffectiveSelection({
         ...(override === undefined
@@ -709,6 +928,25 @@ export function createLiveDesktopService(
         catalog: modelCatalog,
       }),
       contextWindow: override?.contextWindow ?? null,
+    });
+  }
+
+  /**
+   * Same order as the Grok resolution. The effort is not reconciled with the catalog: the adapter
+   * reports efforts only for the model that is selected, and the effort list of a model a session
+   * has not switched to yet is only known after the switch.
+   */
+  function resolveClaudeSelection(
+    task: Readonly<{ modelId: string | null; reasoningEffort: string | null }> | undefined,
+    global: Readonly<{ modelId: string | null; reasoningEffort: string | null }>,
+  ): ReturnType<typeof resolveEffectiveSelection> {
+    const taskPinned = task !== undefined && (task.modelId !== null || task.reasoningEffort !== null);
+    const globalPinned = global.modelId !== null || global.reasoningEffort !== null;
+    const catalog = claudeCatalogProjection();
+    return Object.freeze({
+      modelId: task?.modelId ?? global.modelId ?? runtimeDefaultModelOf(catalog)?.id ?? null,
+      reasoningEffort: task?.reasoningEffort ?? global.reasoningEffort ?? null,
+      source: taskPinned ? "task" as const : globalPinned ? "global" as const : "runtime" as const,
     });
   }
 
@@ -772,11 +1010,11 @@ export function createLiveDesktopService(
       port: adapter,
       session,
       options: controller.sessionConfigOptions,
-      catalog: modelCatalog,
+      catalog: catalogOfEngine(controller.engine),
       desired: { modelId: selection.modelId, reasoningEffort: selection.reasoningEffort, contextWindow },
       currentContextWindow: controller.contextWindowUsage?.size ?? controller.contextWindowSize,
     });
-    controller.sessionConfigOptions = outcome.options;
+    applySessionOptions(controller, outcome.options);
     if (outcome.status !== "refused" && outcome.contextWindow !== undefined) {
       controller.contextWindowSize = outcome.contextWindow;
     }
@@ -793,15 +1031,246 @@ export function createLiveDesktopService(
     return outcome.status;
   }
 
-  /** The effort is passed at creation only when the model a new session starts on offers it. */
-  function sessionStartOptionsFor(taskId: TaskId): AcpV1SessionStartOptions | undefined {
-    const { selection } = desiredSelection(taskId);
-    if (selection.source === "runtime" || selection.reasoningEffort === null) return undefined;
-    const startModel = grokModelById(modelCatalog, modelCatalog.runtimeDefaultModelId);
-    if (startModel !== undefined && !modelSupportsReasoningEffort(startModel, selection.reasoningEffort)) {
-      return undefined;
+  /**
+   * Claude takes its permission mode as a config option (docs/20 3.2), from the Claude settings. A
+   * mode the session does not offer is skipped; a refused or failed change throws, because a resumed
+   * session keeps the mode it last had and must never run looser than the setting says.
+   */
+  async function reconcileClaudePermissionMode(
+    taskId: TaskId,
+    controller: RuntimeController,
+    adapter: RuntimeAdapterPort,
+    session: AcpV1AdapterSession,
+  ): Promise<void> {
+    if (controller.engine !== "claude" || adapter.state !== "ready") return;
+    const desired = store.loadAppSettings().claudePermissionMode;
+    const modeOption = controller.sessionConfigOptions.find((option) => option.category === "mode");
+    const current = modeOption?.type === "select"
+      ? modeOption.currentValue
+      : controller.sessionModes?.currentModeId;
+    if (current === desired) return;
+    if (modeOption === undefined || !optionOffers(modeOption, desired)) {
+      logRuntime({ category: "runtime", event: "permission_mode_unavailable", taskId, sessionId: session.sessionId });
+      return;
     }
-    return Object.freeze({ reasoningEffort: selection.reasoningEffort });
+    applySessionOptions(controller, await adapter.setPermissionMode(session, desired));
+    logRuntime({ category: "runtime", event: "permission_mode_applied", taskId, sessionId: session.sessionId });
+  }
+
+  /**
+   * What a new or resumed session is started with. Grok: the effort, only when the model a new session
+   * starts on offers it. Both engines: the browser MCP server when the agent advertised HTTP MCP.
+   * Claude: the `modelPicker` that adds a routed task's Online / Local models to the model list.
+   */
+  async function sessionStartOptionsFor(
+    taskId: TaskId,
+    controller: RuntimeController,
+    initialized: AcpV1InitializeResult,
+    picker: readonly RoutedModelInfo[] | undefined,
+  ): Promise<AcpV1SessionStartOptions | undefined> {
+    const mcpServers = await browserMcpServersFor(taskId, initialized);
+    if (controller.engine === "claude") {
+      controller.pickerModelIds = new Set(picker?.map((model) => model.id));
+      return mcpServers.length === 0 && picker === undefined
+        ? undefined
+        : Object.freeze({
+            ...(mcpServers.length === 0 ? {} : { mcpServers }),
+            ...(picker === undefined
+              ? {}
+              : {
+                  claudeCodeOptions: Object.freeze({
+                    settings: Object.freeze({
+                      modelPicker: Object.freeze({
+                        options: Object.freeze(picker.map((model) => Object.freeze({
+                          model: model.id,
+                          label: model.label.slice(0, 128),
+                        }))),
+                      }),
+                    }),
+                  }),
+                }),
+          });
+    }
+    const { selection } = desiredSelection(taskId);
+    const startModel = grokModelById(modelCatalog, modelCatalog.runtimeDefaultModelId);
+    const reasoningEffort = selection.source === "runtime" || selection.reasoningEffort === null ||
+        (startModel !== undefined && !modelSupportsReasoningEffort(startModel, selection.reasoningEffort))
+      ? undefined
+      : selection.reasoningEffort;
+    return reasoningEffort === undefined && mcpServers.length === 0
+      ? undefined
+      : Object.freeze({
+          ...(reasoningEffort === undefined ? {} : { reasoningEffort }),
+          ...(mcpServers.length === 0 ? {} : { mcpServers }),
+        });
+  }
+
+  /** The loopback browser server (docs/20 3.5); an engine that did not advertise HTTP MCP is never given it. */
+  async function browserMcpServersFor(
+    taskId: TaskId,
+    initialized: AcpV1InitializeResult,
+  ): Promise<readonly AcpV1HttpMcpServer[]> {
+    if (browserMcp === undefined || initialized.mcpCapabilities?.http !== true) return Object.freeze([]);
+    try {
+      const { url } = await browserMcp.ensureStarted();
+      return Object.freeze([Object.freeze({
+        type: "http" as const,
+        name: "guild-browser",
+        url,
+        headers: Object.freeze([]),
+      })]);
+    } catch {
+      // The browser is an extra: a task still starts without it. The URL carries a token and is never logged.
+      logRuntime({ category: "runtime", event: "browser_mcp_unavailable", taskId });
+      return Object.freeze([]);
+    }
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // Guild 3.0 Claude engine: routed sessions, login state (docs/20 3.2, 3.3)
+  // ---------------------------------------------------------------------------------------------
+
+  /** `setTaskRuntimeSettings` stored a routed model for a live native session; the restart follows. */
+  type RoutedSelectionRestart = Readonly<{
+    status: "routed_restart";
+    previous: ReturnType<GuildPersistence["loadTaskRuntimeSettings"]>;
+  }>;
+
+  /** Whether the session's own model list offers this model. */
+  function optionOffersModel(options: readonly RuntimeConfigOption[], modelId: string): boolean {
+    const modelOption = selectionOptionsOf(options).model;
+    return modelOption !== undefined && optionOffers(modelOption, modelId);
+  }
+
+  type RoutedStart = Readonly<{
+    extraEnvironment: Readonly<Record<string, string>>;
+    picker: readonly RoutedModelInfo[];
+  }>;
+
+  /** The task's selected model is one of the router's Online / Local models. */
+  function selectsRoutedModel(taskId: TaskId): boolean {
+    const { selection } = desiredSelection(taskId);
+    return selection.source !== "runtime" &&
+      selection.modelId !== null &&
+      routedModels().some((model) => model.id === selection.modelId);
+  }
+
+  async function ensureRouterReady(taskId: TaskId): Promise<string> {
+    try {
+      if (modelRouterHost === undefined) throw new Error("model_router_missing");
+      // The URL carries the router token: it goes into the process environment and nowhere else.
+      return (await modelRouterHost.ensureStarted()).baseUrl;
+    } catch {
+      logRuntime({ category: "runtime", event: "model_router_unavailable", taskId });
+      throw new Error(MODEL_ROUTER_UNAVAILABLE);
+    }
+  }
+
+  /**
+   * Whether this process start is routed, and with what. A task is routed from the moment it first
+   * selects an Online / Local model, and then for good: every later start (also after Guild restarts
+   * and crash recovery) goes through the router again (docs/20 3.3). The marker is committed before
+   * the routed process exists.
+   */
+  async function planRoutedStart(taskId: TaskId, controller: RuntimeController): Promise<RoutedStart | undefined> {
+    if (controller.engine !== "claude") return undefined;
+    const metadata = store.loadTaskMetadata(taskId);
+    if (metadata.routedAtMs === undefined && !selectsRoutedModel(taskId)) return undefined;
+    const baseUrl = await ensureRouterReady(taskId);
+    if (metadata.routedAtMs === undefined) {
+      store.markTaskRouted({ taskId });
+      logRuntime({ category: "runtime", event: "task_routed", taskId });
+    }
+    return Object.freeze({
+      extraEnvironment: Object.freeze({
+        ANTHROPIC_BASE_URL: baseUrl,
+        ENABLE_TOOL_SEARCH: "true",
+        OPENVIKING_AUTO_CAPTURE: "false",
+      }),
+      picker: Object.freeze([...routedModels()]),
+    });
+  }
+
+  /**
+   * An idle native (or routed) session whose model list lacks the Online / Local model the task now
+   * selects: the process restarts between turns, routed, and resumes the same session. Selection
+   * changes are refused while a turn runs, so this never interrupts one.
+   */
+  function routedRestartNeeded(taskId: TaskId, controller: RuntimeController): boolean {
+    if (controller.engine !== "claude" || modelRouterHost === undefined) return false;
+    if (
+      controller.adapter?.state !== "ready" ||
+      controller.session === undefined ||
+      controller.startOperation !== undefined ||
+      controller.activeRunId !== undefined ||
+      controller.promptRunId !== undefined ||
+      controller.pendingPermissions.size > 0 ||
+      controller.sendsInFlight > 1
+    ) return false;
+    if (!selectsRoutedModel(taskId)) return false;
+    const modelId = desiredSelection(taskId).selection.modelId;
+    const modelOption = selectionOptionsOf(controller.sessionConfigOptions).model;
+    return modelId !== null && (modelOption === undefined || !optionOffers(modelOption, modelId));
+  }
+
+  /**
+   * A Claude session that never had a prompt has no transcript, so the adapter cannot resume it,
+   * and nothing in it is lost: restore_pending -> broken -> replacement_pending without a question.
+   */
+  function replaceRunlessSession(
+    taskId: TaskId,
+    binding: ReturnType<GuildPersistence["loadSessionBinding"]>,
+  ): ReturnType<GuildPersistence["loadSessionBinding"]> {
+    if (
+      binding.sessionId === undefined ||
+      binding.adapterEpoch === undefined ||
+      binding.restoreAttemptId === undefined
+    ) return binding;
+    requireBinding(store.applySessionBinding({
+      taskId,
+      event: {
+        type: "restore_failed",
+        sessionId: binding.sessionId,
+        adapterEpoch: binding.adapterEpoch,
+        attemptId: binding.restoreAttemptId,
+        idempotencyKey: key("session-runless-restore-skipped"),
+      },
+    }));
+    requireBinding(store.applySessionBinding({
+      taskId,
+      event: { type: "authorize_replacement", idempotencyKey: key("session-runless-replacement") },
+    }));
+    logRuntime({ category: "session", event: "runless_session_replaced", taskId, sessionId: binding.sessionId });
+    return store.loadSessionBinding(taskId);
+  }
+
+  function isClaudeAuthRequired(controller: RuntimeController, cause: unknown): boolean {
+    return controller.engine === "claude" &&
+      cause instanceof AcpV1AdapterError &&
+      cause.code === "auth_required";
+  }
+
+  function noteClaudeLoginRequired(): void {
+    claudeAuth = Object.freeze({ kind: "none" });
+    schedulePhasePublish();
+  }
+
+  /** Display-only engine signals: the Claude account summary and frames dropped after a turn ended. */
+  function observeEngineSignal(taskId: TaskId, signal: EngineSignal): void {
+    if (signal.type === "auth_status") {
+      const label = signal.status.label ?? signal.status.plan;
+      if (claudeAuth?.kind === signal.status.kind && claudeAuth.label === label) return;
+      claudeAuth = Object.freeze({ kind: signal.status.kind, ...(label === undefined ? {} : { label }) });
+      schedulePhasePublish();
+      return;
+    }
+    logRuntime({
+      category: "runtime",
+      event: "late_update_dropped",
+      taskId,
+      sessionId: signal.sessionId,
+      updateKind: signal.discriminator,
+    });
   }
 
   function runPhaseProjection(
@@ -1383,6 +1852,13 @@ export function createLiveDesktopService(
       };
     }
 
+    // Files only (docs/20 3.8): the conversation of an engine without `_x.ai/rewind/*` stays as it is.
+    if (!engineProfileFor(metadata.engine).features.conversationRewind) {
+      return {
+        ok: true, cwd, sessionId: undefined, adapter: undefined, rolledBackRuns, promptText, files,
+        conversation: { available: false, reason: "unsupported" },
+      };
+    }
     if (live === undefined) {
       return {
         ok: true, cwd, sessionId: undefined, adapter: undefined, rolledBackRuns, promptText, files,
@@ -1549,6 +2025,8 @@ export function createLiveDesktopService(
   async function liveForRewind(
     taskId: TaskId,
   ): Promise<Readonly<{ adapter: RuntimeAdapterPort; session: AcpV1AdapterSession }> | undefined> {
+    // An engine without conversation rewind is not started just to be asked.
+    if (!engineProfileFor(engineOfTask(taskId)).features.conversationRewind) return undefined;
     try {
       const session = await ensureSession(taskId);
       const adapter = controllerFor(taskId).adapter;
@@ -1761,7 +2239,10 @@ export function createLiveDesktopService(
     ) {
       return Object.freeze({ available: false, reason: "runtime_unavailable" });
     }
-    if (controller.steerUnsupported) return Object.freeze({ available: false, reason: "unsupported" });
+    // Claude: Steer exists only when the adapter advertised `_meta.steering` at initialize.
+    if (controller.steerUnsupported || !controller.adapter.features.steer) {
+      return Object.freeze({ available: false, reason: "unsupported" });
+    }
     return Object.freeze({ available: true });
   }
 
@@ -1776,20 +2257,25 @@ export function createLiveDesktopService(
     }
   }
 
-  function steerFallbackNotice(reason: GuildSteerFallbackReason, locale: GuildLocale): string {
+  function steerFallbackNotice(
+    reason: GuildSteerFallbackReason,
+    locale: GuildLocale,
+    engine: GuildEngine,
+  ): string {
+    const name = engineName(engine);
     if (locale === "zh-CN") {
       switch (reason) {
-        case "unsupported": return "当前 Grok 版本不支持向运行中的回合插话，这条消息已改为普通消息处理（排队或在回合结束后发送）。";
+        case "unsupported": return `当前 ${name} 版本不支持向运行中的回合插话，这条消息已改为普通消息处理（排队或在回合结束后发送）。`;
         case "turn_not_running": return "回合已经结束，这条消息已改为普通消息发送。";
         case "turn_not_steerable": return "当前回合暂时不能插话（尚未开始或正在取消），这条消息已改为普通消息处理。";
-        case "runtime_error": return "Grok 没有接受这次插话，这条消息已改为普通消息处理。";
+        case "runtime_error": return `${name} 没有接受这次插话，这条消息已改为普通消息处理。`;
       }
     }
     switch (reason) {
-      case "unsupported": return "This Grok version cannot take a message into a running turn, so it was handled as an ordinary message (queued, or sent when the turn ends).";
+      case "unsupported": return `This ${name} version cannot take a message into a running turn, so it was handled as an ordinary message (queued, or sent when the turn ends).`;
       case "turn_not_running": return "The turn had already ended, so the message was sent as an ordinary message.";
       case "turn_not_steerable": return "The turn cannot take a message right now (it has not started, or it is being cancelled), so the message was handled as an ordinary message.";
-      case "runtime_error": return "Grok did not accept the interjection, so the message was handled as an ordinary message.";
+      case "runtime_error": return `${name} did not accept the interjection, so the message was handled as an ordinary message.`;
     }
   }
 
@@ -1832,17 +2318,27 @@ export function createLiveDesktopService(
     });
   }
 
-  type SteerRequestOutcome = "accepted" | "unsupported" | "failed";
+  /** `not_running`: Claude answered `promptRequired`; nothing was sent, the turn had already ended. */
+  type SteerRequestOutcome = "accepted" | "unsupported" | "failed" | "not_running";
 
   async function sendInterjection(
     send: Extract<SteerSend, { readonly kind: "send" }>,
     text: string,
   ): Promise<SteerRequestOutcome> {
+    const timeoutMs = options.steerRequestTimeoutMs ?? DEFAULT_STEER_REQUEST_TIMEOUT_MS;
     try {
+      if (send.adapter.engine === "claude") {
+        // `_session/steering`: the agent tells us whether the text went into the running turn.
+        const result = await send.adapter.steer(send.session, text, { timeoutMs });
+        if (result.status === "unsupported") return "unsupported";
+        if (result.outcome === "injected") return "accepted";
+        // `startedNewTurn` cannot happen for a request that asked for `promptRequired`.
+        return result.outcome === "promptRequired" ? "not_running" : "failed";
+      }
       const outcome = await send.adapter.sendExtensionRequest(
         "_x.ai/interject",
         { sessionId: send.session.sessionId, text, interjectionId: send.interjectionId },
-        { timeoutMs: options.steerRequestTimeoutMs ?? DEFAULT_STEER_REQUEST_TIMEOUT_MS },
+        { timeoutMs },
       );
       if (outcome.status === "unsupported") return "unsupported";
       const status = (outcome.result as { readonly status?: unknown } | null)?.status;
@@ -1850,6 +2346,10 @@ export function createLiveDesktopService(
     } catch {
       return "failed";
     }
+  }
+
+  function steerFallbackOf(outcome: Exclude<SteerRequestOutcome, "accepted">): GuildSteerFallbackReason {
+    return outcome === "unsupported" ? "unsupported" : outcome === "not_running" ? "turn_not_running" : "runtime_error";
   }
 
   async function steerMessage(taskId: TaskId, rawText: string): Promise<SteerMessageResponse> {
@@ -1882,7 +2382,7 @@ export function createLiveDesktopService(
       });
       return Object.freeze({ status: "steered" as const, interjectionId: prepared.interjectionId });
     }
-    const reason: GuildSteerFallbackReason = outcome === "unsupported" ? "unsupported" : "runtime_error";
+    const reason = steerFallbackOf(outcome);
     if (outcome === "unsupported") prepared.controller.steerUnsupported = true;
     await recordSteerFallback(taskId, text, reason, prepared.interjectionId);
     const sent = await service.sendMessage(taskId, text);
@@ -1913,7 +2413,7 @@ export function createLiveDesktopService(
         interjectionId: id,
         reason,
         noticeEntryId: unique("steer-fallback"),
-        noticeText: steerFallbackNotice(reason, store.loadAppSettings().locale),
+        noticeText: steerFallbackNotice(reason, store.loadAppSettings().locale, engineOfTask(taskId)),
       });
       await publish();
     }).catch(() => {
@@ -1961,7 +2461,7 @@ export function createLiveDesktopService(
         }
       }
       if (outcome === "unsupported") send.controller.steerUnsupported = true;
-      const reason: GuildSteerFallbackReason = outcome === "unsupported" ? "unsupported" : "runtime_error";
+      const reason = steerFallbackOf(outcome);
       store.failInterjection({ taskId, interjectionId: send.interjectionId, reason });
       await publish();
       return Object.freeze({ status: "unchanged" as const, reason });
@@ -1981,6 +2481,8 @@ export function createLiveDesktopService(
     let controller = controllers.get(taskId);
     if (controller === undefined) {
       controller = {
+        engine: engineOfTask(taskId),
+        pickerModelIds: new Set(),
         adapter: undefined,
         adapterEpoch: undefined,
         lastAllocatedAdapterEpoch: undefined,
@@ -2400,6 +2902,13 @@ export function createLiveDesktopService(
         startup: settings.startup,
         availablePermissionModes: GUILD_GROK_PERMISSION_MODES,
         canChange: runtimeSettingsCanChange(),
+        claude: Object.freeze({
+          model: settings.claudeModel,
+          reasoningEffort: settings.claudeEffort,
+          permissionMode: settings.claudePermissionMode,
+          availablePermissionModes: GUILD_CLAUDE_PERMISSION_MODES,
+        }),
+        modelCatalogs: Object.freeze({ grok: modelCatalog, claude: claudeCatalogProjection() }),
       }),
       generalSettings: Object.freeze({
         restoreLastTask: settings.restoreLastTask,
@@ -2532,6 +3041,8 @@ export function createLiveDesktopService(
     for (const controller of controllers.values()) {
       const adapter = controller.adapter;
       if (adapter === undefined || adapter.state !== "ready" || controller.session === undefined) continue;
+      // Official usage is Grok's account billing; the Claude engine has none (PC-FALLBACK-001).
+      if (!adapter.features.billing) continue;
       if (controller.promptRunId === undefined) return adapter;
       busy ??= adapter;
     }
@@ -2588,6 +3099,7 @@ export function createLiveDesktopService(
       pinned: metadata.pinned,
       archived: metadata.disposition === "archived",
       updatedAtMs: metadata.lastActivityAtMs,
+      engine: metadata.engine,
       queuedTurnCount: readOncePerBuild(`queue:${metadata.taskId}`, () => store.listQueuedTurns(metadata.taskId)).length,
       ...(restored?.currentRun === undefined
         ? {}
@@ -2595,6 +3107,20 @@ export function createLiveDesktopService(
       ...(activity === undefined ? {} : { activeActivity: activity }),
       ...(worktreeStatus === undefined ? {} : { worktreeStatus }),
     });
+  }
+
+  /** Claude's login summary and routed state (docs/20 3.8). A Grok task has none. */
+  function engineStatusProjection(
+    metadata: ReturnType<GuildPersistence["loadTaskMetadata"]>,
+  ): EngineStatusProjection | undefined {
+    if (metadata.engine !== "claude") return undefined;
+    const loginRequired = claudeAuth?.kind === "none";
+    const status: EngineStatusProjection = Object.freeze({
+      ...(claudeAuth?.label === undefined || loginRequired ? {} : { accountLabel: claudeAuth.label }),
+      ...(loginRequired ? { loginRequired: true as const } : {}),
+      ...(metadata.routedAtMs === undefined ? {} : { routed: true as const }),
+    });
+    return Object.keys(status).length === 0 ? undefined : status;
   }
 
   function currentTaskActivity(controller: RuntimeController | undefined): GuildTaskActivity | undefined {
@@ -2702,6 +3228,7 @@ export function createLiveDesktopService(
       throw new Error("message_too_long");
     }
     const capsule = replacementRecoveryCapsule({
+      engineName: engineName(metadata.engine),
       taskId,
       title: metadata.title,
       workspacePath: taskRoot,
@@ -2790,6 +3317,7 @@ export function createLiveDesktopService(
         .map((tool) => tool.kind)),
     )];
     const runPhase = runPhaseProjection(controller, summary.activeRunState);
+    const engineStatus = engineStatusProjection(metadata);
     const windowCheckpoints = runCheckpointProjections(taskId, entries);
     const worktreeProjection = worktreeManager.projectionOf(taskId);
     // Opening a task with a worktree refreshes its numbers in the background (bounded, at most
@@ -2834,6 +3362,7 @@ export function createLiveDesktopService(
       sessionModes: controller?.sessionModes ?? null,
       sessionConfigOptions: controller?.sessionConfigOptions ?? Object.freeze([]),
       modelSelection: modelSelectionProjection(taskId, controller),
+      ...(engineStatus === undefined ? {} : { engineStatus }),
       ...(runPhase === undefined ? {} : { runPhase }),
       steer: steerAvailability(taskId, controller),
       ...(windowCheckpoints.length === 0 ? {} : { runCheckpoints: windowCheckpoints }),
@@ -3191,11 +3720,23 @@ export function createLiveDesktopService(
     const controller = controllerFor(taskId);
     if (!prewarm) controller.prewarmOnly = false;
     if (controller.session !== undefined && controller.adapter?.state === "ready") {
-      return controller.session;
+      if (prewarm || !routedRestartNeeded(taskId, controller)) return controller.session;
+      // A router that cannot start leaves the working native session alone. Once it runs, the task is
+      // routed for good, and that is committed before the native process is closed.
+      await ensureRouterReady(taskId);
+      store.markTaskRouted({ taskId });
+      logRuntime({ category: "runtime", event: "task_routed", taskId });
     }
     if (controller.startOperation !== undefined) {
       if (!prewarm) controller.startIsPrewarm = false;
       return controller.startOperation;
+    }
+    if (
+      controller.session !== undefined &&
+      controller.adapter?.state === "ready" &&
+      !routedRestartNeeded(taskId, controller)
+    ) {
+      return controller.session;
     }
     controller.startIsPrewarm = prewarm;
     controller.prewarmOnly = prewarm;
@@ -3229,7 +3770,9 @@ export function createLiveDesktopService(
       if (
         metadata.disposition !== "active" ||
         store.loadWorkspace(metadata.workspaceId).disposition !== "active" ||
-        store.loadSessionBinding(taskId).state !== "restore_pending"
+        store.loadSessionBinding(taskId).state !== "restore_pending" ||
+        // A Claude session without a prompt cannot be resumed, so there is nothing to warm up.
+        (metadata.engine === "claude" && store.listTaskRuns(taskId).length === 0)
       ) return;
     } catch {
       return;
@@ -3604,8 +4147,8 @@ export function createLiveDesktopService(
         entryId: unique("queue-session-replaced"),
         kind: "notice",
         text: store.loadAppSettings().locale === "zh-CN"
-          ? `${discarded} 条排队消息未发送，因为 Grok 会话已经重建；内容已保留，请重新发送。`
-          : `${discarded} queued message${discarded === 1 ? " was" : "s were"} not sent because the Grok session was rebuilt. The content is preserved above; please send it again.`,
+          ? `${discarded} 条排队消息未发送，因为 ${engineName(controller.engine)} 会话已经重建；内容已保留，请重新发送。`
+          : `${discarded} queued message${discarded === 1 ? " was" : "s were"} not sent because the ${engineName(controller.engine)} session was rebuilt. The content is preserved above; please send it again.`,
         metadata: { queueFailure: "session_replaced", discarded },
         status: "complete",
       });
@@ -3639,8 +4182,8 @@ export function createLiveDesktopService(
           kind: "notice",
           text: failure === "message_too_long"
             ? store.loadAppSettings().locale === "zh-CN"
-              ? "这条排队消息没有发送：与任务恢复摘要合并后超过 Grok 的单条消息上限。内容已保留，请删短后重新发送。"
-              : "This queued message was not sent because it exceeds Grok's single-message limit when combined with the task recovery summary. The content is preserved; shorten it and send again."
+              ? `这条排队消息没有发送：与任务恢复摘要合并后超过 ${engineName(controller.engine)} 的单条消息上限。内容已保留，请删短后重新发送。`
+              : `This queued message was not sent because it exceeds ${engineName(controller.engine)}'s single-message limit when combined with the task recovery summary. The content is preserved; shorten it and send again.`
             : store.loadAppSettings().locale === "zh-CN"
               ? "这条排队消息没有发送：替换会话缺少可恢复的任务内容。请写明要继续做什么，不要只发送“继续”。"
               : "This queued message was not sent because the replacement session has no recoverable task context. Describe what to continue instead of sending only 'continue'.",
@@ -3712,11 +4255,19 @@ export function createLiveDesktopService(
     controller.auxiliarySessions.clear();
     clearCancelTimer(controller);
     clearPromptSilenceTimer(controller);
-    const binding = store.loadSessionBinding(taskId);
+    let binding = store.loadSessionBinding(taskId);
+    // A Claude session that never had a prompt has no transcript to resume (the adapter answers
+    // "resource not found"), and nothing in it to lose: it is replaced without asking.
+    const silentReplacement = controller.engine === "claude" &&
+      (binding.state === "restore_pending" || binding.state === "replacement_pending") &&
+      store.listTaskRuns(taskId).length === 0;
+    if (silentReplacement && binding.state === "restore_pending") {
+      binding = replaceRunlessSession(taskId, binding);
+    }
     if (binding.state === "broken") {
       throw new Error("session_replacement_requires_user_authorization");
     }
-    const replacingSession = binding.state === "replacement_pending";
+    const replacingSession = binding.state === "replacement_pending" && !silentReplacement;
     const nextEpochResult = nextAdapterEpoch(
       controller.lastAllocatedAdapterEpoch ?? binding.adapterEpoch,
     );
@@ -3755,7 +4306,12 @@ export function createLiveDesktopService(
     let startStage = "runtime_factory";
     try {
       const selectedRuntimeSettings = store.loadAppSettings();
+      // A routed Claude task always starts through the router, also after a Guild restart.
+      startStage = "routed_plan";
+      const routed = await planRoutedStart(taskId, controller);
+      startStage = "runtime_factory";
       created = await runtimeFactory({
+        engine: controller.engine,
         adapterEpoch,
         sink: createSink(taskId, controller),
         stagingRoot: options.stagingRoot,
@@ -3764,6 +4320,7 @@ export function createLiveDesktopService(
           permissionMode: selectedRuntimeSettings.permissionMode,
           startup: selectedRuntimeSettings.startup,
         }),
+        ...(routed === undefined ? {} : { extraEnvironment: routed.extraEnvironment }),
       });
       logRuntime({ category: "runtime", event: "factory_ready", taskId, adapterEpoch });
       if (runtimeGeneration !== startGeneration) {
@@ -3771,23 +4328,29 @@ export function createLiveDesktopService(
       }
       controller.adapter = created.adapter;
       if (closed || closing) throw new Error("desktop_service_closed");
-      runtimeVersion = created.runtimeVersion ?? runtimeVersion;
+      // The version label is Grok's; Claude keeps its own for the model list cache.
+      if (controller.engine === "grok") runtimeVersion = created.runtimeVersion ?? runtimeVersion;
+      else claudeRuntimeVersion = created.runtimeVersion ?? claudeRuntimeVersion;
       startStage = "initialize";
       const initialized = await created.adapter.start();
       logRuntime({ category: "runtime", event: "initialized", taskId, adapterEpoch });
       if (runtimeGeneration !== startGeneration) {
         throw new Error("runtime_start_invalidated_by_resume");
       }
-      if (initialized.agentInfo?.version !== undefined) {
+      if (controller.engine === "grok" && initialized.agentInfo?.version !== undefined) {
         runtimeVersion = [initialized.agentInfo.title ?? initialized.agentInfo.name, initialized.agentInfo.version]
           .filter(Boolean)
           .join(" ");
       }
       noteModelCatalog(initialized.modelCatalog);
+      // Guild never authenticates for Claude: the user's own `claude` login is used as it is, and a
+      // missing login surfaces as `auth_required` from the first session call (docs/20 3.2).
       const selectedAuthMethod = initialized.authMethods.length === 1
         ? initialized.authMethods[0]!.id
         : initialized.defaultAuthMethodId;
-      if (selectedAuthMethod !== undefined) {
+      if (engineProfileFor(controller.engine).authPolicy === "never") {
+        // Nothing to select.
+      } else if (selectedAuthMethod !== undefined) {
         startStage = `authenticate_${selectedAuthMethod}`;
         await created.adapter.authenticate(selectedAuthMethod);
         if (runtimeGeneration !== startGeneration) {
@@ -3823,7 +4386,7 @@ export function createLiveDesktopService(
         currentBinding = store.loadSessionBinding(taskId);
       }
       let session: AcpV1AdapterSession | undefined;
-      const sessionStartOptions = sessionStartOptionsFor(taskId);
+      const sessionStartOptions = await sessionStartOptionsFor(taskId, controller, initialized, routed?.picker);
       notePhase(controller, { type: "opening_session" });
       if (currentBinding.state === "creating") {
         startStage = "session_new";
@@ -3845,6 +4408,8 @@ export function createLiveDesktopService(
             );
           } catch (cause: unknown) {
             if (created.adapter.state !== "ready") throw cause;
+            // A login that lapsed is not a lost session: nothing is replaced, the retry resumes it.
+            if (isClaudeAuthRequired(controller, cause)) throw cause;
             restoreCause = cause;
           }
         }
@@ -3894,7 +4459,7 @@ export function createLiveDesktopService(
       if (session === undefined) throw new Error("runtime_session_unavailable");
       controller.contextWindowSize = session.contextWindowSize;
       controller.sessionModes = session.modes ?? null;
-      controller.sessionConfigOptions = session.configOptions ?? Object.freeze([]);
+      applySessionOptions(controller, session.configOptions ?? Object.freeze([]));
       if (session.contextWindowSize !== undefined) {
         store.saveContextWindowSize({
           taskId,
@@ -3903,6 +4468,9 @@ export function createLiveDesktopService(
         });
       }
       noteModelCatalog(session.modelCatalog);
+      // Claude: the permission mode first, then the model and effort (docs/20 3.2).
+      startStage = "session_permission_mode";
+      await reconcileClaudePermissionMode(taskId, controller, created.adapter, session);
       startStage = "session_selection";
       await reconcileRuntimeSelection(taskId, controller, created.adapter, session);
       if (runtimeGeneration !== startGeneration) {
@@ -3916,8 +4484,8 @@ export function createLiveDesktopService(
           entryId: replacementNoticeEntryId,
           kind: "notice",
           text: store.loadAppSettings().locale === "zh-CN"
-            ? "已按你的确认开始新的 Grok 会话。Guild 会在你下一次发送时附带本任务的本地恢复摘要；中断的指令仍不会自动重发。"
-            : "A new Grok session was started with your confirmation. On your next send, Guild will attach a local recovery summary for this task; the interrupted instruction will still not be resent automatically.",
+            ? `已按你的确认开始新的 ${engineName(controller.engine)} 会话。Guild 会在你下一次发送时附带本任务的本地恢复摘要；中断的指令仍不会自动重发。`
+            : `A new ${engineName(controller.engine)} session was started with your confirmation. On your next send, Guild will attach a local recovery summary for this task; the interrupted instruction will still not be resent automatically.`,
           metadata: {
             sessionReplaced: true,
             userAuthorized: true,
@@ -3957,6 +4525,7 @@ export function createLiveDesktopService(
         bindingChanged = true;
       } else if (
         startStage === "session_resume" &&
+        !isClaudeAuthRequired(controller, cause) &&
         failedBinding.state === "restore_pending" &&
         failedBinding.restoreAttemptId === attemptId &&
         failedBinding.sessionId !== undefined &&
@@ -3974,6 +4543,19 @@ export function createLiveDesktopService(
         }));
         bindingChanged = true;
       }
+      // A Claude task with no prompt has no session worth a question (see silentReplacement): a
+      // failed creation, for example a missing login, leaves it ready for the next try.
+      if (
+        bindingChanged &&
+        controller.engine === "claude" &&
+        store.loadSessionBinding(taskId).state === "broken" &&
+        store.listTaskRuns(taskId).length === 0
+      ) {
+        requireBinding(store.applySessionBinding({
+          taskId,
+          event: { type: "authorize_replacement", idempotencyKey: key("session-runless-replacement") },
+        }));
+      }
       controller.adapter = undefined;
       controller.adapterEpoch = undefined;
       controller.session = undefined;
@@ -3987,6 +4569,11 @@ export function createLiveDesktopService(
         adapterEpoch,
         reason: `${startStage}:${detail}`.slice(0, 320),
       });
+      if (isClaudeAuthRequired(controller, cause)) {
+        noteClaudeLoginRequired();
+        throw new Error(CLAUDE_LOGIN_REQUIRED);
+      }
+      if (cause instanceof Error && cause.message === MODEL_ROUTER_UNAVAILABLE) throw cause;
       throw new Error(`runtime_start_${startStage}:${detail}`);
     }
   }
@@ -4292,7 +4879,7 @@ export function createLiveDesktopService(
   ): void {
     controller.contextWindowSize = state.contextWindowSize;
     controller.sessionModes = state.modes ?? null;
-    controller.sessionConfigOptions = state.configOptions ?? Object.freeze([]);
+    applySessionOptions(controller, state.configOptions ?? Object.freeze([]));
     for (const update of updates) {
       if (update.type !== "session_context") continue;
       const context = update.payload.context;
@@ -4308,9 +4895,9 @@ export function createLiveDesktopService(
           });
         }
       } else if (context.kind === "config") {
-        controller.sessionConfigOptions = Object.freeze(
+        applySessionOptions(controller, Object.freeze(
           context.options.map((option) => Object.freeze({ ...option })),
-        );
+        ));
       } else if (context.kind === "usage") {
         controller.contextWindowUsage = Object.freeze({ used: context.used, size: context.size });
       }
@@ -4320,6 +4907,7 @@ export function createLiveDesktopService(
   function createSink(taskId: TaskId, controller: RuntimeController): AcpV1AdapterSink {
     return Object.freeze({
       observeSignal: (envelope: XaiSignalEnvelope) => observeRuntimeSignal(taskId, controller, envelope),
+      observeEngineSignal: (signal: EngineSignal) => observeEngineSignal(taskId, signal),
       commitSessionEstablished: async (event) => {
         if (controller.adapterEpoch !== event.identity.adapterEpoch) return;
         const attemptId = controller.currentAttemptId;
@@ -4454,9 +5042,9 @@ export function createLiveDesktopService(
             }
             await publish();
           } else if (event.update.payload.context.kind === "config") {
-            controller.sessionConfigOptions = Object.freeze(
+            applySessionOptions(controller, Object.freeze(
               event.update.payload.context.options.map((option) => Object.freeze({ ...option })),
-            );
+            ));
             await publish();
           } else if (event.update.payload.context.kind === "info") {
             const runtimeTitle = event.update.payload.context.title;
@@ -5531,6 +6119,7 @@ export function createLiveDesktopService(
             text: transportInterruptionMessage(
               store.loadAppSettings().locale,
               diagnostic,
+              controller.engine,
             ),
             metadata: { incidentId, reason },
             status: "failed",
@@ -5603,8 +6192,8 @@ export function createLiveDesktopService(
             entryId: unique("session-auto-restored"),
             kind: "notice",
             text: store.loadAppSettings().locale === "zh-CN"
-              ? "原 Grok 会话已恢复。为避免重复修改，刚才中断的指令没有自动重发；需要时请手动重试。"
-              : "The original Grok session was restored. The interrupted instruction was not resent automatically, avoiding duplicate changes; retry it manually if needed.",
+              ? `原 ${engineName(engineOfTask(taskId))} 会话已恢复。为避免重复修改，刚才中断的指令没有自动重发；需要时请手动重试。`
+              : `The original ${engineName(engineOfTask(taskId))} session was restored. The interrupted instruction was not resent automatically, avoiding duplicate changes; retry it manually if needed.`,
             metadata: { incidentId, recovery: "restored", automaticResend: false },
             status: "complete",
           });
@@ -5704,6 +6293,8 @@ export function createLiveDesktopService(
         );
       }
       let runTerminalized = false;
+      const loginRequired = isClaudeAuthRequired(controller, cause);
+      if (loginRequired) noteClaudeLoginRequired();
       if (controller.activeRunId === runId) {
         const run = safeLoadRun(taskId, runId);
         if (run?.state === "starting") {
@@ -5723,14 +6314,16 @@ export function createLiveDesktopService(
             kind: "error",
             text: deliveryUnconfirmed
               ? (store.loadAppSettings().locale === "zh-CN"
-                  ? "指令已经写入 Grok，但 Guild 未能确认本地接收记录。为避免重复修改，不会自动重发；请先查看原任务状态。"
-                  : "The instruction was written to Grok, but Guild could not confirm its local acceptance record. It will not resend automatically; check the original task state first.")
-              : (store.loadAppSettings().locale === "zh-CN"
-                  ? "Grok 运行时未能开始这次任务。你可以重新发送这条消息。"
-                  : "The Grok runtime could not start this task. You can send the message again."),
+                  ? `指令已经写入 ${engineName(controller.engine)}，但 Guild 未能确认本地接收记录。为避免重复修改，不会自动重发；请先查看原任务状态。`
+                  : `The instruction was written to ${engineName(controller.engine)}, but Guild could not confirm its local acceptance record. It will not resend automatically; check the original task state first.`)
+              : loginRequired
+                ? claudeLoginRequiredMessage(store.loadAppSettings().locale)
+                : (store.loadAppSettings().locale === "zh-CN"
+                  ? `${engineName(controller.engine)} 运行时未能开始这次任务。你可以重新发送这条消息。`
+                  : `The ${engineName(controller.engine)} runtime could not start this task. You can send the message again.`),
             metadata: deliveryUnconfirmed
               ? { failureCategory: "prompt_delivery_unconfirmed" }
-              : { failureCategory: "prompt_launch_failed" },
+              : { failureCategory: loginRequired ? "claude_login_required" : "prompt_launch_failed" },
             status: "failed",
           });
           controller.activeRunId = undefined;
@@ -5754,8 +6347,8 @@ export function createLiveDesktopService(
             runId,
             entryId: unique("prompt-protocol-error"),
             kind: "error",
-            text: promptFailureMessage(locale),
-            metadata: { failureCategory: "runtime_prompt_rejected" },
+            text: loginRequired ? claudeLoginRequiredMessage(locale) : promptFailureMessage(locale, controller.engine),
+            metadata: { failureCategory: loginRequired ? "claude_login_required" : "runtime_prompt_rejected" },
             status: "failed",
           });
           controller.activeRunId = undefined;
@@ -5997,9 +6590,10 @@ export function createLiveDesktopService(
     await writeFile(path, bytes, { flag: "wx", mode: 0o600 });
     try {
       const zh = store.loadAppSettings().locale === "zh-CN";
+      const engine = engineName(controller.engine);
       const alt = media.mediaType === "image"
-        ? (zh ? "Grok 图片" : "Grok image")
-        : (zh ? "Grok 音频" : "Grok audio");
+        ? (zh ? `${engine} 图片` : `${engine} image`)
+        : (zh ? `${engine} 音频` : `${engine} audio`);
       store.createConversationEntry({
         taskId,
         runId,
@@ -6322,7 +6916,7 @@ export function createLiveDesktopService(
       }
       return Object.freeze({ status: "selected", attachments: Object.freeze(attachments) });
     },
-    createTask: async (workspaceId, isolation?: GuildTaskIsolation) => enqueueCommand(async () => {
+    createTask: async (workspaceId, isolation?: GuildTaskIsolation, engine?: GuildEngine) => enqueueCommand(async () => {
       assertOpen();
       const workspace = store.loadWorkspace(workspaceId);
       if (workspace.disposition !== "active") throw new Error("workspace_not_active");
@@ -6335,6 +6929,7 @@ export function createLiveDesktopService(
           workspaceId,
           title,
           owningWindowId: PRIMARY_WINDOW_ID,
+          ...(engine === undefined ? {} : { engine }),
         });
       };
       if (isolation === "worktree") {
@@ -6423,6 +7018,8 @@ export function createLiveDesktopService(
         workspaceId: source.workspaceId,
         title,
         owningWindowId: PRIMARY_WINDOW_ID,
+        // A branch continues the conversation on the engine it was written for.
+        engine: source.engine,
       });
       const rolledBackRuns = new Set<string>(store.listRolledBackRunIds(taskId));
       for (const entry of allTaskConversationEntries(taskId)) {
@@ -6444,8 +7041,8 @@ export function createLiveDesktopService(
         entryId: unique("branch-notice"),
         kind: "notice",
         text: store.loadAppSettings().locale === "zh-CN"
-          ? `已从“${source.title}”复制本地对话快照。此分支会启动新的官方 Grok 会话，不会冒充上游会话克隆。`
-          : `Copied a local transcript snapshot from “${source.title}”. This branch starts a new official Grok session; it is not an upstream session clone.`,
+          ? `已从“${source.title}”复制本地对话快照。此分支会启动新的${source.engine === "claude" ? " Claude " : "官方 Grok "}会话，不会冒充上游会话克隆。`
+          : `Copied a local transcript snapshot from “${source.title}”. This branch starts a new ${source.engine === "claude" ? "Claude" : "official Grok"} session; it is not an upstream session clone.`,
         status: "complete",
       });
       activeTaskId = branchTaskId;
@@ -6565,6 +7162,8 @@ export function createLiveDesktopService(
           // Model and effort have their own validated channel (D-011: only official models, between turns).
           option.category === "model" ||
           option.category === "thought_level" ||
+          // The Claude permission mode follows the Claude settings (reconcileClaudePermissionMode).
+          (controller.engine === "claude" && option.category === "mode") ||
           (option.type === "boolean" && typeof value !== "boolean") ||
           (option.type === "select" && typeof value !== "string")
         ) {
@@ -6578,7 +7177,7 @@ export function createLiveDesktopService(
             throw new Error("session_config_value_unavailable");
           }
         }
-        controller.sessionConfigOptions = await controller.adapter.setConfigOption(session, configId, value);
+        applySessionOptions(controller, await controller.adapter.setConfigOption(session, configId, value));
         await publish();
         return taskView(taskId);
       });
@@ -7193,8 +7792,9 @@ export function createLiveDesktopService(
       await publish();
       return buildBootstrap();
     }),
-    setTaskRuntimeSettings: async (request: SetTaskRuntimeSettingsRequest) => enqueueCommand(
-      async (): Promise<SetTaskRuntimeSettingsResponse> => {
+    setTaskRuntimeSettings: async (request: SetTaskRuntimeSettingsRequest) => {
+      const outcome = await enqueueCommand(
+      async (): Promise<SetTaskRuntimeSettingsResponse | RoutedSelectionRestart> => {
         assertOpen();
         const { taskId } = request;
         const metadata = store.loadTaskMetadata(taskId);
@@ -7221,7 +7821,26 @@ export function createLiveDesktopService(
           await publish();
           return Object.freeze({ status: "refused" as const, reason, task: view() });
         };
-        if (request.model !== null && modelCatalog.models.length > 0) {
+        const claude = metadata.engine === "claude";
+        if (claude) {
+          if (request.model !== null) {
+            // The effort of a model the session has not switched to is only known after the switch,
+            // so only its form is checked here; the engine has the last word when it is applied.
+            try {
+              parseGuildModelId("claude", request.model);
+              if (request.reasoningEffort !== null) parseGuildClaudeReasoningEffort(request.reasoningEffort);
+            } catch {
+              return refuse("unsupported_value");
+            }
+            const offered = claudeCatalogProjection();
+            if (
+              (request.contextWindow ?? null) !== null ||
+              (offered.models.length > 0 && !offered.models.some((model) => model.id === request.model))
+            ) {
+              return refuse("unsupported_value");
+            }
+          }
+        } else if (request.model !== null && modelCatalog.models.length > 0) {
           const offered = grokModelById(modelCatalog, request.model);
           if (
             offered === undefined ||
@@ -7243,6 +7862,24 @@ export function createLiveDesktopService(
           session !== undefined &&
           adapter.state === "ready"
         ) {
+          // docs/20 3.3: the first Online / Local model restarts the process, routed, between turns.
+          // The restart takes seconds, so it runs after this command, outside the queue.
+          if (
+            claude &&
+            request.model !== null &&
+            modelRouterHost !== undefined &&
+            routedModels().some((model) => model.id === request.model) &&
+            !optionOffersModel(controller.sessionConfigOptions, request.model)
+          ) {
+            try {
+              await ensureRouterReady(taskId);
+            } catch {
+              return refuse("unavailable");
+            }
+            persist();
+            await publish();
+            return Object.freeze({ status: "routed_restart" as const, previous: existing });
+          }
           // Apply to the live session first: a refused switch must leave the stored choice untouched.
           const outcome = request.model === null
             ? undefined
@@ -7250,7 +7887,7 @@ export function createLiveDesktopService(
                 port: adapter,
                 session,
                 options: controller.sessionConfigOptions,
-                catalog: modelCatalog,
+                catalog: catalogOfEngine(metadata.engine),
                 desired: {
                   modelId: request.model,
                   reasoningEffort: request.reasoningEffort,
@@ -7259,7 +7896,7 @@ export function createLiveDesktopService(
                 currentContextWindow: controller.contextWindowUsage?.size ?? controller.contextWindowSize,
               });
           if (outcome !== undefined) {
-            controller.sessionConfigOptions = outcome.options;
+            applySessionOptions(controller, outcome.options);
             if (outcome.status === "refused") {
               logRuntime({
                 category: "runtime",
@@ -7285,7 +7922,108 @@ export function createLiveDesktopService(
         await publish();
         return Object.freeze({ status: "saved" as const, task: view() });
       },
-    ),
+      );
+      if (outcome.status !== "routed_restart") return outcome;
+      // The override is stored; ensureSession sees the model the live session lacks and restarts it.
+      const taskId = request.taskId;
+      try {
+        await ensureSession(taskId);
+      } catch {
+        // The previous choice comes back; the task may already be routed, which only means it
+        // keeps going through the router with a model it offers.
+        await enqueueCommand(async () => {
+          const current = store.loadTaskRuntimeSettings(taskId);
+          if (outcome.previous === undefined) {
+            if (current !== undefined) store.clearTaskRuntimeSettings({ taskId, expectedRevision: current.revision });
+          } else {
+            store.saveTaskRuntimeSettings({
+              taskId,
+              expectedRevision: current?.revision ?? 0,
+              modelId: outcome.previous.modelId,
+              reasoningEffort: outcome.previous.reasoningEffort,
+              contextWindow: outcome.previous.contextWindow,
+            });
+          }
+          await publish();
+        }).catch(() => undefined);
+        return enqueueCommand(async () => Object.freeze({
+          status: "refused" as const,
+          reason: "unavailable" as const,
+          task: taskView(taskId, conversationPageDepths.get(taskId) ?? 1),
+        }));
+      }
+      return enqueueCommand(async () => {
+        await publish();
+        return Object.freeze({
+          status: "applied" as const,
+          task: taskView(taskId, conversationPageDepths.get(taskId) ?? 1),
+        });
+      });
+    },
+    setTaskEngine: async (taskId, engine) => enqueueCommand(async () => {
+      assertOpen();
+      const metadata = store.loadTaskMetadata(taskId);
+      if (metadata.disposition !== "active") throw new Error("task_not_writable");
+      if (metadata.engine === engine) return taskView(taskId, conversationPageDepths.get(taskId) ?? 1);
+      // PC-TASK-001: no silent rebinding. The engine is chosen before the first turn and then fixed.
+      if (
+        metadata.routedAtMs !== undefined ||
+        store.listTaskRuns(taskId).length > 0 ||
+        !taskSelectionCanChange(taskId)
+      ) {
+        throw new Error(TASK_ENGINE_LOCKED);
+      }
+      // A session the slash-command menu opened belongs to the old engine: stop its process first;
+      // the store then starts the task's session over.
+      await settlePrewarmStarts([taskId]);
+      const controller = controllers.get(taskId);
+      if (controller !== undefined) {
+        await closeController(taskId, controller, true);
+        controllers.delete(taskId);
+      }
+      persistedContextTokens.delete(taskId);
+      try {
+        store.setTaskEngine({ taskId, expectedRevision: store.loadTaskMetadata(taskId).revision, engine });
+      } catch {
+        throw new Error(TASK_ENGINE_LOCKED);
+      }
+      logRuntime({ category: "runtime", event: "task_engine_changed", taskId });
+      await publish();
+      return taskView(taskId, conversationPageDepths.get(taskId) ?? 1);
+    }),
+    setClaudeSettings: async (model, reasoningEffort, permissionMode) => enqueueCommand(async () => {
+      assertOpen();
+      const exactMode = parseGuildClaudePermissionMode(permissionMode);
+      if (model === null && reasoningEffort !== null) throw new Error("runtime_settings_change_unavailable");
+      try {
+        if (model !== null) parseGuildModelId("claude", model);
+        if (reasoningEffort !== null) parseGuildClaudeReasoningEffort(reasoningEffort);
+      } catch {
+        throw new Error("runtime_settings_change_unavailable");
+      }
+      // The stored default must be something the engine or the router offers. The effort of a model
+      // the session has not switched to is only known after the switch, so only its form is checked.
+      const catalog = claudeCatalogProjection();
+      if (model !== null && catalog.models.length > 0 && !catalog.models.some((candidate) => candidate.id === model)) {
+        throw new Error("runtime_settings_change_unavailable");
+      }
+      const current = store.loadAppSettings();
+      if (
+        current.claudeModel === model &&
+        current.claudeEffort === reasoningEffort &&
+        current.claudePermissionMode === exactMode
+      ) return buildBootstrap();
+      // Applied to each session between turns (reconcileRuntimeSelection, reconcileClaudePermissionMode),
+      // so changing a default never closes a process or loses a conversation's context.
+      store.updateAppSettings({
+        expectedRevision: current.revision,
+        claudeModel: model,
+        claudeEffort: reasoningEffort,
+        claudePermissionMode: exactMode,
+      });
+      await publish();
+      return buildBootstrap();
+    }),
     setSidebarWidth: async (width) => enqueueCommand(async () => {
       assertOpen();
       const settings = store.loadAppSettings();
@@ -7565,6 +8303,7 @@ export function createLiveDesktopService(
       await streamPublishOperation?.catch(() => undefined);
       if (maintenance) await diagnosticLog.flush();
       else await diagnosticLog.flush().catch(() => undefined);
+      unsubscribeRouterChanges?.();
       listeners.clear();
       deltaListeners.clear();
       store.close();
@@ -7903,6 +8642,7 @@ function activityForToolKind(kind: AcpToolKind): GuildTaskActivity {
 function transportInterruptionMessage(
   locale: GuildLocale,
   diagnostic: AcpV1AdapterInterruptionDiagnostic,
+  engine: GuildEngine,
 ): string {
   const evidence = diagnostic.signal !== undefined && diagnostic.signal !== null
     ? (locale === "zh-CN" ? `（信号 ${diagnostic.signal}）` : ` (signal ${diagnostic.signal})`)
@@ -7910,20 +8650,31 @@ function transportInterruptionMessage(
       ? (locale === "zh-CN" ? `（退出码 ${diagnostic.exitCode}）` : ` (exit code ${diagnostic.exitCode})`)
       : "";
   return locale === "zh-CN"
-    ? `Grok 运行连接中断${evidence}。Guild 正在恢复原会话；为避免重复修改，不会自动重发这条指令。诊断详情已写入本地日志。`
-    : `The Grok runtime connection was interrupted${evidence}. Guild is restoring the original session and will not resend this instruction automatically, avoiding duplicate changes. Diagnostic details were written to the local log.`;
+    ? `${engineName(engine)} 运行连接中断${evidence}。Guild 正在恢复原会话；为避免重复修改，不会自动重发这条指令。诊断详情已写入本地日志。`
+    : `The ${engineName(engine)} runtime connection was interrupted${evidence}. Guild is restoring the original session and will not resend this instruction automatically, avoiding duplicate changes. Diagnostic details were written to the local log.`;
 }
 
-async function createProductionRuntime(input: {
-  readonly adapterEpoch: AdapterEpoch;
-  readonly sink: AcpV1AdapterSink;
-  readonly stagingRoot: string;
-  readonly workingDirectory: string;
-  readonly runtimeSettings: {
-    readonly permissionMode: GuildGrokPermissionMode;
-    readonly startup: GuildGrokStartupSettings;
-  };
-}) {
+/** The engine's name as the user knows it, for the notices Guild writes into a task. */
+function engineName(engine: GuildEngine): string {
+  return engine === "claude" ? "Claude" : "Grok";
+}
+
+function claudeLoginRequiredMessage(locale: GuildLocale): string {
+  return locale === "zh-CN"
+    ? "Claude Code 尚未登录。请先在终端运行一次 `claude` 并完成登录，然后重试。"
+    : "Claude Code is not logged in. Run `claude` in Terminal once and log in, then retry.";
+}
+
+async function createProductionRuntime(input: Parameters<RuntimeFactory>[0]) {
+  if (input.engine === "claude") {
+    return createClaudeRuntime({
+      adapterEpoch: input.adapterEpoch,
+      sink: input.sink,
+      stagingRoot: input.stagingRoot,
+      workingDirectory: input.workingDirectory,
+      ...(input.extraEnvironment === undefined ? {} : { extraEnvironment: input.extraEnvironment }),
+    });
+  }
   const [located, runtimeEnvironment] = await Promise.all([
     locateOfficialGrokRuntime(),
     resolveOfficialGrokEnvironment(),
@@ -8015,10 +8766,10 @@ function throwIfAborted(signal: AbortSignal): void {
   throw signal.reason instanceof Error ? signal.reason : new Error("operation_aborted");
 }
 
-function promptFailureMessage(locale: GuildLocale): string {
+function promptFailureMessage(locale: GuildLocale, engine: GuildEngine): string {
   return locale === "zh-CN"
-    ? "Grok 返回了无法处理的错误，本轮已经停止。你的消息仍保留在对话中，可以直接重试。"
-    : "Grok returned an error that could not be processed. This turn has stopped, and your message remains in the conversation so you can retry it.";
+    ? `${engineName(engine)} 返回了无法处理的错误，本轮已经停止。你的消息仍保留在对话中，可以直接重试。`
+    : `${engineName(engine)} returned an error that could not be processed. This turn has stopped, and your message remains in the conversation so you can retry it.`;
 }
 
 function createUsageOnlySink(): AcpV1AdapterSink {
@@ -8196,6 +8947,7 @@ function recoveryToolPaths(
 }
 
 function replacementRecoveryCapsule(input: {
+  readonly engineName: string;
   readonly taskId: TaskId;
   readonly title: string;
   readonly workspacePath: string;
@@ -8213,7 +8965,7 @@ function replacementRecoveryCapsule(input: {
     : input.observedPaths.map((path) => `- ${truncateRecoverySection(path, 480)}`).join("\n");
   const capsule = [
     "[Guild replacement-session recovery context]",
-    "The prior official Grok session for this exact Guild task could not be resumed. This is a replacement session, not a new or different task.",
+    `The prior official ${input.engineName} session for this exact Guild task could not be resumed. This is a replacement session, not a new or different task.`,
     "Treat this task-local capsule and the current user message as authoritative. Do not infer a different project from global memory, another conversation, or a sibling folder.",
     "Before using tools, verify that the target matches this task. If the task identity or target path conflicts, stop and ask the user instead of editing.",
     `Guild task ID: ${input.taskId}`,

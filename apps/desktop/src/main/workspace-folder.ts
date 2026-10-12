@@ -4,6 +4,12 @@ import { isAbsolute } from "node:path";
 export const WORKSPACE_FOLDER_MISSING = "workspace_folder_missing";
 export const SESSION_RECOVERY_CONTEXT_REQUIRED = "session_recovery_context_required";
 export const MESSAGE_TOO_LONG = "message_too_long";
+/** PC-ENG-002: the Claude engine reported that nobody is logged in; Guild never logs in for it. */
+export const CLAUDE_LOGIN_REQUIRED = "claude_login_required";
+/** PC-ENG-001: the task has a Run or switched to a router model, so its engine can no longer change. */
+export const TASK_ENGINE_LOCKED = "task_engine_locked";
+/** Docs/20 3.3: a routed task needs the model router, which is not available. */
+export const MODEL_ROUTER_UNAVAILABLE = "model_router_unavailable";
 
 export async function workspaceFolderExists(canonicalPath: string): Promise<boolean> {
   if (canonicalPath.length === 0 || !isAbsolute(canonicalPath)) {
@@ -32,7 +38,10 @@ export function toDesktopIpcFailure(cause: unknown): Error {
   if (
     message === WORKSPACE_FOLDER_MISSING ||
     message === SESSION_RECOVERY_CONTEXT_REQUIRED ||
-    message === MESSAGE_TOO_LONG
+    message === MESSAGE_TOO_LONG ||
+    message === CLAUDE_LOGIN_REQUIRED ||
+    message === TASK_ENGINE_LOCKED ||
+    message === MODEL_ROUTER_UNAVAILABLE
   ) {
     return new Error(message);
   }
