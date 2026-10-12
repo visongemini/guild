@@ -318,6 +318,11 @@ span.guild-pill { cursor: default; }
 .guild-empty-task .guild-banny { width: 76px; height: 92px; margin-bottom: var(--guild-s2); }
 .guild-empty-task h1 { margin: 0; color: var(--guild-text); font-size: clamp(22px, 2.5vw, 28px); line-height: 1.35; letter-spacing: -.025em; }
 .guild-empty-task > p { margin: 0; color: var(--guild-muted); font-size: 14px; }
+.guild-empty-task h1.guild-acronym { display: flex; justify-content: center; gap: clamp(16px, 3vw, 40px); margin-bottom: var(--guild-s2); letter-spacing: 0; }
+.guild-acronym span { display: grid; justify-items: center; gap: 3px; min-width: 56px; }
+.guild-acronym b { color: var(--guild-text); font-size: clamp(30px, 3.4vw, 42px); font-weight: 700; line-height: 1.05; }
+.guild-acronym small { color: var(--guild-faint); font-size: 11px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; }
+.guild-acronym em { color: var(--guild-muted); font-size: 14px; font-style: normal; font-weight: 500; }
 .guild-starters { width: min(660px, 100%); display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin-top: var(--guild-s6); }
 .guild-starters button { position: relative; color: var(--guild-text); min-width: 0; min-height: 96px; display: flex; flex-direction: column; align-items: flex-start; justify-content: space-between; gap: var(--guild-s4); padding: var(--guild-s4); border: 1px solid var(--guild-line); border-radius: var(--guild-r-lg); background: var(--guild-surface); box-shadow: var(--guild-shadow-1); text-align: left; cursor: pointer; transition: background-color var(--guild-dur-1) var(--guild-ease), border-color var(--guild-dur-1) var(--guild-ease); }
 .guild-starters button svg:first-child { color: var(--guild-accent); }
@@ -1263,6 +1268,8 @@ span.guild-pill { cursor: default; }
   .guild-starters button > svg:last-child { position: static; }
   .guild-empty-task { padding: var(--guild-s2) 0; }
   .guild-empty-task .guild-banny { width: 56px; height: 68px; }
+  .guild-empty-task h1.guild-acronym { gap: 12px; }
+  .guild-acronym span { min-width: 0; }
   .guild-composer-hints { display: none; }
   .guild-control-layout, .guild-control-layout.browsing { grid-template-columns: 128px minmax(0,1fr); }
   .guild-control-layout:not(.browsing) .guild-control-browser { display: none; }

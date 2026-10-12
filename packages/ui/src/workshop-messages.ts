@@ -5,7 +5,9 @@ import type { AcpToolKind } from "@guild/contracts";
 export const WORKSHOP_ZH = {
   tools: "工具", appearance: "外观与阅读", theme: "主题", lightTheme: "暖白", darkTheme: "深色", systemTheme: "跟随系统",
   textSize: "正文字号", standardText: "标准 · 15", largeText: "大字 · 18", density: "界面密度", comfortable: "舒适", compact: "紧凑",
-  starterTitle: "从一个清楚的目标开始", starterHelp: "选一个起点，补充细节后发送。", starterReview: "审查项目", starterBuild: "实现功能", starterExplain: "理解代码",
+  starterTitle: "GUILD：目标、读懂、动手、迭代、交付",
+  guildGoal: "目标", guildUnderstand: "读懂", guildImplement: "动手", guildLoop: "迭代", guildDeliver: "交付",
+  starterHelp: "选一个起点，补充细节后发送。", starterReview: "审查项目", starterBuild: "实现功能", starterExplain: "理解代码",
   starterReviewDraft: "请审查这个项目，找出影响正确性、使用体验和维护成本的问题。先给出证据和修复优先级。",
   starterBuildDraft: "我想在这个项目中实现一个功能：\n\n请先确认现有实现，再完成修改和必要验证。",
   starterExplainDraft: "请解释这个项目的结构、启动方式和主要数据流程，指出最值得先阅读的文件。",
@@ -42,7 +44,9 @@ export const WORKSHOP_ZH = {
 export const WORKSHOP_EN: { readonly [K in keyof typeof WORKSHOP_ZH]: typeof WORKSHOP_ZH[K] extends (...args: infer A) => string ? (...args: A) => string : string } = {
   tools: "Tools", appearance: "Appearance & reading", theme: "Theme", lightTheme: "Warm light", darkTheme: "Dark", systemTheme: "System",
   textSize: "Message size", standardText: "Standard · 15", largeText: "Large · 18", density: "Density", comfortable: "Comfortable", compact: "Compact",
-  starterTitle: "Start with a clear goal", starterHelp: "Choose a starting point, add details, then send.", starterReview: "Review project", starterBuild: "Build a feature", starterExplain: "Understand code",
+  starterTitle: "GUILD: Goal, Understand, Implement, Loop, Deliver",
+  guildGoal: "", guildUnderstand: "", guildImplement: "", guildLoop: "", guildDeliver: "",
+  starterHelp: "Choose a starting point, add details, then send.", starterReview: "Review project", starterBuild: "Build a feature", starterExplain: "Understand code",
   starterReviewDraft: "Review this project for correctness, usability, and maintainability. Show evidence and prioritize fixes first.",
   starterBuildDraft: "I want to add this feature to the project:\n\nInspect the current implementation, make the changes, and verify the result.",
   starterExplainDraft: "Explain this project's structure, startup steps, and main data flow. Point out the best files to read first.",

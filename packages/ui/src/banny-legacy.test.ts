@@ -24,7 +24,7 @@ describe("Banny mascot", () => {
     const app = await readFile(new URL("../src/App.tsx", import.meta.url), "utf8");
     const css = await readFile(new URL("../src/styles.css", import.meta.url), "utf8");
     assert.equal(app.match(/BANNY_ASSET_URL/gu)?.length, 2, "one definition and one use");
-    assert.match(app, /<div className="guild-empty-task">\s*<img className="guild-banny" src=\{BANNY_ASSET_URL\} alt="" draggable=\{false\} \/>\s*<h1>\{messages\.starterTitle\}<\/h1>/u);
+    assert.match(app, /<div className="guild-empty-task">\s*<img className="guild-banny" src=\{BANNY_ASSET_URL\} alt="" draggable=\{false\} \/>\s*<h1 className="guild-acronym" aria-label=\{messages\.starterTitle\}>/u);
     assert.doesNotMatch(app, /BANNY_DRAG_MIME|guild-banny-floating|guild-task-banny|banny-seated/u);
     assert.doesNotMatch(css, /guild-banny-floating|guild-banny-home-target|guild-task-banny|banny-dragging|banny-drop-target/u);
   });

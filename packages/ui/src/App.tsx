@@ -2326,7 +2326,14 @@ export function GuildApp({ api }: GuildAppProps) {
           ) : activeTimeline.length === 0 && pendingSendForActive === undefined ? (
             <div className="guild-empty-task">
               <img className="guild-banny" src={BANNY_ASSET_URL} alt="" draggable={false} />
-              <h1>{messages.starterTitle}</h1><p>{messages.starterHelp}</p>
+              <h1 className="guild-acronym" aria-label={messages.starterTitle}>{([
+                ["G", "Goal", messages.guildGoal],
+                ["U", "Understand", messages.guildUnderstand],
+                ["I", "Implement", messages.guildImplement],
+                ["L", "Loop", messages.guildLoop],
+                ["D", "Deliver", messages.guildDeliver],
+              ] as const).map(([letter, word, gloss]) => <span key={letter} aria-hidden="true"><b>{letter}</b><small>{word}</small>{gloss !== "" && <em>{gloss}</em>}</span>)}</h1>
+              <p>{messages.starterHelp}</p>
               <div className="guild-starters">{([
                 [messages.starterReview, messages.starterReviewDraft, <MagnifyingGlass size={19} />],
                 [messages.starterBuild, messages.starterBuildDraft, <Code size={19} />],
