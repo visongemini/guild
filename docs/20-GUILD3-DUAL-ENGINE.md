@@ -181,8 +181,10 @@ created and never changes. Process topology stays one engine process per task (D
   "Take over") and the active tab and its page when it starts, and every step goes to that tab. Right
   before each CDP command and each navigation the call checks the generation (mismatch: the paused
   message) and that its tab is still open (else a tab-changed message). Input and screenshots also
-  need the bound tab to still be the shown one, and until a call has sent input, `DOM.*` and `Input.*`
-  steps need the page not to have navigated since the call began (a ref or coordinate belongs to that page).
+  need the bound tab to still be the shown one, and until a call has sent actionable input (a pressed mouse
+  button, a key going down or a typed character, inserted text; pointer movement and wheel events do not
+  count), `DOM.*` and `Input.*` steps need the page not to have navigated since the call began (a ref or
+  coordinate belongs to that page).
 
 ### 3.6 OpenViking (D-060)
 Claude engine: OpenViking on (no kill-switch env). Routed Claude sessions: `OPENVIKING_AUTO_CAPTURE=false`

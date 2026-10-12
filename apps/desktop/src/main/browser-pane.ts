@@ -287,7 +287,10 @@ type ToolCall = {
   tab: Tab | undefined;
   /** The page of that tab at the start. */
   page: { readonly url: string; readonly navEpoch: number } | undefined;
-  /** Set once the call sent input: its later steps finish that gesture on the page it validated. */
+  /**
+   * Set once the call sent actionable input (see `isActionableInput`): its later steps finish that
+   * gesture on the page it validated. Pointer movement and wheel events do not set it.
+   */
   inputDispatched: boolean;
 };
 
@@ -295,7 +298,26 @@ type ToolCall = {
 const RENDER_DEPENDENT_METHOD = /^(?:Input\.|Page\.captureScreenshot$)/u;
 /** Steps that act on, or compute from, the page the call started on. */
 const PAGE_BOUND_METHOD = /^(?:DOM\.|Input\.)/u;
-const INPUT_METHOD = /^Input\./u;
+
+/**
+ * Input that acts on the page, which ends the check that the page is still the one the call started
+ * on: a pressed button, a key going down, a typed character or inserted text. Moving the pointer or
+ * the wheel changes nothing there, so a click that navigates in between its `mouseMoved` and its
+ * `mousePressed` is still stopped. Everything else under `Input.` stays validated.
+ */
+function isActionableInput(method: string, params: Record<string, unknown> | undefined): boolean {
+  const type = params?.["type"];
+  switch (method) {
+    case "Input.insertText":
+      return true;
+    case "Input.dispatchMouseEvent":
+      return type === "mousePressed";
+    case "Input.dispatchKeyEvent":
+      return type === "keyDown" || type === "rawKeyDown" || type === "char";
+    default:
+      return false;
+  }
+}
 
 type Tab = {
   readonly id: string;
@@ -765,7 +787,7 @@ export function createBrowserPaneController(deps: BrowserPaneDeps): BrowserPaneC
     if (RENDER_DEPENDENT_METHOD.test(method) && tab.id !== activeTabId) {
       throw new BrowserToolError(BROWSER_PANE_TAB_CHANGED_MESSAGE);
     }
-    // Refs and coordinates were computed on the page the call started on; until input is sent, it must still be that page.
+    // Refs and coordinates were computed on the page the call started on; until actionable input is sent, it must still be that page.
     if (!call.inputDispatched && PAGE_BOUND_METHOD.test(method)) {
       const page = call.page;
       if (page === undefined || page.navEpoch !== tab.navEpoch || page.url !== urlOf(tab)) {
@@ -780,7 +802,7 @@ export function createBrowserPaneController(deps: BrowserPaneDeps): BrowserPaneC
     assertTabCurrent(call, tab);
     return sendCdp(tab, method, params, () => {
       assertStepAllowed(call, tab, method);
-      if (INPUT_METHOD.test(method)) call.inputDispatched = true;
+      if (isActionableInput(method, params)) call.inputDispatched = true;
     });
   }
 
