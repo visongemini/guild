@@ -1399,6 +1399,69 @@ describe("dual engine orchestration [PC-ENG-001, PC-MODEL-001]", () => {
     assert.notEqual(report?.status, "not_logged_in");
   });
 
+  it("keeps the native Claude model list when a routed process reports its degraded one, in the picker and in the cache [PC-MODEL-001, D-064]", async () => {
+    const router = new FakeRouterHost([DEEPSEEK]);
+    const h = await harness({ modelRouterHost: router }, {
+      claude: { routedNativeList: { models: ["default", "opus"], defaultDescription: "Opus" } },
+    });
+    const nativeRows = async () => (await h.service.bootstrap()).runtimeSettings.modelCatalogs!.claude.models
+      .filter((model) => model.group === "claude")
+      .map((model) => [model.id, model.description]);
+    const task = await h.service.createTask(h.workspaceId, undefined, "claude");
+    const taskId = task.task.taskId;
+    await h.send(taskId, "native");
+    await h.completed();
+    await h.idle();
+    const full = await nativeRows();
+    assert.deepEqual(full.map(([id]) => id), [...NATIVE_MODELS]);
+    assert.deepEqual(full[0], ["default", "Opus 5.5"]);
+
+    // The routed process lists a poorer set of Claude's models; none of it reaches the picker.
+    assert.equal((await h.service.setTaskRuntimeSettings({ taskId, model: "deepseek-v4-flash", reasoningEffort: null, contextWindow: null })).status, "applied");
+    await h.send(taskId, "routed");
+    await h.completed(2);
+    await h.idle();
+    const routed = h.world.adapters[1]!;
+    assert.deepEqual(routed.modelValues(), ["default", "opus", "deepseek-v4-flash"], "the routed process really lists the degraded set");
+    assert.deepEqual(await nativeRows(), full);
+    // Nor does it reach the persisted list: a Guild that starts again shows the native one.
+    await h.restart({ modelRouterHost: undefined });
+    assert.deepEqual(await nativeRows(), full);
+
+    // The native process is the one that updates it, also after the routed one.
+    await h.restart({ modelRouterHost: router });
+    await h.service.openTask(taskId);
+    assert.equal((await h.service.setTaskRuntimeSettings({ taskId, model: "sonnet", reasoningEffort: null, contextWindow: null })).status, "applied");
+    await h.send(taskId, "native again");
+    await h.completed(3);
+    assert.deepEqual(await nativeRows(), full);
+  });
+
+  it("leaves the native Claude list empty when only a routed process has reported since Guild opened, and takes the native one when it comes [PC-MODEL-001, D-064]", async () => {
+    const router = new FakeRouterHost([DEEPSEEK]);
+    const h = await harness({ modelRouterHost: router }, {
+      claude: { routedNativeList: { models: ["default", "opus"], defaultDescription: "Opus" } },
+    });
+    const claudeIds = async () => (await h.service.bootstrap()).runtimeSettings.modelCatalogs!.claude.models.map((model) => model.id);
+    const task = await h.service.createTask(h.workspaceId, undefined, "claude");
+    const taskId = task.task.taskId;
+    await h.service.setTaskRuntimeSettings({ taskId, model: "deepseek-v4-flash", reasoningEffort: null, contextWindow: null });
+    await h.send(taskId, "routed first");
+    await h.completed();
+    await h.idle();
+    assert.deepEqual(h.world.adapters[0]!.modelValues(), ["default", "opus", "deepseek-v4-flash"]);
+    assert.deepEqual(await claudeIds(), ["deepseek-v4-flash"], "the routed list is not Claude's own list");
+    await h.restart({ modelRouterHost: undefined });
+    assert.deepEqual(await claudeIds(), [], "and nothing of it was cached");
+
+    await h.restart({ modelRouterHost: router });
+    await h.service.openTask(taskId);
+    await h.service.setTaskRuntimeSettings({ taskId, model: "opus", reasoningEffort: null, contextWindow: null });
+    await h.send(taskId, "native");
+    await h.completed(2);
+    assert.deepEqual(await claudeIds(), [...NATIVE_MODELS, "deepseek-v4-flash"]);
+  });
+
   it("maps Steer to the Claude steering request and queues what it cannot inject [docs/20 3.8]", async () => {
     // injected
     const injected = await harness();
@@ -1804,6 +1867,11 @@ type EngineSpec = {
   resumeGate?: Promise<void>;
   /** Claude: the Default row describes no model (the real adapter does, but a version of it may not). */
   readonly vagueDefault?: boolean;
+  /**
+   * Claude: what a routed process (one started with a modelPicker) lists as Claude's own models. It runs on an
+   * API token, so the real list is a degraded one: fewer models and a Default row that only says "Opus".
+   */
+  readonly routedNativeList?: { readonly models: readonly string[]; readonly defaultDescription: string };
 };
 
 type World = {
@@ -2120,7 +2188,13 @@ class EngineFake implements RuntimeAdapterPort {
       const picker = (startOptions?.claudeCodeOptions as
         { settings?: { modelPicker?: { options?: Array<{ model: string }> } } } | undefined)
         ?.settings?.modelPicker?.options?.map((entry) => entry.model) ?? [];
-      this.options = claudeOptions([...NATIVE_MODELS, ...picker], this.options, this.spec.vagueDefault === true);
+      const routedList = picker.length > 0 ? this.spec.routedNativeList : undefined;
+      this.options = claudeOptions(
+        [...(routedList?.models ?? NATIVE_MODELS), ...picker],
+        this.options,
+        this.spec.vagueDefault === true,
+        routedList?.defaultDescription,
+      );
       const lastModel = establishedBy !== "resume"
         ? undefined
         : this.spec.resumedModel ??
@@ -2214,6 +2288,15 @@ class EngineFake implements RuntimeAdapterPort {
     return this.state === "ready";
   }
 
+  /** The values of the session's model option: what this process really lists. */
+  modelValues(): string[] {
+    const option = this.options.find((candidate) => candidate.id === "model");
+    if (option === undefined || option.type !== "select") return [];
+    return option.choices.form === "flat"
+      ? option.choices.options.map((choice) => choice.value)
+      : option.choices.groups.flatMap((group) => group.options.map((choice) => choice.value));
+  }
+
   async close(): Promise<void> {
     if (this.state === "closed") return;
     this.note("close");
@@ -2272,7 +2355,12 @@ const lapsedResumes = new WeakMap<EngineSpec, number>();
 /** The error codes the next resumes of a spec fail with, in order (consumed one per resume). */
 const resumeFailureCodes = new WeakMap<EngineSpec, AcpV1AdapterError["code"][]>();
 
-function claudeOptions(models: readonly string[], previous: readonly RuntimeConfigOption[], vagueDefault = false): readonly RuntimeConfigOption[] {
+function claudeOptions(
+  models: readonly string[],
+  previous: readonly RuntimeConfigOption[],
+  vagueDefault = false,
+  defaultDescription = "Opus 5.5",
+): readonly RuntimeConfigOption[] {
   const current = (id: string, fallback: string): string => {
     const option = previous.find((candidate) => candidate.id === id);
     return option?.type === "select" ? option.currentValue : fallback;
@@ -2280,7 +2368,7 @@ function claudeOptions(models: readonly string[], previous: readonly RuntimeConf
   const flat = (values: readonly string[]) => ({
     form: "flat" as const,
     // The adapter's Default row says which model it stands for, like the real adapter does.
-    options: values.map((value) => ({ value, name: value, ...(value === "default" && !vagueDefault ? { description: "Opus 5.5" } : {}) })),
+    options: values.map((value) => ({ value, name: value, ...(value === "default" && !vagueDefault ? { description: defaultDescription } : {}) })),
   });
   return Object.freeze([
     {

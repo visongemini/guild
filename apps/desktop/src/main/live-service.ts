@@ -892,7 +892,10 @@ export function createLiveDesktopService(
    * Claude's own models as the adapter reported them (group `claude`). The adapter's `model` option
    * also lists whatever Guild put in the session's `modelPicker`, so those ids are dropped here: they
    * belong to the router's sources, not to the Claude subscription. Efforts are only reported for the
-   * model that is selected, so the ones seen for a model earlier are kept.
+   * model that is selected, so the ones seen for a model earlier are kept. Only a native process
+   * reaches this (see `applySessionOptions`): a routed process runs with an API token, so its list of
+   * Claude's models is a degraded one (a bare Default row, no older models) and must neither replace
+   * the picker's list nor the persisted cache.
    */
   function noteClaudeNativeCatalog(
     derived: ModelCatalog | undefined,
@@ -990,11 +993,14 @@ export function createLiveDesktopService(
     return engine === "claude" ? claudeCatalogProjection() : modelCatalog;
   }
 
-  /** The one place a session's config options are stored, so a Claude model list is never missed. */
+  /**
+   * The one place a session's config options are stored, so a Claude model list is never missed. Only a native
+   * process may set the native Claude catalog, the same rule as the account label (D-062, D-064).
+   */
   function applySessionOptions(controller: RuntimeController, options: readonly RuntimeConfigOption[]): void {
     controller.sessionConfigOptions = options;
     if (controller.engine === "claude") {
-      noteClaudeNativeCatalog(deriveClaudeModelCatalog(options), controller.pickerModelIds);
+      if (!controller.routedProcess) noteClaudeNativeCatalog(deriveClaudeModelCatalog(options), controller.pickerModelIds);
       syncClaudePermissionModes(controller, options);
     }
   }
