@@ -810,6 +810,17 @@ function routerSummary() {
   };
 }
 
+/** Opens the picker once its trigger is enabled again (a switch or a turn holds the selection). */
+async function openPicker() {
+  await until("model picker trigger enabled", async () => {
+    const value = await cdp.evaluate(locate(".guild-model-picker-trigger"));
+    return value !== null && !value.disabled ? value : undefined;
+  }, { timeout: 60_000 });
+  if (!(await domExists(".guild-model-popover"))) await clickDom(".guild-model-picker-trigger");
+  await until("model popover", () => domExists(".guild-model-popover"), { timeout: 10_000 });
+  await sleep(300);
+}
+
 async function closePicker() {
   await cdp.evaluate(`document.querySelector(".guild-model-picker")?.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }))`);
   await sleep(300);
@@ -858,9 +869,7 @@ async function checkC() {
   if (tools.length === 0 || !tools.some((item) => item.toolStatus === "completed")) throw new Error("DeepSeek turn used no completed tool");
 
   // 2. On the routed task the Claude rows are ordinary rows again, tagged, and so is "Use default"; nothing is locked.
-  await clickDom(".guild-model-picker-trigger");
-  await until("model popover", () => domExists(".guild-model-popover"), { timeout: 10_000 });
-  await sleep(300);
+  await openPicker();
   details.pickerTagsOnRoutedTask = await readPickerTags();
   assertRestartTags(details.pickerTagsOnRoutedTask, "routed", "routed task, Claude rows");
   await shot("C", "claude-rows-restart-tags-on-routed-task");
