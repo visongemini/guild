@@ -42,8 +42,12 @@ function leaderWithDescendant(closeStdio) {
 }
 
 // An engine helper that leaves the engine's process group (an MCP server in a session of its own).
-function leaderWithDetachedHelper() {
-  const helper = spawn(node, ["-e", "setInterval(() => undefined, 1000)"], { detached: true, stdio: "ignore" });
+// With `holdStdio` it also keeps the engine's stdout and stderr open, which keeps the engine's `close` from firing.
+function leaderWithDetachedHelper(holdStdio) {
+  const helper = spawn(node, ["-e", "setInterval(() => undefined, 1000)"], {
+    detached: true,
+    stdio: holdStdio ? ["ignore", "inherit", "inherit"] : "ignore",
+  });
   helper.unref();
   if (helper.pid === undefined) {
     process.exit(93);
@@ -104,7 +108,10 @@ switch (mode) {
     leaderWithDescendant(true);
     break;
   case "detached-helper":
-    leaderWithDetachedHelper();
+    leaderWithDetachedHelper(false);
+    break;
+  case "detached-helper-hold-stdio":
+    leaderWithDetachedHelper(true);
     break;
   default:
     process.exit(92);

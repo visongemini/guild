@@ -28,9 +28,12 @@ import {
   type PinnedExecutableCleanup,
 } from "./executable-pin.js";
 import {
+  readChildIdentity,
   snapshotDescendants,
   terminateDescendants,
   type DescendantRecord,
+  type DescendantSnapshot,
+  type ProcessIdentity,
 } from "./process-tree.js";
 
 export type ProcessHostPreflightCode =
@@ -185,8 +188,10 @@ export type InternalProcessHostTestConfiguration = {
   readonly cleanupPinned?: (pinned: PinnedExecutable) => Promise<PinnedExecutableCleanup>;
   readonly signalGroup?: (processGroupId: number, signal: "SIGTERM" | "SIGKILL") => ProcessGroupSignalEvidence;
   readonly probeGroup?: (processGroupId: number) => ProcessGroupProbeEvidence;
+  /** The engine's pid and start time, read right after it was spawned. */
+  readonly readProcessIdentity?: (pid: number) => Promise<ProcessIdentity | undefined>;
   /** The engine's descendants outside its process group, read while the engine is still alive. */
-  readonly snapshotDescendants?: (rootPid: number, rootGroupId: number) => Promise<readonly DescendantRecord[]>;
+  readonly snapshotDescendants?: (root: ProcessIdentity, rootGroupId: number) => Promise<DescendantSnapshot>;
   /** Ends the snapshot's processes that are still the same ones; called once the group is gone. */
   readonly terminateDescendants?: (records: readonly DescendantRecord[]) => Promise<unknown>;
   readonly delay?: (milliseconds: number) => Promise<void>;
@@ -242,8 +247,11 @@ class ProcessHostCore {
   private groupTermSignal: ProcessGroupSignalEvidence | undefined;
   private groupKillSignal: ProcessGroupSignalEvidence | undefined;
   private groupGoneObserved = false;
+  /** Who the engine is, recorded at spawn so a recycled pid is never taken for it (see process-tree.ts). */
+  private engineIdentity: Promise<ProcessIdentity | undefined> = Promise.resolve(undefined);
   /** Helpers of the engine that left its process group, read at stop time (see process-tree.ts). */
   private descendantSnapshot: readonly DescendantRecord[] = [];
+  private helperSweep: Promise<void> | undefined;
   private closeEvidence: ProcessCloseEvidence | undefined;
   private cleanupOperation: Promise<PinnedExecutableCleanup> | undefined;
   private cleanupEvidenceOperation: Promise<ProcessCleanupEvidence> | undefined;
@@ -408,6 +416,7 @@ class ProcessHostCore {
         }
         settled = true;
         this.spawnSucceeded = true;
+        this.engineIdentity = this.lifecycle.readProcessIdentity(pid).catch(() => undefined);
         this.processGroupId = pid;
         this.currentState = this.explicitStopRequested ? "stopping" : "running";
         const receipt: ProcessStartReceipt = {
@@ -469,8 +478,7 @@ class ProcessHostCore {
     // below, and once the engine is gone nothing links them to it any more: read them now.
     const enginePid = this.child?.pid;
     if (enginePid !== undefined && !this.exitObserved && this.closeEvidence === undefined) {
-      this.descendantSnapshot = await this.lifecycle.snapshotDescendants(enginePid, processGroupId)
-        .catch(() => Object.freeze([]) as readonly DescendantRecord[]);
+      await this.snapshotHelpers(enginePid, processGroupId);
     }
     this.observeGroupGone();
     this.groupTermSignal = this.groupGoneObserved
@@ -510,6 +518,11 @@ class ProcessHostCore {
     while (true) {
       // Probe on every lifecycle poll, including while close evidence is delayed.
       const groupGone = this.observeGroupGone();
+      if (groupGone) {
+        // An escaped helper can hold the engine's stdout open, and then `close` never fires: end the
+        // helpers as soon as the group is gone instead of after the close they may be preventing.
+        void this.sweepHelpers();
+      }
       if (this.closeEvidence !== undefined && groupGone) {
         return true;
       }
@@ -545,11 +558,7 @@ class ProcessHostCore {
     if (close === undefined || !this.groupGoneObserved) {
       throw new Error("reap completion requires direct close and confirmed group absence");
     }
-    if (this.descendantSnapshot.length > 0) {
-      const records = this.descendantSnapshot;
-      this.descendantSnapshot = [];
-      await this.lifecycle.terminateDescendants(records).catch(() => undefined);
-    }
+    await this.sweepHelpers();
     const cleanup = await this.cleanupPin();
     const groupTermSignal = this.groupTermSignal ?? { signal: "SIGTERM", outcome: "already_gone" };
     const receipt: ProcessStopReceipt = {
@@ -574,7 +583,49 @@ class ProcessHostCore {
     return receipt;
   }
 
+  /**
+   * Records the engine's escaped helpers, but only through the identity read at spawn: the engine must
+   * show up with the same start time in the table the helpers are read from. Otherwise nothing is swept.
+   */
+  private async snapshotHelpers(enginePid: number, processGroupId: number): Promise<void> {
+    const identity = await this.engineIdentity;
+    let snapshot: DescendantSnapshot | undefined;
+    if (identity !== undefined && identity.pid === enginePid) {
+      try {
+        snapshot = await this.lifecycle.snapshotDescendants(identity, processGroupId);
+      } catch {
+        return;
+      }
+    }
+    if (snapshot?.rootVerified !== true) {
+      console.warn("helper_sweep_skipped_identity", { pid: enginePid });
+      return;
+    }
+    this.descendantSnapshot = snapshot.records;
+  }
+
+  /** Ends the snapshot's helpers; the first caller starts it, every later caller shares it. Never rejects. */
+  private sweepHelpers(): Promise<void> {
+    this.helperSweep ??= this.beginHelperSweep();
+    return this.helperSweep;
+  }
+
+  private async beginHelperSweep(): Promise<void> {
+    const records = this.descendantSnapshot;
+    this.descendantSnapshot = [];
+    if (records.length === 0) {
+      return;
+    }
+    try {
+      await this.lifecycle.terminateDescendants(records);
+    } catch {
+      // Best effort: the sweep does not decide the outcome of the stop.
+    }
+  }
+
   private async failReap(failure: Extract<ProcessHostFailure, { type: "reap_timeout" }>): Promise<never> {
+    // A stop that timed out still ends the helpers it found: they are Guild's to clean up either way.
+    await this.sweepHelpers();
     const cleanup = await this.cleanupPin();
     const error = new GrokProcessHostError(failure);
     this.currentState = "failed";
@@ -773,6 +824,7 @@ const PRODUCTION_LIFECYCLE = Object.freeze<ProcessHostLifecycle>({
   cleanupPinned: (pinned) => pinned.cleanup(),
   signalGroup,
   probeGroup,
+  readProcessIdentity: readChildIdentity,
   snapshotDescendants,
   terminateDescendants,
   delay,
@@ -796,6 +848,7 @@ export function createInternalProcessHostForTesting(
     cleanupPinned: configuration.cleanupPinned ?? PRODUCTION_LIFECYCLE.cleanupPinned,
     signalGroup: configuration.signalGroup ?? PRODUCTION_LIFECYCLE.signalGroup,
     probeGroup: configuration.probeGroup ?? PRODUCTION_LIFECYCLE.probeGroup,
+    readProcessIdentity: configuration.readProcessIdentity ?? PRODUCTION_LIFECYCLE.readProcessIdentity,
     snapshotDescendants: configuration.snapshotDescendants ?? PRODUCTION_LIFECYCLE.snapshotDescendants,
     terminateDescendants: configuration.terminateDescendants ?? PRODUCTION_LIFECYCLE.terminateDescendants,
     delay: configuration.delay ?? PRODUCTION_LIFECYCLE.delay,

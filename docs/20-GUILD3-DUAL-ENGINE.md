@@ -98,13 +98,17 @@ created and never changes. Process topology stays one engine process per task (D
   agent that does not advertise resume.
 - Shutdown and helpers (both engines): the process host signals the engine's process group (TERM, then KILL).
   Helpers the engine started that left its group (Grok's MCP servers such as `chrome-devtools-mcp`, Claude's
-  plugin and connector processes in a session of their own) are not reached by that signal and used to
-  survive a graceful quit. At stop time, while the engine is alive, the host reads its descendants outside the
-  group (`ps -axo pid=,ppid=,pgid=,lstart=`, walked from the engine pid, at most 256, 1 s bound); after the
-  group is gone it sends TERM, then KILL, to exactly those processes, and only to a process whose pid, group
-  and start time still match the snapshot. Nothing outside the engine's tree is touched. Limitation: an engine
-  that dies on its own (crash, kill from outside) has already re-parented its helpers, so nothing links them to
-  it and they are not swept.
+  plugin and connector processes in a session of their own) are not reached by that signal and used to survive a
+  graceful quit. The host records the engine's identity (pid and `ps` start time) right after the spawn. At stop
+  time, while the engine is alive, it reads the engine's descendants outside the group
+  (`ps -axo pid=,ppid=,pgid=,lstart=`, walked from the engine pid, at most 256, 1 s bound) and keeps the
+  snapshot only if that same table shows the engine with the recorded start time; if the root is missing or its
+  start time differs (the pid was reused), it sweeps nothing and logs `helper_sweep_skipped_identity`. As soon as
+  the group is gone it sends TERM, then KILL, to exactly those processes, and only to a process whose pid, group
+  and start time still match the snapshot. It does not wait for the engine's stdout to close first (a helper
+  that inherited it would keep that from ever happening), and a stop that times out sweeps once too. Nothing
+  outside the engine's tree is touched. Limitation: an engine that dies on its own (crash, kill from outside)
+  has already re-parented its helpers, so nothing links them to it and they are not swept.
 - Auth: never call `authenticate` for Claude. If `authMethods` is non-empty and the first session
   fails with auth required, show "Run `claude` once in Terminal and log in" (named reduced state).
 
