@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 
 /**
  * A modal dialog of the app (D-064). The narrow-window workbench is `aria-modal` too, but it is a panel of the page
@@ -11,6 +11,16 @@ export const FOCUS_HISTORY_LIMIT = 8;
 
 export function modalPresent(root: Pick<ParentNode, "querySelector">): boolean {
   return root.querySelector(MODAL_SELECTOR) !== null;
+}
+
+/**
+ * The value to store when a modal appeared or went, nothing when the stored value already says so. The check runs after
+ * every commit of the app, so it must not set state for a value that is already stored: a same-value update from a
+ * layout effect can still schedule a render, and a render that is not skipped runs the effect again (the live QA hit
+ * "Maximum update depth exceeded" this way when a routed model switch settled).
+ */
+export function modalStateChange(stored: boolean, present: boolean): boolean | undefined {
+  return stored === present ? undefined : present;
 }
 
 /** Newest first, without repeats, at most `limit` entries. */
@@ -47,8 +57,15 @@ function canTakeFocus(element: HTMLElement): boolean {
  */
 export function useModalLayer(): boolean {
   const [open, setOpen] = useState(false);
+  const stored = useRef(false);
   const history = useRef<readonly HTMLElement[]>([]);
   const wasOpen = useRef(false);
+  const sync = useCallback(() => {
+    const change = modalStateChange(stored.current, modalPresent(document));
+    if (change === undefined) return;
+    stored.current = change;
+    setOpen(change);
+  }, []);
 
   useEffect(() => {
     const onFocusIn = (event: FocusEvent) => {
@@ -57,17 +74,15 @@ export function useModalLayer(): boolean {
       history.current = rememberFocus(history.current, target);
     };
     document.addEventListener("focusin", onFocusIn, true);
-    const observer = new MutationObserver(() => setOpen(modalPresent(document)));
+    const observer = new MutationObserver(sync);
     observer.observe(document.body, { childList: true });
     return () => {
       document.removeEventListener("focusin", onFocusIn, true);
       observer.disconnect();
     };
-  }, []);
+  }, [sync]);
 
-  useLayoutEffect(() => {
-    setOpen(modalPresent(document));
-  });
+  useLayoutEffect(sync);
 
   useLayoutEffect(() => {
     if (open) {

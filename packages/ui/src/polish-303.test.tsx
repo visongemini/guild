@@ -6,7 +6,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { Timeline } from "./App.js";
 import { BROWSER_OVERLAY_SELECTOR } from "./browser-pane-view.js";
 import { messagesFor } from "./locales.js";
-import { FOCUS_HISTORY_LIMIT, MODAL_SELECTOR, focusIsLost, focusReturnTarget, modalPresent, rememberFocus } from "./modal-layer.js";
+import { FOCUS_HISTORY_LIMIT, MODAL_SELECTOR, focusIsLost, focusReturnTarget, modalPresent, modalStateChange, rememberFocus } from "./modal-layer.js";
 import { newTaskWorkspace, noTaskWorkspaceChip } from "./welcome.js";
 
 /*
@@ -126,6 +126,20 @@ test("a modal is any aria-modal element but the workbench panel, and the browser
   assert.equal(modalPresent({ querySelector: (selector: string) => { seen.push(selector); return null; } } as never), false);
   assert.equal(modalPresent({ querySelector: () => ({}) } as never), true);
   assert.deepEqual(seen, [MODAL_SELECTOR]);
+});
+
+test("the modal check sets state only when a modal appeared or went, never for a value that is already stored", async () => {
+  // It runs after every commit of the app: a same-value update from a layout effect can schedule a render that is not
+  // skipped, which ran the effect again until React gave up ("Maximum update depth exceeded", live QA of 3.0.3).
+  assert.equal(modalStateChange(false, false), undefined);
+  assert.equal(modalStateChange(true, true), undefined);
+  assert.equal(modalStateChange(false, true), true);
+  assert.equal(modalStateChange(true, false), false);
+  const hook = await source("modal-layer.ts");
+  assert.match(hook, /const change = modalStateChange\(stored\.current, modalPresent\(document\)\);\s*if \(change === undefined\) return;\s*stored\.current = change;\s*setOpen\(change\);/u);
+  assert.match(hook, /useLayoutEffect\(sync\);/u, "the after-every-commit check goes through the guard");
+  assert.match(hook, /new MutationObserver\(sync\)/u, "and so does the watch on the body");
+  assert.equal((hook.match(/setOpen\(/gu) ?? []).length, 1, "state is set in one place only");
 });
 
 test("the focus history is newest first, has no repeats and is bounded", () => {
