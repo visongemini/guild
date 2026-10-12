@@ -3,9 +3,10 @@ import { createHash } from "node:crypto";
 import { mkdtemp, mkdir, writeFile, readFile, readdir, rm, rename, symlink, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, basename } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { test, type TestContext } from "node:test";
 import { parseTaskId, parseWindowId, parseWorkspaceId, type Result } from "@guild/contracts";
-import { openGuildPersistence } from "@guild/persistence";
+import { openGuildPersistence, SCHEMA_VERSION } from "@guild/persistence";
 import { finishRestoreShutdown, applyStagedBackup, finishLocalRestore, recoverLocalRestore, sealBackup, stageBackup, validateBackup } from "./local-backup.js";
 async function root(t: TestContext) {
   const path = await mkdtemp(join(tmpdir(), "guild-restore-test-"));
@@ -56,6 +57,66 @@ test("tampered files, legacy manifests, symlinks, unknown paths, and broken SQLi
       await assert.rejects(sealBackup(source, "2.1.0"));
     } else await assert.rejects(validateBackup(source));
   }
+});
+/** Rewrites a sealed backup's database as the previous release (schema 19) made it, then reseals its manifest at that version. */
+async function asSchema19(path: string) {
+  const database = new DatabaseSync(join(path, "guild.sqlite3"));
+  try {
+    database.exec(`
+      PRAGMA foreign_keys = OFF;
+      DROP TABLE IF EXISTS run_model_labels;
+      DELETE FROM schema_migrations WHERE version = 20;
+      CREATE TABLE guild_meta_v19 (
+        singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+        schema_version INTEGER NOT NULL CHECK(schema_version = 19),
+        clean_shutdown INTEGER NOT NULL CHECK(clean_shutdown IN (0, 1)),
+        last_integrity_at_ms INTEGER CHECK(last_integrity_at_ms IS NULL OR last_integrity_at_ms >= 0)
+      ) STRICT;
+      INSERT INTO guild_meta_v19(singleton, schema_version, clean_shutdown, last_integrity_at_ms)
+      SELECT singleton, 19, clean_shutdown, last_integrity_at_ms FROM guild_meta;
+      DROP TABLE guild_meta;
+      ALTER TABLE guild_meta_v19 RENAME TO guild_meta;
+      PRAGMA user_version = 19;
+    `);
+  } finally { database.close(); }
+  await rm(join(path, "manifest.json"));
+  await sealBackup(path, "3.0.1-test");
+  const manifest = JSON.parse(await readFile(join(path, "manifest.json"), "utf8"));
+  await writeFile(join(path, "manifest.json"), JSON.stringify({ ...manifest, schemaVersion: 19 }), { mode: 0o600 });
+}
+async function withManifestSchema(path: string, schemaVersion: number) {
+  const manifest = JSON.parse(await readFile(join(path, "manifest.json"), "utf8"));
+  await writeFile(join(path, "manifest.json"), JSON.stringify({ ...manifest, schemaVersion }), { mode: 0o600 });
+}
+test("a backup made by the previous release (schema 19) restores and migrates forward, a newer or older-than-3.0 one is refused", async (t) => {
+  const base = await root(t), source = join(base, "backup"), live = join(base, "live");
+  await snapshot(source, "Old release"); await snapshot(live, "Current");
+  await asSchema19(source);
+  assert.equal((await validateBackup(source)).schemaVersion, 19);
+  const staged = await stageBackup(source, live);
+  await applyStagedBackup(staged, live);
+  assert.equal(await recoverLocalRestore(live), true);
+  const store = openGuildPersistence({ path: join(live, "guild.sqlite3") });
+  try {
+    assert.equal(store.loadAppSettings().nickname, "Old release");
+    assert.equal(store.verifyIntegrity().schemaVersion, SCHEMA_VERSION, "the restored database migrated to this release's schema");
+  } finally { store.close(); }
+  await finishLocalRestore(live);
+
+  // The manifest must name a schema this build can reach: neither a future one nor one before 3.0.
+  for (const schemaVersion of [SCHEMA_VERSION + 1, 18, 19.5, "19"] as const) {
+    const refused = join(base, "refused-" + String(schemaVersion));
+    await snapshot(refused, "Refused");
+    await withManifestSchema(refused, schemaVersion as number);
+    await assert.rejects(validateBackup(refused), String(schemaVersion));
+  }
+  // A database newer than this build is refused even when its manifest claims the current schema.
+  const future = join(base, "future");
+  await snapshot(future, "Future");
+  const database = new DatabaseSync(join(future, "guild.sqlite3"));
+  try { database.exec(`INSERT INTO schema_migrations(version, name, applied_at_ms) VALUES (${SCHEMA_VERSION + 1}, 'future', 0)`); } finally { database.close(); }
+  await rm(join(future, "manifest.json"));
+  await assert.rejects(sealBackup(future, "9.9.9"));
 });
 test("tool image grants nested in timeline metadata are sealed and verified", async (t) => {
   const source = join(await root(t), "backup");

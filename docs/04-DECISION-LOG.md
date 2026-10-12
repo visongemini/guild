@@ -1159,10 +1159,13 @@ Decisions
 - **Per-turn model attribution.** Schema v20 adds `run_model_labels` (one row per Run: the display name of the
   model the Run started on, written after the engine applied the task's selection and before the prompt goes out).
   Additive, forward-only: Guild 3.0.1 cannot open a database written by 3.0.2 (`schema_version_unsupported`),
-  like every earlier migration. The name is the catalog's (a source's label for an Online or Local model; for the
-  Claude Default row the model the adapter says it stands for, and no row when it says nothing). The task view
-  carries the labels of the Runs in its window; the footer of a finished turn shows "model - time" on one muted
-  line. A Run from before the table has no label and shows only the time.
+  like every earlier migration. The other way round works: a local backup made by 3.0.0 or 3.0.1 (schema 19) is
+  still accepted for restore (`local-backup.ts` takes schema 19 up to the current one) and migrates forward when
+  the restored database opens; a backup newer than the build, or older than 3.0, is refused as before. The name is
+  the catalog's (the model's own label for an Online or Local model; for the Claude Default row the model the
+  adapter says it stands for, and no row when it says nothing). The task view carries the labels of the Runs in
+  its window; the footer of a finished turn shows "model - time" on one muted line. A Run from before the table
+  has no label and shows only the time.
 - **Connection test.** `guild:v1:model-sources:test`, see `docs/20-GUILD3-DUAL-ENGINE.md` 3.4. The probe lives in
   `packages/model-router` and reuses the router's own source rules (extracted to `source-policy.ts`), headers and
   transport, so a test can never reach a host or carry a key a real turn could not.

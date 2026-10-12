@@ -66,6 +66,13 @@ async function inventory(root: string): Promise<FileEntry[]> {
   if (!files.some((file) => file.path === "guild.sqlite3")) fail();
   return files;
 }
+/**
+ * A backup is restorable when its schema is one this build can migrate forward from: Guild 3.0.0 and 3.0.1 (schema 19)
+ * made backups that 3.0.2 (schema 20) must still be able to restore. A newer schema is refused, as before.
+ */
+const OLDEST_RESTORABLE_SCHEMA = 19;
+const restorableSchema = (version: unknown): boolean =>
+  typeof version === "number" && Number.isInteger(version) && version >= OLDEST_RESTORABLE_SCHEMA && version <= SCHEMA_VERSION;
 export async function sealBackup(root: string, appVersion: string): Promise<void> {
   for (const item of await inventory(root)) await chmod(join(root, item.path), 0o600);
   const files = await inventory(root);
@@ -77,7 +84,7 @@ export async function validateBackup(root: string): Promise<Manifest> {
   const details = await lstat(join(root, "manifest.json"));
   if (!details.isFile() || details.isSymbolicLink() || details.nlink !== 1 || details.size > 8 * 1024 ** 2) fail();
   const manifest = JSON.parse(await readFile(join(root, "manifest.json"), "utf8")) as Manifest;
-  if (manifest?.format !== "guild-local-backup-v2" || manifest.schemaVersion !== SCHEMA_VERSION ||
+  if (manifest?.format !== "guild-local-backup-v2" || !restorableSchema(manifest.schemaVersion) ||
     typeof manifest.appVersion !== "string" || !Number.isFinite(Date.parse(manifest.createdAt)) ||
     !Array.isArray(manifest.files)) fail();
   const files = await inventory(root);
@@ -94,7 +101,7 @@ export async function validateDatabase(path: string, files?: readonly FileEntry[
     }
     if (database.prepare("PRAGMA foreign_key_check").all().length !== 0) fail();
     const version = database.prepare("SELECT max(version) AS version FROM schema_migrations").get();
-    if (version?.version !== SCHEMA_VERSION) fail();
+    if (!restorableSchema(version?.version)) fail();
     // No backup may silently resume a queued or unfinished operation after restore.
     if (database.prepare("SELECT 1 FROM queued_turns LIMIT 1").get() ||
       database.prepare("SELECT 1 FROM continuous_tasks WHERE status = 'active' LIMIT 1").get() ||
