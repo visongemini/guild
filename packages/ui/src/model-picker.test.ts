@@ -447,8 +447,8 @@ test("the Claude group is unavailable when the status says so, or the Claude cat
 test("an empty Claude catalog offers Claude Code (default model), so a Claude task can still start (PC-ENG-001)", () => {
   const emptyClaude = { grok: REAL_CATALOG, claude: EMPTY_CLAUDE_MODEL_CATALOG };
   const fresh = { messages: EN, catalogs: emptyClaude, selection: selection("grok-4.7", "high", "runtime"), taskEngine: "grok" as const, engineFixed: false };
-  // Unknown, ready, not logged in or unusable: only a missing installation withholds the row.
-  for (const claudeState of [undefined, "ready", "not_logged_in", "unavailable"] as const) {
+  // Unknown, ready or not logged in: Claude can start, so the row is offered.
+  for (const claudeState of [undefined, "ready", "not_logged_in"] as const) {
     const view = modelPickerView({ ...fresh, ...(claudeState === undefined ? {} : { claudeState }) });
     const claude = groupView(view, "claude");
     assert.deepEqual(
@@ -461,7 +461,11 @@ test("an empty Claude catalog offers Claude Code (default model), so a Claude ta
     assert.equal(view.models.some((row) => row.runtimeDefault === true), true);
     assert.equal(view.catalogEmpty, false);
   }
-  assert.equal(groupView(modelPickerView({ ...fresh, claudeState: "not_found" }), "claude").models.length, 0);
+  // Missing, unavailable or changed engine files: Guild would refuse to start, so the row is withheld
+  // (picking it would bind the task to an engine that cannot run).
+  for (const claudeState of ["not_found", "unavailable", "integrity_changed"] as const) {
+    assert.equal(groupView(modelPickerView({ ...fresh, claudeState }), "claude").models.length, 0, claudeState);
+  }
   assert.equal(groupView(modelPickerView({ ...fresh, claudeState: "not_found" }), "claude").empty?.kind, "claude_unavailable");
   // Only models of Claude's own count: Online and Local models alone do not make the list.
   const routedOnly = { grok: REAL_CATALOG, claude: freezeClaude([{ id: "deepseek-v4-flash", name: "DeepSeek V4 Flash", group: "online" }]) };

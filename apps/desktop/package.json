@@ -2,7 +2,7 @@
   "name": "@guild/desktop",
   "version": "3.0.0",
   "author": "BDV",
-  "description": "An independent desktop client for the official Grok agent process.",
+  "description": "An independent desktop client for the official Grok agent process and the user-installed Claude Code engine.",
   "license": "MIT",
   "private": true,
   "type": "module",

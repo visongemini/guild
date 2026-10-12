@@ -338,6 +338,14 @@ export function encodeLoadSessionParams(
   options?: AcpV1SessionStartOptions,
   dialect: AcpDialect = "grok",
 ): Readonly<Record<string, unknown>> {
+  // Grok's session/load keeps its 2.x shape; only the Claude dialect carries the resume options on load.
+  if (dialect !== "claude") {
+    return deepFreeze({
+      sessionId: identifier(sessionId, "$.sessionId"),
+      cwd: canonicalAbsolutePath(cwd, "$.cwd"),
+      mcpServers: [],
+    });
+  }
   return deepFreeze({
     sessionId: identifier(sessionId, "$.sessionId"),
     cwd: canonicalAbsolutePath(cwd, "$.cwd"),

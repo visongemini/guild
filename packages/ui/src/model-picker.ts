@@ -365,9 +365,11 @@ export function modelPickerView(input: {
       .filter((candidate) => modelGroupOf(candidate) === group)
       .map((candidate) => rowOf(candidate, group));
   // Claude Code lists its models only once a session has started. Until then (and whenever it lists none) the Claude
-  // group offers "Claude Code (default model)", so a fresh install can still start a Claude task; a missing
-  // installation offers nothing, and an unknown state is not a reason to withhold it.
-  const claudeDefaultOffered = input.claudeState !== "not_found" &&
+  // group offers "Claude Code (default model)", so a fresh install can still start a Claude task. It is offered only
+  // when Claude can start (ready, not yet logged in, or unknown): a missing installation, changed engine files or an
+  // unavailable engine would bind the task to an engine Guild already refuses to run.
+  const claudeDefaultOffered =
+    (input.claudeState === undefined || input.claudeState === "ready" || input.claudeState === "not_logged_in") &&
     !catalogs.claude.models.some((candidate) => modelGroupOf(candidate) === "claude");
   const claudeDefaultRow = (): Omit<ModelRowView, "tabStop"> => ({
     id: "",

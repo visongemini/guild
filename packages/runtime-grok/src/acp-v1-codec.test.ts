@@ -116,6 +116,12 @@ describe("ACP v1 request encoders", () => {
       cwd: "/tmp/project",
       mcpServers: [],
     });
+    // Grok's load request ignores resume options (unchanged 2.x shape).
+    assert.deepEqual(encodeLoadSessionParams("session-1", "/tmp/project", { reasoningEffort: "high" }), {
+      sessionId: "session-1",
+      cwd: "/tmp/project",
+      mcpServers: [],
+    });
     assert.deepEqual(encodeCancelParams("session-1"), { sessionId: "session-1" });
     assert.equal(Object.hasOwn(encodeCancelParams("session-1"), "id"), false);
     assert.deepEqual(encodeSetSessionModelParams("session-1", "grok-4.5"), {
