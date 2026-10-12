@@ -8,9 +8,10 @@ export const MESSAGE_TOO_LONG = "message_too_long";
 export const CLAUDE_LOGIN_REQUIRED = "claude_login_required";
 /**
  * PC-ENG-002: the user's node, the ACP adapter or the claude binary changed on disk without an
- * update (same version, other bytes); Guild refuses to run them. The user-facing wording is
- * `claudeStatusIntegrityChanged`: "Claude engine files changed unexpectedly; reinstall
- * claude-agent-acp or restart Guild".
+ * update Guild accepts (a node update waits for the next launch; the same adapter version with other
+ * bytes is never one); Guild refuses to run them. The user-facing wording is
+ * `claudeStatusIntegrityChanged`: "Claude engine files changed unexpectedly; restart Guild to accept
+ * updated engine files, or reinstall claude-agent-acp".
  */
 export const ENGINE_INTEGRITY_CHANGED = "engine_integrity_changed";
 /**

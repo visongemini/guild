@@ -6,12 +6,14 @@ import { delimiter, join } from "node:path";
 import { after, afterEach, describe, it } from "node:test";
 import {
   buildClaudeSearchPath,
+  ClaudeEngineIntegrityError,
   ClaudeLocatorError,
   invalidateClaudeLocatorCache,
   locateClaudeAdapter,
   locateClaudeBinary,
   locateClaudeEngine,
   locateNode,
+  resetClaudeLaunchPinsForTesting,
   unexpectedEngineChange,
   type ClaudeLocatorErrorCode,
   type ClaudeLocatorOptions,
@@ -29,6 +31,7 @@ after(async () => {
 
 afterEach(() => {
   invalidateClaudeLocatorCache();
+  resetClaudeLaunchPinsForTesting();
 });
 
 type Sandbox = Readonly<{
@@ -154,7 +157,7 @@ describe("Claude locator: node", () => {
     assert.equal(Object.isFrozen(located), true);
   });
 
-  it("reuses the cached identity until the file changes", async () => {
+  it("reuses the cached identity while the file is unchanged", async () => {
     const box = await sandbox();
     const node = join(box.bin, "node");
     await writeMachO(node, "first");
@@ -163,11 +166,107 @@ describe("Claude locator: node", () => {
     const second = await locateNode(box.options(probe.execute));
     assert.equal(second, first, "the same result object comes back from the cache");
     assert.equal(probe.calls.length, 1);
+  });
+
+  it("trusts the first node of an app launch and refuses a changed one without running it [PC-ENG-002]", async () => {
+    const box = await sandbox();
+    const node = join(box.bin, "node");
+    await writeMachO(node, "first");
+    const probe = answers({ [node]: "v24.0.0" });
+    const first = await locateNode(box.options(probe.execute));
+    assert.equal(probe.calls.length, 1);
+
+    // The bytes change under the same path. Dropping the identity cache does not make the new file trusted.
     await writeMachO(node, "second, longer payload");
     await utimes(node, new Date(), new Date(Date.now() + 5_000));
-    const third = await locateNode(box.options(probe.execute));
-    assert.equal(probe.calls.length, 2);
-    assert.notEqual(third.sha256, first.sha256);
+    invalidateClaudeLocatorCache();
+    await assert.rejects(locateNode(box.options(probe.execute)), (cause: unknown) => {
+      assert.ok(cause instanceof ClaudeEngineIntegrityError, String(cause));
+      assert.equal(cause.component, "node");
+      assert.equal(cause.message, "engine_integrity_changed");
+      return true;
+    });
+    assert.equal(probe.calls.length, 1, "the changed node was never run, not even for --version");
+    // The whole engine is refused the same way, and still nothing runs.
+    await assert.rejects(locateClaudeEngine(box.options(probe.execute)), ClaudeEngineIntegrityError);
+    assert.equal(probe.calls.length, 1);
+
+    // The pinned bytes coming back clear the refusal; a new launch then trusts what is on disk.
+    await writeMachO(node, "first");
+    await utimes(node, new Date(), new Date(Date.now() + 9_000));
+    assert.equal((await locateNode(box.options(probe.execute))).sha256, first.sha256);
+    assert.equal(probe.calls.length, 1, "unchanged bytes are the same node, no run needed");
+
+    await writeMachO(node, "second, longer payload");
+    resetClaudeLaunchPinsForTesting();
+    invalidateClaudeLocatorCache();
+    const second = await locateNode(box.options(probe.execute));
+    assert.equal(probe.calls.length, 2, "a new launch probes the new node (trust on first use)");
+    assert.notEqual(second.sha256, first.sha256);
+  });
+
+  it("keeps the launch's node when only a touch or a different PATH is seen, and refuses it when gone [PC-ENG-002]", async () => {
+    const box = await sandbox();
+    const node = join(box.bin, "node");
+    await writeMachO(node, "first");
+    const probe = answers({ [node]: "v24.0.0" });
+    const first = await locateNode(box.options(probe.execute));
+
+    // Same bytes, new mtime: no run.
+    await utimes(node, new Date(), new Date(Date.now() + 5_000));
+    invalidateClaudeLocatorCache();
+    assert.equal((await locateNode(box.options(probe.execute))).sha256, first.sha256);
+
+    // Another node earlier on the path is never even considered within this launch.
+    const other = join(box.root, "other", "node");
+    await writeMachO(other, "other node");
+    const both = answers({ [node]: "v24.0.0", [other]: "v26.0.0" });
+    const viaOther = await locateNode(box.options(both.execute, []));
+    assert.equal(viaOther.executablePath, node);
+    const reordered = { ...box.options(both.execute), environment: { PATH: [join(box.root, "other"), box.bin].join(delimiter) } };
+    assert.equal((await locateNode(reordered)).executablePath, node);
+    assert.deepEqual(both.calls, [], "no other node was run");
+
+    await rm(node);
+    invalidateClaudeLocatorCache();
+    await assert.rejects(locateNode(box.options(both.execute)), ClaudeEngineIntegrityError);
+    assert.deepEqual(both.calls, []);
+  });
+
+  it("pins nothing for a node that is too old, so a newer one is found without a restart", async () => {
+    const box = await sandbox();
+    const node = join(box.bin, "node");
+    await writeMachO(node, "old");
+    await expectLocatorError(locateNode(box.options(answers({ [node]: "v20.0.0" }).execute)), "node_too_old", "20.0.0");
+    await writeMachO(node, "new enough");
+    const located = await locateNode(box.options(answers({ [node]: "v26.0.0" }).execute));
+    assert.equal(located.version, "26.0.0");
+    assert.equal(located.sha256, createHash("sha256").update(await readFile(node)).digest("hex"));
+  });
+
+  it("hashes before the first run and trusts nothing that changed while it was probed [PC-ENG-002]", async () => {
+    const box = await sandbox();
+    const node = join(box.bin, "node");
+    await writeMachO(node, "original");
+    const originalSha = createHash("sha256").update(await readFile(node)).digest("hex");
+    let runs = 0;
+    const swappingProbe: NonNullable<ClaudeLocatorOptions["execute"]> = async () => {
+      runs += 1;
+      if (runs === 1) {
+        await writeMachO(node, "swapped while the probe ran");
+        await utimes(node, new Date(), new Date(Date.now() + 5_000));
+      }
+      return "v26.0.0";
+    };
+    const first = await locateNode(box.options(swappingProbe));
+    assert.equal(first.sha256, originalSha, "the hash is of the bytes that were there before the run");
+    // The torn identity was not remembered or trusted: the next locate looks at the file again.
+    const second = await locateNode(box.options(swappingProbe));
+    assert.equal(runs, 2);
+    assert.notEqual(second.sha256, originalSha);
+    const third = await locateNode(box.options(swappingProbe));
+    assert.equal(third, second);
+    assert.equal(runs, 2, "now stable, so it is pinned and cached");
   });
 
   it("reports node_too_old with the version found, and prefers a later node that is new enough", async () => {
@@ -213,6 +312,34 @@ describe("Claude locator: adapter", () => {
     assert.equal(pin.entryPath, entry);
     assert.equal(pin.version, "0.89.1");
     assert.match(pin.fingerprintSha256, /^[0-9a-f]{64}$/u);
+  });
+
+  it("re-pins by reading only: a new version is an update, the same version with other bytes is flagged, and nothing runs [PC-ENG-002]", async () => {
+    const box = await sandbox();
+    const prefix = join(box.home, ".npm-global");
+    const { entry, packageRoot } = await writeAdapterPackage(prefix, "0.89.1");
+    await symlink("../lib/node_modules/@agentclientprotocol/claude-agent-acp/dist/index.js", join(prefix, "bin", "claude-agent-acp"));
+    const executed: string[] = [];
+    const options = box.options(async (file) => { executed.push(file); return ""; });
+    const before = await locateClaudeAdapter(options);
+
+    await writeFile(entry, "#!/usr/bin/env node\nconsole.log('swapped');\n");
+    const swapped = await locateClaudeAdapter(options);
+    assert.equal(swapped.version, before.version);
+    assert.notEqual(swapped.fingerprintSha256, before.fingerprintSha256);
+
+    await writeFile(join(packageRoot, "package.json"), JSON.stringify({ name: "@agentclientprotocol/claude-agent-acp", version: "0.89.2" }));
+    const updated = await locateClaudeAdapter(options);
+    assert.equal(updated.version, "0.89.2");
+    assert.deepEqual(executed, [], "the adapter's files were only read");
+
+    const engine = (adapter: typeof before): LocatedClaudeEngine => ({
+      node: { executablePath: "/n", sha256: "a".repeat(64), version: "26.0.0" },
+      adapter,
+      claude: { executablePath: "/c/versions/2.1.291", version: "2.1.291" },
+    });
+    assert.equal(unexpectedEngineChange(engine(before), engine(swapped)), "adapter");
+    assert.equal(unexpectedEngineChange(engine(before), engine(updated)), undefined);
   });
 
   it("also searches the user PATH and Homebrew-style locations", async () => {
@@ -294,6 +421,107 @@ describe("Claude locator: claude binary", () => {
   });
 });
 
+describe("Claude locator: claude binary after a failed pin [PC-ENG-002]", () => {
+  async function installed(box: Sandbox, version: string, root = "share"): Promise<string> {
+    const path = join(box.root, root, "claude", "versions", version);
+    await writeMachO(path, `claude ${root} ${version}`);
+    return path;
+  }
+
+  it("judges a different path by its name and never runs it", async () => {
+    const box = await sandbox();
+    const link = join(box.home, ".local", "bin", "claude");
+    const first = await installed(box, "2.1.291");
+    await symlink(first, link);
+    const probe = answers({ [first]: "2.1.291 (Claude Code)" });
+    const pinned = await locateClaudeBinary(box.options(probe.execute));
+    assert.equal(probe.calls.length, 1);
+
+    // The installer repoints the link to a new release.
+    const next = await installed(box, "2.1.300");
+    await rm(link);
+    await symlink(next, link);
+    invalidateClaudeLocatorCache();
+    const updated = await locateClaudeBinary(box.options(probe.execute), pinned);
+    assert.deepEqual({ ...updated }, { executablePath: next, version: "2.1.300" });
+    assert.equal(probe.calls.length, 1, "the new binary was not run to find that out");
+
+    // The same release at another path is not an update.
+    const sameRelease = await installed(box, "2.1.291", "copy");
+    await rm(link);
+    await symlink(sameRelease, link);
+    await assert.rejects(locateClaudeBinary(box.options(probe.execute), pinned), (cause: unknown) => {
+      assert.ok(cause instanceof ClaudeEngineIntegrityError, String(cause));
+      assert.equal(cause.component, "claude");
+      return true;
+    });
+    // Neither is a binary outside the installer's layout, whatever version it would report.
+    const stray = join(box.root, "stray", "claude");
+    await writeMachO(stray, "stray");
+    await rm(link);
+    await symlink(stray, link);
+    await assert.rejects(locateClaudeBinary(box.options(probe.execute), pinned), ClaudeEngineIntegrityError);
+    assert.equal(probe.calls.length, 1, "nothing was run for any of them");
+  });
+
+  it("keeps the pinned binary when the link still resolves to it, without running it", async () => {
+    const box = await sandbox();
+    const link = join(box.home, ".local", "bin", "claude");
+    const first = await installed(box, "2.1.291");
+    await symlink(first, link);
+    const probe = answers({ [first]: "2.1.291 (Claude Code)" });
+    const pinned = await locateClaudeBinary(box.options(probe.execute));
+    invalidateClaudeLocatorCache();
+    assert.equal(await locateClaudeBinary(box.options(probe.execute), pinned), pinned);
+    assert.equal(probe.calls.length, 1);
+    // Gone, or no longer a Mach-O binary: not a replacement, simply missing.
+    await rm(first);
+    await expectLocatorError(locateClaudeBinary(box.options(probe.execute), pinned), "claude_missing");
+    await rm(link);
+    await writeScript(link);
+    await expectLocatorError(locateClaudeBinary(box.options(probe.execute), pinned), "claude_missing");
+    assert.equal(probe.calls.length, 1);
+  });
+
+  it("re-locates the whole engine without running the changed pieces", async () => {
+    const box = await sandbox();
+    const node = join(box.bin, "node");
+    await writeMachO(node, "node");
+    const link = join(box.home, ".local", "bin", "claude");
+    const first = await installed(box, "2.1.291");
+    await symlink(first, link);
+    const prefix = join(box.home, ".npm-global");
+    const { packageRoot } = await writeAdapterPackage(prefix, "0.89.1");
+    await symlink("../lib/node_modules/@agentclientprotocol/claude-agent-acp/dist/index.js", join(prefix, "bin", "claude-agent-acp"));
+    const probe = answers({ [node]: "v26.8.1", [first]: "2.1.291 (Claude Code)" });
+    const before = await locateClaudeEngine(box.options(probe.execute));
+    assert.equal(probe.calls.length, 2);
+    invalidateClaudeLocatorCache();
+
+    // An adapter update and a claude release together: both re-pinned, nothing run.
+    await writeFile(join(packageRoot, "package.json"), JSON.stringify({ name: "@agentclientprotocol/claude-agent-acp", version: "0.89.2" }));
+    const next = await installed(box, "2.1.300");
+    await rm(link);
+    await symlink(next, link);
+    const after = await locateClaudeEngine(box.options(probe.execute), before);
+    assert.equal(after.node, before.node);
+    assert.equal(after.adapter.version, "0.89.2");
+    assert.equal(after.claude.version, "2.1.300");
+    assert.equal(unexpectedEngineChange(before, after), undefined);
+    assert.equal(probe.calls.length, 2, "the node was hashed, the adapter read, the claude path judged: no run");
+
+    // The node's bytes change at the same time: refused, and the node is not run.
+    await writeMachO(node, "node, replaced");
+    invalidateClaudeLocatorCache();
+    await assert.rejects(locateClaudeEngine(box.options(probe.execute), before), (cause: unknown) => {
+      assert.ok(cause instanceof ClaudeEngineIntegrityError, String(cause));
+      assert.equal(cause.component, "node");
+      return true;
+    });
+    assert.equal(probe.calls.length, 2);
+  });
+});
+
 describe("Claude locator: whole engine", () => {
   it("returns node, adapter and claude together", async () => {
     const box = await sandbox();
@@ -348,7 +576,6 @@ describe("Claude locator: what a re-locate may replace [PC-ENG-002]", () => {
 
   it("accepts an identical result and every kind of update", () => {
     assert.equal(unexpectedEngineChange(base, changed({})), undefined);
-    assert.equal(unexpectedEngineChange(base, changed({ node: { version: "26.9.0", sha256: "b".repeat(64) } })), undefined);
     assert.equal(
       unexpectedEngineChange(base, changed({ adapter: { version: "0.89.2", fingerprintSha256: "d".repeat(64) } })),
       undefined,
@@ -359,16 +586,33 @@ describe("Claude locator: what a re-locate may replace [PC-ENG-002]", () => {
     );
   });
 
-  it("refuses the same version with other bytes, naming the piece", () => {
-    assert.equal(unexpectedEngineChange(base, changed({ node: { sha256: "b".repeat(64) } })), "node");
+  it("refuses the same adapter version with other bytes, naming the piece", () => {
     assert.equal(unexpectedEngineChange(base, changed({ adapter: { fingerprintSha256: "d".repeat(64) } })), "adapter");
   });
 
-  it("accepts a claude link only when it now resolves to a versions/<ver> file", () => {
+  it("never replaces the node: other bytes, another path or another version are all refused", () => {
+    assert.equal(unexpectedEngineChange(base, changed({ node: { sha256: "b".repeat(64) } })), "node");
+    assert.equal(unexpectedEngineChange(base, changed({ node: { version: "26.9.0", sha256: "b".repeat(64) } })), "node");
+    assert.equal(unexpectedEngineChange(base, changed({ node: { version: "26.9.0" } })), undefined, "the version label alone is not a change");
+    assert.equal(unexpectedEngineChange(base, changed({ node: { executablePath: "/opt/node/bin/node" } })), "node");
+  });
+
+  it("accepts a claude link only when it now resolves to a new versions/<ver> release [PC-ENG-002]", () => {
     assert.equal(unexpectedEngineChange(base, changed({ claude: { executablePath: "/tmp/evil/claude" } })), "claude");
     assert.equal(unexpectedEngineChange(base, changed({ claude: { executablePath: "/home/u/.local/share/claude/versions/latest" } })), "claude");
     assert.equal(unexpectedEngineChange(base, changed({ claude: { executablePath: "/home/u/versions/2.1.300/other" } })), "claude");
-    // A claude binary that stays where it was is not a path change (it carries no hash pin).
+    // The same release at another path is not an update, whatever the new file claims to be.
+    assert.equal(unexpectedEngineChange(base, changed({ claude: { executablePath: "/tmp/other/versions/2.1.291" } })), "claude");
+    assert.equal(unexpectedEngineChange(base, changed({ claude: { executablePath: "/tmp/other/versions/2.1.291-copy" } })), "claude");
+    assert.equal(unexpectedEngineChange(base, changed({ claude: { executablePath: "/tmp/other/versions/2.1.291", version: "2.1.300" } })), "claude");
+    // The release comes from the directory name: a new file that still reports the pinned version is refused too.
+    assert.equal(unexpectedEngineChange(base, changed({ claude: { executablePath: "/home/u/.local/share/claude/versions/2.1.300", version: "2.1.291" } })), "claude");
+    // A different release in the same layout is an update.
+    assert.equal(unexpectedEngineChange(base, changed({ claude: { executablePath: "/home/u/.local/share/claude/versions/2.1.300", version: "2.1.300" } })), undefined);
+    // A "new release" outside the pinned versions directory is not the installer's update.
+    assert.equal(unexpectedEngineChange(base, changed({ claude: { executablePath: "/tmp/x/versions/9.9.9", version: "9.9.9" } })), "claude");
+    assert.equal(unexpectedEngineChange(base, changed({ claude: { executablePath: "/home/u/.local/share/claude/versions/2.1.200", version: "2.1.200" } })), undefined);
+    // A claude binary that stays where it was is not a path change (it is pinned by path, not by hash).
     assert.equal(unexpectedEngineChange(base, changed({ claude: { version: "2.1.292" } })), undefined);
   });
 

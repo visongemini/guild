@@ -16,7 +16,12 @@ const SECOND_NODE_SHA = "b".repeat(64);
 function located(
   node: string,
   sha: string,
-  over: Readonly<{ nodeVersion?: string; adapterVersion?: string; fingerprint?: string }> = {},
+  over: Readonly<{
+    nodeVersion?: string;
+    adapterVersion?: string;
+    fingerprint?: string;
+    claude?: Readonly<{ executablePath: string; version: string }>;
+  }> = {},
 ): LocatedClaudeEngine {
   return Object.freeze({
     node: Object.freeze({ executablePath: node, sha256: sha, version: over.nodeVersion ?? "26.8.1" }),
@@ -26,9 +31,12 @@ function located(
       version: over.adapterVersion ?? "0.89.1",
       fingerprintSha256: over.fingerprint ?? "c".repeat(64),
     }),
-    claude: Object.freeze({ executablePath: "/opt/claude/bin/claude", version: "2.1.291" }),
+    claude: Object.freeze(over.claude ?? { executablePath: "/opt/claude/bin/claude", version: "2.1.291" }),
   });
 }
+
+const CLAUDE_RELEASE = (version: string, root = "/home/u/.local/share/claude") =>
+  ({ executablePath: `${root}/versions/${version}`, version });
 
 class FakeHost {
   readonly listeners = new Set<(event: ProcessHostEvent) => void>();
@@ -111,12 +119,12 @@ describe("Claude runtime process [PC-ENG-002]", () => {
         extraEnvironment: { ANTHROPIC_BASE_URL: "http://127.0.0.1:1/token/" },
       },
       {
-        // The second answer is a node update (another version), which a re-locate accepts.
+        // The second answer is an adapter update (another package version), which a re-locate accepts.
         locate: async () => {
           locates += 1;
           return locates === 1
             ? located("/usr/local/bin/node", NODE_SHA)
-            : located("/opt/node/bin/node", SECOND_NODE_SHA, { nodeVersion: "26.9.0" });
+            : located("/usr/local/bin/node", NODE_SHA, { adapterVersion: "0.89.2", fingerprint: "d".repeat(64) });
         },
         invalidateLocatorCache: () => { invalidated += 1; },
         baseEnvironment: async () => ({ PATH: "/usr/bin", ANTHROPIC_API_KEY: "must-not-pass" }),
@@ -146,8 +154,9 @@ describe("Claude runtime process [PC-ENG-002]", () => {
     await runtime.adapter.start().catch(() => undefined);
     assert.equal(invalidated, 1);
     assert.equal(locates, 2);
-    assert.equal(hosts[1]!.executablePath, "/opt/node/bin/node");
-    assert.equal(hosts[1]!.expectedSha256, SECOND_NODE_SHA);
+    assert.equal(hosts[1]!.executablePath, "/usr/local/bin/node");
+    assert.equal(hosts[1]!.expectedSha256, NODE_SHA);
+    assert.equal(hosts[1]!.launch.engine === "claude" && hosts[1]!.launch.adapter.version, "0.89.2");
     await runtime.adapter.close().catch(() => undefined);
   });
 
@@ -174,6 +183,8 @@ describe("Claude runtime process [PC-ENG-002]", () => {
   it("builds no second host when only the bytes of a pinned piece changed, and says so [PC-ENG-002]", async () => {
     const cases: Array<[string, (locates: number) => LocatedClaudeEngine]> = [
       ["node", (n) => located("/usr/local/bin/node", n === 1 ? NODE_SHA : SECOND_NODE_SHA)],
+      // A node with a new version is no update either: a node change takes effect on the next launch.
+      ["node", (n) => n === 1 ? located("/usr/local/bin/node", NODE_SHA) : located("/opt/node/bin/node", SECOND_NODE_SHA, { nodeVersion: "26.9.0" })],
       ["adapter", (n) => located("/usr/local/bin/node", NODE_SHA, { fingerprint: n === 1 ? "c".repeat(64) : "d".repeat(64) })],
     ];
     for (const [component, answer] of cases) {
@@ -198,6 +209,65 @@ describe("Claude runtime process [PC-ENG-002]", () => {
       assert.equal(runtime.refusedForIntegrity(), true, component);
       await runtime.adapter.close().catch(() => undefined);
     }
+  });
+
+  it("hands the pieces of the first locate to the re-locate and accepts a new claude release only [PC-ENG-002]", async () => {
+    const cases: Array<{ name: string; second: LocatedClaudeEngine; refused: boolean }> = [
+      { name: "new release", second: located("/usr/local/bin/node", NODE_SHA, { claude: CLAUDE_RELEASE("2.1.300") }), refused: false },
+      { name: "same release elsewhere", second: located("/usr/local/bin/node", NODE_SHA, { claude: CLAUDE_RELEASE("2.1.291", "/tmp/other") }), refused: true },
+      { name: "outside the layout", second: located("/usr/local/bin/node", NODE_SHA, { claude: { executablePath: "/tmp/evil/claude", version: "2.1.300" } }), refused: true },
+    ];
+    for (const { name, second, refused } of cases) {
+      const seen: Array<LocatedClaudeEngine | undefined> = [];
+      const hosts: EngineProcessHostOptions[] = [];
+      const first = located("/usr/local/bin/node", NODE_SHA, { claude: CLAUDE_RELEASE("2.1.291") });
+      const runtime = await createClaudeRuntime(
+        { adapterEpoch: 1, sink: {} as AcpV1AdapterSink, stagingRoot: "/tmp/staging", workingDirectory: "/tmp/work" },
+        {
+          locate: async (previous) => { seen.push(previous); return seen.length === 1 ? first : second; },
+          invalidateLocatorCache: () => undefined,
+          baseEnvironment: async () => ({ PATH: "/usr/bin" }),
+          createHost: (options) => {
+            hosts.push(options);
+            return asHost(new FakeHost(hosts.length === 1 ? { code: "claude_executable_invalid" } : { code: "working_directory_not_absolute" }));
+          },
+        },
+      );
+      await runtime.adapter.start().catch(() => undefined);
+      assert.deepEqual(seen, [undefined, first], `${name}: only the re-locate gets the earlier pieces`);
+      assert.equal(runtime.refusedForIntegrity(), refused, name);
+      assert.equal(hosts.length, refused ? 1 : 2, name);
+      if (!refused) assert.equal(hosts[1]!.launch.engine === "claude" && hosts[1]!.launch.claudeExecutablePath, "/home/u/.local/share/claude/versions/2.1.300");
+      await runtime.adapter.close().catch(() => undefined);
+    }
+  });
+
+  it("hands out a runtime that refuses to start when the pieces already differ at creation [PC-ENG-002]", async () => {
+    const hosts: EngineProcessHostOptions[] = [];
+    const runtime = await createClaudeRuntime(
+      { adapterEpoch: 1, sink: {} as AcpV1AdapterSink, stagingRoot: "/tmp/staging", workingDirectory: "/tmp/work" },
+      {
+        locate: async () => { throw new ClaudeEngineIntegrityError("node"); },
+        invalidateLocatorCache: () => undefined,
+        baseEnvironment: async () => ({ PATH: "/usr/bin" }),
+        createHost: (options) => { hosts.push(options); return asHost(new FakeHost(undefined)); },
+      },
+    );
+    assert.equal(runtime.refusedForIntegrity(), true);
+    assert.equal(runtime.runtimeVersion, undefined);
+    await assert.rejects(runtime.adapter.start());
+    await assert.rejects(runtime.adapter.start(), "and again");
+    await runtime.adapter.close().catch(() => undefined);
+    assert.equal(hosts.length, 0, "no host, so nothing was executed");
+
+    // Anything but an integrity refusal is the caller's to handle.
+    await assert.rejects(
+      createClaudeRuntime(
+        { adapterEpoch: 1, sink: {} as AcpV1AdapterSink, stagingRoot: "/tmp/staging", workingDirectory: "/tmp/work" },
+        { locate: async () => { throw new Error("claude_missing"); }, baseEnvironment: async () => ({ PATH: "/usr/bin" }) },
+      ),
+      /claude_missing/u,
+    );
   });
 
   it("re-pins an adapter that moved to a new version [PC-ENG-002]", async () => {
