@@ -1,8 +1,12 @@
-Guild 2
+Guild
 Copyright 2026 BDV
 
-Guild 2 is an independent project and is not affiliated with, endorsed by, or
+Guild is an independent project and is not affiliated with, endorsed by, or
 sponsored by xAI.
 
+Guild is also not affiliated with, endorsed by, or sponsored by Anthropic.
+
 Third-party components and the official Grok runtime retain their respective
-copyrights, trademarks, and license terms.
+copyrights, trademarks, and license terms. Claude Code and the Claude Code ACP
+adapter (`@agentclientprotocol/claude-agent-acp`) are installed by the user, are
+not distributed with Guild, and retain their own terms and trademarks.

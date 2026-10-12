@@ -1,8 +1,10 @@
 # Guild
 
-Guild 是 BDV 独立实现的、双语、本地优先的 macOS 桌面客户端，通过官方 `grok`
-进程使用 Grok，模型列表跟随官方运行时。Guild 2 不接入 MiniMax、Ornith 或其他第三方模型，也不提供
-OpenAI 兼容路由。当前源码版本为 **2.2.1**。
+Guild 是 BDV 独立实现的、双语、本地优先的 macOS 桌面客户端，有两个引擎：官方 `grok`
+进程（Grok 任务的模型列表跟随官方运行时，不接入第三方模型），以及用户自行安装的 Claude Code
+（经 ACP 适配器 `@agentclientprotocol/claude-agent-acp` 驱动 `claude`）。Claude 任务还可以经本机回环
+路由器使用 Online 和 Local 模型，并在工作台使用隔离的浏览器面板。Guild 不提供 OpenAI 兼容路由。
+当前源码版本为 **3.0.0（开发中）**，最近发布的安装包为 2.2.1。
 
 ## 当前状态
 
@@ -16,6 +18,13 @@ Guild 已开放源码，当前仓库包含可构建的桌面客户端源码：
 - 简体中文与 English 可持久化切换；浏览器登录态默认不复制；
 - macOS arm64 DMG 的安全配置、内容扫描和完整性验证。
 
+3.0 开发中（设计见 `docs/20-GUILD3-DUAL-ENGINE.md`，决策 D-057 至 D-060；各项按工作包分阶段落地，
+当前分支可能尚未全部可用）：
+
+- Claude Code 引擎：任务在第一轮时绑定引擎，之后不再更换；
+- 模型来源与本机路由器：Claude 任务内可在 Claude 订阅、Online 和 Local 模型之间切换；
+- 隔离的浏览器面板，以及智能体可经本机 MCP 服务器操作它的固定工具集。
+
 源码公开不等于 macOS 安装包已通过 Apple 公证。面向普通用户分发的安装包仍需
 Developer ID 签名与公证；开发者可按下方步骤在本机自行构建。
 
@@ -26,8 +35,9 @@ Developer ID 签名与公证；开发者可按下方步骤在本机自行构建�
 验证，请在 Finder 中右键 Guild，选择“打开”，并再次确认。不要从第三方网站下载或
 执行来历不明的解除隔离命令。
 
-从源码构建需要 Apple Silicon Mac、Node.js 24/npm，以及已经由用户自行安装并登录的
-官方 `grok` CLI：
+从源码构建需要 Apple Silicon Mac、Node.js 24/npm，以及至少一个由用户自行安装并登录的引擎：
+官方 `grok` CLI，和/或 `claude`（Claude Code）加 `claude-agent-acp` 适配器（适配器需要
+Node.js >= 22）。Guild 不分发其中任何一个：
 
 ```sh
 git clone https://github.com/visongemini/guild.git
@@ -35,7 +45,7 @@ cd guild
 npm ci
 npm test
 npm run package:desktop
-open apps/desktop/dist/Guild-2.2.1-arm64.dmg
+open apps/desktop/dist/Guild-<version>-arm64.dmg
 ```
 
 `npm ci` 会在首次安装时下载并校验与锁文件一致的 Electron 二进制；桌面构建也会再次
@@ -44,7 +54,7 @@ open apps/desktop/dist/Guild-2.2.1-arm64.dmg
 
 ## 开发与验证
 
-Guild 不读取 `~/.grok/auth.json`，也不会代替 Grok 直接请求上游。
+Guild 不读取 `~/.grok/auth.json`，也不读取 Claude 的登录凭据，也不会代替 Grok 直接请求上游。
 
 ```sh
 npm ci
@@ -59,7 +69,7 @@ npm run start:desktop
 npm run package:desktop
 ```
 
-输出位于 `apps/desktop/dist/Guild-2.2.1-arm64.dmg`。未配置 Apple Developer ID
+输出位于 `apps/desktop/dist/Guild-<version>-arm64.dmg`。未配置 Apple Developer ID
 时只会生成临时签名构建；为使没有 Team ID 的 Electron 子组件能够启动，该内部构建
 显式关闭了 library validation。它不应作为面向公众的安装包发布。正式发行必须由同一
 Developer ID 签完整个应用、移除这项临时权限并完成公证。
@@ -74,31 +84,50 @@ Guild 1.1.13 只作为黑盒视觉与交互基准；它的渲染器、程序包�
 都不是实现输入。
 
 - Guild 是单用户本地客户端，不是共享 API 网关；
-- 所有模型请求都由官方 `grok` 子进程通过 ACP stdio 发出；
-- 运行时固定为官方 Grok Build，不提供第三方模型适配器或模型切换入口；
-- 不提取凭据来直接调用上游，也不共享登录；
+- Grok 任务的所有模型请求都由官方 `grok` 子进程通过 ACP stdio 发出，只使用官方 Grok 模型；
+- Claude 任务的请求由用户自行安装的 `claude` 发出；Online 和 Local 模型经 Guild 在 `127.0.0.1`
+  上的本机路由器转发，该路由器仅回环、单用户、带随机令牌，不对外开放；
+- 不提取凭据来直接调用上游：Guild 不读取 Grok 或 Claude 的登录凭据，也不共享登录；Claude
+  订阅的凭据只会被转发到 `api.anthropic.com`；
+- Online 模型会把对话发送给该模型的厂商：首次切换时会先提醒，内容包括 CLAUDE.md、记忆、对话
+  以及对话里的浏览器页面文本和截图，可按工作区选择不再提醒；Local 模型的对话只留在本机或你自己的
+  Tailscale 网络内；
+- 第三方模型的密钥从你指定的环境变量文件读取，只在内存中使用，不写入数据库、日志或界面；新增来源或
+  修改其地址、密钥变量须经原生确认框；
+- 浏览器面板使用独立的存储分区和沙箱，访问不到 Node 或 Guild 自身界面；智能体只能使用固定工具集
+  （没有 eval），每次调用都走权限确认；
 - 对话、工作区、诊断和账号状态默认只保留在本机；仓库不包含用户数据或密钥；
 - 第三方运行时、依赖和商标仍受各自权利约束；
-- Guild 与 xAI 没有隶属、背书或赞助关系。
+- Guild 与 xAI、Anthropic 均没有隶属、背书或赞助关系。
 
 ## 许可证
 
-Guild 自有源码以 [MIT License](LICENSE) 开源。官方 Grok 运行时、第三方依赖、
-字体、图标及商标分别受其自身条款约束，详见 `NOTICE` 与 `THIRD-PARTY-NOTICES`。
+Guild 自有源码以 [MIT License](LICENSE) 开源。官方 Grok 运行时、Claude Code 与 ACP 适配器（均由
+用户自行安装，不随 Guild 分发）、第三方依赖、字体、图标及商标分别受其自身条款约束，详见 `NOTICE`
+与 `THIRD-PARTY-NOTICES`。
 
 ---
 
-Guild is BDV's independently implemented, bilingual, local-first macOS desktop client for
-the official `grok` process. The current source version is **2.2.1**.
+Guild is BDV's independently implemented, bilingual, local-first macOS desktop client with two
+engines: the official `grok` process, and the user-installed Claude Code (the `claude` binary driven
+through the ACP adapter `@agentclientprotocol/claude-agent-acp`). Inside a Claude task the user can
+also use Online and Local models through a loopback router, and the workbench has an isolated browser
+pane. The current source version is **3.0.0 (in development)**; the latest released package is 2.2.1.
 
 The current branch contains the complete daily-use core: native workspace selection,
 workspace-owned tasks, multi-turn conversations, cancellation, durable follow-up queues,
 ACP permission choices, official usage display, inline image/audio rendering, local SQLite
 persistence, restart and sleep/wake recovery, bilingual UI, and a verified arm64 DMG build.
 
+The 3.0 work (Claude engine, model sources and router, browser pane; design in
+`docs/20-GUILD3-DUAL-ENGINE.md`, decisions D-057 to D-060) lands in stages, so the current branch may
+not have all of it yet.
+
 Apple Silicon users can download `Guild-2.2.1-arm64.dmg` from GitHub Releases. The current
 build is not Apple-notarized; on first launch, use Finder's **Open** context-menu action and
-confirm macOS's warning. To build from source with Node.js 24 and npm 11:
+confirm macOS's warning. Building from source needs Node.js 24 and npm 11, plus at least one
+user-installed and logged-in engine: the official `grok` CLI, and/or `claude` (Claude Code) with the
+`claude-agent-acp` adapter (the adapter needs Node.js >= 22). Guild distributes none of them.
 
 ```sh
 git clone https://github.com/visongemini/guild.git
@@ -106,14 +135,23 @@ cd guild
 npm ci
 npm test
 npm run package:desktop
-open apps/desktop/dist/Guild-2.2.1-arm64.dmg
+open apps/desktop/dist/Guild-<version>-arm64.dmg
 ```
 
 The install and desktop-build paths both prepare and verify the lockfile-pinned Electron binary.
 If the first download is interrupted, restore network access and run `npm run prepare:electron`.
 
 Public source availability does not imply an Apple-notarized binary release. Guild never reads
-`~/.grok/auth.json`; all model requests originate from the official user-installed Grok process.
-Conversation and account data remain local and are not included in this repository. Guild is
-not affiliated with, endorsed by, or sponsored by xAI. Guild-owned source is available under
-the MIT License; third-party components remain under their own terms.
+`~/.grok/auth.json` or Claude credentials. Requests of Grok tasks originate from the official
+user-installed Grok process and use official Grok models only; requests of Claude tasks originate
+from the user-installed `claude`, and Online and Local models are reached through a loopback-only,
+single-user router on `127.0.0.1` that is never exposed to the network. The first switch to an Online
+model shows a reminder that CLAUDE.md, memory, the conversation, and browser page text or screenshots
+in the conversation will be sent to that model's vendor; Local models stay on your machine or your own
+Tailscale network. Keys for Online and Local sources are read from an env file you designate, kept in
+memory only and never stored, and adding or changing a source needs a native confirmation. The browser
+pane runs in its own sandboxed partition, and agents reach it only through a fixed tool set with no
+eval and a permission prompt per call. Conversation and account data remain local and are not included
+in this repository. Guild is not affiliated with, endorsed by, or sponsored by xAI or Anthropic.
+Guild-owned source is available under the MIT License; third-party components, and the user-installed
+Grok, Claude Code and adapter, remain under their own terms.

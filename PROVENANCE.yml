@@ -1,5 +1,5 @@
 project: Guild
-target_version: 2.2.1
+target_version: 3.0.0
 owner: BDV
 implementation_origin: blank_repository
 created: 2026-08-26
@@ -21,11 +21,20 @@ forbidden_inputs:
   - old_repository_diffs_architecture_dumps_or_review_transcripts
   - copied_code_comments_identifiers_or_distinctive_nonfunctional_organization
 
-external_runtime:
-  name: official_grok_process
-  transport_target: ACP_over_stdio
-  credentials_policy: never_extract_for_direct_upstream_requests
-  network_policy: no_shared_gateway
+external_runtimes:
+  - name: official_grok_process
+    transport_target: ACP_over_stdio
+    credentials_policy: never_extract_for_direct_upstream_requests
+    network_policy: no_shared_gateway
+  - name: user_installed_claude_code_adapter
+    components:
+      - claude-agent-acp
+      - claude
+    distribution: user_installed_not_distributed_with_guild
+    transport_target: ACP_over_stdio
+    credentials_policy: guild_never_reads_claude_credentials
+    network_policy: no_shared_gateway
+    network_note: loopback_model_router
 
 evidence_required:
   - independently_initialized_clean_repository_without_governance_git_objects
