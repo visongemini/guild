@@ -1517,6 +1517,14 @@ export class AcpV1Adapter {
         this.claudeSessionIsIdle(notification.params)
       ) {
         // Content the agent sends outside a prompt is dropped, and so is content Guild cannot decode.
+        this.emitEngineSignal({
+          type: "late_update_dropped",
+          engine: "claude",
+          sessionId: String((notification.params as { readonly sessionId: unknown }).sessionId).slice(0, 128),
+          discriminator: typeof update?.["sessionUpdate"] === "string"
+            ? update["sessionUpdate"].slice(0, 80)
+            : "unknown",
+        });
         return;
       }
       if (this.currentState === "ready" || this.currentState === "starting") {

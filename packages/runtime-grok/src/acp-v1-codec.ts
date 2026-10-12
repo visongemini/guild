@@ -686,6 +686,13 @@ function decodeModelDescriptor(entry: unknown): GrokModelDescriptor | undefined 
   });
 }
 
+/**
+ * A Grok-shaped catalog tagged with its engine. The tag makes `freezeGrokModelCatalog` reject it,
+ * so a Claude catalog can never be stored in the Grok cache by mistake.
+ */
+// TODO(WP-B): replace with the engine-keyed catalog type from @guild/contracts.
+export type ClaudeModelCatalog = GrokModelCatalog & Readonly<{ engine: "claude" }>;
+
 // TODO(WP-B): replace with the per-engine model id grammar (`parseGuildModelId`) from @guild/contracts.
 /** Claude model option values: aliases (`opus`), explicit ids (`claude-opus-4-8`) and routed ids (`name[1m]`). */
 const CLAUDE_MODEL_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:[\]-]{0,127}$/u;
@@ -707,7 +714,7 @@ export function isClaudeModelId(id: string): boolean {
 // TODO(WP-B): return the engine-keyed catalog type from @guild/contracts.
 export function deriveClaudeModelCatalog(
   options: readonly RuntimeConfigOption[],
-): GrokModelCatalog | undefined {
+): ClaudeModelCatalog | undefined {
   const modelOption = options.find((option) => option.type === "select" && option.category === "model");
   if (modelOption === undefined || modelOption.type !== "select") return undefined;
   const effortOption = options.find((option) => option.type === "select" && option.category === "thought_level");
@@ -742,6 +749,7 @@ export function deriveClaudeModelCatalog(
   }
   if (models.length === 0) return undefined;
   return Object.freeze({
+    engine: "claude" as const,
     models: Object.freeze(models),
     ...(seen.has(modelOption.currentValue) ? { runtimeDefaultModelId: modelOption.currentValue } : {}),
   });

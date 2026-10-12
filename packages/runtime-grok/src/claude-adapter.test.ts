@@ -343,6 +343,7 @@ describe("Claude dialect: sessions, catalog and start options", () => {
     const catalog = session.modelCatalog;
     assert.ok(catalog !== undefined);
     assert.equal(catalog.runtimeDefaultModelId, "default");
+    assert.equal((catalog as { engine?: string }).engine, "claude");
     assert.deepEqual(
       catalog.models.map((model) => model.id),
       ["default", "opus", "fable", "sonnet", "haiku", "claude-sonnet-5", "claude-opus-5", "claude-fable-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-4-6"],
@@ -589,17 +590,19 @@ describe("Claude dialect: turns, late frames and liveness", () => {
       update({ sessionUpdate: "agent_message_chunk", content: { type: "no-such-content-type" } }),
       update({ sessionUpdate: "plan", entries: "not-an-array" }),
     );
-    await waitFor(() => sink.engineSignals.filter((signal) => signal.type === "late_update_dropped").length >= 2);
+    await waitFor(() => sink.engineSignals.filter((signal) => signal.type === "late_update_dropped").length >= 4);
     await immediate();
     assert.equal(sink.updates.length, 0);
     assert.equal(sink.agentTurns.length, 0);
     assert.equal(adapter.state, "ready");
     assert.equal(sink.interruptions.length, 0);
     const dropped = sink.engineSignals.filter((signal) => signal.type === "late_update_dropped");
-    assert.deepEqual(dropped.slice(0, 2).map((signal) => signal.type === "late_update_dropped" ? signal.discriminator : ""), [
+    assert.deepEqual(dropped.map((signal) => signal.type === "late_update_dropped" ? signal.discriminator : ""), [
       "agent_text_chunk",
       "tool_call_create",
-    ]);
+      "agent_message_chunk",
+      "plan",
+    ], "decodable content is named by its payload type, undecodable content by its wire discriminator");
     assert.equal(JSON.stringify(dropped).includes("unprompted words"), false, "no content in the signal");
 
     // And a permission request outside any prompt is cancelled, not asked and not a fault.

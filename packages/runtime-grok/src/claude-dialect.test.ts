@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { describe, it } from "node:test";
-import type { RuntimeConfigOption } from "@guild/contracts";
+import { freezeGrokModelCatalog, type RuntimeConfigOption } from "@guild/contracts";
 import {
   AcpV1CodecError,
   decodeInitializeResult,
@@ -117,6 +117,9 @@ describe("Claude dialect: session decoding and the model catalog", () => {
     assert.equal(decoded.configOptions?.length, 4);
     assert.equal(decoded.modelCatalog?.models.length, 12);
     assert.equal(decoded.modelCatalog?.runtimeDefaultModelId, "default");
+    assert.equal((decoded.modelCatalog as { engine?: string } | undefined)?.engine, "claude");
+    // The Grok catalog validator refuses a Claude catalog.
+    assert.throws(() => freezeGrokModelCatalog(decoded.modelCatalog));
     assert.equal(Object.isFrozen(decoded.modelCatalog), true);
     for (const model of decoded.modelCatalog?.models ?? []) {
       assert.equal(isClaudeModelId(model.id), true, model.id);
