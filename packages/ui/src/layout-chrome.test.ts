@@ -138,7 +138,7 @@ test("settings tabs expose roving keyboard focus and linked tab panels", async (
   assert.match(source, /tabIndex=\{settingsTab === tab \? 0 : -1\}/);
   assert.match(source, /onKeyDown=\{\(event\) => moveSettingsTabFocus\(event, tab, setSettingsTab\)\}/);
   assert.match(source, /aria-controls=\{`guild-settings-panel-\$\{tab\}`\}/);
-  for (const tab of ["general", "grok", "privacy", "about"]) {
+  for (const tab of ["general", "engines", "sources", "privacy", "about"]) {
     assert.match(source, new RegExp(`id="guild-settings-panel-${tab}" role="tabpanel"`, "u"));
     assert.match(source, new RegExp(`aria-labelledby="guild-settings-tab-${tab}"`, "u"));
   }

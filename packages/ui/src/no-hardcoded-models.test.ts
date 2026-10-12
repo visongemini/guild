@@ -14,6 +14,12 @@ test("the renderer carries no model ids and none of the removed model constants"
   for (const name of files) {
     const source = await readFile(new URL(name, directory), "utf8");
     if (name !== TRANSLATION_TABLE) assert.doesNotMatch(source, /grok-\d/u, `${name} hard-codes a model id`);
+    // Guild 3.0: the Claude catalog and the model sources are data too. Group names are fine; ids are not.
+    assert.doesNotMatch(
+      source,
+      /\bclaude-(?:opus|sonnet|haiku|fable|\d)|\b(?:deepseek|localmodel|qwen|llama)-[a-z]*\d|"(?:opus|sonnet|haiku|fable)"/iu,
+      `${name} hard-codes a Claude, Online or Local model id`,
+    );
     assert.doesNotMatch(
       source,
       /GUILD_GROK_MODELS|GUILD_GROK_REASONING_EFFORTS|supportsGuildGrokReasoningEffort|availableModels|\bselectedModel\b/u,

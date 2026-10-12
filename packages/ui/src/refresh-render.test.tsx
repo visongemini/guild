@@ -5,6 +5,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { readFile } from "node:fs/promises";
 import { ActivityGroupView, Timeline, TimelineItem } from "./App.js";
 import { messagesFor } from "./locales.js";
+import { EMPTY_CLAUDE_MODEL_CATALOG } from "@guild/contracts";
 import { REAL_CATALOG } from "./model-catalog.fixture.js";
 import { ModelPicker } from "./ModelPicker.js";
 
@@ -54,8 +55,10 @@ test("the model popover tags only the model whose official description states a 
   const markup = renderToStaticMarkup(
     <ModelPicker
       messages={messagesFor("zh-CN")}
-      catalog={REAL_CATALOG}
+      catalogs={{ grok: REAL_CATALOG, claude: EMPTY_CLAUDE_MODEL_CATALOG }}
       selection={{ modelId: "grok-4.7", reasoningEffort: "high", source: "task", canChange: true }}
+      taskEngine="grok"
+      engineFixed
       onApply={async () => { throw new Error("not called"); }}
       initialOpen
     />,
