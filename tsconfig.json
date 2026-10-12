@@ -3,6 +3,7 @@
   "references": [
     { "path": "./packages/contracts" },
     { "path": "./packages/domain" },
+    { "path": "./packages/model-router" },
     { "path": "./packages/persistence" },
     { "path": "./packages/runtime-grok" },
     { "path": "./packages/ui" },
