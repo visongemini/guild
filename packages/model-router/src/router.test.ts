@@ -26,6 +26,8 @@ import {
   type ModelRouterOptions,
   type ProvenanceStore,
   type RouterSource,
+  type UpstreamFetch,
+  type UpstreamRequestContext,
 } from "./types.js";
 
 /*
@@ -72,6 +74,7 @@ interface LogEntry {
 interface FetchCall {
   readonly url: string;
   readonly init: RequestInit | undefined;
+  readonly context: UpstreamRequestContext | undefined;
 }
 
 class MemoryStore implements ProvenanceStore {
@@ -234,9 +237,9 @@ async function startHarness(t: TestContext, options: HarnessOptions = {}): Promi
     ["100.101.102.103:8080", local.port],
     ["[::1]:8080", local.port],
   ]);
-  const fetchImpl: typeof fetch = async (input, init) => {
+  const fetchImpl: UpstreamFetch = async (input, init, context) => {
     const url = new URL(String(input));
-    calls.push({ url: url.href, init });
+    calls.push({ url: url.href, init, context });
     const mapped = hostMap.get(url.host);
     if (mapped !== undefined) {
       url.protocol = "http:";
@@ -595,8 +598,8 @@ describe("anthropic route", () => {
   it("startModelRouter always uses the fixed Anthropic base URL", async (t) => {
     assert.equal(ANTHROPIC_BASE_URL, "https://api.anthropic.com");
     const seen: FetchCall[] = [];
-    const fetchImpl: typeof fetch = async (input, init) => {
-      seen.push({ url: String(input), init });
+    const fetchImpl: UpstreamFetch = async (input, init, context) => {
+      seen.push({ url: String(input), init, context });
       return new Response(JSON.stringify(OK_MESSAGE), { status: 200, headers: { "content-type": "application/json" } });
     };
     // Options are copied structurally by TypeScript only; a smuggled override must be inert.
@@ -826,6 +829,43 @@ describe("online and local credential rules", () => {
       ["[::1]:8080", "[::1]:8080", `127.0.0.1:${h.local.port}`, `127.0.0.1:${h.local.port}`],
     );
     assert.ok(h.calls.every((call) => isIP(new URL(call.url).hostname.replace(/^\[|\]$/gu, "")) !== 0), "no hostname may reach the transport");
+  });
+});
+
+describe("upstream transport context", () => {
+  it("tells the transport the source kind of every upstream request [PC-ROUTE-002]", async (t) => {
+    const h = await startHarness(t);
+    assert.equal((await h.post("v1/messages", simpleBody("claude-sonnet-5"))).status, 200);
+    assert.equal((await h.post("v1/messages", simpleBody("deepseek-v4"))).status, 200);
+    assert.equal((await h.post("v1/messages/count_tokens", simpleBody("local-27b"))).status, 200);
+    assert.deepEqual(
+      h.calls.map((call) => call.context),
+      [{ sourceKind: "anthropic" }, { sourceKind: "online" }, { sourceKind: "local" }],
+    );
+  });
+
+  it("decides the kind per request: a registry update after planning cannot change it", async (t) => {
+    const gate = deferred();
+    const entered = deferred();
+    const h = await startHarness(t, {
+      lookup: async () => {
+        entered.resolve();
+        await gate.promise;
+        return ["127.0.0.1"];
+      },
+    });
+    const source: RouterSource = {
+      id: "slow-local", kind: "local", label: "x", baseUrl: `http://localhost:${h.local.port}`, key: LOCAL_KEY,
+      confirmedHost: `localhost:${h.local.port}`, models: [{ id: "slow-model", label: "x" }],
+    };
+    h.router.updateSources([source]);
+    const pending = h.post("v1/messages", simpleBody("slow-model"));
+    // The request is admitted and waits in the address check; now the same origin becomes Online.
+    await within(entered.promise, 2000, "the address check");
+    h.router.updateSources([{ ...source, id: "swapped", kind: "online", baseUrl: `https://localhost:${h.local.port}`, confirmedHost: `localhost:${h.local.port}`, models: [{ id: "slow-model", label: "x" }] }]);
+    gate.resolve();
+    assert.equal((await pending).status, 200);
+    assert.deepEqual(h.calls.map((call) => call.context), [{ sourceKind: "local" }]);
   });
 });
 

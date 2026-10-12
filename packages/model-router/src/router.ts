@@ -527,13 +527,17 @@ class RouterCore {
 
     let upstream: Response;
     try {
-      upstream = await this.options.fetchImpl(plan.url, {
-        method: "POST",
-        headers: plan.headers,
-        body: plan.body,
-        redirect: "manual",
-        signal: controller.signal,
-      });
+      upstream = await this.options.fetchImpl(
+        plan.url,
+        {
+          method: "POST",
+          headers: plan.headers,
+          body: plan.body,
+          redirect: "manual",
+          signal: controller.signal,
+        },
+        { sourceKind: plan.source.kind },
+      );
     } catch (error) {
       if (controller.signal.aborted) {
         this.finish(ctx, 499, "client_closed");

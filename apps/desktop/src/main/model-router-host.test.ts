@@ -223,6 +223,31 @@ describe("model router host: isAnthropicModel and credentials", () => {
     assert.equal(h.calls.length, 0);
   });
 
+  it("picks the direct or proxied transport from the source kind alone, not from the URL [PC-ROUTE-002]", async (t) => {
+    const h = harness(t);
+    const keys = writeEnv(h, "keys.env", "VENDOR_KEY='sk-vendor-key-123456'\n");
+    // Same origin for a Local and an Online source: a URL lookup cannot tell them apart.
+    add(h.store, draft({ baseUrl: "https://127.0.0.1:8443", models: [{ id: "flash-local", label: "Flash local" }] }));
+    add(h.store, onlineDraft({ baseUrl: "https://127.0.0.1:8443/anthropic", keyFile: keys }));
+    await h.host.refresh();
+    const { baseUrl } = await h.host.ensureStarted();
+
+    assert.equal((await post(baseUrl, "vendor-fast")).status, 200);
+    assert.equal((await post(baseUrl, "flash-local")).status, 200);
+    assert.deepEqual(h.calls.map((call) => call.via), ["proxied", "direct"]);
+  });
+
+  it("a Local source reached through a hostname still uses the direct transport after address pinning [PC-ROUTE-002]", async (t) => {
+    const h = harness(t);
+    add(h.store, draft({ baseUrl: "http://localhost:8081" }));
+    await h.host.refresh();
+    const { baseUrl } = await h.host.ensureStarted();
+    assert.equal((await post(baseUrl, "flash-local")).status, 200);
+    assert.equal(h.calls.length, 1);
+    assert.match(h.calls[0]?.url ?? "", /^http:\/\/(?:127\.0\.0\.1|\[::1\]):8081\/v1\/messages$/u, "the router sends the validated IP literal");
+    assert.equal(h.calls[0]?.via, "direct");
+  });
+
   it("replaces the client credential with the source key for the confirmed host only [PC-ROUTE-002]", async (t) => {
     const h = harness(t);
     const keys = writeEnv(h, "keys.env", "VENDOR_KEY='sk-vendor-key-123456'\n");

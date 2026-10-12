@@ -30,6 +30,17 @@ export interface RouterLogger {
   info(event: string, fields: Record<string, string | number | boolean>): void;
 }
 
+/** What the router tells the transport about an upstream request, beyond the request itself. */
+export interface UpstreamRequestContext {
+  /**
+   * Kind of the source the router chose for this request. A transport that differs by kind (Local
+   * never uses a proxy) must decide from this alone, never from the registry or the URL.
+   */
+  readonly sourceKind: SourceKind;
+}
+
+export type UpstreamFetch = (input: string, init: RequestInit, context: UpstreamRequestContext) => Promise<Response>;
+
 export interface ModelRouterOptions {
   /** Online and local sources. Entries of kind "anthropic" are never routable. */
   readonly sources: readonly RouterSource[];
@@ -37,8 +48,8 @@ export interface ModelRouterOptions {
   readonly isAnthropicModel: (model: string) => boolean;
   readonly provenance: ProvenanceStore;
   readonly logger: RouterLogger;
-  /** Production: Electron net.fetch (system proxy). Tests: global fetch. */
-  readonly fetchImpl: typeof fetch;
+  /** Production: Electron net.fetch (system proxy). Tests: global fetch, which ignores the context. */
+  readonly fetchImpl: UpstreamFetch;
   /** DNS lookup used for local-source address checks. Default: node:dns. */
   readonly lookup?: (host: string) => Promise<string[]>;
   /** Must be a loopback address. Default "127.0.0.1". */

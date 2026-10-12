@@ -109,6 +109,9 @@ created and never changes. Process topology stays one engine process per task (D
   a second DNS answer cannot reach the connection (DNS rebinding). Local https is allowed only when
   the host is already an IP literal or `localhost` (a certificate name cannot match a rewritten IP);
   any other https host answers 403 `local_https_requires_ip`. No `Host` header is set.
+- **Transport selection.** The router calls `fetchImpl(url, init, { sourceKind })` with the kind of the
+  source it chose for that request. The Electron host uses the direct (no proxy) session for `local`
+  and the proxied session otherwise, from that argument only, never from the URL or the live registry.
 - **Compat layer** (Online/Local only; Anthropic gets the original body):
   1. `role:"system"` messages are removed; their text is queued and inserted as one
      `<system-reminder>` text block into the next user message **after** its `tool_result` blocks
