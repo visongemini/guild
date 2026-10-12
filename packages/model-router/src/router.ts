@@ -503,6 +503,11 @@ class RouterCore {
     if (source.confirmedHost === undefined || url.host !== source.confirmedHost) {
       return deny("source not confirmed", "source_not_confirmed");
     }
+    // D-061: Claude is reached only by Claude Code itself, never through the router, whatever a source says.
+    if (isAnthropicHost(bareHostname(url.hostname))) return deny("Anthropic hosts are not a model source", "anthropic_host_denied");
+    if (source.key !== undefined && /^(?:bearer\s+)?sk-ant-/iu.test(source.key.trim())) {
+      return deny("an Anthropic credential is not a source key", "anthropic_key_denied");
+    }
     if (source.kind === "online") {
       return url.protocol === "https:" ? { baseUrl: source.baseUrl } : deny("online sources require https", "online_requires_https");
     }
@@ -677,4 +682,10 @@ export async function startRouterInternal(
 
 export function startModelRouter(options: ModelRouterOptions): Promise<ModelRouterHandle> {
   return startRouterInternal(options, { maxRequestBytes: DEFAULT_MAX_REQUEST_BYTES });
+}
+
+/** Anthropic-operated hosts (D-061): no source may point at them. */
+function isAnthropicHost(hostname: string): boolean {
+  const host = hostname.toLowerCase().replace(/\.$/u, "");
+  return ["anthropic.com", "claude.ai", "claude.com"].some((domain) => host === domain || host.endsWith(`.${domain}`));
 }

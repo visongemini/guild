@@ -687,6 +687,25 @@ describe("online and local credential rules", () => {
     assert.equal(h.online.requests.length, 1);
   });
 
+  it("refuses sources on Anthropic hosts and Anthropic credentials as source keys, before any connection [PC-ROUTE-002]", async (t) => {
+    const h = await startHarness(t);
+    const cases: RouterSource[] = [
+      { id: "a1", kind: "online", label: "x", baseUrl: "https://api.anthropic.com", key: ONLINE_KEY, confirmedHost: "api.anthropic.com", models: [{ id: "m-api-host", label: "x" }] },
+      { id: "a2", kind: "online", label: "x", baseUrl: "https://Gateway.Claude.AI./v1", key: ONLINE_KEY, confirmedHost: "Gateway.Claude.AI.", models: [{ id: "m-claude-host", label: "x" }] },
+      { id: "a3", kind: "online", label: "x", baseUrl: "https://vendor.example/anthropic", key: "sk-ant-oat01-abcdef", confirmedHost: "vendor.example", models: [{ id: "m-oauth-key", label: "x" }] },
+      { id: "a4", kind: "online", label: "x", baseUrl: "https://vendor.example/anthropic", key: "Bearer sk-ant-api03-abcdef", confirmedHost: "vendor.example", models: [{ id: "m-api-key", label: "x" }] },
+    ];
+    h.router.updateSources(cases);
+    for (const source of cases) {
+      const response = await h.post("v1/messages", simpleBody(source.models[0]?.id ?? ""));
+      assert.equal(response.status, 403, source.id);
+      const text = await response.text();
+      assert.ok(!text.includes("sk-ant-"), source.id);
+    }
+    assert.equal(h.calls.length, 0);
+    assert.equal(h.online.requests.length, 0);
+  });
+
   it("requires https for online sources", async (t) => {
     const h = await startHarness(t);
     h.router.updateSources([

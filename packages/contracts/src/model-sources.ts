@@ -132,7 +132,8 @@ export function canonicalModelSourceBaseUrl(kind: ModelSourceKind, value: unknow
     parsed.username !== "" ||
     parsed.password !== "" ||
     parsed.search !== "" ||
-    parsed.hash !== ""
+    parsed.hash !== "" ||
+    isAnthropicHostname(parsed.hostname)
   ) {
     throw new TypeError("invalid_model_source_base_url");
   }
@@ -140,6 +141,12 @@ export function canonicalModelSourceBaseUrl(kind: ModelSourceKind, value: unknow
   // An `@` anywhere would read as user info to some parsers; the database refuses it as well.
   if (/[@?#]/u.test(canonical)) throw new TypeError("invalid_model_source_base_url");
   return canonical;
+}
+
+/** D-061: Claude is reached only by Claude Code itself, so no source may point at an Anthropic-operated host. */
+function isAnthropicHostname(hostname: string): boolean {
+  const host = hostname.toLowerCase().replace(/\.$/u, "");
+  return ["anthropic.com", "claude.ai", "claude.com"].some((domain) => host === domain || host.endsWith(`.${domain}`));
 }
 
 /** Host (with a non-default port) of a canonical base URL: what a key is bound to. */
