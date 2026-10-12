@@ -1377,6 +1377,15 @@ export function createLiveDesktopService(
   }
 
   /**
+   * A start (the routed switch included) is in flight or due for this task, so the session in hand may
+   * be about to go away: no prompt may launch on it. The caller goes through `ensureSession` instead,
+   * which joins the start and hands out the session it produced (docs/20 3.3).
+   */
+  function sessionStartPending(taskId: TaskId, controller: RuntimeController): boolean {
+    return controller.startOperation !== undefined || routedRestartNeeded(taskId, controller);
+  }
+
+  /**
    * A Claude session that never had a prompt has no transcript, so the adapter cannot resume it,
    * and nothing in it is lost: restore_pending -> broken -> replacement_pending without a question.
    */
@@ -4097,6 +4106,16 @@ export function createLiveDesktopService(
       controller.session.adapterEpoch !== session.adapterEpoch ||
       controller.adapter?.state !== "ready"
     ) return;
+    if (sessionStartPending(taskId, controller)) {
+      // Wait for the start (the routed switch), then dispatch again on the session it produced.
+      const again = (): void => {
+        const retry = setTimeout(() => void scheduleContinuousDispatch(taskId), 0);
+        retry.unref?.();
+      };
+      if (controller.startOperation !== undefined) void controller.startOperation.then(again, again);
+      else again();
+      return;
+    }
     const rawPrompt = buildContinuousPrompt(mission, store.loadAppSettings().locale);
     const prompt = prepareRuntimePrompt(taskId, session, rawPrompt);
     const runId = id(parseRunId, "run");
@@ -4295,6 +4314,16 @@ export function createLiveDesktopService(
     ) {
       const retry = setTimeout(() => scheduleQueuedDispatch(taskId), 0);
       retry.unref?.();
+      return;
+    }
+    if (sessionStartPending(taskId, controller)) {
+      // The queued turn waits for the start (the routed switch) and then runs on the session it produced.
+      const again = (): void => {
+        const retry = setTimeout(() => scheduleQueuedDispatch(taskId), 0);
+        retry.unref?.();
+      };
+      if (controller.startOperation !== undefined) void controller.startOperation.then(again, again);
+      else again();
       return;
     }
     let discarded = 0;
@@ -7562,7 +7591,12 @@ export function createLiveDesktopService(
           assertOpen();
           const controller = controllerFor(taskId);
           const session = controller.session;
-          if (session === undefined || controller.adapter?.state !== "ready") {
+          if (
+            session === undefined ||
+            controller.adapter?.state !== "ready" ||
+            // A routed switch started (or became due) after ensureSession handed this session out.
+            sessionStartPending(taskId, controller)
+          ) {
             return Object.freeze({ status: "retry_session" as const });
           }
           const restored = store.restoreTask(taskId);
