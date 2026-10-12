@@ -4555,7 +4555,8 @@ function RunCardView({ card, locale, engine, onViewRunDiff, onRewind }: {
 
 /**
  * The row under a finished answer: copy and branch as labelled ghost buttons (visible on hover and
- * focus, always for the newest answer) with the turn's duration on the right. `slot` holds the
+ * focus, always for the newest answer) with the answering model and the turn's duration on the right,
+ * which stay visible under every finished answer. `slot` holds the
  * per-turn changed-files card (with "rewind to before this turn"); nothing renders there for a
  * turn without file changes, so no placeholder is shown.
  */

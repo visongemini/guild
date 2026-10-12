@@ -398,9 +398,10 @@ span.guild-pill { cursor: default; }
 /* Turn footer under a finished answer */
 .guild-turn-footer { margin-top: var(--guild-s1); }
 .guild-turn-slot:not(:empty) { margin-bottom: var(--guild-s2); }
-.guild-turn-actions { display: flex; align-items: center; gap: 2px; min-height: 28px; opacity: 0; transition: opacity var(--guild-dur-1) var(--guild-ease); }
-.guild-turn-footer.last .guild-turn-actions, .guild-message-assistant:hover .guild-turn-actions, .guild-message-assistant:focus-within .guild-turn-actions { opacity: 1; }
-.guild-turn-actions .guild-ghost-button { height: 28px; padding: 0 var(--guild-s2); }
+/* The model and the time under an answer are always there; only the Copy and Branch buttons wait for hover or focus on an older answer. They keep their space, so nothing moves. */
+.guild-turn-actions { display: flex; align-items: center; gap: 2px; min-height: 28px; }
+.guild-turn-actions .guild-ghost-button { height: 28px; padding: 0 var(--guild-s2); opacity: 0; transition: opacity var(--guild-dur-1) var(--guild-ease), background-color var(--guild-dur-1) var(--guild-ease), color var(--guild-dur-1) var(--guild-ease); }
+.guild-turn-footer.last .guild-turn-actions .guild-ghost-button, .guild-message-assistant:hover .guild-turn-actions .guild-ghost-button, .guild-message-assistant:focus-within .guild-turn-actions .guild-ghost-button { opacity: 1; }
 .guild-turn-meta { min-width: 0; margin-left: auto; display: flex; align-items: baseline; color: var(--guild-faint); font-size: var(--guild-fs-meta); font-variant-numeric: tabular-nums; white-space: nowrap; }
 .guild-turn-model { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .guild-turn-took { flex: none; white-space: pre; }
