@@ -1847,7 +1847,8 @@ describe("live desktop service", () => {
       stagingRoot: join(root, "staging"),
       chooseWorkspace: async () => workspace,
       runtimeFactory: fakeRuntimeFactory([], (adapter) => adapters.push(adapter)),
-      promptSilenceMs: 25,
+      // Long enough that a CPU-starved machine does not read the retried turn as silent too.
+      promptSilenceMs: 250,
     });
     services.push(service);
 
@@ -5129,7 +5130,7 @@ describe("live desktop service", () => {
       stagingRoot: join(root, "staging"),
       chooseWorkspace: async () => workspace,
       runtimeFactory: fakeRuntimeFactory(),
-      promptSilenceMs: 25,
+      promptSilenceMs: 250,
     });
     services.push(service);
 
@@ -5137,7 +5138,7 @@ describe("live desktop service", () => {
     const task = await service.createTask(bootstrapped.workspaces[0]!.workspaceId);
     const sent = await service.sendMessage(task.task.taskId, "permission");
     const pending = await waitForPermission(service);
-    await new Promise((resolve) => setTimeout(resolve, 75));
+    await new Promise((resolve) => setTimeout(resolve, 750));
     const stillWaiting = await service.bootstrap();
     assert.equal(stillWaiting.activeTask?.task.activeRunState, "awaiting_permission");
     assert.equal(
