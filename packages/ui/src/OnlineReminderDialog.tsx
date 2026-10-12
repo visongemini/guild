@@ -40,7 +40,7 @@ export function OnlineReminderDialog({
       onPointerDown={(event) => event.stopPropagation()}
       onKeyDown={(event) => onDialogKeyDown(event, onCancel)}
     >
-      <div className="guild-dialog-header"><strong id={titleId}>{messages.onlineReminderTitle(vendorLabel)}</strong></div>
+      <div className="guild-dialog-header"><strong id={titleId}>{messages.onlineReminderTitle}</strong></div>
       <div className="guild-dialog-body guild-online-reminder-body" id={bodyId}>
         <p>{messages.onlineReminderLead(vendorLabel)}</p>
         <ul>

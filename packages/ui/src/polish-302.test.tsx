@@ -79,3 +79,21 @@ test("the card's last button says it stops the turn, and it does stop the turn",
   assert.match(body, /decision\.type === "cancelled"[\s\S]*api\.cancelRun\(\{ taskId: item\.taskId, runId: item\.runId! \}\)/u);
   assert.match(body, /api\.decidePermission\(\{/u);
 });
+
+test("the online reminder dialog closes the model popover first and its copy is two-way", async () => {
+  const picker = await source("ModelPicker.tsx");
+  const app = await source("App.tsx");
+  assert.match(picker, /useEffect\(\(\) => \{\s*if \(modalOpen\) setOpen\(false\);\s*\}, \[modalOpen\]\);/u);
+  assert.match(app, /modalOpen=\{onlineReminder !== undefined\}/u);
+  for (const locale of ["zh-CN", "en-US"] as const) {
+    const messages = messagesFor(locale);
+    const copy = [
+      messages.onlineReminderTitle, messages.onlineReminderLead("DeepSeek"), messages.onlineReminderItemClaudeMd,
+      messages.onlineReminderItemMemory, messages.onlineReminderItemConversation, messages.onlineReminderItemBrowser,
+      messages.onlineReminderDontRemind, messages.onlineReminderSwitch,
+    ].join("\n");
+    assert.doesNotMatch(copy, /不能再|无法再|不可再|切回|cannot (?:go|switch) back|can(?:'|’)t (?:go|switch) back|one-way|no longer be able/iu, locale);
+  }
+  assert.equal(messagesFor("zh-CN").onlineReminderTitle, "发给在线模型前确认一下");
+  assert.equal(messagesFor("en-US").onlineReminderTitle, "Confirm before sending to an online model");
+});

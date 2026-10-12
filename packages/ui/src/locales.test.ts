@@ -76,7 +76,7 @@ test("Guild 3.0 strings exist, are non-empty and mention no undefined in both ca
       messages.settingsEngines, messages.settingsModelSources, messages.settingsClaude, messages.enginesClaudeIntro,
       messages.modelPickerOpenModelSources, messages.modelPickerClaudeUnavailable, messages.modelPickerClaudeUnavailableHelp,
       messages.modelPickerClaudeNotStarted, messages.modelPickerClaudeDefault, messages.modelPickerEngineNote,
-      messages.onlineReminderTitle("V"), messages.onlineReminderLead("V"), messages.onlineReminderItemClaudeMd,
+      messages.onlineReminderTitle, messages.onlineReminderLead("V"), messages.onlineReminderItemClaudeMd,
       messages.onlineReminderItemMemory, messages.onlineReminderItemConversation, messages.onlineReminderItemBrowser,
       messages.onlineReminderDontRemind, messages.onlineReminderSwitch,
       messages.privacyOnlineReminder, messages.privacyOnlineReminderHelp, messages.privacyOnlineReminderNoWorkspace, messages.privacyOnlineReminderFailed,
@@ -123,7 +123,7 @@ test("the picker group names are the ones the product contract states", () => {
   assert.deepEqual((["grok", "claude", "online", "local"] as const).map(zh.modelGroupName), ["Grok", "Claude\uff08\u8ba2\u9605\uff09", "\u5728\u7ebf", "\u672c\u5730"]);
   assert.equal(en.modelPickerGroupEmpty("online"), "No online models \u2014 add one in Settings \u203a Model sources");
   assert.equal(en.modelPickerClaudeUnavailable, "Claude Code not found or not logged in");
-  assert.equal(en.onlineReminderTitle("DeepSeek"), "Send this conversation to DeepSeek?");
+  assert.equal(en.onlineReminderTitle, "Confirm before sending to an online model");
   assert.equal(en.onlineReminderDontRemind, "Don't remind me again in this workspace");
   assert.equal(en.settingsEngines, "Engines");
   assert.equal(en.settingsModelSources, "Model sources");

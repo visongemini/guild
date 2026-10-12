@@ -194,7 +194,7 @@ export type GuildMessages = WorkshopMessages & ChangeMessages & {
   readonly taskEngineName: (engine: GuildEngine) => string;
   readonly taskEngineMarkerTitle: (engine: GuildEngine) => string;
   // Online-model reminder (PC-PRIV-001)
-  readonly onlineReminderTitle: (vendor: string) => string;
+  readonly onlineReminderTitle: string;
   readonly onlineReminderLead: (vendor: string) => string;
   readonly onlineReminderItemClaudeMd: string;
   readonly onlineReminderItemMemory: string;
@@ -751,8 +751,8 @@ const ZH_CN: GuildMessages = Object.freeze({
   modelSwitchStatus: (model) => `正在切换到「${model}」，需要重启引擎，通常 30–90 秒。消息会在切换完成后发出。`,
   taskEngineName: (engine) => ({ grok: "Grok", claude: "Claude" })[engine],
   taskEngineMarkerTitle: (engine) => ({ grok: "Grok 对话", claude: "Claude Code 对话" })[engine],
-  onlineReminderTitle: (vendor) => `要把这段对话发给「${vendor}」吗？`,
-  onlineReminderLead: (vendor) => `「${vendor}」是在线模型。切换后，下面这些内容会发送给它的服务商：`,
+  onlineReminderTitle: "发给在线模型前确认一下",
+  onlineReminderLead: (vendor) => `「${vendor}」是在线模型。切换后，这个任务的下面这些内容会发送给它的服务商：`,
   onlineReminderItemClaudeMd: "CLAUDE.md",
   onlineReminderItemMemory: "记忆",
   onlineReminderItemConversation: "本次对话",
@@ -1296,8 +1296,8 @@ const EN_US: GuildMessages = Object.freeze({
   modelSwitchStatus: (model) => `Switching to \u201c${model}\u201d. The engine needs a restart, usually 30\u201390 seconds. Your message will be sent once the switch is done.`,
   taskEngineName: (engine) => ({ grok: "Grok", claude: "Claude" })[engine],
   taskEngineMarkerTitle: (engine) => ({ grok: "Grok conversation", claude: "Claude Code conversation" })[engine],
-  onlineReminderTitle: (vendor) => `Send this conversation to ${vendor}?`,
-  onlineReminderLead: (vendor) => `${vendor} is an online model. If you switch, these are sent to its vendor:`,
+  onlineReminderTitle: "Confirm before sending to an online model",
+  onlineReminderLead: (vendor) => `${vendor} is an online model. If you switch, these parts of this task are sent to its vendor:`,
   onlineReminderItemClaudeMd: "CLAUDE.md",
   onlineReminderItemMemory: "Memory",
   onlineReminderItemConversation: "This conversation",

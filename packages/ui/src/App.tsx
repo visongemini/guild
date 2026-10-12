@@ -2744,6 +2744,7 @@ export function GuildApp({ api }: GuildAppProps) {
                 taskEngine={activeEngine}
                 engineFixed={engineFixed}
                 switching={modelSwitchRunning(modelSwitch, activeTask?.task.taskId)}
+                modalOpen={onlineReminder !== undefined}
                 {...(claudeStatus === undefined ? {} : { claudeState: claudeStatus.state })}
                 onApply={applyTaskRuntimeSettings}
                 onOpenModelSources={() => openSettings("sources")}

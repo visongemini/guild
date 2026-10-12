@@ -43,6 +43,11 @@ export type ModelPickerProps = Readonly<{
   /** A switch between a Claude model and an Online / Local one is running for this task (D-062): the trigger says so. */
   switching?: boolean;
   /**
+   * A dialog the picker's own choice opened (the Online reminder) is showing. The popover closes the moment it
+   * does, so it is not left open and blurred behind the dialog; it stays closed after the dialog is answered.
+   */
+  modalOpen?: boolean;
+  /**
    * Applies a change for the active task and resolves with the response. The caller owns the API
    * calls (moving the task to the other engine first, the Online reminder) and replaces its task
    * state with the returned task; the picker owns the pending state and the inline notice. A
@@ -99,6 +104,7 @@ export function ModelPicker({
   engineFixed,
   claudeState,
   switching = false,
+  modalOpen = false,
   onApply,
   onOpenModelSources,
   initialOpen = false,
@@ -139,6 +145,10 @@ export function ModelPicker({
   useEffect(() => {
     if (locked) setOpen(false);
   }, [locked]);
+
+  useEffect(() => {
+    if (modalOpen) setOpen(false);
+  }, [modalOpen]);
 
   useEffect(() => {
     if (!panelOpen) return;

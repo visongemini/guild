@@ -123,8 +123,8 @@ const dialog = (messages = EN, initialDontRemind = false) => renderToStaticMarku
 test("the dialog asks to send the conversation to the vendor and lists what goes", () => {
   const markup = dialog();
   assert.match(markup, /role="alertdialog" aria-modal="true"/u);
-  assert.match(markup, /<strong id="[^"]+">Send this conversation to DeepSeek\?<\/strong>/u);
-  assert.match(markup, /DeepSeek is an online model\. If you switch, these are sent to its vendor:/u);
+  assert.match(markup, /<strong id="[^"]+">Confirm before sending to an online model<\/strong>/u);
+  assert.match(markup, /DeepSeek is an online model\. If you switch, these parts of this task are sent to its vendor:/u);
   for (const item of ["CLAUDE.md", "Memory", "This conversation", "Text and screenshots of web pages in this conversation"]) {
     assert.match(markup, new RegExp(`<li>${item}</li>`, "u"));
   }
@@ -162,7 +162,8 @@ test("the app asks once per switch, only for an Online vendor not agreed yet, an
 test("the checkbox starts unticked, the dialog is localized, and the key handling is the app's", async () => {
   assert.match(dialog(EN, true), /type="checkbox"[^>]*checked/u);
   const zh = dialog(ZH);
-  assert.match(zh, /要把这段对话发给「DeepSeek」吗？/u);
+  assert.match(zh, /<strong id="[^"]+">发给在线模型前确认一下<\/strong>/u);
+  assert.match(zh, /「DeepSeek」是在线模型。切换后，这个任务的下面这些内容会发送给它的服务商：/u);
   assert.match(zh, /在此工作区不再提醒/u);
   const component = await readFile(new URL("../src/OnlineReminderDialog.tsx", import.meta.url), "utf8");
   assert.match(component, /onKeyDown=\{\(event\) => onDialogKeyDown\(event, onCancel\)\}/u);
