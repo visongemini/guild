@@ -2,17 +2,11 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 import { renderToStaticMarkup } from "react-dom/server";
-import {
-  BROWSER_PANE_MAX_TABS,
-  BrowserPane,
-  normalizeBrowserAddress,
-  type BrowserPaneMessageKey,
-  type BrowserPaneProjection,
-  type BrowserPaneTabProjection,
-} from "./BrowserPane.js";
+import { GUILD_BROWSER_LIMITS, type BrowserPaneProjection, type BrowserTabProjection } from "@guild/contracts/browser-pane";
+import { BrowserPane, normalizeBrowserAddress, type BrowserPaneMessageKey } from "./BrowserPane.js";
 import { messagesFor } from "./locales.js";
 
-const tab = (id: string, patch: Partial<BrowserPaneTabProjection> = {}): BrowserPaneTabProjection => ({
+const tab = (id: string, patch: Partial<BrowserTabProjection> = {}): BrowserTabProjection => ({
   id, url: `https://example.com/${id}`, title: `Title ${id}`, loading: false, canGoBack: false, canGoForward: false, ...patch,
 });
 
@@ -51,7 +45,7 @@ test("the new-tab button is disabled at the five-tab limit", () => {
   assert.doesNotMatch(four, /class="guild-browser-newtab"[^>]*disabled/u);
   const five = render({ tabs: ["a", "b", "c", "d", "e"].map((id) => tab(id)), activeTabId: "a" });
   assert.match(five, /class="guild-browser-newtab"[^>]*title="Up to 5 tabs can be open"[^>]*disabled/u);
-  assert.equal(BROWSER_PANE_MAX_TABS, 5);
+  assert.equal(GUILD_BROWSER_LIMITS.maxTabs, 5);
 });
 
 test("back and forward follow the active tab; reload becomes stop while loading", () => {
@@ -156,19 +150,19 @@ test("addresses are normalised to http(s) URLs and plain words are not searches"
 test("the component reports the placeholder rectangle and visibility to main", async () => {
   const source = await readFile(new URL("../src/BrowserPane.tsx", import.meta.url), "utf8");
   assert.match(source, /new ResizeObserver\(report\)/u);
-  assert.match(source, /type: "setBounds", bounds/u);
-  assert.match(source, /type: "setVisible", visible: !hidden/u);
-  assert.match(source, /type: "setVisible", visible: false/u);
+  assert.match(source, /kind: "setBounds", \.\.\.bounds/u);
+  assert.match(source, /kind: "setVisible", visible: !hidden/u);
+  assert.match(source, /kind: "setVisible", visible: false/u);
   assert.match(render({}, "en-US", true), /class="guild-browser-viewport"/u);
 });
 
-test("the local projection and command types stay identical to the main-process ones", async () => {
-  // Until @guild/contracts owns these types (WP-B), the pane component and the controller each carry a copy.
+test("the pane component and the controller use the contracts types and keep no local copies", async () => {
   const ui = await readFile(new URL("../src/BrowserPane.tsx", import.meta.url), "utf8");
   const main = await readFile(new URL("../../../apps/desktop/src/main/browser-pane.ts", import.meta.url), "utf8");
-  for (const name of ["BrowserPaneBounds", "BrowserPaneAgentControl", "BrowserPaneTabProjection", "BrowserPaneProjection", "BrowserPaneCommand"]) {
-    const grab = (source: string) => source.match(new RegExp(`export type ${name} =[\\s\\S]*?;\\n`, "u"))?.[0].replace(/\s+/gu, " ");
-    assert.ok(grab(ui), `${name} missing in the component`);
-    assert.equal(grab(ui), grab(main), name);
+  assert.match(ui, /from "@guild\/contracts\/browser-pane"/u);
+  assert.match(main, /from "@guild\/contracts"/u);
+  for (const [name, source] of [["component", ui], ["controller", main]] as const) {
+    assert.doesNotMatch(source, /export type BrowserPane(AgentControl|TabProjection|Projection|Command)\b/u, name);
+    assert.doesNotMatch(source, /\btype: "(navigate|back|forward|reload|stop|newTab|closeTab|selectTab|setBounds|setVisible|takeOver|resumeAgent)"/u, name);
   }
 });

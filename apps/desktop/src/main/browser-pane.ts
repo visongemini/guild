@@ -9,6 +9,13 @@
  */
 
 import {
+  GUILD_BROWSER_LIMITS,
+  type BrowserAgentControl,
+  type BrowserCommand,
+  type BrowserPaneProjection,
+  type BrowserTabProjection,
+} from "@guild/contracts";
+import {
   browserPaneRegistry,
   isPaneNavigationAllowed,
   isPaneUrlAllowed,
@@ -16,40 +23,11 @@ import {
 } from "./window-guards.js";
 
 // ---------------------------------------------------------------------------------------------
-// Public shapes (WP-B defines the same names in @guild/contracts; keep them identical)
+// Public shapes (the command and projection types are the canonical ones from @guild/contracts)
 // ---------------------------------------------------------------------------------------------
 
-export type BrowserPaneBounds = Readonly<{ x: number; y: number; width: number; height: number }>;
-export type BrowserPaneAgentControl = "idle" | "operating" | "paused";
-
-export type BrowserPaneTabProjection = Readonly<{
-  id: string;
-  url: string;
-  title: string;
-  loading: boolean;
-  canGoBack: boolean;
-  canGoForward: boolean;
-}>;
-
-export type BrowserPaneProjection = Readonly<{
-  tabs: readonly BrowserPaneTabProjection[];
-  activeTabId: string | null;
-  agentControl: BrowserPaneAgentControl;
-}>;
-
-export type BrowserPaneCommand =
-  | Readonly<{ type: "navigate"; url: string }>
-  | Readonly<{ type: "back" }>
-  | Readonly<{ type: "forward" }>
-  | Readonly<{ type: "reload" }>
-  | Readonly<{ type: "stop" }>
-  | Readonly<{ type: "newTab"; url?: string }>
-  | Readonly<{ type: "closeTab"; tabId: string }>
-  | Readonly<{ type: "selectTab"; tabId: string }>
-  | Readonly<{ type: "setBounds"; bounds: BrowserPaneBounds }>
-  | Readonly<{ type: "setVisible"; visible: boolean }>
-  | Readonly<{ type: "takeOver" }>
-  | Readonly<{ type: "resumeAgent" }>;
+/** The rectangle handed to the native view: the four fields of the contracts `setBounds` command. */
+export type BrowserPaneBounds = Readonly<Pick<Extract<BrowserCommand, { kind: "setBounds" }>, "x" | "y" | "width" | "height">>;
 
 export type BrowserPaneCommandFailure =
   | "invalid_url"
@@ -68,7 +46,6 @@ export type BrowserPaneCommandResult =
 // ---------------------------------------------------------------------------------------------
 
 export const BROWSER_PANE_PARTITION = "persist:guild-browser";
-export const BROWSER_PANE_MAX_TABS = 5;
 /** The agent badge goes back to idle this long after the last tool call ended. */
 export const BROWSER_PANE_IDLE_DEBOUNCE_MS = 1_500;
 export const BROWSER_PANE_PAUSED_MESSAGE = "Paused by the user in Guild";
@@ -248,8 +225,8 @@ export type BrowserPaneToolSurface = Readonly<{
    * check this first.
    */
   isOnScreen: () => boolean;
-  activeTab: () => BrowserPaneTabProjection | undefined;
-  tabs: () => readonly BrowserPaneTabProjection[];
+  activeTab: () => BrowserTabProjection | undefined;
+  tabs: () => readonly BrowserTabProjection[];
   selectTab: (tabId: string) => boolean;
   consoleMessages: () => readonly BrowserConsoleEntry[];
   networkRequests: () => readonly BrowserNetworkEntry[];
@@ -259,7 +236,7 @@ export type BrowserPaneController = Readonly<{
   projection: () => BrowserPaneProjection;
   /** Called whenever the projection changes. Returns the unsubscribe function. */
   subscribe: (listener: (projection: BrowserPaneProjection) => void) => () => void;
-  command: (command: BrowserPaneCommand) => Promise<BrowserPaneCommandResult>;
+  command: (command: BrowserCommand) => Promise<BrowserPaneCommandResult>;
   tools: BrowserPaneToolSurface;
   /** Closes every tab and stops all timers. */
   dispose: () => void;
@@ -324,7 +301,7 @@ export function createBrowserPaneController(deps: BrowserPaneDeps): BrowserPaneC
   let activeTabId: string | null = null;
   let bounds: BrowserPaneBounds = DEFAULT_BOUNDS;
   let visible = false;
-  let agentControl: BrowserPaneAgentControl = "idle";
+  let agentControl: BrowserAgentControl = "idle";
   let operatingCalls = 0;
   let idleTimer: unknown;
   let lastKey = "";
@@ -332,7 +309,7 @@ export function createBrowserPaneController(deps: BrowserPaneDeps): BrowserPaneC
 
   // ---- projection -----------------------------------------------------------------------
 
-  function tabProjection(tab: Tab): BrowserPaneTabProjection {
+  function tabProjection(tab: Tab): BrowserTabProjection {
     if (tab.closed || tab.contents.isDestroyed()) {
       return { id: tab.id, url: "about:blank", title: "", loading: false, canGoBack: false, canGoForward: false };
     }
@@ -388,7 +365,7 @@ export function createBrowserPaneController(deps: BrowserPaneDeps): BrowserPaneC
 
   // ---- agent control --------------------------------------------------------------------
 
-  function setAgentControl(next: BrowserPaneAgentControl): void {
+  function setAgentControl(next: BrowserAgentControl): void {
     if (agentControl === next) return;
     agentControl = next;
     emit();
@@ -543,7 +520,7 @@ export function createBrowserPaneController(deps: BrowserPaneDeps): BrowserPaneC
   // ---- tabs -----------------------------------------------------------------------------
 
   function openTab(): Tab | undefined {
-    if (tabs.length >= BROWSER_PANE_MAX_TABS || disposed) return undefined;
+    if (tabs.length >= GUILD_BROWSER_LIMITS.maxTabs || disposed) return undefined;
     const view = host.createView();
     const contents = view.contents;
     tabSequence += 1;
@@ -568,7 +545,7 @@ export function createBrowserPaneController(deps: BrowserPaneDeps): BrowserPaneC
       willAttachWebview: (event) => event.preventDefault(),
       windowOpen: ({ url }) => {
         // Deferred: the opener is still inside Electron's window.open handler.
-        if (isPaneNavigationAllowed(contents.id, url, registry) && url !== "about:blank" && tabs.length < BROWSER_PANE_MAX_TABS) {
+        if (isPaneNavigationAllowed(contents.id, url, registry) && url !== "about:blank" && tabs.length < GUILD_BROWSER_LIMITS.maxTabs) {
           queueMicrotask(() => {
             if (tab.closed || disposed) return;
             const opened = openTab();
@@ -760,9 +737,9 @@ export function createBrowserPaneController(deps: BrowserPaneDeps): BrowserPaneC
     return values.every((value) => Number.isFinite(value) && value >= 0 && value <= MAX_BOUNDS_VALUE);
   }
 
-  async function command(input: BrowserPaneCommand): Promise<BrowserPaneCommandResult> {
+  async function command(input: BrowserCommand): Promise<BrowserPaneCommandResult> {
     if (disposed) return { ok: false, reason: "failed" };
-    switch (input.type) {
+    switch (input.kind) {
       case "navigate": {
         if (!isPaneUrlAllowed(input.url)) return { ok: false, reason: "invalid_url" };
         const tab = activeTab() ?? openTab();
@@ -772,7 +749,7 @@ export function createBrowserPaneController(deps: BrowserPaneDeps): BrowserPaneC
       }
       case "newTab": {
         if (input.url !== undefined && !isPaneUrlAllowed(input.url)) return { ok: false, reason: "invalid_url" };
-        if (tabs.length >= BROWSER_PANE_MAX_TABS) return { ok: false, reason: "tab_limit" };
+        if (tabs.length >= GUILD_BROWSER_LIMITS.maxTabs) return { ok: false, reason: "tab_limit" };
         const tab = openTab();
         if (tab === undefined) return { ok: false, reason: "failed" };
         if (input.url !== undefined) void load(tab, input.url).catch(() => undefined);
@@ -793,11 +770,11 @@ export function createBrowserPaneController(deps: BrowserPaneDeps): BrowserPaneC
       case "stop": {
         const tab = activeTab();
         if (tab === undefined) return { ok: false, reason: "no_tab" };
-        if (input.type === "back") {
+        if (input.kind === "back") {
           if (tab.contents.canGoBack()) tab.contents.goBack();
-        } else if (input.type === "forward") {
+        } else if (input.kind === "forward") {
           if (tab.contents.canGoForward()) tab.contents.goForward();
-        } else if (input.type === "reload") {
+        } else if (input.kind === "reload") {
           tab.contents.reload();
         } else {
           tab.contents.stop();
@@ -805,13 +782,12 @@ export function createBrowserPaneController(deps: BrowserPaneDeps): BrowserPaneC
         return { ok: true };
       }
       case "setBounds": {
-        const next = input.bounds;
-        if (!validBounds(next)) return { ok: false, reason: "invalid_bounds" };
+        if (!validBounds(input)) return { ok: false, reason: "invalid_bounds" };
         bounds = {
-          x: Math.round(next.x),
-          y: Math.round(next.y),
-          width: Math.round(next.width),
-          height: Math.round(next.height),
+          x: Math.round(input.x),
+          y: Math.round(input.y),
+          width: Math.round(input.width),
+          height: Math.round(input.height),
         };
         applyLayout();
         return { ok: true };

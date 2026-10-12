@@ -5,9 +5,7 @@
  * placeholder's bounding rectangle with `setBounds` and shows or hides the native view with
  * `setVisible`. It holds no page state: everything it shows comes from the projection.
  *
- * The projection and command types below mirror `BrowserPaneProjection` / `BrowserPaneCommand`
- * of apps/desktop/src/main/browser-pane.ts (WP-B moves them into @guild/contracts with the same
- * shape; swap these local definitions for the contract import then).
+ * The projection and command types are the canonical ones from `@guild/contracts/browser-pane`.
  */
 
 import { ArrowClockwiseIcon as ArrowClockwise } from "@phosphor-icons/react/ArrowClockwise";
@@ -19,48 +17,15 @@ import { PlusIcon as Plus } from "@phosphor-icons/react/Plus";
 import { SpinnerGapIcon as SpinnerGap } from "@phosphor-icons/react/SpinnerGap";
 import { StopIcon as Stop } from "@phosphor-icons/react/Stop";
 import { XIcon as X } from "@phosphor-icons/react/X";
+import { GUILD_BROWSER_LIMITS, type BrowserCommand, type BrowserPaneProjection } from "@guild/contracts/browser-pane";
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import type { GuildMessages } from "./locales.js";
 
-export type BrowserPaneBounds = Readonly<{ x: number; y: number; width: number; height: number }>;
-export type BrowserPaneAgentControl = "idle" | "operating" | "paused";
-
-export type BrowserPaneTabProjection = Readonly<{
-  id: string;
-  url: string;
-  title: string;
-  loading: boolean;
-  canGoBack: boolean;
-  canGoForward: boolean;
-}>;
-
-export type BrowserPaneProjection = Readonly<{
-  tabs: readonly BrowserPaneTabProjection[];
-  activeTabId: string | null;
-  agentControl: BrowserPaneAgentControl;
-}>;
-
-export type BrowserPaneCommand =
-  | Readonly<{ type: "navigate"; url: string }>
-  | Readonly<{ type: "back" }>
-  | Readonly<{ type: "forward" }>
-  | Readonly<{ type: "reload" }>
-  | Readonly<{ type: "stop" }>
-  | Readonly<{ type: "newTab"; url?: string }>
-  | Readonly<{ type: "closeTab"; tabId: string }>
-  | Readonly<{ type: "selectTab"; tabId: string }>
-  | Readonly<{ type: "setBounds"; bounds: BrowserPaneBounds }>
-  | Readonly<{ type: "setVisible"; visible: boolean }>
-  | Readonly<{ type: "takeOver" }>
-  | Readonly<{ type: "resumeAgent" }>;
-
 export type BrowserPaneMessageKey = Extract<keyof GuildMessages, `browserPane${string}`>;
-
-export const BROWSER_PANE_MAX_TABS = 5;
 
 export type BrowserPaneProps = Readonly<{
   projection: BrowserPaneProjection;
-  onCommand: (command: BrowserPaneCommand) => void;
+  onCommand: (command: BrowserCommand) => void;
   t: (key: BrowserPaneMessageKey) => string;
   /** True while something drawn by the page (a menu, a dialog) must not sit under the native view. */
   hidden?: boolean;
@@ -121,7 +86,7 @@ export function normalizeBrowserAddress(input: string): BrowserAddress {
  * the document is resized, the window resizes, or a layout transition ends (a moved sidebar changes
  * the element's position without changing its size). Unmounting hides the native view.
  */
-function useNativeViewBounds(onCommand: (command: BrowserPaneCommand) => void, hidden: boolean) {
+function useNativeViewBounds(onCommand: (command: BrowserCommand) => void, hidden: boolean) {
   const ref = useRef<HTMLDivElement | null>(null);
   const send = useRef(onCommand);
   useEffect(() => {
@@ -138,7 +103,7 @@ function useNativeViewBounds(onCommand: (command: BrowserPaneCommand) => void, h
       const key = `${bounds.x},${bounds.y},${bounds.width},${bounds.height}`;
       if (key === last) return;
       last = key;
-      send.current({ type: "setBounds", bounds });
+      send.current({ kind: "setBounds", ...bounds });
     };
     report();
     const observer = new ResizeObserver(report);
@@ -154,8 +119,8 @@ function useNativeViewBounds(onCommand: (command: BrowserPaneCommand) => void, h
   }, []);
 
   useEffect(() => {
-    send.current({ type: "setVisible", visible: !hidden });
-    return () => send.current({ type: "setVisible", visible: false });
+    send.current({ kind: "setVisible", visible: !hidden });
+    return () => send.current({ kind: "setVisible", visible: false });
   }, [hidden]);
 
   return ref;
@@ -186,7 +151,7 @@ export function BrowserPane({ projection, onCommand, t, hidden = false }: Browse
     }
     setInvalid(false);
     setDraft(undefined);
-    onCommand({ type: "navigate", url: parsed.url });
+    onCommand({ kind: "navigate", url: parsed.url });
   };
 
   const agentLabel = agentControl === "operating" ? t("browserPaneAgentOperating") : agentControl === "paused" ? t("browserPaneAgentPaused") : t("browserPaneAgentIdle");
@@ -202,7 +167,7 @@ export function BrowserPane({ projection, onCommand, t, hidden = false }: Browse
               className="guild-browser-tab-main"
               aria-selected={tab.id === activeTabId}
               title={tab.title !== "" ? tab.title : displayUrl(tab.url)}
-              onClick={() => onCommand({ type: "selectTab", tabId: tab.id })}
+              onClick={() => onCommand({ kind: "selectTab", tabId: tab.id })}
             >
               {tab.loading && <SpinnerGap size={12} className="guild-spin" aria-hidden="true" />}
               <span>{tab.title !== "" ? tab.title : displayUrl(tab.url) !== "" ? displayUrl(tab.url) : t("browserPaneUntitledTab")}</span>
@@ -212,7 +177,7 @@ export function BrowserPane({ projection, onCommand, t, hidden = false }: Browse
               className="guild-browser-tab-close"
               aria-label={t("browserPaneCloseTab")}
               title={t("browserPaneCloseTab")}
-              onClick={() => onCommand({ type: "closeTab", tabId: tab.id })}
+              onClick={() => onCommand({ kind: "closeTab", tabId: tab.id })}
             ><X size={11} /></button>
           </div>
         ))}
@@ -220,19 +185,19 @@ export function BrowserPane({ projection, onCommand, t, hidden = false }: Browse
           type="button"
           className="guild-browser-newtab"
           aria-label={t("browserPaneNewTab")}
-          title={tabs.length >= BROWSER_PANE_MAX_TABS ? t("browserPaneTabLimit") : t("browserPaneNewTab")}
-          disabled={tabs.length >= BROWSER_PANE_MAX_TABS}
-          onClick={() => onCommand({ type: "newTab" })}
+          title={tabs.length >= GUILD_BROWSER_LIMITS.maxTabs ? t("browserPaneTabLimit") : t("browserPaneNewTab")}
+          disabled={tabs.length >= GUILD_BROWSER_LIMITS.maxTabs}
+          onClick={() => onCommand({ kind: "newTab" })}
         ><Plus size={13} /></button>
       </div>
 
       <form className="guild-browser-toolbar" onSubmit={submit}>
-        <button type="button" aria-label={t("browserPaneBack")} title={t("browserPaneBack")} disabled={!(active?.canGoBack ?? false)} onClick={() => onCommand({ type: "back" })}><ArrowLeft size={15} /></button>
-        <button type="button" aria-label={t("browserPaneForward")} title={t("browserPaneForward")} disabled={!(active?.canGoForward ?? false)} onClick={() => onCommand({ type: "forward" })}><ArrowRight size={15} /></button>
+        <button type="button" aria-label={t("browserPaneBack")} title={t("browserPaneBack")} disabled={!(active?.canGoBack ?? false)} onClick={() => onCommand({ kind: "back" })}><ArrowLeft size={15} /></button>
+        <button type="button" aria-label={t("browserPaneForward")} title={t("browserPaneForward")} disabled={!(active?.canGoForward ?? false)} onClick={() => onCommand({ kind: "forward" })}><ArrowRight size={15} /></button>
         {active?.loading === true ? (
-          <button type="button" aria-label={t("browserPaneStop")} title={t("browserPaneStop")} onClick={() => onCommand({ type: "stop" })}><Stop size={14} weight="fill" /></button>
+          <button type="button" aria-label={t("browserPaneStop")} title={t("browserPaneStop")} onClick={() => onCommand({ kind: "stop" })}><Stop size={14} weight="fill" /></button>
         ) : (
-          <button type="button" aria-label={t("browserPaneReload")} title={t("browserPaneReload")} disabled={active === undefined} onClick={() => onCommand({ type: "reload" })}><ArrowClockwise size={15} /></button>
+          <button type="button" aria-label={t("browserPaneReload")} title={t("browserPaneReload")} disabled={active === undefined} onClick={() => onCommand({ kind: "reload" })}><ArrowClockwise size={15} /></button>
         )}
         <input
           className="guild-browser-address"
@@ -265,9 +230,9 @@ export function BrowserPane({ projection, onCommand, t, hidden = false }: Browse
           <span className="guild-browser-agent-label" role="status" aria-live="polite">{agentLabel}</span>
         )}
         {agentControl === "paused" ? (
-          <button type="button" onClick={() => onCommand({ type: "resumeAgent" })}><Play size={12} weight="fill" />{t("browserPaneResume")}</button>
+          <button type="button" onClick={() => onCommand({ kind: "resumeAgent" })}><Play size={12} weight="fill" />{t("browserPaneResume")}</button>
         ) : (
-          <button type="button" onClick={() => onCommand({ type: "takeOver" })}><HandPalm size={13} />{t("browserPaneTakeOver")}</button>
+          <button type="button" onClick={() => onCommand({ kind: "takeOver" })}><HandPalm size={13} />{t("browserPaneTakeOver")}</button>
         )}
       </div>
 
