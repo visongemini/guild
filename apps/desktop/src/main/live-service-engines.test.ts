@@ -27,7 +27,7 @@ import {
   type JsonValue,
   type XaiExtensionOutcome,
 } from "@guild/runtime-grok";
-import { ClaudeLocatorError } from "./claude-locator.js";
+import { ClaudeEngineIntegrityError, ClaudeLocatorError } from "./claude-locator.js";
 import { toDesktopIpcFailure } from "./workspace-folder.js";
 import type { BrowserMcpPort, ModelRouterHostPort, RoutedModelInfo } from "./engine-ports.js";
 import { openGuildPersistence, type GuildPersistence } from "@guild/persistence";
@@ -1053,6 +1053,13 @@ describe("dual engine orchestration [PC-ENG-001, PC-MODEL-001]", () => {
     await eventually(async () => (await missing.service.bootstrap()).runtimeSettings.claude?.status === "not_found");
     const broken = await harness({ claudeEngineProbe: async () => { throw new Error("EACCES"); } });
     await eventually(async () => (await broken.service.bootstrap()).runtimeSettings.claude?.status === "unavailable");
+    // Pinned files that changed without an update are not a missing install: the periodic probe says so by name.
+    for (const component of ["node", "adapter", "claude"] as const) {
+      const changed = await harness({
+        claudeEngineProbe: async () => { throw new ClaudeEngineIntegrityError(component); },
+      });
+      await eventually(async () => (await changed.service.bootstrap()).runtimeSettings.claude?.status === "integrity_changed");
+    }
 
     // Without a probe the status is learned from the engine: a missing piece at start, a session that runs.
     const failing = await harness({

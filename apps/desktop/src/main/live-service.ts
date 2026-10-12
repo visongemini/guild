@@ -166,7 +166,7 @@ import {
   type XaiExtensionOutcome,
 } from "@guild/runtime-grok";
 import type { DesktopApplicationService } from "./application-service.js";
-import { ClaudeLocatorError, locateClaudeEngine } from "./claude-locator.js";
+import { ClaudeEngineIntegrityError, ClaudeLocatorError, locateClaudeEngine } from "./claude-locator.js";
 import { createClaudeRuntime } from "./claude-runtime.js";
 import type { BrowserMcpPort, ModelRouterHostPort, RoutedModelInfo } from "./engine-ports.js";
 import {
@@ -808,7 +808,13 @@ export function createLiveDesktopService(
       try {
         next = Object.freeze({ status: "ready" as const, version: (await claudeProbe()).version });
       } catch (cause: unknown) {
-        next = Object.freeze({ status: cause instanceof ClaudeLocatorError ? "not_found" as const : "unavailable" as const });
+        next = Object.freeze({
+          // Changed pinned files are not a missing install: the picker withholds the default row and Settings
+          // shows the integrity text (PC-ENG-002).
+          status: cause instanceof ClaudeEngineIntegrityError
+            ? "integrity_changed" as const
+            : cause instanceof ClaudeLocatorError ? "not_found" as const : "unavailable" as const,
+        });
       }
       // A refusal to run changed files stays until a Claude session opens again; a probe that only
       // finds the pieces present must not hide it.
