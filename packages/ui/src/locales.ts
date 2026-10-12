@@ -288,6 +288,26 @@ export type GuildMessages = WorkshopMessages & ChangeMessages & {
   readonly openTerminal: string;
   readonly openTerminalHelp: string;
   readonly emptyFile: string;
+  readonly browserPaneWorkbenchTab: string;
+  readonly browserPaneTitle: string;
+  readonly browserPaneTabs: string;
+  readonly browserPaneNewTab: string;
+  readonly browserPaneCloseTab: string;
+  readonly browserPaneTabLimit: string;
+  readonly browserPaneUntitledTab: string;
+  readonly browserPaneBack: string;
+  readonly browserPaneForward: string;
+  readonly browserPaneReload: string;
+  readonly browserPaneStop: string;
+  readonly browserPaneAddress: string;
+  readonly browserPaneAddressPlaceholder: string;
+  readonly browserPaneInvalidAddress: string;
+  readonly browserPaneAgentIdle: string;
+  readonly browserPaneAgentOperating: string;
+  readonly browserPaneAgentPaused: string;
+  readonly browserPaneTakeOver: string;
+  readonly browserPaneResume: string;
+  readonly browserPaneEmpty: string;
   readonly permissionModeName: (mode: GuildGrokPermissionMode) => string;
   readonly officialSessionCapabilities: string;
   readonly startTaskForCapabilities: string;
@@ -744,6 +764,26 @@ const ZH_CN: GuildMessages = Object.freeze({
   openTerminal: "在工作区打开终端",
   openTerminalHelp: "只在你明确点击时打开当前工作区。",
   emptyFile: "（空文件）",
+  browserPaneWorkbenchTab: "浏览器",
+  browserPaneTitle: "浏览器",
+  browserPaneTabs: "浏览器标签页",
+  browserPaneNewTab: "新建标签页",
+  browserPaneCloseTab: "关闭标签页",
+  browserPaneTabLimit: "最多同时打开 5 个标签页",
+  browserPaneUntitledTab: "新标签页",
+  browserPaneBack: "后退",
+  browserPaneForward: "前进",
+  browserPaneReload: "刷新",
+  browserPaneStop: "停止加载",
+  browserPaneAddress: "地址",
+  browserPaneAddressPlaceholder: "输入网址，例如 example.com",
+  browserPaneInvalidAddress: "请输入网址，例如 example.com",
+  browserPaneAgentIdle: "智能体空闲",
+  browserPaneAgentOperating: "智能体正在操作",
+  browserPaneAgentPaused: "智能体已暂停，由你操作",
+  browserPaneTakeOver: "接管",
+  browserPaneResume: "恢复智能体",
+  browserPaneEmpty: "输入网址即可打开页面，智能体也可以在这里浏览网页。",
   permissionModeName: (mode) => ({
     default: "按需询问",
     acceptEdits: "自动接受编辑",
@@ -1126,6 +1166,26 @@ const EN_US: GuildMessages = Object.freeze({
   openTerminal: "Open terminal in workspace",
   openTerminalHelp: "Opens this workspace only when you explicitly click.",
   emptyFile: "(empty file)",
+  browserPaneWorkbenchTab: "Browser",
+  browserPaneTitle: "Browser",
+  browserPaneTabs: "Browser tabs",
+  browserPaneNewTab: "New tab",
+  browserPaneCloseTab: "Close tab",
+  browserPaneTabLimit: "Up to 5 tabs can be open",
+  browserPaneUntitledTab: "New tab",
+  browserPaneBack: "Back",
+  browserPaneForward: "Forward",
+  browserPaneReload: "Reload",
+  browserPaneStop: "Stop loading",
+  browserPaneAddress: "Address",
+  browserPaneAddressPlaceholder: "Enter a web address, e.g. example.com",
+  browserPaneInvalidAddress: "Enter a web address, e.g. example.com",
+  browserPaneAgentIdle: "Agent idle",
+  browserPaneAgentOperating: "Agent operating",
+  browserPaneAgentPaused: "Agent paused, you have control",
+  browserPaneTakeOver: "Take over",
+  browserPaneResume: "Resume agent",
+  browserPaneEmpty: "Enter an address to open a page. The agent can browse here too.",
   permissionModeName: (mode) => ({
     default: "Ask as needed",
     acceptEdits: "Accept edits",

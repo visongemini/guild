@@ -836,6 +836,38 @@ span.guild-pill { cursor: default; }
 .guild-review-item pre.before { background: color-mix(in srgb, var(--guild-del) 7%, var(--guild-surface)); }
 .guild-review-item pre.after { background: color-mix(in srgb, var(--guild-add) 7%, var(--guild-surface)); }
 
+/* ------------------------------------------------------------------ browser pane */
+.guild-browser { min-width: 0; min-height: 0; height: 100%; display: grid; grid-template-rows: auto auto auto auto minmax(0,1fr); gap: var(--guild-s2); }
+.guild-browser-tabs { min-width: 0; display: flex; align-items: center; gap: 2px; overflow-x: auto; }
+.guild-browser-tab { min-width: 0; max-width: 168px; height: 30px; display: flex; flex: 0 1 auto; align-items: center; border-radius: var(--guild-r-sm); background: transparent; color: var(--guild-muted); }
+.guild-browser-tab:hover { background: var(--guild-hover); }
+.guild-browser-tab.selected { background: var(--guild-selected); color: var(--guild-text); }
+.guild-browser-tab-main { min-width: 0; height: 30px; padding: 0 var(--guild-s1) 0 var(--guild-s2); display: flex; flex: 1; align-items: center; gap: 6px; border: 0; border-radius: var(--guild-r-sm); background: transparent; color: inherit; font-size: var(--guild-fs-sm); cursor: pointer; }
+.guild-browser-tab-main span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.guild-browser-tab.selected .guild-browser-tab-main { font-weight: 600; }
+.guild-browser-tab-close, .guild-browser-newtab, .guild-browser-toolbar button { display: grid; flex: none; place-items: center; border: 0; border-radius: var(--guild-r-sm); background: transparent; color: var(--guild-muted); cursor: pointer; }
+.guild-browser-tab-close { width: 20px; height: 20px; margin-right: var(--guild-s1); }
+.guild-browser-newtab, .guild-browser-toolbar button { width: 28px; height: 28px; }
+.guild-browser-tab-close:hover, .guild-browser-newtab:hover:not(:disabled), .guild-browser-toolbar button:hover:not(:disabled) { background: var(--guild-hover); color: var(--guild-text); }
+.guild-browser-newtab:disabled, .guild-browser-toolbar button:disabled { opacity: .4; cursor: default; }
+.guild-browser-toolbar { min-width: 0; display: flex; align-items: center; gap: 2px; }
+.guild-browser-address { min-width: 0; height: 30px; margin-left: var(--guild-s1); padding: 0 var(--guild-s3); flex: 1; border: 1px solid var(--guild-line-strong); border-radius: var(--guild-r-sm); background: var(--guild-surface); color: var(--guild-text); font-size: var(--guild-fs-sm); }
+.guild-browser-address::placeholder { color: var(--guild-faint); }
+.guild-browser-address[aria-invalid="true"] { border-color: var(--guild-error); }
+.guild-browser-agent { min-width: 0; min-height: 32px; padding: 0 var(--guild-s2) 0 var(--guild-s3); display: flex; align-items: center; gap: var(--guild-s2); border: 1px solid var(--guild-line); border-radius: var(--guild-r-sm); background: var(--guild-soft); color: var(--guild-muted); font-size: var(--guild-fs-sm); }
+.guild-browser-agent-pip { width: 8px; height: 8px; flex: none; border-radius: 50%; background: var(--guild-faint); }
+.guild-browser-agent.operating { border-color: color-mix(in srgb, var(--guild-run) 45%, var(--guild-line)); background: var(--guild-accent-soft); color: var(--guild-accent-text); }
+.guild-browser-agent.operating .guild-browser-agent-pip { background: var(--guild-run); animation: guild-browser-pulse 1.2s ease-in-out infinite; }
+.guild-browser-agent.paused { border-color: color-mix(in srgb, var(--guild-wait) 55%, var(--guild-line)); color: var(--guild-wait-text); }
+.guild-browser-agent.paused .guild-browser-agent-pip { background: var(--guild-wait); }
+.guild-browser-agent-label { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.guild-browser-agent button { height: 24px; padding: 0 var(--guild-s2); display: flex; flex: none; align-items: center; gap: var(--guild-s1); border: 1px solid var(--guild-line-strong); border-radius: var(--guild-r-xs); background: var(--guild-surface); color: var(--guild-text); font-size: var(--guild-fs-meta); font-weight: 600; cursor: pointer; }
+.guild-browser-agent button:hover { background: var(--guild-hover); }
+.guild-browser-agent-label.error { color: var(--guild-error-text); font-size: var(--guild-fs-meta); line-height: 1.25; white-space: normal; }
+.guild-browser-viewport { min-width: 0; min-height: 160px; display: grid; place-items: center; border: 1px dashed var(--guild-line-strong); border-radius: var(--guild-r-sm); background: var(--guild-soft); }
+.guild-browser-viewport p { margin: 0; padding: var(--guild-s4); color: var(--guild-muted); font-size: var(--guild-fs-ui); line-height: 1.65; text-align: center; }
+@keyframes guild-browser-pulse { 50% { opacity: .35; } }
+
 /* ------------------------------------------------------------------ overlays: palette, menus, dialogs */
 .guild-command-backdrop { position: fixed; z-index: 110; inset: 0; padding: min(16vh, 128px) var(--guild-s5) var(--guild-s5); display: flex; align-items: flex-start; justify-content: center; background: var(--guild-scrim); backdrop-filter: blur(3px); }
 .guild-command-palette { width: min(620px, 100%); max-height: min(590px, 72vh); display: grid; grid-template-rows: auto minmax(0,1fr) auto; overflow: hidden; border: 1px solid var(--guild-line); border-radius: var(--guild-r-lg); background: var(--guild-surface); box-shadow: var(--guild-shadow-pop); animation: guild-pop-in var(--guild-dur-1) var(--guild-ease); }
