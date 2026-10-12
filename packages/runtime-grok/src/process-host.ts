@@ -244,6 +244,7 @@ class ProcessHostCore {
   private groupGoneObserved = false;
   /** Helpers of the engine that left its process group, read at stop time (see process-tree.ts). */
   private descendantSnapshot: readonly DescendantRecord[] = [];
+  private helperSweep: Promise<void> | undefined;
   private closeEvidence: ProcessCloseEvidence | undefined;
   private cleanupOperation: Promise<PinnedExecutableCleanup> | undefined;
   private cleanupEvidenceOperation: Promise<ProcessCleanupEvidence> | undefined;
@@ -510,6 +511,11 @@ class ProcessHostCore {
     while (true) {
       // Probe on every lifecycle poll, including while close evidence is delayed.
       const groupGone = this.observeGroupGone();
+      if (groupGone) {
+        // An escaped helper can hold the engine's stdout open, and then `close` never fires: end the
+        // helpers as soon as the group is gone instead of after the close they may be preventing.
+        void this.sweepHelpers();
+      }
       if (this.closeEvidence !== undefined && groupGone) {
         return true;
       }
@@ -545,11 +551,7 @@ class ProcessHostCore {
     if (close === undefined || !this.groupGoneObserved) {
       throw new Error("reap completion requires direct close and confirmed group absence");
     }
-    if (this.descendantSnapshot.length > 0) {
-      const records = this.descendantSnapshot;
-      this.descendantSnapshot = [];
-      await this.lifecycle.terminateDescendants(records).catch(() => undefined);
-    }
+    await this.sweepHelpers();
     const cleanup = await this.cleanupPin();
     const groupTermSignal = this.groupTermSignal ?? { signal: "SIGTERM", outcome: "already_gone" };
     const receipt: ProcessStopReceipt = {
@@ -574,7 +576,28 @@ class ProcessHostCore {
     return receipt;
   }
 
+  /** Ends the snapshot's helpers; the first caller starts it, every later caller shares it. Never rejects. */
+  private sweepHelpers(): Promise<void> {
+    this.helperSweep ??= this.beginHelperSweep();
+    return this.helperSweep;
+  }
+
+  private async beginHelperSweep(): Promise<void> {
+    const records = this.descendantSnapshot;
+    this.descendantSnapshot = [];
+    if (records.length === 0) {
+      return;
+    }
+    try {
+      await this.lifecycle.terminateDescendants(records);
+    } catch {
+      // Best effort: the sweep does not decide the outcome of the stop.
+    }
+  }
+
   private async failReap(failure: Extract<ProcessHostFailure, { type: "reap_timeout" }>): Promise<never> {
+    // A stop that timed out still ends the helpers it found: they are Guild's to clean up either way.
+    await this.sweepHelpers();
     const cleanup = await this.cleanupPin();
     const error = new GrokProcessHostError(failure);
     this.currentState = "failed";

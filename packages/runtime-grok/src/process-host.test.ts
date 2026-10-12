@@ -1358,6 +1358,77 @@ describe("GrokProcessHost execution policy and lifecycle (PC-TRN-001/002/003)", 
     }
   });
 
+  it("ends an escaped helper that holds the engine's stdout open, without waiting for close first [PC-ENG-001]", async () => {
+    const fixture = await prepareFixture();
+    let host: TestHost | undefined;
+    let group: number | undefined;
+    let helper: number | undefined;
+    const bystander = spawn(process.execPath, ["-e", "setInterval(() => undefined, 1000)"], { detached: true, stdio: "ignore" });
+    bystander.unref();
+    try {
+      host = testHost(fixture, ["detached-helper-hold-stdio"]);
+      const pidLine = waitForStdout(host, "DETACHED:");
+      group = (await startOwned(host, fixture)).processGroupId;
+      helper = Number(/DETACHED:(\d+)/u.exec(await bounded(pidLine, FIXTURE_STARTUP_TIMEOUT_MS))?.[1]);
+      assert.ok(helper > 0);
+      assert.notEqual(
+        (await processRows()).find((row) => row.pid === helper)?.processGroupId,
+        group,
+        "the helper is outside the engine's group and keeps the engine's inherited stdout open",
+      );
+      // Without the sweep the engine's close never fires, and the stop ends in reap_timeout.
+      const receipt = await bounded(host.stop(), 8_000);
+      assert.equal(receipt.type, "stop_reaped");
+      await eventuallyGone(helper);
+      await eventuallyGone(group, true);
+      assert.doesNotThrow(() => process.kill(bystander.pid!, 0), "a process outside the tree is left alone");
+    } finally {
+      if (helper !== undefined) {
+        try { process.kill(helper, "SIGKILL"); } catch { /* already gone: the point of the test */ }
+      }
+      try { process.kill(bystander.pid!, "SIGKILL"); } catch { /* already gone */ }
+      await cleanup(host, group);
+      await fixture.remove();
+    }
+  });
+
+  it("still sweeps the snapshot, once, when the stop ends in reap_timeout [PC-ENG-001]", async () => {
+    const fixture = await prepareFixture();
+    let host: TestHost | undefined;
+    let group: number | undefined;
+    const swept: string[] = [];
+    const record = { pid: 4_194_000, ppid: 1, pgid: 4_194_000, startedAt: "Mon Oct 12 15:08:42 2026" };
+    try {
+      host = testHost(fixture, ["ignore-term"], { stopGraceMs: 30, killGraceMs: 30 }, {
+        snapshotDescendants: async () => [record],
+        terminateDescendants: async (records) => {
+          swept.push(records.map((entry) => entry.pid).join(","));
+          return records.length;
+        },
+        signalGroup: (processGroupId, signal) => {
+          if (signal === "SIGKILL") {
+            // Report the synthetic failure, but end the fixture group underneath so nothing is stranded.
+            try {
+              process.kill(-processGroupId, "SIGKILL");
+            } catch (cause: unknown) {
+              if ((cause as { readonly code?: string }).code !== "ESRCH") throw cause;
+            }
+          }
+          return { signal, outcome: "failed", errorCode: "EPERM" };
+        },
+        probeGroup: () => "present",
+      });
+      const ready = waitForStdout(host, "READY\n");
+      group = (await startOwned(host, fixture)).processGroupId;
+      await bounded(ready, FIXTURE_STARTUP_TIMEOUT_MS);
+      await assert.rejects(bounded(host.stop(), 2_000), isFailure("reap_timeout"));
+      assert.deepEqual(swept, ["4194000"], "the failure path ends the helpers it found, exactly once");
+    } finally {
+      await cleanup(host, group);
+      await fixture.remove();
+    }
+  });
+
   it("reads the helpers before the group signal and ends them after the group is gone, in that order [PC-ENG-001]", async () => {
     const fixture = await prepareFixture();
     let host: TestHost | undefined;
