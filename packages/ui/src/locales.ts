@@ -75,6 +75,10 @@ export type GuildMessages = WorkshopMessages & ChangeMessages & {
   readonly terminalOutputUnavailable: string;
   readonly unsupportedToolContent: (contentType: string) => string;
   readonly permissionNeeded: string;
+  /** Local label of a standard ACP permission option, by kind; undefined keeps the agent's own text (always the case in English). */
+  readonly permissionOptionByKind: (kind: string) => string | undefined;
+  readonly permissionStopTurn: string;
+  readonly permissionStopTurnHelp: string;
   readonly cancel: string;
   readonly archive: string;
   readonly archived: string;
@@ -621,6 +625,14 @@ const ZH_CN: GuildMessages = Object.freeze({
   terminalOutputUnavailable: "当前 Grok 会话没有提供可显示的终端正文。",
   unsupportedToolContent: (contentType) => `此工具内容暂不支持显示：${contentType}`,
   permissionNeeded: "需要你的确认",
+  permissionOptionByKind: (kind) => (({
+    allow_once: "允许",
+    allow_always: "本会话都允许",
+    reject_once: "拒绝",
+    reject_always: "都拒绝",
+  }) as Readonly<Record<string, string>>)[kind],
+  permissionStopTurn: "停止本轮",
+  permissionStopTurnHelp: "不执行这个操作，并停止本轮任务。",
   cancel: "取消",
   archive: "归档",
   archived: "已归档",
@@ -1163,6 +1175,9 @@ const EN_US: GuildMessages = Object.freeze({
   terminalOutputUnavailable: "The current Grok session did not provide displayable terminal output.",
   unsupportedToolContent: (contentType) => `This tool content is not supported for display: ${contentType}`,
   permissionNeeded: "Needs your approval",
+  permissionOptionByKind: () => undefined,
+  permissionStopTurn: "Stop this turn",
+  permissionStopTurnHelp: "Do not run this action, and stop the turn.",
   cancel: "Cancel",
   archive: "Archive",
   archived: "Archived",

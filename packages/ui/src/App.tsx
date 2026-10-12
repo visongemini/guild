@@ -151,6 +151,7 @@ import { RunPhaseLine } from "./RunPhaseLine.js";
 import { groupEntries, segmentTimeline, type TimelineRow } from "./rolled-back.js";
 import { attentionStripTasks } from "./attention-tasks.js";
 import type { RolledBackResult } from "./rewind-flow.js";
+import { permissionOptionView } from "./permission-options.js";
 import { cardAnchors, latestChangedRun, resultSummaryRepeatsChangeCard } from "./run-changes.js";
 import { composerEnterAction, steerButtonState } from "./steer.js";
 import {
@@ -1909,6 +1910,15 @@ export function GuildApp({ api }: GuildAppProps) {
     decision: { readonly type: "cancelled" } | { readonly type: "selected"; readonly optionId: string },
   ) {
     if (item.runId === undefined) return;
+    // The card's last button stops the turn. It goes down the same path as the composer's stop button, which
+    // answers the pending request with ACP's cancelled outcome while the Run is cancelling. Sending that
+    // outcome mid-turn instead broke the Grok transport and only aborted the one tool call under Claude.
+    if (decision.type === "cancelled") {
+      await run(async () => {
+        await api.cancelRun({ taskId: item.taskId, runId: item.runId! });
+      });
+      return;
+    }
     await run(async () => {
       await api.decidePermission({
         taskId: item.taskId,
@@ -4626,16 +4636,24 @@ function PermissionCard({ item, messages, onDecision }: {
     </div>
     <code className="guild-permission-title">{item.title}</code>
     <div className="guild-permission-actions">
-      {item.options.map((option) => (
-        <button
+      {item.options.map((option) => {
+        const view = permissionOptionView(messages, option);
+        return <button
           disabled={submitting}
           type="button"
           key={option.optionId}
+          title={view.title}
           className={`${option.kind.startsWith("allow") ? "allow" : "reject"}${option.kind === "allow_once" ? " primary" : ""}`}
           onClick={() => void decide({ type: "selected", optionId: option.optionId })}
-        >{option.name}</button>
-      ))}
-      <button disabled={submitting} type="button" className="dismiss" onClick={() => void decide({ type: "cancelled" })}>{messages.cancel}</button>
+        >{view.label}</button>;
+      })}
+      <button
+        disabled={submitting}
+        type="button"
+        className="dismiss"
+        title={messages.permissionStopTurnHelp}
+        onClick={() => void decide({ type: "cancelled" })}
+      >{messages.permissionStopTurn}</button>
     </div>
   </div>;
 }
