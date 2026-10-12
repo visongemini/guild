@@ -8,13 +8,20 @@ import {
 } from "@guild/contracts";
 import { BrowserWindow, ipcMain, type IpcMainInvokeEvent } from "electron";
 import type { DesktopApplicationService } from "./application-service.js";
+import type { ModelSourcesService } from "./model-sources-service.js";
 import { createStreamDeltaForwarder } from "./stream-delta-channel.js";
 import { isTrustedGuildSender } from "./window-security.js";
 import { toDesktopIpcFailure } from "./workspace-folder.js";
 
+/** Guild 3.0 services that sit beside the application service (docs/20 section 3.4). */
+export type DesktopIpcExtras = {
+  readonly modelSources?: ModelSourcesService;
+};
+
 export function registerDesktopIpc(
   window: BrowserWindow,
   service: DesktopApplicationService,
+  extras: DesktopIpcExtras = {},
 ): () => void {
   const channels: DesktopInvokeChannel[] = [];
   const handle = <Channel extends DesktopInvokeChannel>(
@@ -154,6 +161,19 @@ export function registerDesktopIpc(
   });
   handle(DESKTOP_IPC_CHANNELS.runGrokManagement, async (request) =>
     service.runGrokManagement(request));
+
+  const modelSources = extras.modelSources;
+  if (modelSources !== undefined) {
+    handle(DESKTOP_IPC_CHANNELS.listModelSources, async () => modelSources.list());
+    handle(DESKTOP_IPC_CHANNELS.upsertModelSource, async (request) => modelSources.upsert(request));
+    handle(DESKTOP_IPC_CHANNELS.deleteModelSource, async (request) => {
+      await modelSources.remove(request.id);
+      return Object.freeze({});
+    });
+    handle(DESKTOP_IPC_CHANNELS.confirmModelSource, async (request) => modelSources.confirm(request.id));
+    handle(DESKTOP_IPC_CHANNELS.getWorkspacePrefs, async (request) => modelSources.getWorkspacePrefs(request));
+    handle(DESKTOP_IPC_CHANNELS.setWorkspacePrefs, async (request) => modelSources.setWorkspacePrefs(request));
+  }
 
   const unsubscribe = service.subscribe((projection: DesktopBootstrapProjection) => {
     if (!window.isDestroyed()) {
