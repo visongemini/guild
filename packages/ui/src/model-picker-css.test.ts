@@ -47,6 +47,7 @@ test("every picker class the component renders is styled, and the old summary bu
     "guild-model-row-description", "guild-model-row-meta", "guild-model-efforts",
     "guild-model-default-dot", "guild-model-notice", "guild-model-use-default",
     "guild-model-group", "guild-model-group-heading", "guild-model-action", "guild-model-engine-note",
+    "guild-model-group-note", "guild-model-older", "guild-model-older-caret",
   ]) {
     assert.match(css, new RegExp(`\\.${name}[\\s,:{.\\[]`), `${name} is not styled`);
     assert.match(component, new RegExp(name), `${name} is not rendered`);

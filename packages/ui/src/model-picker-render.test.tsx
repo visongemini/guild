@@ -301,6 +301,6 @@ test("the grouped picker keeps arrow-key navigation over every option and opens 
   assert.match(source, /setOpen\(false\);\s*onOpenModelSources\(\);/u);
   assert.match(source, /selectionForRow\(catalogs, row, view\.selectedEffortId, taskEngine\)/u);
   // The popover opens on the selected row, else the first row (a hint is also an option, but not what a person came to pick).
-  assert.match(source, /querySelector<HTMLElement>\('\[role="option"\]\[aria-selected="true"\]'\) \?\?\s*\n\s*popover\.querySelector<HTMLElement>\('button\[role="option"\]'\)/u);
+  assert.match(source, /querySelector<HTMLElement>\('\[role="option"\]\[aria-selected="true"\]'\) \?\?\s*\n\s*popover\.querySelector<HTMLElement>\('button\[role="option"\]:not\(\[aria-disabled="true"\]\)'\)/u);
   assert.match(source, /role="option" aria-disabled="true" aria-selected="false" tabIndex=\{-1\}/u);
 });

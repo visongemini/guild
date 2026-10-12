@@ -172,6 +172,14 @@ export type GuildMessages = WorkshopMessages & ChangeMessages & {
   readonly modelPickerClaudeNotStarted: string;
   /** The Claude group's one row while Claude Code lists no model yet: the task follows Claude Code's own default. */
   readonly modelPickerClaudeDefault: string;
+  /** The trigger of a routed task that selects no model of the router (its Claude choice is gone). */
+  readonly modelPickerChooseModel: string;
+  /** The Default row of the Claude group, with the model it stands for when the adapter says which. */
+  readonly modelPickerClaudeDefaultRow: (model: string | undefined) => string;
+  /** The collapsed row that holds every Claude model but the newest of each family. */
+  readonly modelPickerOlderModels: (count: number) => string;
+  /** Spoken after the label of that row, so a screen reader hears whether it is open. */
+  readonly modelPickerOlderState: (expanded: boolean) => string;
   readonly modelPickerEngineNote: string;
   /** One line under the disabled Claude rows of a task that runs through the model router (D-061). */
   readonly modelPickerClaudeLockedNote: string;
@@ -684,6 +692,8 @@ const ZH_CN: GuildMessages = Object.freeze({
   reasoningEffort: "推理强度",
   permissionMode: "工具授权",
   reasoningEffortName: (effort, officialLabel) => (({
+    default: "默认",
+    max: "最高",
     xhigh: "超高",
     high: "高",
     medium: "中",
@@ -722,6 +732,10 @@ const ZH_CN: GuildMessages = Object.freeze({
   modelPickerClaudeUnavailableHelp: "请先安装 Claude Code，并在终端运行一次 claude 完成登录。",
   modelPickerClaudeNotStarted: "Claude 启动后才会显示可选的模型。",
   modelPickerClaudeDefault: "Claude Code（默认模型）",
+  modelPickerChooseModel: "选择模型",
+  modelPickerClaudeDefaultRow: (model) => model === undefined ? "默认" : `默认（${model}）`,
+  modelPickerOlderModels: (count) => `更早的模型（${count}）`,
+  modelPickerOlderState: (expanded) => expanded ? "，已展开" : "，已折叠",
   modelPickerEngineNote: "第一条消息选的模型，决定这个对话用 Grok 还是 Claude，之后不能更换。",
   modelPickerClaudeLockedNote: "这个任务用过在线或本地模型，不能再切回 Claude 订阅。要用 Claude 请新建任务。",
   taskEngineName: (engine) => ({ grok: "Grok", claude: "Claude" })[engine],
@@ -1224,6 +1238,8 @@ const EN_US: GuildMessages = Object.freeze({
   reasoningEffort: "Reasoning effort",
   permissionMode: "Tool permissions",
   reasoningEffortName: (effort, officialLabel) => (({
+    default: "Default",
+    max: "Max",
     xhigh: "Extra high",
     high: "High",
     medium: "Medium",
@@ -1262,6 +1278,10 @@ const EN_US: GuildMessages = Object.freeze({
   modelPickerClaudeUnavailableHelp: "Install Claude Code, then run `claude` once in Terminal and log in.",
   modelPickerClaudeNotStarted: "Model choices appear once Claude has started.",
   modelPickerClaudeDefault: "Claude Code (default model)",
+  modelPickerChooseModel: "Choose a model",
+  modelPickerClaudeDefaultRow: (model) => model === undefined ? "Default" : `Default (${model})`,
+  modelPickerOlderModels: (count) => `Older models (${count})`,
+  modelPickerOlderState: (expanded) => expanded ? ", expanded" : ", collapsed",
   modelPickerEngineNote: "The model you pick for the first message decides whether this conversation runs on Grok or Claude. It cannot change afterwards.",
   modelPickerClaudeLockedNote: "This task has used an online or local model and cannot go back to a Claude subscription. Start a new task to use Claude.",
   taskEngineName: (engine) => ({ grok: "Grok", claude: "Claude" })[engine],

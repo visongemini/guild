@@ -59,3 +59,31 @@ export const CLAUDE_CATALOG: ModelCatalog = freezeModelCatalog("claude", {
   ],
   runtimeDefaultModelId: "default",
 });
+
+/**
+ * The Claude group as the adapter listed it on 2026-10-12 with Claude Code 2.1.296 (names and descriptions are its own
+ * strings, ids are test data): a Default row that stands for Opus 5.5, then twelve models over four families, newest
+ * first within a family but not across them. Plus the two kinds of routed model.
+ */
+const adapterRow = (id: string, name: string, description: string) =>
+  ({ id, name, group: "claude" as const, description, reasoningEfforts: claudeEfforts, contextWindows: [200000] });
+export const CLAUDE_ADAPTER_CATALOG: ModelCatalog = freezeModelCatalog("claude", {
+  models: [
+    adapterRow("default", "Default (recommended)", "Opus 5.5"),
+    adapterRow("opus", "Opus 5.5", "Most capable for complex work"),
+    adapterRow("fable", "Fable 5.1", "Best for the hardest, longest-running tasks"),
+    adapterRow("sonnet", "Sonnet 5.5", "Best for everyday tasks"),
+    adapterRow("haiku", "Haiku 5.5", "Fastest for quick answers"),
+    adapterRow("claude-haiku-4-5", "Haiku 4.5", "Fastest for quick answers"),
+    adapterRow("claude-sonnet-5", "Sonnet 5", "Best for everyday tasks"),
+    adapterRow("claude-opus-5", "Opus 5", "Most capable for complex work"),
+    adapterRow("claude-fable-5", "Fable 5", "Best for the hardest, longest-running tasks"),
+    adapterRow("claude-opus-4-8", "Opus 4.8", "Most capable for complex work"),
+    adapterRow("claude-opus-4-7", "Opus 4.7", "Most capable for complex work"),
+    adapterRow("claude-opus-4-6", "Opus 4.6", "Most capable for complex work"),
+    adapterRow("claude-sonnet-4-6", "Sonnet 4.6", "Best for everyday tasks"),
+    { id: "deepseek-v4-flash", name: "DeepSeek V4 Flash", group: "online", reasoningEfforts: [], contextWindows: [128000] },
+    { id: "local-27b-model", name: "Local 27B", group: "local", reasoningEfforts: [], contextWindows: [32768] },
+  ],
+  runtimeDefaultModelId: "default",
+});
