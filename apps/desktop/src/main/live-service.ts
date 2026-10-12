@@ -177,6 +177,7 @@ import {
   locateOfficialGrokRuntime,
   resolveOfficialGrokEnvironment,
 } from "./runtime-locator.js";
+import { CLAUDE_CAPTURE_OFF_ENVIRONMENT } from "./dev-hooks.js";
 import { warmOfficialGrokRuntime } from "./runtime-warmup.js";
 import {
   applyRuntimeSelection,
@@ -338,8 +339,8 @@ export type RuntimeFactory = (input: {
   };
   /**
    * Claude only: the per-spawn variables of a routed task (docs/20 3.3). Present for every process
-   * start of a routed task and never for a native one. The `ANTHROPIC_BASE_URL` value carries the
-   * router token: never log it.
+   * start of a routed task and, apart from the dev-only capture switch of `claudeCaptureOff`, never
+   * for a native one. The `ANTHROPIC_BASE_URL` value carries the router token: never log it.
    */
   readonly extraEnvironment?: Readonly<Record<string, string>>;
 }) => Promise<{ readonly adapter: RuntimeAdapterPort; readonly runtimeVersion?: string }>;
@@ -381,6 +382,12 @@ export type LiveDesktopServiceOptions = {
   readonly modelRouterHost?: ModelRouterHostPort;
   /** Loopback browser MCP server handed to engines that advertise HTTP MCP (docs/20 3.5). */
   readonly browserMcp?: BrowserMcpPort;
+  /**
+   * Dev-only QA switch (`GUILD_DEV_CLAUDE_CAPTURE_OFF`, see dev-hooks.ts): native Claude spawns also
+   * get `OPENVIKING_AUTO_CAPTURE=false`, so QA turns are not written into the owner's memory store.
+   * The main process passes it only for an unpackaged app; routed spawns carry the variable anyway.
+   */
+  readonly claudeCaptureOff?: boolean;
   readonly usageFetcher?: (signal: AbortSignal) => Promise<AcpV1OfficialBillingSnapshot>;
   readonly managementRunner?: (input: {
     readonly request: RunGrokManagementRequest;
@@ -4400,6 +4407,8 @@ export function createLiveDesktopService(
       startStage = "routed_plan";
       const routed = await planRoutedStart(taskId, controller);
       startStage = "runtime_factory";
+      const spawnEnvironment = routed?.extraEnvironment ??
+        (controller.engine === "claude" && options.claudeCaptureOff === true ? CLAUDE_CAPTURE_OFF_ENVIRONMENT : undefined);
       created = await runtimeFactory({
         engine: controller.engine,
         adapterEpoch,
@@ -4410,7 +4419,7 @@ export function createLiveDesktopService(
           permissionMode: selectedRuntimeSettings.permissionMode,
           startup: selectedRuntimeSettings.startup,
         }),
-        ...(routed === undefined ? {} : { extraEnvironment: routed.extraEnvironment }),
+        ...(spawnEnvironment === undefined ? {} : { extraEnvironment: spawnEnvironment }),
       });
       logRuntime({ category: "runtime", event: "factory_ready", taskId, adapterEpoch });
       if (runtimeGeneration !== startGeneration) {
