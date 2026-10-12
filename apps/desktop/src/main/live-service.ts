@@ -185,6 +185,7 @@ import {
   type RuntimeSelectionOutcome,
 } from "./model-selection.js";
 import {
+  CLAUDE_DEFAULT_MUST_BE_NATIVE,
   CLAUDE_LOGIN_REQUIRED,
   MODEL_ROUTER_UNAVAILABLE,
   MODEL_SELECTION_FAILED,
@@ -8205,6 +8206,17 @@ export function createLiveDesktopService(
       const catalog = claudeCatalogProjection();
       if (model !== null && catalog.models.length > 0 && !catalog.models.some((candidate) => candidate.id === model)) {
         throw new Error("runtime_settings_change_unavailable");
+      }
+      // An Online / Local model is a per-task choice behind the online reminder; as the global default
+      // it would start new tasks on a third-party vendor without one.
+      if (model !== null) {
+        const offered = catalog.models.find((candidate) => candidate.id === model);
+        if (
+          (offered !== undefined && offered.group !== "claude") ||
+          routedModels().some((candidate) => candidate.id === model)
+        ) {
+          throw new Error(CLAUDE_DEFAULT_MUST_BE_NATIVE);
+        }
       }
       const current = store.loadAppSettings();
       if (

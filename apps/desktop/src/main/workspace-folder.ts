@@ -12,6 +12,8 @@ export const TASK_ENGINE_LOCKED = "task_engine_locked";
 export const MODEL_ROUTER_UNAVAILABLE = "model_router_unavailable";
 /** Docs/20 3.3: the Claude session could not be brought to the selected model, so no turn was started on another one. */
 export const MODEL_SELECTION_FAILED = "model_selection_failed";
+/** The Claude global default must be one of Claude's own models; Online / Local models are chosen per task. */
+export const CLAUDE_DEFAULT_MUST_BE_NATIVE = "claude_default_must_be_native";
 
 export async function workspaceFolderExists(canonicalPath: string): Promise<boolean> {
   if (canonicalPath.length === 0 || !isAbsolute(canonicalPath)) {
@@ -47,7 +49,8 @@ export function toDesktopIpcFailure(cause: unknown): Error {
     message === CLAUDE_LOGIN_REQUIRED ||
     message === TASK_ENGINE_LOCKED ||
     message === MODEL_ROUTER_UNAVAILABLE ||
-    message === MODEL_SELECTION_FAILED
+    message === MODEL_SELECTION_FAILED ||
+    message === CLAUDE_DEFAULT_MUST_BE_NATIVE
   ) {
     return new Error(message);
   }

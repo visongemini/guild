@@ -31,6 +31,7 @@ import { ClaudeLocatorError } from "./claude-locator.js";
 import type { BrowserMcpPort, ModelRouterHostPort, RoutedModelInfo } from "./engine-ports.js";
 import { openGuildPersistence, type GuildPersistence } from "@guild/persistence";
 import { createFixtureDesktopService } from "./fixture-service.js";
+import { toDesktopIpcFailure } from "./workspace-folder.js";
 import {
   createLiveDesktopService,
   type LiveDesktopServiceOptions,
@@ -563,6 +564,25 @@ describe("dual engine orchestration [PC-ENG-001, PC-MODEL-001]", () => {
     assert.deepEqual(h.world.adapters[0]!.prompts, ["hi"], "a refusal never blocks a Grok turn");
     const view = await h.service.openTask(task.task.taskId);
     assert.equal(view.timeline.some((item) => item.kind === "error"), false);
+  });
+
+  it("refuses an Online or Local model as the Claude global default with a named code [PC-MODEL-001]", async () => {
+    const router = new FakeRouterHost([DEEPSEEK, LOCAL_MODEL]);
+    const h = await harness({ modelRouterHost: router });
+    await assert.rejects(h.service.setClaudeSettings("deepseek-v4-flash", null, "default"), /^Error: claude_default_must_be_native$/u);
+    await assert.rejects(h.service.setClaudeSettings("local-27b-model", "high", "plan"), /^Error: claude_default_must_be_native$/u);
+    assert.equal((await h.service.bootstrap()).runtimeSettings.claude?.model, null, "nothing was stored");
+    // A native model still passes, also once a session has reported the adapter's list.
+    const task = await h.service.createTask(h.workspaceId, undefined, "claude");
+    await h.send(task.task.taskId, "x");
+    await h.completed();
+    await assert.rejects(h.service.setClaudeSettings("deepseek-v4-flash", null, "default"), /^Error: claude_default_must_be_native$/u);
+    await h.service.setClaudeSettings("opus", "high", "plan");
+    assert.equal((await h.service.bootstrap()).runtimeSettings.claude?.model, "opus");
+    // The named codes reach the renderer as they are.
+    for (const code of ["claude_default_must_be_native", "model_selection_failed", "model_router_unavailable"]) {
+      assert.equal(toDesktopIpcFailure(new Error(code)).message, code);
+    }
   });
 
   it("hands the browser MCP server only to agents that advertised HTTP MCP [PC-BROWSER-002]", async () => {
