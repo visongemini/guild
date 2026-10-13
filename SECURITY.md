@@ -3,7 +3,9 @@
 Guild is a local desktop client. It must not become a shared gateway, extract
 Grok credentials, or read Claude or Codex credentials. Grok model requests come only from the
 official user-installed `grok` process. Codex task requests come from the
-user-installed Codex adapter and its Codex core. Claude task requests come from the
+user-installed Codex adapter and its Codex core. Gemini task requests come from the
+user-installed Gemini CLI, on an API key you designate that Guild reads only in memory and sends
+only to `generativelanguage.googleapis.com`, never a Google account login. Claude task requests come from the
 user-installed `claude`; Online and Local models are reached only through a
 loopback-only, single-user router on `127.0.0.1`.
 

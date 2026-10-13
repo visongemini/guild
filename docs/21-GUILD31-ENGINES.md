@@ -1,7 +1,9 @@
 # Guild 3.1 - more engines: OpenAI Codex first, Gemini next
 
-Date: 2026-10-13. Owner decision recorded as D-066 in `docs/04-DECISION-LOG.md`. This document is the
-implementation brief for Guild 3.1 part 1 (the generic multi-engine foundation and the Codex engine).
+Date: 2026-10-13. Owner decisions recorded as D-066 (sections 1 to 6) and D-067 (sections 7 to 11) in
+`docs/04-DECISION-LOG.md`. This document is the implementation brief for Guild 3.1 part 1 (the generic multi-engine
+foundation and the Codex engine, sections 1 to 6) and part 2 (the Gemini engine and the new app icon with the Dock
+choice, sections 7 to 11).
 Facts marked **[spike]** were measured on this machine on 2026-10-13 with `@agentclientprotocol/codex-acp`
 2.2.2 (bundled `@openai/codex` 0.160.1, native `codex-cli 0.160.1`), node 26.8.1, an existing ChatGPT
 subscription login made by the owner with `codex login`, and the owner's real `~/.codex` configuration. The
@@ -174,3 +176,182 @@ rows for them are left alone.
 ## 6. What the owner installs
 `npm install -g @agentclientprotocol/codex-acp` (Node >= 22 already on PATH; the package brings its own Codex core), and
 `codex login` once if `codex` is not logged in (it is, on this machine).
+
+## 7. Gemini spike findings [spike]
+
+Measured on 2026-10-13 with `@google/gemini-cli` 0.63.0 (installed into a scratch folder with `npm install`, nothing
+global), node 26.8.1, a Gemini API key (`GEMINI_API_KEY`) read from the owner's key file, an isolated `HOME` and
+`GEMINI_CLI_HOME`, and a stand-alone ACP client. The owner's `~/.gemini` was never read, listed or written. The CLI runs
+as an ACP v1 agent over stdio with only the key; no browser or OAuth step happens. Verified: `initialize`,
+`session/new`, a prompt with a tool behind a permission request, cancel, `session/load` after a restart, an HTTP MCP
+server.
+
+| Item | Fact |
+|---|---|
+| Launch | `gemini --acp` (`--experimental-acp` is deprecated); child argv `node .../bundle/gemini.js --acp [--skip-trust]`. The package is `bin: gemini -> bundle/gemini.js`, `files: bundle/` (446 files, 95 MB), Apache-2.0. Native optional dependencies (`@github/keytar`, `node-pty`) are not needed; npm skipped their install scripts and nothing broke. |
+| Environment | `HOME` and `GEMINI_CLI_HOME` = a Guild-owned directory, `PATH`, `USER`, `LOGNAME`, proxy variables, `NO_PROXY=127.0.0.1,localhost`, `GEMINI_API_KEY`, `GEMINI_CLI_NO_RELAUNCH=1` (without it the CLI relaunches a child process, and a SIGKILL of the parent orphans it), `NODE_USE_ENV_PROXY=1` (node 26 ignores `HTTPS_PROXY` otherwise and every request times out). `GOOGLE_GEMINI_BASE_URL` flips the auth type to `gateway`; `GOOGLE_GENAI_USE_GCA` selects OAuth. Neither may be set. |
+| settings.json | `<home>/.gemini/settings.json`: `{"security":{"auth":{"selectedType":"gemini-api-key"}},"privacy":{"usageStatisticsEnabled":false},"general":{"enableAutoUpdate":false,"enableAutoUpdateNotification":false},"model":{"name":"<model>"}}`. Without `selectedType`, `session/load` after a restart fails with `-32000` "Authentication required". The alternative, `authenticate {"methodId":"gemini-api-key","_meta":{"api-key":"<key>"}}`, keeps the key in memory only but must be re-sent per process; Guild does not use it. |
+| Real-home hazard | Never point the CLI at the owner's `~/.gemini`: `authenticate` with another stored `selectedType` calls `clearCachedCredentialFile()` (deletes cached OAuth credentials), and a real `settings.json` with `oauth-personal` starts a browser flow. |
+| No / bad key | Missing key: `initialize` succeeds, `session/new` fails `-32000` "Gemini API key is missing or not configured." Invalid key: the prompt fails with a 400 containing `API_KEY_INVALID`. |
+| initialize | `protocolVersion` 1; `authMethods`: `oauth-personal`, `gemini-api-key` (`_meta.api-key.provider google`), `vertex-ai`, `gateway`; `agentInfo` gemini-cli 0.63.0; `agentCapabilities`: `loadSession` true, `promptCapabilities` image/audio/embeddedContext true, `mcpCapabilities` http and sse true. No `sessionCapabilities.resume`. `authenticate` is not required for the API-key flow. |
+| session/new | `modes`: `default`, `autoEdit`, `yolo`, `plan` (current `default`). `models.availableModels`: `auto`, `gemini-3.1-pro-preview`, `gemini-3-flash-preview`, `gemini-2.5-pro`, `gemini-3.8-flash`, `gemini-3.5-flash-lite` (current `auto`). There are no `configOptions`; `session/set_config_option` answers `-32601`. |
+| Model selection | `session/set_model {sessionId, modelId}` -> `{}` between prompts. It accepts ids the list does not contain (a bad id fails only at the prompt). `settings.json` `model.name` sets `currentModelId` at `session/new`. The default `auto` can route to Pro, and it comes back after `session/load` unless `model.name` is set, so the model is always set explicitly. |
+| Thinking | No thinking level over ACP. Per model in `settings.json` `modelConfigs.overrides` (restart needed), for example `{"match":{"model":"gemini-2.5-flash-lite"},"modelConfig":{"generateContentConfig":{"thinkingConfig":{"thinkingBudget":0,"includeThoughts":false}}}}`. |
+| Modes | `session/set_mode {sessionId, modeId}`; an unknown id answers `-32603`. A change emits an `agent_message_chunk` whose text is `[MODE_UPDATE] yolo` instead of a `current_mode_update`. |
+| Prompt with a tool | `agent_thought_chunk` x2, `tool_call` (pending, kind `edit`, a `diff` content block with `_meta.kind`), `session/request_permission` with options `proceed_always` "Allow for this session" (`allow_always`), `proceed_once` "Allow" (`allow_once`), `cancel` "Reject" (`reject_once`); then `tool_call_update` completed, `agent_message_chunk`, and the result `{"stopReason":"end_turn","_meta":{"quota":{"token_count":{"input_tokens":22065,"output_tokens":25},"model_usage":[...]}}}`. An MCP tool adds `proceed_always_server` and `proceed_always_tool`. No `rawInput`. Some shell commands run with no request at all. |
+| Cancel | `session/cancel` mid-stream: the result `cancelled` arrives within milliseconds, without `_meta.quota`, and the session is reusable. **While a permission request is pending the prompt resolves only after the client answers that request with `{"outcome":{"outcome":"cancelled"}}`.** Nothing arrives after the result (3 s watched); `available_commands_update` arrives from a `setTimeout(0)` after `session/new`, possibly during the first prompt. |
+| Resume / load | `session/resume` answers `-32601`. `session/load` (same cwd, `selectedType` set) answers `{modes, models}` after replaying the history as `session/update` frames, which include a synthetic `user_message_chunk` starting `<session_context>` and `user_message_chunk` frames reading `[Function Response: write_file]`. The replay differs from the live frames: the tool title is the tool's name (`WriteFile`, live "Writing to hello.txt"), the diff path is relative, there is no `locations`, the tool call is already `completed`, and the final text lacks the live trailing newline. Sessions persist at `<home>/.gemini/tmp/<slug>/chats/session-<ts>-<id8>.jsonl` (prompts and tool output in full). |
+| Usage | Only the prompt result `_meta.quota` (`input_tokens`, `output_tokens` per model); no `usage_update`, cost or cached tokens. `output_tokens` excludes thinking, and nothing is reported for a cancelled or failed turn. A trivial turn is about 10.9k input tokens, a tool turn about 22k (two requests). |
+| HTTP MCP | `{"type":"http","name":"stub","url":"http://127.0.0.1:<port>/mcp","headers":[...]}` is accepted and its headers are sent on every request; tools appear behind permission requests. **Only in a trusted folder**: in an untrusted one the server is silently dropped. `--skip-trust` fixes that, and also allows `autoEdit` and `yolo`. |
+| Client file system | Do not advertise it. If it is advertised, answering a read of a missing file with `-32002` breaks `write_file` for a new file. |
+| Network | Only `generativelanguage.googleapis.com:443` (where the key goes) and, with usage statistics on, `play.googleapis.com`. Nothing else. |
+| Telemetry | Usage statistics are on by default (`privacy.usageStatisticsEnabled: false` turns them off, verified). OpenTelemetry is off unless `GEMINI_TELEMETRY_ENABLED` is set. |
+| Trust | `--skip-trust` also enables workspace `.gemini/settings.json`, hooks, skills and `GEMINI.md`, and the CLI loads `.env` files from the working directory upward and from `<home>/.gemini/.env` (not tested). |
+
+Ten gotchas, highest impact first: (1) node 26 ignores the proxy variables, set `NODE_USE_ENV_PROXY=1`; (2) the default
+model `auto` can route to Pro and returns after a load, set the model explicitly; (3) the real home is hazardous, use a
+Guild-owned `GEMINI_CLI_HOME`; (4) an untrusted folder drops ACP MCP servers and refuses `autoEdit` and `yolo`, so
+decide on `--skip-trust` deliberately; (5) two processes unless `GEMINI_CLI_NO_RELAUNCH=1`; (6) `[MODE_UPDATE]` is fake
+chat text, filter it; (7) permission options by kind, and answer pending requests with `cancelled` after
+`session/cancel`; (8) usage under-reports, the billing page is authoritative; (9) with no key `initialize` still
+succeeds and the failure comes at `session/new`; (10) npm skipped the install scripts of the optional native
+packages and the interactive shell tool of the CLI (`node-pty`) was not tested.
+
+## 8. The Gemini engine
+
+### 8.1 Process
+- Executable: the user's `node`, pinned per launch exactly as for Claude and Codex, running the package's
+  `bundle/gemini.js` in place with `--acp --skip-trust`. The package `@google/gemini-cli` is found from `~/.npm-global`,
+  the PATH and the Homebrew paths as `gemini` (a command on the search path must be the package's own `bundle/gemini.js`).
+- Supported versions `>=0.63.0 <0.70.0`. The pin is the package version plus a SHA-256 over `package.json` and every
+  regular file under `bundle/` (about 95 MB, hashed at every spawn and by nothing else: the install probe of
+  Settings only reads `package.json` and checks the entry exists). The optional native dependencies in the package's
+  `node_modules` are not covered, and the CLI does not need them. A mismatch refuses to start (`adapter_changed`) and a
+  later locate accepts only an update (a different version), never other bytes under the same version.
+- Start windows: 180 s for `initialize` and `session/*`, like Codex; a timeout is "still starting", never a lost session.
+- Environment: the Claude allowlist with `GEMINI_*` and `GOOGLE_*` denied by prefix. Guild-owned values:
+  `HOME` and `GEMINI_CLI_HOME` (section 8.3), `GEMINI_CLI_NO_RELAUNCH=1`, `NODE_USE_ENV_PROXY=1`, `NO_PROXY` with
+  the loopback hosts, and, per spawn only, `GEMINI_API_KEY`. After the environment is built it is checked: any other
+  `GEMINI_`/`GOOGLE_` variable, `GOOGLE_GENAI_USE_GCA` and `GOOGLE_GEMINI_BASE_URL` above all, refuses the start.
+  OpenViking is not involved: the Gemini CLI has no OpenViking plugin; the Grok block (config files to `/dev/null`, URLs to a
+  closed loopback port) is still applied as a guard.
+- Before a spawn Guild reads the `.env` and `.gemini/.env` files the CLI would load (from the task's folder upward, and the
+  Guild-owned home) and refuses to start when one of them sets `GOOGLE_GEMINI_BASE_URL`, `GOOGLE_GENAI_USE_GCA`,
+  `GOOGLE_GENAI_USE_VERTEXAI`, `GOOGLE_API_KEY` or `GEMINI_API_KEY` or `GEMINI_CLI_HOME`: those would redirect the key
+  or change the sign-in method (the CLI does not override a variable the environment already has, and Guild must not set the
+  first two). It names the file, never a value.
+- `--skip-trust` trade-off, accepted by the owner: the CLI then loads workspace `.gemini/settings.json`, hooks, skills,
+  `GEMINI.md` and `.env` files in the user's own project folders. It is required for the browser MCP server (an untrusted
+  folder drops it) and for the `autoEdit` and `yolo` modes. For a single-user local client that opens only the user's own
+  folders this is acceptable; opening a folder from an untrusted source with Gemini is the user's risk (the `.env` check
+  above covers the one file that could move the key).
+- No model router, no `authenticate`, no client file-system capability.
+
+### 8.2 The API key (pay-as-you-go, never a subscription)
+- Settings > Engines > Gemini holds a key file (absolute path, or empty for `~/.config/guild/keys.env`) and a
+  variable name (default `GEMINI_API_KEY`). The renderer sends only those two names; the database stores them
+  (`engine_key_bindings`), never a value. The host is fixed by the engine: `generativelanguage.googleapis.com`.
+- Binding: a change of file or variable clears the confirmation. **Confirm** opens the native main-process dialog, the same
+  one a model source uses: "Allow Guild to send GEMINI_API_KEY from <file> to generativelanguage.googleapis.com?" The
+  stored `confirmed_host` is written only by the main process after "Allow"; no request can set it.
+- Use: at each launch the main process reads the variable from the file (`readKeyFromEnvFile`), requires a confirmed binding
+  whose host is the Gemini host, and puts the value in the child's environment as `GEMINI_API_KEY`. It is redacted from every
+  diagnostic (`redactValues`), never in argv, never in `settings.json`, never logged. An unconfirmed binding, a missing file or
+  a missing variable ends the start with a named state ("Gemini needs an API key") and the Settings status says what is
+  missing, without ever naming a value.
+- `oauth-personal`, `vertex-ai` and `gateway` appear in the adapter's `authMethods`; Guild counts and ignores them and has no
+  control to choose them.
+
+### 8.3 Guild-owned home
+`<userData>/engines/gemini-home` (mode 0700) is both `HOME` and `GEMINI_CLI_HOME` of every Gemini process, so the CLI's state,
+its session files (`.gemini/tmp/<slug>/chats/*.jsonl`) and any cache live there, and the owner's `~/.gemini` is never opened.
+Guild writes `<home>/.gemini/settings.json` (atomic replace, mode 0600) before each spawn: API-key auth, usage statistics off,
+auto-update and its notice off, and `model.name` = the task's selected model when the list is known (never `auto`). Task
+sessions are not deleted by Guild.
+
+### 8.4 ACP dialect
+The `gemini` dialect differs from plain ACP v1 and from the other two adapters in these ways.
+- **Models and modes are session state, not config options.** The dialect presents `models` and `modes` of `session/new` and
+  `session/load` as two select options so the rest of Guild is unchanged: `model` (category `model`; the `auto` entry is
+  left out of the choices and a session that is on it reports an `unlisted` current value) and `mode` (category `mode`; ids
+  `default`, `autoEdit`, `yolo`, `plan`). `setConfigOption("model", id)` is `session/set_model`, `setConfigOption("mode", id)`
+  is `session/set_mode`; the adapter keeps the current values and returns the updated options.
+- No effort option, so the effort row of the picker and of Settings is not shown for Gemini; a stored effort is ignored.
+- Filtered frames: an `agent_message_chunk` whose text starts `[MODE_UPDATE]`, and (the replay of `session/load`) a
+  `user_message_chunk` starting `<session_context>` and `user_message_chunk`s starting `[Function Response:`.
+- Permission requests: options by kind (`allow_once`, `allow_always`, `reject_once`; the ids are the agent's own), so the
+  3.0.2 labels apply. Cancelling a turn answers every permission request still pending with `{"outcome":{"outcome":"cancelled"}}`
+  (the CLI does not resolve the prompt otherwise).
+- Usage: the prompt result's `_meta.quota.token_count` (`input_tokens` + `output_tokens`) becomes the turn's token count for the
+  context display, marked approximate; there is no window size, so no ring percentage. The usage popover says that billing is
+  authoritative on Google AI Studio and shows no cost.
+- Late frames are handled as for the other adapters (`available_commands_update` as metadata, content dropped).
+- `session/resume` is not advertised, so a restart uses `session/load`. A load of a session the CLI does not have answers an
+  error that the dialect classifies as "session not found" only when it names a missing session; any other failure keeps the
+  session for the next try.
+
+### 8.5 Models and modes
+The picker group is "Gemini (API, pay-as-you-go)" with a muted line "Billed per use on your Google AI Studio account". It lists
+the models the session reported, without `auto` (it can pick the Pro model by itself). A new task starts on the cheapest
+model the session lists: `flash-lite` first, then `flash`, then the rest, in the CLI's order within a tier, and Guild
+applies it with `session/set_model` before the first prompt of every process (new or loaded), because the CLI starts on `auto`
+and returns to it after a load. A model the session does not list refuses the prompt (`model_selection_failed`). The four
+modes are shown with Guild's own words: Default (asks before edits and commands), Auto-edit (edits without asking), Plan
+(read-only), Full access (YOLO, asks nothing; marked as a warning like Codex's full access); the setting default is `default`.
+
+### 8.6 Session restore
+Because the replay is not faithful (section 7), the replay check of a Gemini task requires that the loaded session replays
+exactly the user prompts of the task's completed turns, in order, by the same digest as for the other engines; it does not
+compare titles, thoughts, tool snapshots or assistant text. A prompt sent with attached files cannot be proven and is
+treated as a conflict, as for Grok.
+
+### 8.7 Browser pane, OpenViking, steer
+The browser MCP server is handed to `session/new` and `session/load` as an HTTP server (the CLI advertises `http`). There is no
+steering request; Steer falls back to an ordinary queued message. Branch copies the local transcript into a new session; rewind
+is files only.
+
+### 8.8 Reduced states (PC-FALLBACK-001)
+Not installed (`gemini` package missing, an unsupported version): "Not installed. Run `npm install -g @google/gemini-cli`".
+No usable key (no binding, unconfirmed binding, missing file or variable, an invalid key at the first prompt): the Settings
+status says which and the task offers the way to Settings; Guild runs no command and shows no key. Changed files: the integrity
+text naming the Gemini CLI. Stop ends the turn; a shell command the CLI already started may keep running until the task's
+process closes, as for Codex.
+
+### 8.9 Interface
+The sidebar engine badge is "Ge" in the Gemini colour (a letter pair, distinct from the single letters G, C, X). The Settings >
+Engines section shows the status, the key file and variable with the Confirm control, the default model (no effort) and the four
+modes.
+
+### 8.10 Schema 21 additions (3.1 is unreleased, so no migration 22)
+`engine_defaults.permission_mode` accepts upper-case letters (Gemini's `autoEdit`); `engine_key_bindings(engine, key_file,
+key_variable, confirmed_host, revision, updated_at_ms)` holds the binding of section 8.2; `app_settings.dock_icon` holds the
+Dock choice of section 9. The `gemini` engine value and Gemini model ids already fit the identifier shapes of the foundation.
+
+## 9. App icon and Dock choice
+
+The owner approved new artwork, hand drawn as vector by Claude on 2026-10-13: the square "G" in a dark (the owner's "I") and a light
+(the owner's "H") variant. `apps/desktop/build/icon.icns` and `icon.png` are the dark variant (the default); the sources are
+`icon-dark.svg` and `icon-light.svg` next to them, and `icon-light.png` (1024 px) ships as the packaged resource
+`Contents/Resources/icon-light.png`. Settings > General > "Dock icon" (Dark / Light, default Dark, with small previews) persists
+in `app_settings.dock_icon`. The main process applies it at startup and immediately on change with
+`app.dock.setIcon(<resource path>)` for Light and restores the bundle icon (`app.dock.setIcon(null)` is not supported, so it
+sets the dark PNG) for Dark. The packaged-app verification checks that the packaged `icon.icns` equals `build/icon.icns` and
+that the light PNG is present and byte-equal to its source.
+
+## 10. Acceptance (installed app)
+1. A fresh Gemini task: the "Gemini (API, pay-as-you-go)" group lists the session's models without `auto`, the cheapest Flash(-Lite)
+   model is selected, one turn runs a tool behind a permission card approved in the UI, the footer names the model.
+2. Quit and reopen Guild; the task continues through `session/load` with the same model and permission mode.
+3. The sidebar shows the "Ge" badge; Settings > Engines shows the Gemini section and its key binding.
+4. Settings > General: Dock icon Light / Dark takes effect at once and survives a restart.
+
+Automated as checks J and K of `scripts/run-guild3-qa.mjs`. Check J runs only when `GUILD_QA_GEMINI_CLI=<package directory of
+a @google/gemini-cli install>` is set (handed to the unpackaged app as the dev-only `GUILD_DEV_GEMINI_CLI`; a packaged app ignores
+it and the locator pins whatever it finds there like any other install) and the key file holds `GEMINI_API_KEY`. The key binding is
+seeded through the store the way the model sources are (`confirmEngineKeyBinding`, which stands in for the native dialog for QA
+only). Check K needs no engine.
+
+## 11. What the owner installs
+`npm install -g @google/gemini-cli` (0.63 up to 0.69; Node >= 20 on PATH, Guild uses its own pinned node). A Gemini API key from
+Google AI Studio in `~/.config/guild/keys.env` as `GEMINI_API_KEY` (or any file and variable), then Settings > Engines >
+Gemini > Confirm.

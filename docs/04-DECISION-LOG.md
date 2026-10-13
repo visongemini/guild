@@ -1264,3 +1264,39 @@ Consequences
     `idleBehavior` and would start a turn nobody sees.
   - Stop does not stop a foreground command Codex already started; this is stated to the user, not hidden.
 - Requirements: PC-ENG-001, PC-ENG-003, PC-MODEL-001, PC-SET-002.
+
+## D-067 — Guild 3.1: a fourth engine, Google Gemini, on an API key bound to its host, and a new app icon
+
+- Date: 2026-10-13
+- Status: accepted
+- Context: the owner wants Gemini in the same window as Grok, Claude Code and Codex, paid per use. The measured facts
+  of the official Gemini CLI (`@google/gemini-cli` 0.63.0) as an ACP agent are in `docs/21-GUILD31-ENGINES.md`
+  (spike of 2026-10-13). The owner also approved new app artwork with a dark and a light variant.
+- Decision
+  - Gemini runs the user-installed `@google/gemini-cli` (0.63 up to 0.69) with `--acp --skip-trust` under the user's
+    pinned `node`. The package (`package.json` and the `bundle/` tree) is pinned by version and SHA-256 like the other
+    adapters. Subscription and OAuth sign-in are never used: the only method is an API key (pay-as-you-go), and
+    `oauth-personal`, `vertex-ai` and `gateway` are never offered, selected or authenticated.
+  - The key comes from a user-designated env file and variable (default `~/.config/guild/keys.env`,
+    `GEMINI_API_KEY`), is bound to `generativelanguage.googleapis.com` by the same native, main-process confirmation
+    that binds a model source's key to its host, is read by the main process at each launch and reaches the child as
+    `GEMINI_API_KEY` only. It is never stored, logged, sent over IPC or shown, and is redacted from diagnostics.
+  - The child runs on a Guild-owned `HOME` and `GEMINI_CLI_HOME` (never the owner's `~/.gemini`), whose
+    `settings.json` Guild writes: API-key auth, usage statistics off, auto-update off. No inherited `GEMINI_*` or
+    `GOOGLE_*` variable reaches it, and Guild refuses to start when a project `.env` file it would load sets a
+    variable that redirects the key or switches the sign-in method.
+  - `--skip-trust` is accepted knowingly: it makes the CLI load workspace `.gemini` settings, hooks, `GEMINI.md` and `.env`
+    files in the user's own project folders. It is needed for the browser MCP server and for the auto-edit and yolo
+    modes, and it is acceptable for a single-user local client.
+  - Gemini has no config options, so the adapter presents its models and modes as the same two select options the
+    other adapters have (`model`, `mode`) and maps their changes to `session/set_model` and `session/set_mode`. The
+    model is applied explicitly after every start, `auto` is never offered (it can route to the Pro model), and a new
+    task starts on the cheapest Flash or Flash-Lite model the session lists. There is no effort control.
+  - History is restored with `session/load` only. The replay is not byte-faithful to what the live turn showed
+    (titles, paths and trailing text differ), so the replay check for a Gemini task compares the user prompts of each turn
+    and nothing else.
+  - Usage is what the prompt result reports (`_meta.quota` tokens); it is labelled as approximate and Google AI Studio is the
+    billing authority. Guild shows no cost for Gemini.
+- Icon: the new artwork (hand-drawn vector, dark and light) replaces the application icon; the dark variant is the bundle icon
+  and the default, the light one ships as a resource for a runtime Dock icon chosen in Settings > General.
+- Requirements: PC-ENG-001, PC-ENG-004, PC-MODEL-001, PC-SET-002, PC-PROV-002.

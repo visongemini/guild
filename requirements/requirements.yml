@@ -996,8 +996,8 @@ requirements:
   - id: PC-ENG-001
     title: Per-task engine binding across the supported engines
     statement: >-
-      Guild runs a task on one of three engines, the official Grok process, the user-installed Claude
-      Code adapter or the user-installed Codex adapter. The task's engine is set when its first turn is
+      Guild runs a task on one of four engines, the official Grok process, the user-installed Claude
+      Code adapter, the user-installed Codex adapter or the user-installed Gemini CLI. The task's engine is set when its first turn is
       created and never changes; the model group chosen for that turn fixes it. One engine process
       serves each active task. A capability an engine lacks is shown as a named reduced state in
       Chinese and English and is never simulated.
@@ -1043,11 +1043,33 @@ requirements:
     implementation_commits: []
     sources: [docs/21-GUILD31-ENGINES.md, docs/04-DECISION-LOG.md]
 
+  - id: PC-ENG-004
+    title: Pinned user-installed Gemini engine on an API key bound to its host
+    statement: >-
+      The Gemini engine runs the user-installed Gemini CLI (@google/gemini-cli, 0.63 up to 0.69) in its ACP mode
+      under the user's node, and Guild distributes none of it. The package is pinned by a version range and a
+      SHA-256 over its installed package.json and bundle tree, and a mismatch refuses to start with a named error.
+      The engine is paid for per use with an API key only: the key is read by the main process at launch from a
+      user-designated env file and variable, bound to generativelanguage.googleapis.com by a native confirmation
+      the renderer cannot replace, handed to the child as GEMINI_API_KEY and nothing else, and never written to
+      SQLite, IPC payloads, the renderer or logs. Subscription, OAuth, Vertex and gateway sign-in are never
+      offered or used. The child environment is an allowlist with no inherited GEMINI_ or GOOGLE_ variable, it
+      runs on a Guild-owned home directory with usage statistics and self-update off, and it is not started when
+      a project env file it would load redirects the key or changes the sign-in method. The model is applied
+      after every session start and the automatic model choice is never offered, so a turn cannot silently run
+      on a dearer model than the one selected.
+    severity: P0
+    phase: 3
+    acceptance_stories: [AS-011]
+    acceptance_tests: [AT-ENGINE-001, IT-SEC-001, EV-RELEASE-001]
+    implementation_commits: []
+    sources: [docs/21-GUILD31-ENGINES.md, docs/04-DECISION-LOG.md]
+
   - id: PC-MODEL-001
     title: Grouped model picker limited to reported or configured models
     statement: >-
-      The model picker groups models as Grok, Claude, ChatGPT (Codex), Online and Local. A Grok task lists
-      only models the official Grok process reports, and a Codex task only the models its adapter reports. A Claude task lists the models its adapter reports plus the
+      The model picker groups models as Grok, Claude, ChatGPT (Codex), Gemini (API, pay-as-you-go), Online and Local. A Grok task lists
+      only models the official Grok process reports, and a Codex or Gemini task only the models its adapter reports. A Claude task lists the models its adapter reports plus the
       enabled Online and Local models of sources the user configured and confirmed. Nothing from any
       other origin is selectable. Inside a Claude task the model can change between turns, in both
       directions between a Claude subscription model and an Online or Local model. The engine process
@@ -1184,8 +1206,8 @@ requirements:
     title: Settings tabs General, Engines, Model sources, Privacy and About
     statement: >-
       Settings open as an independent dialog with General, Engines, Model sources, Privacy and About.
-      Language, restore-last-task, new-task workspace mode and background-task notification policy
-      persist. Engines shows each engine's status and settings; the official Grok model, reasoning
+      Language, restore-last-task, new-task workspace mode, background-task notification policy and the
+      Dock icon (dark or light) persist. Engines shows each engine's status and settings; the official Grok model, reasoning
       effort and tool authorization are sent to the official process. Model sources holds the Online
       and Local sources, whose key values are never displayed or stored by Guild and whose changes
       need a native confirmation. Browser login sync stays off and unavailable.
