@@ -25,7 +25,7 @@
  * section of Settings > Engines, J Gemini (own API key, pay-as-you-go; Guild 3.1): a fresh task on the cheapest Flash
  * model of the session's list, one tool turn behind a permission card approved in the UI, the per-turn model line, a
  * Guild restart that continues the session through session/load, the child's environment (Guild's own home, the key as a
- * presence only, no OAuth / Google Cloud / base-URL variable), the badge in the sidebar and the Gemini section of
+ * presence only, no OAuth / Google Cloud / base-URL value, the variables a .env could use fixed in the environment), the badge in the sidebar and the Gemini section of
  * Settings > Engines, K the Dock icon setting (Settings > General): light and back to dark, each persisted across a restart.
  * Environment: GUILD_QA_STAMP (reuse a run), GUILD_QA_ONLY=A,B (subset), GUILD_QA_KEEP_APP=1,
  * GUILD_QA_CODEX_ACP=<package directory of a codex-acp install> (handed to the unpackaged app as the dev-only
@@ -130,6 +130,12 @@ function processEnvHas(pid, name) {
   const result = spawnSync("/bin/ps", ["-E", "-ww", "-o", "command=", "-p", String(pid)], { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 });
   const text = result.stdout ?? "";
   return new RegExp(`(?:^|\\s)${name}=`, "u").test(text);
+}
+
+/** Whether the process environment gives a variable a non-empty value. Only a boolean leaves this function. */
+function processEnvHasValue(pid, name) {
+  const result = spawnSync("/bin/ps", ["-E", "-ww", "-o", "command=", "-p", String(pid)], { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 });
+  return new RegExp(`(?:^|\\s)${name}=\\S`, "u").test(result.stdout ?? "");
 }
 
 function processEnvValueIs(pid, name, value) {
@@ -655,10 +661,16 @@ function geminiEnvironment(pid) {
     keyPresent: processEnvHas(pid, "GEMINI_API_KEY"),
     singleProcess: processEnvValueIs(pid, "GEMINI_CLI_NO_RELAUNCH", "1"),
     envProxy: processEnvValueIs(pid, "NODE_USE_ENV_PROXY", "1"),
-    noOAuthSwitch: !processEnvHas(pid, "GOOGLE_GENAI_USE_GCA"),
-    noBaseUrl: !processEnvHas(pid, "GOOGLE_GEMINI_BASE_URL"),
-    noVertex: !processEnvHas(pid, "GOOGLE_GENAI_USE_VERTEXAI") && !processEnvHas(pid, "GOOGLE_CLOUD_PROJECT"),
-    noGoogleKeyOrCredentials: !processEnvHas(pid, "GOOGLE_API_KEY") && !processEnvHas(pid, "GOOGLE_APPLICATION_CREDENTIALS"),
+    // Guild fixes these variables to an empty value (or a harmless default) so that no .env file can supply them: each one is
+    // present, and none of them carries a value that would change the sign-in or the host.
+    noOAuthSwitch: !processEnvHasValue(pid, "GOOGLE_GENAI_USE_GCA"),
+    noBaseUrl: !processEnvHasValue(pid, "GOOGLE_GEMINI_BASE_URL") && !processEnvHasValue(pid, "GOOGLE_VERTEX_BASE_URL"),
+    noVertex: !processEnvHasValue(pid, "GOOGLE_GENAI_USE_VERTEXAI") && !processEnvHasValue(pid, "GOOGLE_CLOUD_PROJECT"),
+    noGoogleKeyOrCredentials: !processEnvHasValue(pid, "GOOGLE_API_KEY") && !processEnvHasValue(pid, "GOOGLE_APPLICATION_CREDENTIALS"),
+    fixedAgainstEnvFiles: ["GOOGLE_GEMINI_BASE_URL", "GOOGLE_GENAI_USE_GCA", "GOOGLE_GENAI_USE_VERTEXAI", "GOOGLE_API_KEY", "GOOGLE_APPLICATION_CREDENTIALS", "CLOUD_SHELL"]
+      .every((name) => processEnvHas(pid, name)),
+    noBrowser: processEnvValueIs(pid, "NO_BROWSER", "true"),
+    codeAssistClosed: processEnvValueIs(pid, "CODE_ASSIST_ENDPOINT", "http://127.0.0.1:9"),
     noOtherEngineKeys: !processEnvHas(pid, "ANTHROPIC_BASE_URL") && !processEnvHas(pid, "ANTHROPIC_AUTH_TOKEN") && !processEnvHas(pid, "OPENAI_API_KEY"),
   };
 }

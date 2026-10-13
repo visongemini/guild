@@ -1702,19 +1702,32 @@ export function createLiveDesktopService(
   }
 
   /**
-   * Tells the user, in the task, which env file stopped a Gemini start and which variable in it did (never a value;
-   * docs/21 8.1). A failure to write the note must not hide the refusal.
+   * Tells the user, in the task, which env or settings file stopped a Gemini start and which variable or setting in it did
+   * (never a value; docs/21 8.1). A failure to write the note must not hide the refusal.
    */
-  function writeEnvFileNotice(taskId: TaskId, problem: Readonly<{ path: string; variable: string }>): void {
+  function writeEnvFileNotice(
+    taskId: TaskId,
+    problem: Readonly<{ path: string; variable: string; source?: "env_file" | "settings_file"; reason?: "forbidden" | "uncheckable" }>,
+  ): void {
     try {
       const locale = store.loadAppSettings().locale;
+      const zh = locale === "zh-CN";
+      const text = problem.reason === "uncheckable"
+        ? zh
+          ? `Gemini 没有启动：${problem.path} 太大或格式异常，Guild 无法在 Gemini 读取它之前检查其中的内容。请缩小或移除该文件，或把它移出这个项目，然后重新发送。`
+          : `Gemini was not started: ${problem.path} is too large or too unusual for Guild to check before Gemini reads it. Shrink or remove the file, or move it out of this project, then send again.`
+        : problem.source === "settings_file"
+          ? zh
+            ? `Gemini 没有启动：${problem.path} 设置了 ${problem.variable}，它会改变登录方式或把对话发往别处。请从该文件删除这项设置，或把它移出这个项目，然后重新发送。`
+            : `Gemini was not started: ${problem.path} sets ${problem.variable}, which could change the sign-in method or send the conversation elsewhere. Remove that setting from the file, or move the file out of this project, then send again.`
+          : zh
+            ? `Gemini 没有启动：${problem.path} 设置了 ${problem.variable}，它会把 API 密钥发往别处或改变登录方式。请从该文件删除这一行，或把它移出这个项目，然后重新发送。`
+            : `Gemini was not started: ${problem.path} sets ${problem.variable}, which could send the API key elsewhere or change the sign-in method. Remove that line from the file, or move the file out of this project, then send again.`;
       store.createConversationEntry({
         taskId,
         entryId: unique("gemini-env-file"),
         kind: "notice",
-        text: locale === "zh-CN"
-          ? `Gemini 没有启动：${problem.path} 设置了 ${problem.variable}，它会把 API 密钥发往别处或改变登录方式。请从该文件删除这一行，或把它移出这个项目，然后重新发送。`
-          : `Gemini was not started: ${problem.path} sets ${problem.variable}, which could send the API key elsewhere or change the sign-in method. Remove that line from the file, or move the file out of this project, then send again.`,
+        text,
         metadata: { failureCategory: "gemini_env_file_unsafe" },
         status: "complete",
       });

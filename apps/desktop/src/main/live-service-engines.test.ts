@@ -2128,6 +2128,20 @@ describe("Gemini engine orchestration [PC-ENG-004]", () => {
     assert.equal(toDesktopIpcFailure(new Error("engine_env_file_unsafe")).message, "engine_env_file_unsafe");
   });
 
+  it("says in its note when a settings file or an oversized file stopped the start, and never shows a value [PC-ENG-004]", async () => {
+    for (const [problem, expected] of [
+      [{ path: "/work/project/.gemini/settings.json", variable: "security.auth.selectedType", source: "settings_file", reason: "forbidden" }, /(sets security\.auth\.selectedType.*Remove that setting)|(设置了 security\.auth\.selectedType.*删除这项设置)/u],
+      [{ path: "/work/project/.env", variable: "", source: "env_file", reason: "uncheckable" }, /(\.env is too large or too unusual for Guild to check)|(\.env 太大或格式异常，Guild 无法)/u],
+    ] as const) {
+      const h = await harness({}, { gemini: { ...loadOnly, envFileProblem: problem } });
+      const task = await h.service.createTask(h.workspaceId, undefined, "gemini");
+      await assert.rejects(h.send(task.task.taskId, "hi"), /^Error: engine_env_file_unsafe$/u);
+      assert.equal(h.world.adapters.length, 0);
+      const notice = (await h.service.openTask(task.task.taskId)).timeline.find((item) => item.kind === "notice" && item.text.includes(problem.path));
+      assert.ok(notice !== undefined && notice.kind === "notice" && expected.test(notice.text), notice?.kind === "notice" ? notice.text : "no note");
+    }
+  });
+
   it("reports the install state from the probe: ready with the version, not found, integrity, unavailable [PC-ENG-004]", async () => {
     let answer: () => Promise<{ version: string }> = async () => ({ version: "0.63.0" });
     const path = await keyFile(`GEMINI_API_KEY=${KEY}\n`);
@@ -2334,7 +2348,7 @@ type EngineSpec = {
   /** Gemini: the runtime cannot be built because no usable key was found (nothing is spawned). */
   readonly keyUnavailable?: "unconfirmed" | "unusable";
   /** Gemini: the runtime cannot be built because an env file names a variable that moves the key. */
-  readonly envFileProblem?: { readonly path: string; readonly variable: string };
+  readonly envFileProblem?: { readonly path: string; readonly variable: string; readonly source?: "env_file" | "settings_file"; readonly reason?: "forbidden" | "uncheckable" };
   /** The prompt result reports this many tokens (`contextTokensUsed`), as Gemini's quota does. */
   readonly terminalTokens?: number;
   /**

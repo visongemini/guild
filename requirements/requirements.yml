@@ -1015,8 +1015,11 @@ requirements:
       user-installed claude binary; Guild distributes neither. The adapter is pinned by a version
       range and a SHA-256 over its installed package.json and dist tree, and a mismatch refuses to
       start with a named error. The child environment is an allowlist with every inherited ANTHROPIC_
-      and CLAUDE_CODE_ variable stripped. Guild never reads Claude credentials and never calls the
-      adapter's authenticate method; a missing login is shown as a named reduced state.
+      and CLAUDE_CODE_ variable stripped. A packaged app never searches the PATH it was started
+      with for node, the adapter or claude: it uses fixed directories and only files whose real path
+      is trusted (not in a temporary directory, owned by the user or root, not writable by others).
+      Guild never reads Claude credentials and never calls the adapter's authenticate method; a
+      missing login is shown as a named reduced state.
     severity: P0
     phase: 3
     acceptance_stories: [AS-011]
@@ -1031,7 +1034,8 @@ requirements:
       the user's node, together with the Codex core that adapter ships, and Guild distributes none of
       it. The adapter is pinned by a version range and a SHA-256 over its installed package.json and dist
       tree, its Codex core by real path, version and size, and a mismatch refuses to start with a named
-      error. The child environment is an allowlist with no inherited CODEX_ or OPENAI_ variable, and
+      error. The same locator rules as the Claude engine apply: a packaged app never searches the PATH it
+      was started with. The child environment is an allowlist with no inherited CODEX_ or OPENAI_ variable, and
       OpenViking recall and capture are switched off. Guild never reads Codex credentials, never calls the
       adapter's authenticate method and offers no API key field; a missing login is shown as a named
       reduced state with the command to run. The model, reasoning effort and permission mode are applied
@@ -1054,8 +1058,11 @@ requirements:
       the renderer cannot replace, handed to the child as GEMINI_API_KEY and nothing else, and never written to
       SQLite, IPC payloads, the renderer or logs. Subscription, OAuth, Vertex and gateway sign-in are never
       offered or used. The child environment is an allowlist with no inherited GEMINI_ or GOOGLE_ variable, it
-      runs on a Guild-owned home directory with usage statistics and self-update off, and it is not started when
-      a project env file it would load redirects the key or changes the sign-in method. The model is applied
+      runs on a Guild-owned home directory with usage statistics and self-update off, holds every variable that
+      could redirect the key or change the sign-in method at a value Guild chose, and is not started when a
+      project env file it would load (read with the CLI's own grammar) or the project's settings file redirects the
+      key or changes the sign-in method. A packaged app never searches the PATH it was started with for node or
+      the CLI. The model is applied
       after every session start and the automatic model choice is never offered, so a turn cannot silently run
       on a dearer model than the one selected.
     severity: P0

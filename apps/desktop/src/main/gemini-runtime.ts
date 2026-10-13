@@ -17,14 +17,15 @@ import {
   type GeminiLocatorOptions,
   type LocatedGeminiEngine,
 } from "./gemini-locator.js";
+import { assertNoForbiddenWorkspaceSetting } from "./gemini-workspace-guard.js";
 import { RelocatingEngineProcess } from "./relocating-engine-process.js";
 import { resolveOfficialGrokEnvironment } from "./runtime-locator.js";
 
 /**
  * PC-ENG-004: builds the Gemini engine's runtime for one task process: the user's `node` (Mach-O pin) running the
  * user-installed Gemini CLI in its ACP mode on a Guild-owned home and the API key the user confirmed (docs/21 8).
- * Before anything is spawned the key is read (just now, in memory), the env files the CLI would load are checked and the
- * home's settings are written. Guild never reads `~/.gemini`, never calls `authenticate` and never starts the CLI on a
+ * Before anything is spawned the key is read (just now, in memory), the env files and the settings file the CLI would load
+ * from the project folder are checked and the home's settings are written. Guild never reads `~/.gemini`, never calls `authenticate` and never starts the CLI on a
  * sign-in other than the API key.
  */
 
@@ -104,7 +105,9 @@ export async function createGeminiRuntime(
   if (dependencies.prepare !== undefined) {
     await dependencies.prepare(input);
   } else {
+    // Everything the CLI would read from the project folder that could move the key or change the sign-in method.
     await assertNoForbiddenEnvFileVariable(input.workingDirectory, dependencies.homeDirectory);
+    await assertNoForbiddenWorkspaceSetting(input.workingDirectory);
     await prepareGeminiHome(dependencies.homeDirectory, input.model);
   }
   const buildHost = (engine: LocatedGeminiEngine): EngineProcessHost => {

@@ -40,6 +40,9 @@ Developer ID 签名与公证；开发者可按下方步骤在本机自行构建�
 验证，请在 Finder 中右键 Guild，选择“打开”，并再次确认。不要从第三方网站下载或
 执行来历不明的解除隔离命令。
 
+已安装的 Guild 只在固定位置查找 `node`、适配器和 `claude`（`~/.local/bin`、`~/.npm-global/bin`、Homebrew 和系统目录，以及 nvm、Volta、asdf、fnm、mise 的最新版本）：
+它不读取启动它时的 `PATH`，也不使用他人可写或位于临时目录的文件。
+
 从源码构建需要 Apple Silicon Mac、Node.js 24/npm，以及至少一个由用户自行安装并登录的引擎：
 官方 `grok` CLI，和/或 `claude`（Claude Code）加 `claude-agent-acp` 适配器，和/或 `codex-acp` 适配器
 （`npm install -g @agentclientprotocol/codex-acp`，再用 `codex login` 登录；适配器需要 Node.js >= 22），和/或 `@google/gemini-cli`
@@ -143,7 +146,11 @@ icon with a dark or light Dock icon choice in Settings.
 
 Apple Silicon users can download `Guild-2.2.1-arm64.dmg` from GitHub Releases. The current
 build is not Apple-notarized; on first launch, use Finder's **Open** context-menu action and
-confirm macOS's warning. Building from source needs Node.js 24 and npm 11, plus at least one
+confirm macOS's warning. An installed Guild looks for `node`, the adapters and `claude` only in fixed places (`~/.local/bin`, `~/.npm-global/bin`, the Homebrew and
+system directories, and the newest releases of nvm, Volta, asdf, fnm and mise): it does not read the `PATH` it was started with and does not
+use a file that others can write or that sits in a temporary directory.
+
+Building from source needs Node.js 24 and npm 11, plus at least one
 user-installed and logged-in engine: the official `grok` CLI, and/or `claude` (Claude Code) with the
 `claude-agent-acp` adapter, and/or the `codex-acp` adapter (`npm install -g @agentclientprotocol/codex-acp`,
 then `codex login`; the adapters need Node.js >= 22), and/or the Gemini CLI (`npm install -g @google/gemini-cli`, then

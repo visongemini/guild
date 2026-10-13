@@ -1302,3 +1302,28 @@ Consequences
   and the default. Both variants also ship as 1024 px PNG resources, because the runtime Dock icon chosen in Settings > General
   is set from a PNG (`nativeImage` cannot read the bundle `icon.icns` and the Dock icon cannot be unset).
 - Requirements: PC-ENG-001, PC-ENG-004, PC-MODEL-001, PC-SET-002, PC-PROV-002.
+
+## D-068 — Guild 3.1: a packaged app chooses its programs itself, and the Gemini CLI's own configuration cannot redirect the key
+
+- Date: 2026-10-13
+- Status: accepted
+- Context: a review of the Gemini engine found three P1 weaknesses (details and proofs in `docs/21-GUILD31-ENGINES.md`
+  section 12). A project `.env` written as `KEY: value` bypassed the check for `GOOGLE_GEMINI_BASE_URL`; a project
+  `.gemini/settings.json` with `security.auth.selectedType: "oauth-personal"` replaced the API-key sign-in once the CLI's settings
+  cache expired; and `node` was taken from the `PATH` the app was started with and run before its hash was pinned.
+- Decision
+  - The Gemini child's environment holds every variable that could move the key or change the sign-in with a value Guild chose
+    (the CLI never lets a `.env` replace a variable the environment has), plus `NO_BROWSER=true` and a closed Code Assist endpoint.
+  - The `.env` check uses the CLI's own `dotenv` grammar and file selection and refuses a file it cannot check. A new check refuses a
+    project `.gemini/settings.json` that sets the sign-in method or an endpoint for the conversation, because no setting Guild can
+    write is unoverridable. The settings that run code stay the accepted `--skip-trust` risk (D-067).
+  - A packaged app never reads its `PATH` to find `node`, an engine adapter or `claude`. It searches fixed directories (the user's
+    `~/.local/bin` and `~/.npm-global/bin`, Homebrew, the system directories, the newest releases of nvm, Volta, asdf, fnm and
+    mise) and uses only a file whose real path is not under a temporary directory, is owned by the current user or root, and is
+    not writable by others (nor by the group, except directories of the macOS `admin` group, which Homebrew uses). The pin and the
+    trust on first use are unchanged; the file is hashed before anything runs it. Only an unpackaged development run, switched on
+    by the main process, keeps the `PATH` search and the dev-only QA roots.
+  - The Grok binary's own locator (`runtime-locator.ts`) still takes `grok` from the PATH; it is not an add-on engine, receives no
+    key from Guild, and is left as a separate follow-up.
+- Requirements: PC-ENG-002, PC-ENG-003, PC-ENG-004.
+
