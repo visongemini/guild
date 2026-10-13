@@ -4,11 +4,11 @@ Copyright 2026 BDV
 Guild is an independent project and is not affiliated with, endorsed by, or
 sponsored by xAI.
 
-Guild is also not affiliated with, endorsed by, or sponsored by Anthropic, OpenAI or Google.
+Guild is also not affiliated with, endorsed by, or sponsored by Anthropic or OpenAI.
 
 Third-party components and the official Grok runtime retain their respective
 copyrights, trademarks, and license terms. Claude Code and the Claude Code ACP
 adapter (`@agentclientprotocol/claude-agent-acp`) are installed by the user, are
 not distributed with Guild, and retain their own terms and trademarks. The same holds for
 the Codex ACP adapter (`@agentclientprotocol/codex-acp`) and the Codex core it ships
-(`@openai/codex`), and for the Gemini CLI (`@google/gemini-cli`).
+(`@openai/codex`).

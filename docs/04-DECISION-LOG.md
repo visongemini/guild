@@ -1268,7 +1268,7 @@ Consequences
 ## D-067 — Guild 3.1: a fourth engine, Google Gemini, on an API key bound to its host, and a new app icon
 
 - Date: 2026-10-13
-- Status: accepted
+- Status: the Gemini engine parts are withdrawn before release (D-069); the icon and Dock icon parts stand
 - Context: the owner wants Gemini in the same window as Grok, Claude Code and Codex, paid per use. The measured facts
   of the official Gemini CLI (`@google/gemini-cli` 0.63.0) as an ACP agent are in `docs/21-GUILD31-ENGINES.md`
   (spike of 2026-10-13). The owner also approved new app artwork with a dark and a light variant.
@@ -1306,7 +1306,7 @@ Consequences
 ## D-068 — Guild 3.1: a packaged app chooses its programs itself, and the Gemini CLI's own configuration cannot redirect the key
 
 - Date: 2026-10-13
-- Status: accepted
+- Status: the Gemini parts are withdrawn before release (D-069); the locator rules (trusted locations, staged probe) stand and cover the Claude and Codex engines
 - Context: a review of the Gemini engine found three P1 weaknesses (details and proofs in `docs/21-GUILD31-ENGINES.md`
   section 12). A project `.env` written as `KEY: value` bypassed the check for `GOOGLE_GEMINI_BASE_URL`; a project
   `.gemini/settings.json` with `security.auth.selectedType: "oauth-personal"` replaced the API-key sign-in once the CLI's settings
@@ -1327,3 +1327,27 @@ Consequences
     key from Guild, and is left as a separate follow-up.
 - Requirements: PC-ENG-002, PC-ENG-003, PC-ENG-004.
 
+## D-069 — Guild 3.1: the Gemini engine is withdrawn before release; the icon and the locator rules stay
+
+- Date: 2026-10-13
+- Status: accepted
+- Context: D-067 added a fourth engine, Google Gemini on a pay-as-you-go API key, and D-068 hardened it after a security review.
+  The owner wants Gemini only on his own Google subscription with no risk of an account ban. By his reading of Google's notices
+  the Gemini CLI stopped serving personal Google AI Pro and Ultra plans on 2026-06-18, and the Antigravity FAQ calls wrapping its
+  agent in third-party apps unsupported on consumer plans. He declined the API-key route.
+- Decision
+  - The Gemini engine is removed from 3.1 completely: the engine registry entry and picker group, the ACP dialect, engine profile and
+    package pin, the locator, runtime, Guild-owned home and the two project-file guards, the API key binding (the IPC channels,
+    the store table, the `engine_key_bindings` projection and the Settings key section, whose only user it was), the wording,
+    fixtures, tests and QA check J with the `GUILD_QA_GEMINI_CLI` hook. Nothing Gemini-specific is left in code or tests.
+  - Schema 21 is unreleased, so its migration is edited rather than followed by a 22: it no longer adds `engine_key_bindings` and
+    `engine_defaults.permission_mode` is lowercase-only again; it still adds `app_settings.dock_icon` and `engine_defaults`
+    (Codex). The 3.0.5 to 21 upgrade was rehearsed on a copy of the real database.
+  - Kept: the new square app icon (dark default, light variant), the Dock icon setting (Settings > General, check K,
+    diagnostics), the Codex engine and the N-engine foundation, and the locator rules of D-068: a packaged app never reads its
+    `PATH`, uses only trusted files of fixed locations, and runs `--version` only on a hashed, verified staged copy (docs/20 3.2).
+  - PC-ENG-004 stays in the requirement catalog with `disposition: withdrawn`, because commits cite it; the other requirement
+    texts return to three engines.
+  - D-067 and D-068 stay in the log as the record of what was decided and reviewed; their Gemini parts are marked withdrawn.
+    The branch history still holds the design, the spike findings and the three security reviews.
+- Requirements: PC-ENG-001, PC-ENG-002, PC-ENG-003, PC-MODEL-001, PC-SET-002.

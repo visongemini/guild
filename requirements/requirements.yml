@@ -17,6 +17,9 @@ id_policy:
     superseded_in_part: >-
       Only the clauses named in disposition_note are replaced. superseded_by lists the replacement
       IDs and the remaining text stays normative.
+    withdrawn: >-
+      The requirement was withdrawn before the release it was written for and nothing replaces it.
+      disposition_note says why; the entry stays in the file unchanged and no code implements it.
 
 traceability_policy:
   pre_implementation: implementation_commits may be empty only while no production code implements the requirement.
@@ -996,8 +999,8 @@ requirements:
   - id: PC-ENG-001
     title: Per-task engine binding across the supported engines
     statement: >-
-      Guild runs a task on one of four engines, the official Grok process, the user-installed Claude
-      Code adapter, the user-installed Codex adapter or the user-installed Gemini CLI. The task's engine is set when its first turn is
+      Guild runs a task on one of three engines, the official Grok process, the user-installed Claude
+      Code adapter or the user-installed Codex adapter. The task's engine is set when its first turn is
       created and never changes; the model group chosen for that turn fixes it. One engine process
       serves each active task. A capability an engine lacks is shown as a named reduced state in
       Chinese and English and is never simulated.
@@ -1071,12 +1074,18 @@ requirements:
     acceptance_tests: [AT-ENGINE-001, IT-SEC-001, EV-RELEASE-001]
     implementation_commits: []
     sources: [docs/21-GUILD31-ENGINES.md, docs/04-DECISION-LOG.md]
+    disposition: withdrawn
+    disposition_note: >-
+      Withdrawn before release (D-069): the Gemini engine is not part of Guild 3.1. The owner wants Gemini only on his own
+      Google subscription, which Google no longer serves through the Gemini CLI for personal plans and does not support
+      through third-party apps, and he declined the API-key route this requirement describes. No code implements it; the
+      entry stays so the commits that cite it keep resolving.
 
   - id: PC-MODEL-001
     title: Grouped model picker limited to reported or configured models
     statement: >-
-      The model picker groups models as Grok, Claude, ChatGPT (Codex), Gemini (API, pay-as-you-go), Online and Local. A Grok task lists
-      only models the official Grok process reports, and a Codex or Gemini task only the models its adapter reports. A Claude task lists the models its adapter reports plus the
+      The model picker groups models as Grok, Claude, ChatGPT (Codex), Online and Local. A Grok task lists
+      only models the official Grok process reports, and a Codex task only the models its adapter reports. A Claude task lists the models its adapter reports plus the
       enabled Online and Local models of sources the user configured and confirmed. Nothing from any
       other origin is selectable. Inside a Claude task the model can change between turns, in both
       directions between a Claude subscription model and an Online or Local model. The engine process
