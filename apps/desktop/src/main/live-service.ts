@@ -162,6 +162,7 @@ import {
   deriveClaudeModelCatalog,
   deriveCodexModelCatalog,
   engineProfileFor,
+  secureStagingRoot,
   type AcpV1AdapterInterruptionReason,
   type AcpV1AdapterInterruptionDiagnostic,
   type AcpV1AdapterSession,
@@ -773,7 +774,9 @@ export function createLiveDesktopService(
   const avatarPreviews = new Map<string, string>();
 
   void Promise.all([
-    mkdir(options.stagingRoot, { recursive: true, mode: 0o700 }),
+    // The staging root is proven private to this user (owner, mode 0700, a parent others cannot write to) before anything
+    // is staged into it; one that is not is refused here and again by every pin (runtime-grok staging-root.ts).
+    secureStagingRoot(options.stagingRoot, { create: true }).catch(() => undefined),
     mkdir(mediaRoot, { recursive: true, mode: 0o700 }),
   ]);
   if (options.runtimeFactory === undefined) {
@@ -9520,7 +9523,7 @@ async function fetchProductionOfficialUsage(input: {
   readonly signal: AbortSignal;
 }): Promise<AcpV1OfficialBillingSnapshot> {
   throwIfAborted(input.signal);
-  await mkdir(input.stagingRoot, { recursive: true, mode: 0o700 });
+  await secureStagingRoot(input.stagingRoot, { create: true });
   const workingDirectory = await realpath(input.workingDirectory);
   throwIfAborted(input.signal);
   const [located, runtimeEnvironment] = await Promise.all([

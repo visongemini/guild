@@ -40,6 +40,8 @@ export * from "./json-value.js";
 export * from "./ndjson.js";
 export * from "./xai-extensions.js";
 export { isMachOExecutableFile, pinExecutable, pinExecutableShared, pruneStalePinnedExecutables } from "./executable-pin.js";
+export { StagingRootError, secureStagingRoot } from "./staging-root.js";
+export type { StagingRootIo, StagingRootProblem } from "./staging-root.js";
 export {
   EngineProcessHost,
   GrokProcessHost,

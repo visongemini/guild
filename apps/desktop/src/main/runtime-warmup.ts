@@ -1,6 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdir } from "node:fs/promises";
-import { pinExecutableShared, pruneStalePinnedExecutables } from "@guild/runtime-grok";
+import { pinExecutableShared, pruneStalePinnedExecutables, secureStagingRoot } from "@guild/runtime-grok";
 import { locateNode } from "./claude-locator.js";
 import { locateOfficialGrokRuntime } from "./runtime-locator.js";
 
@@ -16,7 +15,7 @@ const WARMUP_TIMEOUT_MS = 20_000;
  */
 export async function warmOfficialGrokRuntime(stagingRoot: string): Promise<void> {
   const located = await locateOfficialGrokRuntime();
-  await mkdir(stagingRoot, { recursive: true, mode: 0o700 });
+  await secureStagingRoot(stagingRoot, { create: true });
   // The Claude engine runs the user's `node` from the same staging root (PC-ENG-002): its pin stays,
   // otherwise every start would delete the node stage a Claude task is about to use.
   const keep = [located.sha256];

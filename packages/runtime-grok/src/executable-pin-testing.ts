@@ -4,9 +4,12 @@ import {
   pinExecutableSharedInternal,
   type PinnedExecutable,
 } from "./executable-pin.js";
+import type { StagingRootIo } from "./staging-root.js";
 
 export type ExecutablePinTestHooks = {
   readonly afterDescriptorCopy?: () => void | Promise<void>;
+  /** Owner and mode of the staging root come through here, so a root owned by somebody else can be tested. */
+  readonly stagingRootIo?: StagingRootIo;
 };
 
 /** Package-internal deterministic entry. This module is not exported by `src/index.ts`. */

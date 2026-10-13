@@ -1,7 +1,8 @@
 import { createHash, randomBytes } from "node:crypto";
 import { constants, type BigIntStats } from "node:fs";
 import { chmod, lstat, mkdir, open, readdir, realpath, rename, rm, type FileHandle } from "node:fs/promises";
-import { basename, isAbsolute, join } from "node:path";
+import { basename, dirname, isAbsolute, join } from "node:path";
+import { StagingRootError, secureStagingRoot, type StagingRootIo } from "./staging-root.js";
 
 export type ExecutablePinFailureCode =
   | "executable_changed"
@@ -11,7 +12,8 @@ export type ExecutablePinFailureCode =
   | "not_regular_file"
   | "path_not_absolute"
   | "preflight_io_failure"
-  | "staging_root_not_absolute";
+  | "staging_root_not_absolute"
+  | "staging_root_unsafe";
 
 export class ExecutablePinError extends Error {
   readonly code: ExecutablePinFailureCode;
@@ -41,6 +43,8 @@ export type PinnedExecutableCleanup = {
 
 type ExecutablePinTestHooks = {
   readonly afterDescriptorCopy?: () => void | Promise<void>;
+  /** Owner and mode of the staging root come through here, so a root owned by somebody else can be tested. */
+  readonly stagingRootIo?: StagingRootIo;
 };
 
 type PinFailureCleanupStep =
@@ -126,7 +130,7 @@ export async function pinExecutableSharedInternal(
   if (!SHA256_HEX.test(sha256)) {
     throw failure("hash_mismatch", "executable SHA-256 pin is malformed");
   }
-  const resolvedStagingRoot = await resolveDirectory(stagingRoot);
+  const resolvedStagingRoot = await secureRoot(stagingRoot, testHooks?.stagingRootIo);
   const resolvedExecutablePath = await resolvePath(executablePath, "executable metadata could not be read");
   const key = `${resolvedStagingRoot}\0${sha256}`;
   const create = (): Promise<SharedStage> =>
@@ -228,7 +232,7 @@ async function createSharedStage(
   await preflightSource(resolvedExecutablePath);
   const directory = join(resolvedStagingRoot, `${SHARED_STAGE_PREFIX}${sha256}`);
   const name = basename(resolvedExecutablePath);
-  const adopted = await adoptSharedStage(key, directory, name, sha256);
+  const adopted = await adoptSharedStage(key, directory, name, sha256, testHooks?.stagingRootIo);
   if (adopted !== undefined) return adopted;
 
   const staged = await stageVerifiedCopy(resolvedExecutablePath, resolvedStagingRoot, sha256, testHooks);
@@ -241,7 +245,7 @@ async function createSharedStage(
       const code = nodeErrorCode(cause);
       if (code === "ENOTEMPTY" || code === "EEXIST") {
         // Another process published first. Use its copy only if it proves itself.
-        const winner = await adoptSharedStage(key, directory, name, sha256);
+        const winner = await adoptSharedStage(key, directory, name, sha256, testHooks?.stagingRootIo);
         if (winner !== undefined) {
           await discardStagedCopy(staged);
           return winner;
@@ -256,6 +260,7 @@ async function createSharedStage(
       sha256,
       staged.retainedStage,
       staged.verifiedStageSnapshot,
+      testHooks?.stagingRootIo,
     );
   } catch (cause) {
     if (published) {
@@ -274,6 +279,7 @@ async function adoptSharedStage(
   directory: string,
   name: string,
   sha256: string,
+  stagingRootIo: StagingRootIo | undefined,
 ): Promise<SharedStage | undefined> {
   try {
     await lstat(directory);
@@ -293,7 +299,7 @@ async function adoptSharedStage(
       lstat(stagedExecutablePath, { bigint: true }),
     ]);
     if (!sameSnapshot(before, after) || !sameSnapshot(before, pathAfter)) throw new Error("changed");
-    return await describeSharedStage(key, directory, stagedExecutablePath, sha256, handle, Object.freeze(after));
+    return await describeSharedStage(key, directory, stagedExecutablePath, sha256, handle, Object.freeze(after), stagingRootIo);
   } catch {
     await closeQuietly(handle);
     await rm(directory, { recursive: true, force: true, maxRetries: 0 }).catch(() => undefined);
@@ -309,6 +315,7 @@ async function describeSharedStage(
   sha256: string,
   handle: FileHandle,
   snapshot: BigIntStats,
+  stagingRootIo: StagingRootIo | undefined,
 ): Promise<SharedStage> {
   const directoryIdentity = await lstat(directory, { bigint: true });
   if (!isOwnedPrivateDirectory(directoryIdentity)) {
@@ -331,7 +338,7 @@ async function describeSharedStage(
     sha256,
     handle,
     snapshot,
-    verifyForSpawn: createSpawnVerifier(stagedExecutablePath, handle, snapshot),
+    verifyForSpawn: createSpawnVerifier(stagedExecutablePath, handle, snapshot, stagingRootIo),
   });
 }
 
@@ -405,7 +412,7 @@ export async function pinExecutableInternal(
 ): Promise<PinnedExecutable> {
   const staged = await stageVerifiedCopy(executablePath, stagingRoot, expectedSha256, testHooks);
   const { retainedStage, stagingDirectory, stagedExecutablePath, verifiedStageSnapshot } = staged;
-  const verifyForSpawn = createSpawnVerifier(stagedExecutablePath, retainedStage, verifiedStageSnapshot);
+  const verifyForSpawn = createSpawnVerifier(stagedExecutablePath, retainedStage, verifiedStageSnapshot, testHooks?.stagingRootIo);
   const cleanup = Object.freeze(once(async () => {
     let stageHandleClosed = true;
     try {
@@ -464,7 +471,7 @@ async function stageVerifiedCopy(
     throw failure("staging_root_not_absolute", "staging root must be absolute");
   }
 
-  const resolvedStagingRoot = await resolveDirectory(stagingRoot);
+  const resolvedStagingRoot = await secureRoot(stagingRoot, testHooks?.stagingRootIo);
   const resolvedExecutablePath = await resolvePath(executablePath, "executable metadata could not be read");
   let source: FileHandle | undefined;
   let writer: FileHandle | undefined;
@@ -553,8 +560,12 @@ function createSpawnVerifier(
   stagedExecutablePath: string,
   retainedStage: FileHandle,
   verifiedStageSnapshot: BigIntStats,
+  stagingRootIo: StagingRootIo | undefined,
 ): () => Promise<void> {
+  // <root>/.grok-pin-<id>/<name>: the root is two levels up, and it is proven private again right before every spawn.
+  const stagingRoot = dirname(dirname(stagedExecutablePath));
   return Object.freeze(async (): Promise<void> => {
+    await secureRoot(stagingRoot, stagingRootIo, false);
     let reopened: FileHandle | undefined;
     try {
       reopened = await open(stagedExecutablePath, constants.O_RDONLY | constants.O_NOFOLLOW);
@@ -590,14 +601,21 @@ async function resolvePath(path: string, message: string): Promise<string> {
   }
 }
 
-async function resolveDirectory(path: string): Promise<string> {
-  const resolved = await resolvePath(path, "staging root must name a directory");
+/**
+ * The real path of the staging root once it has been proven private to the current user (staging-root.ts): created when
+ * missing (`create`), tightened when ours and looser, refused when it is a link, not ours, or sits in a parent others can
+ * write to without the sticky bit.
+ */
+async function secureRoot(path: string, stagingRootIo: StagingRootIo | undefined, create = true): Promise<string> {
+  if (!isAbsolute(path)) {
+    throw failure("staging_root_not_absolute", "staging root must be absolute");
+  }
   try {
-    if (!(await lstat(resolved)).isDirectory()) {
-      throw new Error("not a directory");
+    return await secureStagingRoot(path, { create, ...(stagingRootIo === undefined ? {} : { io: stagingRootIo }) });
+  } catch (cause) {
+    if (cause instanceof StagingRootError) {
+      throw failure("staging_root_unsafe", cause.message);
     }
-    return resolved;
-  } catch {
     throw failure("preflight_io_failure", "staging root must name a directory");
   }
 }

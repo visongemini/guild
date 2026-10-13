@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
 import { createReadStream, type BigIntStats } from "node:fs";
-import { lstat, mkdir, realpath } from "node:fs/promises";
+import { lstat, realpath } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, join } from "node:path";
 import {
@@ -175,8 +175,9 @@ export function defaultProbeStagingRoot(): string {
  * hash, kept); `claude` is a private copy removed after the probe. Throws when the copy cannot be proven identical.
  */
 export function createProbeStager(stagingRoot: string): ProbeStager {
+  // The pin creates the root when it is missing and proves it private to this user before every copy and spawn
+  // (runtime-grok staging-root.ts); a root somebody else made is refused there, so the probe never runs from it.
   return async (candidate, sha256, kind) => {
-    await mkdir(stagingRoot, { recursive: true, mode: 0o700 });
     if (kind === "node") {
       const pinned = await pinExecutableShared(candidate, stagingRoot, sha256);
       await pinned.verifyForSpawn();

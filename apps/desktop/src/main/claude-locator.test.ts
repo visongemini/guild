@@ -771,6 +771,47 @@ describe("Claude locator: a packaged app takes nothing from the PATH it was star
     assert.equal((await readdir(box.staging)).length, 1);
   });
 
+  it("runs nothing from a staging root that is a link somebody planted, and writes nothing through it [PC-SEC-001]", async () => {
+    const box = await packagedBox();
+    await writeMachO(join(box.trusted, "node"), "genuine");
+    const elsewhere = join(box.root, "attacker-dir");
+    await mkdir(elsewhere, { recursive: true, mode: 0o700 });
+    await rm(box.staging, { recursive: true });
+    await symlink(elsewhere, box.staging);
+    const probe = probesByPayload({ genuine: "v26.8.1" });
+    await expectLocatorError(locateNode(box.packaged(probe.execute)), "node_missing");
+    assert.deepEqual(probe.runs, [], "nothing was run from behind the link");
+    assert.deepEqual(await readdir(elsewhere), [], "nothing was copied through it");
+  });
+
+  it("tightens a staging root of ours that is too open before it copies into it [PC-SEC-001]", async () => {
+    const box = await packagedBox();
+    await writeMachO(join(box.trusted, "node"), "genuine");
+    await chmod(box.staging, 0o777);
+    const probe = probesByPayload({ genuine: "v26.8.1" });
+    await locateNode(box.packaged(probe.execute));
+    assert.equal(probe.runs.length, 1);
+    assert.equal((await stat(box.staging)).mode & 0o777, 0o700);
+  });
+
+  it("refuses a staging root whose parent others can write to and that is not sticky [PC-SEC-001]", async () => {
+    const box = await packagedBox();
+    await writeMachO(join(box.trusted, "node"), "genuine");
+    const shared = join(box.root, "shared-tmp");
+    await mkdir(shared, { recursive: true });
+    await chmod(shared, 0o777);
+    const probe = probesByPayload({ genuine: "v26.8.1" });
+    const options = { ...box.packaged(probe.execute), stagingRoot: join(shared, "guild-v2-runtime") };
+    await expectLocatorError(locateNode(options), "node_missing");
+    assert.deepEqual(probe.runs, []);
+    assert.deepEqual(await readdir(shared), [], "the root was not even created in it");
+    // The same parent with the sticky bit (as /tmp has) is fine.
+    await chmod(shared, 0o1777);
+    invalidateClaudeLocatorCache();
+    await locateNode(options);
+    assert.equal(probe.runs.length, 1);
+  });
+
   it("probes claude on a private verified copy that is gone afterwards, never on the original", async () => {
     const box = await packagedBox();
     const claude = join(box.home, ".local", "bin", "claude");
