@@ -10,8 +10,11 @@ import type {
 import {
   AdapterPinError,
   verifyClaudeAdapterPin,
+  verifyCodexAdapterPin,
   type ClaudeAdapterPin,
+  type CodexAdapterPin,
 } from "./adapter-pin.js";
+import { verifyCodexCorePin, type CodexCorePin } from "./codex-core-pin.js";
 import { isMachOExecutableFile } from "./executable-pin.js";
 import {
   GROK_ACP_PRODUCTION_ARGV,
@@ -25,8 +28,13 @@ import {
  * ACP dialect it speaks and which Grok-only features exist for it (PC-FALLBACK-001).
  */
 
-/** Wire differences between the official Grok agent and the Claude ACP adapter. */
-export type AcpDialect = "grok" | "claude";
+/** Wire differences between the official Grok agent and the ACP adapters (Claude, Codex). */
+export type AcpDialect = "grok" | "claude" | "codex";
+
+/** Every dialect but Grok's belongs to a user-installed ACP adapter that Guild does not authenticate for. */
+export function isAdapterDialect(dialect: AcpDialect): boolean {
+  return dialect !== "grok";
+}
 
 /**
  * `macho-binary`: the engine is one Mach-O executable, copied to a private stage and verified by
@@ -90,7 +98,14 @@ export type ClaudeLaunch = Readonly<{
   extraEnvironment?: Readonly<Record<string, string>>;
 }>;
 
-export type EngineLaunch = GrokLaunch | ClaudeLaunch;
+export type CodexLaunch = Readonly<{
+  engine: "codex";
+  adapter: CodexAdapterPin;
+  /** The Codex core the adapter ships; becomes CODEX_PATH, so the checked file is the one that runs. */
+  core: CodexCorePin;
+}>;
+
+export type EngineLaunch = GrokLaunch | ClaudeLaunch | CodexLaunch;
 
 export type EngineLaunchPlan = Readonly<{
   argv: readonly string[];
@@ -133,6 +148,7 @@ const ROUTED_AUTH_TOKEN_PATTERN = /^guild-router-[0-9a-f]{32}$/u;
 
 export const GROK_ENVIRONMENT_POLICY_VERSION = "macos-posix-v3";
 export const CLAUDE_ENVIRONMENT_POLICY_VERSION = "macos-posix-claude-v1";
+export const CODEX_ENVIRONMENT_POLICY_VERSION = "macos-posix-codex-v1";
 
 /**
  * Grok: OpenViking memory is for Claude Code and Codex only (owner decision, 2026-10-10), but grok
@@ -141,16 +157,20 @@ export const CLAUDE_ENVIRONMENT_POLICY_VERSION = "macos-posix-claude-v1";
  * closed local port, so a Guild Grok session can neither read nor write the memory store.
  * External Claude and Cursor instruction imports are switched off too.
  */
-const GROK_FIXED_ENVIRONMENT = Object.freeze({
-  GROK_CLAUDE_AGENTS_ENABLED: "false",
-  GROK_CLAUDE_RULES_ENABLED: "false",
-  GROK_CURSOR_AGENTS_ENABLED: "false",
-  GROK_CURSOR_RULES_ENABLED: "false",
+const GROK_OPENVIKING_OFF_ENVIRONMENT = Object.freeze({
   OPENVIKING_MEMORY_ENABLED: "0",
   OPENVIKING_CONFIG_FILE: "/dev/null",
   OPENVIKING_CLI_CONFIG_FILE: "/dev/null",
   OPENVIKING_URL: "http://127.0.0.1:9",
   OPENVIKING_BASE_URL: "http://127.0.0.1:9",
+} as const);
+
+const GROK_FIXED_ENVIRONMENT = Object.freeze({
+  GROK_CLAUDE_AGENTS_ENABLED: "false",
+  GROK_CLAUDE_RULES_ENABLED: "false",
+  GROK_CURSOR_AGENTS_ENABLED: "false",
+  GROK_CURSOR_RULES_ENABLED: "false",
+  ...GROK_OPENVIKING_OFF_ENVIRONMENT,
 } as const);
 
 export const GROK_ENVIRONMENT_POLICY: EnvironmentPolicy = Object.freeze({
@@ -200,6 +220,37 @@ export const CLAUDE_ENVIRONMENT_POLICY: EnvironmentPolicy = Object.freeze({
   loopbackNoProxy: true,
   ensureUser: true,
   perSpawnKeys: CLAUDE_PER_SPAWN_ENVIRONMENT,
+});
+
+/**
+ * Codex (docs/21 4.1): the Claude allowlist, and nothing from the parent that selects a credential, a
+ * provider, a state directory or the Codex binary (no `CODEX_*`, no `OPENAI_*`: the adapter reads
+ * `CODEX_API_KEY`, `OPENAI_API_KEY`, `CODEX_HOME`, `CODEX_PATH`, `CODEX_CONFIG`, `MODEL_PROVIDER` and
+ * `DEFAULT_AUTH_REQUEST` from its environment, and the allowlist drops all of them). Guild-owned values: the
+ * pinned core as `CODEX_PATH`, and OpenViking off. The Codex plugin ignores `OPENVIKING_MEMORY_ENABLED`, so recall
+ * and capture have their own switches here, and the Grok block (config files to nothing, URLs to a closed
+ * loopback port) keeps the plugin's MCP proxy from reaching the store as well.
+ *
+ * USER and LOGNAME are identity names, not credentials; they match what the login lookup of a user-installed
+ * engine expects (verified with codex-acp 2.2.2: the clean environment of the spike carried both).
+ */
+const CODEX_FIXED_ENVIRONMENT = Object.freeze({
+  ...GROK_OPENVIKING_OFF_ENVIRONMENT,
+  OPENVIKING_AUTO_RECALL: "false",
+  OPENVIKING_AUTO_CAPTURE: "false",
+} as const);
+
+export const CODEX_ENVIRONMENT_POLICY: EnvironmentPolicy = Object.freeze({
+  version: CODEX_ENVIRONMENT_POLICY_VERSION,
+  allowedKeys: new Set<string>([...SHARED_ALLOWED_KEYS, "USER", "LOGNAME"]),
+  allowedKeyPrefixes: Object.freeze(["LC_"]),
+  deniedKeys: new Set<string>(SHARED_DENIED_KEYS),
+  deniedKeyPrefixes: Object.freeze(["DYLD_", "LD_", "CODEX_", "OPENAI_"]),
+  pathHomeDirectories: Object.freeze([join(".local", "bin")]),
+  fixedValues: CODEX_FIXED_ENVIRONMENT,
+  loopbackNoProxy: true,
+  ensureUser: true,
+  perSpawnKeys: Object.freeze({}),
 });
 
 /**
@@ -397,6 +448,47 @@ export const CLAUDE_ENGINE_PROFILE: EngineProfile = Object.freeze({
   },
 });
 
+export const CODEX_ENGINE_PROFILE: EngineProfile = Object.freeze({
+  engine: "codex",
+  dialect: "codex",
+  pinStrategy: "node-script",
+  authPolicy: "never",
+  features: Object.freeze({
+    billing: false,
+    steer: true,
+    conversationRewind: false,
+    xaiSignals: false,
+    agentInitiatedTurns: false,
+  }),
+  environment: CODEX_ENVIRONMENT_POLICY,
+  buildArgv: (launch) => {
+    const codex = requireLaunch(launch, "codex");
+    if (!isAbsolute(codex.adapter.entryPath) || codex.adapter.entryPath.includes("\0")) {
+      throw new TypeError("adapter entry path must be an absolute NUL-free path");
+    }
+    return Object.freeze([codex.adapter.entryPath]);
+  },
+  planLaunch: (launch) => {
+    const codex = requireLaunch(launch, "codex");
+    const argv = CODEX_ENGINE_PROFILE.buildArgv(codex);
+    if (!isAbsolute(codex.core.executablePath) || codex.core.executablePath.includes("\0")) {
+      throw new TypeError("codex core path must be an absolute NUL-free path");
+    }
+    return Object.freeze({
+      argv,
+      environmentPolicyVersion: CODEX_ENVIRONMENT_POLICY.version,
+      buildEnvironment: (base) => buildEngineEnvironment(CODEX_ENVIRONMENT_POLICY, base, {
+        fixedValues: { CODEX_PATH: codex.core.executablePath },
+      }),
+      verifyBeforeSpawn: async () => {
+        await verifyCodexAdapterPin(codex.adapter);
+        await verifyCodexCorePin(codex.core);
+      },
+      redactValues: Object.freeze([]),
+    });
+  },
+});
+
 /** The claude binary is path-pinned: it must be a real (link-free) Mach-O executable. */
 async function verifyClaudeExecutable(path: string): Promise<void> {
   const resolved = await realpath(path).catch(() => undefined);
@@ -416,5 +508,5 @@ function requireLaunch<E extends GuildEngine>(
 }
 
 export function engineProfileFor(engine: GuildEngine): EngineProfile {
-  return engine === "claude" ? CLAUDE_ENGINE_PROFILE : GROK_ENGINE_PROFILE;
+  return engine === "claude" ? CLAUDE_ENGINE_PROFILE : engine === "codex" ? CODEX_ENGINE_PROFILE : GROK_ENGINE_PROFILE;
 }

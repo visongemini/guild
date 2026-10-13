@@ -3,12 +3,12 @@ import { types as nodeTypes } from "node:util";
 import {
   classifyStopReason,
   freezeRuntimePayload,
+  parseGuildAddonPermissionMode,
   parseGuildClaudePermissionMode,
   parseGuildGrokContextWindow,
   parseGuildGrokReasoningEffort,
   parseGuildModelId,
   type AcpPromptStopReason,
-  type GuildClaudePermissionMode,
   type GuildEngine,
   type GuildGrokModel,
   type GuildGrokReasoningEffort,
@@ -62,8 +62,10 @@ import {
   type ClaudeSteerOutcome,
   type EngineSignal,
 } from "./claude-dialect.js";
+import { isCodexSessionNotFound } from "./codex-dialect.js";
 import {
   GROK_ENGINE_PROFILE,
+  isAdapterDialect,
   type EngineFeatureFlags,
   type EngineProfile,
 } from "./engine-profile.js";
@@ -124,6 +126,17 @@ export const CLAUDE_ACP_ADAPTER_DEFAULT_TIMEOUTS = Object.freeze({
   ...ACP_V1_ADAPTER_DEFAULT_TIMEOUTS,
   initializeMs: 300_000,
   sessionMs: 300_000,
+});
+
+/**
+ * The Codex adapter starts the Codex app-server and the user's plugins and MCP servers with its session; 0.1 to 4 s
+ * were measured on this machine (docs/21 section 2). The bound is for a start that is merely slow, and a timeout is
+ * the same retryable "still starting" as for Claude, never a lost session.
+ */
+export const CODEX_ACP_ADAPTER_DEFAULT_TIMEOUTS = Object.freeze({
+  ...ACP_V1_ADAPTER_DEFAULT_TIMEOUTS,
+  initializeMs: 180_000,
+  sessionMs: 180_000,
 });
 
 export type AcpV1AdapterTimeouts = {
@@ -551,7 +564,9 @@ export class AcpV1Adapter {
     this.profile = options.profile ?? GROK_ENGINE_PROFILE;
     const defaults = this.profile.dialect === "claude"
       ? CLAUDE_ACP_ADAPTER_DEFAULT_TIMEOUTS
-      : ACP_V1_ADAPTER_DEFAULT_TIMEOUTS;
+      : this.profile.dialect === "codex"
+        ? CODEX_ACP_ADAPTER_DEFAULT_TIMEOUTS
+        : ACP_V1_ADAPTER_DEFAULT_TIMEOUTS;
     this.timeouts = Object.freeze({
       authenticateMs: positiveSafeInteger(
         options.timeouts?.authenticateMs ?? defaults.authenticateMs,
@@ -601,12 +616,12 @@ export class AcpV1Adapter {
   }
 
   /**
-   * The features available through this adapter. For Claude, Steer additionally needs the agent to
-   * have advertised `_meta.steering.supported` at initialize, so it reads false before then.
+   * The features available through this adapter. For an adapter engine (Claude, Codex), Steer additionally
+   * needs the agent to have advertised `_meta.steering.supported` at initialize, so it reads false before then.
    */
   get features(): EngineFeatureFlags {
     const base = this.profile.features;
-    if (this.profile.dialect !== "claude") return base;
+    if (!isAdapterDialect(this.profile.dialect)) return base;
     return Object.freeze({ ...base, steer: base.steer && this.initializeResult?.steering?.supported === true });
   }
 
@@ -805,12 +820,18 @@ export class AcpV1Adapter {
   }
 
   /**
-   * Claude Steer (`_session/steering`): injects `text` into the running turn. Asked with
-   * `idleBehavior: "promptRequired"`, so when no turn is running the agent sends nothing and
+   * Adapter Steer (`_session/steering`): injects `text` into the running turn. Asked with
+   * `idleBehavior: "promptRequired"`, so when no turn is running the Claude agent sends nothing and
    * answers `promptRequired`: the caller then sends the text as an ordinary prompt. Engines
    * without this request (Grok uses `_x.ai/interject` through `sendExtensionRequest`) and agents
    * that did not advertise `_meta.steering.supported` answer `unsupported` without a wire call; a
    * -32601 from the agent is remembered for the life of this adapter.
+   *
+   * The Codex agent ignores `idleBehavior` (docs/21 section 2): with no turn running it starts a new turn from
+   * the text, a turn Guild would neither show nor answer for. So Guild asks Codex only while its own prompt is in
+   * flight, answers `promptRequired` itself otherwise, and cancels a turn Codex reports it started
+   * (`startedNewTurn`, a race: the turn ended while the request was on the wire), so the caller can send the text
+   * as an ordinary message without it running twice.
    */
   async steer(
     session: AcpV1AdapterSession,
@@ -825,11 +846,17 @@ export class AcpV1Adapter {
     if (transport.phase !== "ready") {
       throw new AcpV1AdapterError("stale_session_identity");
     }
-    if (!this.features.steer || this.profile.dialect !== "claude") {
+    if (!this.features.steer || !isAdapterDialect(this.profile.dialect)) {
       return UNSUPPORTED_FOR_ENGINE;
     }
     if (this.unsupportedExtensions.has(CLAUDE_STEERING_METHOD)) {
       return NOT_FOUND_STEER;
+    }
+    if (
+      this.profile.dialect === "codex" &&
+      (transport.activePrompt === undefined || transport.activePrompt.responseProven)
+    ) {
+      return Object.freeze({ status: "ok" as const, outcome: "promptRequired" as const });
     }
     try {
       const response = await this.request(
@@ -842,6 +869,9 @@ export class AcpV1Adapter {
       if (outcome === undefined) {
         // An outcome this client does not know is a refused steer, not a broken transport.
         throw new AcpV1AdapterError("operation_failed");
+      }
+      if (this.profile.dialect === "codex" && outcome === "startedNewTurn") {
+        await this.cancelStrayTurn(transport);
       }
       return Object.freeze({ status: "ok" as const, outcome });
     } catch (cause: unknown) {
@@ -857,19 +887,21 @@ export class AcpV1Adapter {
   }
 
   /**
-   * Claude applies the permission mode as the `mode` config option after the session starts (no
-   * argv, no restart). Grok takes its permission mode on the command line.
+   * The adapter engines apply the permission mode as the `mode` config option after the session starts (no
+   * argv, no restart), by the ids of the engine's own modes. Grok takes its permission mode on the command line.
    */
   async setPermissionMode(
     session: AcpV1AdapterSession,
-    mode: GuildClaudePermissionMode,
+    mode: string,
   ): Promise<readonly RuntimeConfigOption[]> {
-    if (this.profile.dialect !== "claude") {
+    if (!isAdapterDialect(this.profile.dialect)) {
       throw new AcpV1AdapterError("unsupported_for_engine");
     }
-    let exactMode: GuildClaudePermissionMode;
+    let exactMode: string;
     try {
-      exactMode = parseGuildClaudePermissionMode(mode);
+      exactMode = this.profile.dialect === "codex"
+        ? parseGuildAddonPermissionMode("codex", mode)
+        : parseGuildClaudePermissionMode(mode);
     } catch {
       throw new AcpV1AdapterError("invalid_adapter_options");
     }
@@ -1311,6 +1343,19 @@ export class AcpV1Adapter {
     session.ready.reject(new AcpV1AdapterError("operation_failed"));
   }
 
+  /** Cancels a turn the agent started on its own (a notification: it needs no prompt of Guild's). Best effort. */
+  private async cancelStrayTurn(session: SessionTransport): Promise<void> {
+    try {
+      await this.peer.sendNotification(
+        ACP_V1_METHODS.sessionCancel,
+        jsonParams(encodeCancelParams(session.identity.sessionId)),
+        { writeTimeoutMs: this.timeouts.writeMs },
+      );
+    } catch {
+      // A transport that cannot take the cancel is faulting anyway; the steer outcome is still reported.
+    }
+  }
+
   private async cancelActivePrompt(
     session: SessionTransport,
     active: ActivePrompt,
@@ -1549,14 +1594,14 @@ export class AcpV1Adapter {
         return;
       }
       if (
-        this.profile.dialect === "claude" &&
+        this.adapterEngine() !== undefined &&
         cause instanceof AcpV1CodecError &&
         this.claudeSessionIsIdle(notification.params)
       ) {
         // Content the agent sends outside a prompt is dropped, and so is content Guild cannot decode.
         this.emitEngineSignal({
           type: "late_update_dropped",
-          engine: "claude",
+          engine: this.adapterEngine()!,
           sessionId: String((notification.params as { readonly sessionId: unknown }).sessionId).slice(0, 128),
           discriminator: typeof update?.["sessionUpdate"] === "string"
             ? update["sessionUpdate"].slice(0, 80)
@@ -1580,11 +1625,12 @@ export class AcpV1Adapter {
    * here without being decoded, stored or logged (`_x.ai/mcp/servers_updated` carries secrets).
    */
   private observeExtensionNotification(notification: JsonRpcInboundNotification): void {
-    if (this.profile.dialect === "claude") {
+    const adapterEngine = this.adapterEngine();
+    if (adapterEngine !== undefined) {
       // Out-of-session account summary; every other method outside a session is ignored.
       if (notification.method === CLAUDE_AUTH_STATUS_METHOD) {
         const status = decodeClaudeAuthStatus(notification.params);
-        if (status !== undefined) this.emitEngineSignal({ type: "auth_status", engine: "claude", status });
+        if (status !== undefined) this.emitEngineSignal({ type: "auth_status", engine: adapterEngine, status });
       }
       return;
     }
@@ -1732,7 +1778,7 @@ export class AcpV1Adapter {
         active = session.activePrompt;
       }
       if (active === undefined || active.responseProven) {
-        if (this.profile.dialect === "claude") {
+        if (isAdapterDialect(this.profile.dialect)) {
           // Work the agent does on its own after a turn: nothing is asked of the user, and the
           // transport stays healthy.
           return this.cancelUnboundPermission(key);
@@ -1925,7 +1971,7 @@ export class AcpV1Adapter {
     const turnScoped = update.type === "turn" ||
       update.type === "media_content" ||
       update.type === "unsupported_content";
-    if (this.profile.dialect === "claude" && (active === undefined || active.responseProven)) {
+    if (isAdapterDialect(this.profile.dialect) && (active === undefined || active.responseProven)) {
       return this.routeClaudeLateUpdate(session, update);
     }
     if (turnScoped && (active === undefined || active.responseProven)) {
@@ -1956,9 +2002,10 @@ export class AcpV1Adapter {
   }
 
   /**
-   * Claude frames that arrive when no prompt is in flight (the adapter sends `session_info_update`
-   * and sometimes `available_commands_update` after the prompt response). Session metadata is
-   * applied to the session without a prompt identity and never opens a Run; any content is
+   * Adapter frames that arrive when no prompt is in flight (the Claude adapter sends `session_info_update`
+   * and sometimes `available_commands_update` after the prompt response, the Codex adapter an
+   * `available_commands_update` every time and the `tool_call_update` frames of a command that outlived a cancel).
+   * Session metadata is applied to the session without a prompt identity and never opens a Run; any content is
    * dropped and reported, and neither faults the transport (PC-ENG-001).
    */
   private routeClaudeLateUpdate(session: SessionTransport, update: AcpV1DecodedUpdate): Promise<void> {
@@ -1969,7 +2016,7 @@ export class AcpV1Adapter {
       }
       this.emitEngineSignal({
         type: "late_update_dropped",
-        engine: "claude",
+        engine: this.adapterEngine() ?? "claude",
         sessionId: session.identity.sessionId,
         discriminator,
       });
@@ -2144,6 +2191,11 @@ export class AcpV1Adapter {
   }
 
   /** True when the notification names a bound session that has no prompt of Guild's in flight. */
+  /** The engine of an adapter dialect (Claude, Codex); undefined for Grok. */
+  private adapterEngine(): "claude" | "codex" | undefined {
+    return this.profile.dialect === "claude" || this.profile.dialect === "codex" ? this.profile.dialect : undefined;
+  }
+
   private claudeSessionIsIdle(params: JsonRpcParams | undefined): boolean {
     if (!isNonArrayObject(params) || typeof params["sessionId"] !== "string") return false;
     const session = this.sessions.get(params["sessionId"]);
@@ -2372,21 +2424,29 @@ export class AcpV1Adapter {
 
   private normalizeOperationFailure(cause: unknown): AcpV1AdapterError {
     if (cause instanceof AcpV1AdapterError) return cause;
-    // Claude is never authenticated by Guild; the user logs in with `claude` themselves.
+    // An adapter engine is never authenticated by Guild; the user logs in with the engine's own command.
     if (
-      this.profile.dialect === "claude" &&
+      isAdapterDialect(this.profile.dialect) &&
       cause instanceof JsonRpcRemoteError &&
       cause.response.code === ACP_AUTH_REQUIRED_CODE
     ) {
       return new AcpV1AdapterError("auth_required");
     }
-    if (this.profile.dialect === "claude") {
+    if (isAdapterDialect(this.profile.dialect)) {
       // Checked before the state: a timed-out initialize faults the adapter, and a slow start is
       // not the same thing as a lost transport.
       if (cause instanceof JsonRpcPeerError && cause.code === "request_timeout") {
         return new AcpV1AdapterError("request_timeout");
       }
       if (cause instanceof JsonRpcRemoteError && cause.response.code === ACP_RESOURCE_NOT_FOUND_CODE) {
+        return new AcpV1AdapterError("session_not_found");
+      }
+      // Codex answers a thread it does not have with an internal error that names the cause.
+      if (
+        this.profile.dialect === "codex" &&
+        cause instanceof JsonRpcRemoteError &&
+        isCodexSessionNotFound(cause.response)
+      ) {
         return new AcpV1AdapterError("session_not_found");
       }
     }

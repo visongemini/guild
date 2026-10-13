@@ -3,21 +3,33 @@ import { lstat, readFile, readdir, realpath } from "node:fs/promises";
 import { isAbsolute, join } from "node:path";
 
 /**
- * PC-ENG-002: the Claude engine runs the user-installed ACP adapter (a Node script). Its entry
- * script cannot be copied next to the pinned `node` (it must resolve its own node_modules), so
- * the adapter is pinned by package version and by a SHA-256 over `package.json` plus every file
- * under `dist/`. The pin is re-verified before every spawn; a mismatch names `adapter_changed`
- * and the caller re-locates. Files outside that set (node_modules) are not covered.
+ * PC-ENG-002, PC-ENG-003: a user-installed ACP adapter (a Node script) is pinned by package version
+ * and by a SHA-256 over `package.json` plus every file under `dist/`. Its entry script cannot be
+ * copied next to the pinned `node` (it must resolve its own node_modules), so it runs in place.
+ * The pin is re-verified before every spawn; a mismatch names `adapter_changed` and the caller
+ * re-locates. Files outside that set (node_modules) are not covered here; the Codex engine pins
+ * the one native executable it runs from there separately (`codex-core-pin.ts`).
  */
 export const CLAUDE_ADAPTER_PACKAGE_NAME = "@agentclientprotocol/claude-agent-acp";
 /** Human-readable form of what `isSupportedAdapterVersion` accepts. */
 export const CLAUDE_ADAPTER_SUPPORTED_RANGE = ">=0.89.0 <0.90.0";
+export const CODEX_ADAPTER_PACKAGE_NAME = "@agentclientprotocol/codex-acp";
+/** Human-readable form of what `isSupportedCodexAdapterVersion` accepts. */
+export const CODEX_ADAPTER_SUPPORTED_RANGE = ">=2.0.0 <3.0.0";
 
 export type AdapterPinFailureCode =
   | "adapter_changed"
   | "adapter_missing"
   | "adapter_version_unsupported"
-  | "claude_executable_invalid";
+  | "claude_executable_invalid"
+  | "engine_core_invalid";
+
+/** What distinguishes one adapter package from another: its name and the versions Guild runs. */
+export type AdapterPackageSpec = Readonly<{
+  packageName: string;
+  isSupportedVersion: (version: string) => boolean;
+  supportedRange: string;
+}>;
 
 export class AdapterPinError extends Error {
   readonly code: AdapterPinFailureCode;
@@ -32,7 +44,7 @@ export class AdapterPinError extends Error {
   }
 }
 
-export type ClaudeAdapterPin = Readonly<{
+export type AdapterPin = Readonly<{
   /** Real path of the package directory (the one holding package.json). */
   packageRoot: string;
   /** `<packageRoot>/dist/index.js`, passed to node as argv[0]. */
@@ -41,6 +53,9 @@ export type ClaudeAdapterPin = Readonly<{
   /** SHA-256 over package.json and every file under dist/, see `fingerprintAdapterPackage`. */
   fingerprintSha256: string;
 }>;
+
+export type ClaudeAdapterPin = AdapterPin;
+export type CodexAdapterPin = AdapterPin;
 
 const ENTRY_RELATIVE_PATH = "dist/index.js";
 const MAX_FINGERPRINT_FILES = 10_000;
@@ -52,19 +67,47 @@ export function isSupportedAdapterVersion(version: string): boolean {
   return match !== null && Number(match[1]) === 0 && Number(match[2]) === 89;
 }
 
+/** `>=2.0.0 <3.0.0` (the Codex adapter's major 2). Pre-release and build suffixes are not accepted. */
+export function isSupportedCodexAdapterVersion(version: string): boolean {
+  const match = SEMVER_PATTERN.exec(version);
+  return match !== null && Number(match[1]) === 2;
+}
+
+export const CLAUDE_ADAPTER_SPEC: AdapterPackageSpec = Object.freeze({
+  packageName: CLAUDE_ADAPTER_PACKAGE_NAME,
+  isSupportedVersion: isSupportedAdapterVersion,
+  supportedRange: CLAUDE_ADAPTER_SUPPORTED_RANGE,
+});
+
+export const CODEX_ADAPTER_SPEC: AdapterPackageSpec = Object.freeze({
+  packageName: CODEX_ADAPTER_PACKAGE_NAME,
+  isSupportedVersion: isSupportedCodexAdapterVersion,
+  supportedRange: CODEX_ADAPTER_SUPPORTED_RANGE,
+});
+
+/** Reads, range-checks and fingerprints an installed Claude adapter package. */
+export function pinClaudeAdapter(packageRoot: string): Promise<ClaudeAdapterPin> {
+  return pinAdapterPackage(CLAUDE_ADAPTER_SPEC, packageRoot);
+}
+
+/** Reads, range-checks and fingerprints an installed Codex adapter package. */
+export function pinCodexAdapter(packageRoot: string): Promise<CodexAdapterPin> {
+  return pinAdapterPackage(CODEX_ADAPTER_SPEC, packageRoot);
+}
+
 /** Reads, range-checks and fingerprints an installed adapter package. */
-export async function pinClaudeAdapter(packageRoot: string): Promise<ClaudeAdapterPin> {
+export async function pinAdapterPackage(spec: AdapterPackageSpec, packageRoot: string): Promise<AdapterPin> {
   if (!isAbsolute(packageRoot)) {
     throw new AdapterPinError("adapter_missing", "adapter package path must be absolute");
   }
   const root = await realpath(packageRoot).catch(() => {
     throw new AdapterPinError("adapter_missing", "adapter package directory could not be resolved");
   });
-  const version = await readAdapterVersion(root);
-  if (!isSupportedAdapterVersion(version)) {
+  const version = await readAdapterVersion(root, spec);
+  if (!spec.isSupportedVersion(version)) {
     throw new AdapterPinError(
       "adapter_version_unsupported",
-      `adapter version is outside ${CLAUDE_ADAPTER_SUPPORTED_RANGE}`,
+      `adapter version is outside ${spec.supportedRange}`,
       version,
     );
   }
@@ -81,15 +124,25 @@ export async function pinClaudeAdapter(packageRoot: string): Promise<ClaudeAdapt
   });
 }
 
+/** Re-proves, before a spawn, that the pinned Claude adapter still has the pinned version and bytes. */
+export function verifyClaudeAdapterPin(pin: ClaudeAdapterPin): Promise<void> {
+  return verifyAdapterPin(CLAUDE_ADAPTER_SPEC, pin);
+}
+
+/** Re-proves, before a spawn, that the pinned Codex adapter still has the pinned version and bytes. */
+export function verifyCodexAdapterPin(pin: CodexAdapterPin): Promise<void> {
+  return verifyAdapterPin(CODEX_ADAPTER_SPEC, pin);
+}
+
 /** Re-proves, before a spawn, that the pinned adapter still has the pinned version and bytes. */
-export async function verifyClaudeAdapterPin(pin: ClaudeAdapterPin): Promise<void> {
+export async function verifyAdapterPin(spec: AdapterPackageSpec, pin: AdapterPin): Promise<void> {
   const root = await realpath(pin.packageRoot).catch(() => {
     throw new AdapterPinError("adapter_changed", "adapter package directory disappeared");
   });
   if (root !== pin.packageRoot) {
     throw new AdapterPinError("adapter_changed", "adapter package directory was repointed");
   }
-  const version = await readAdapterVersion(root).catch(() => {
+  const version = await readAdapterVersion(root, spec).catch(() => {
     throw new AdapterPinError("adapter_changed", "adapter package.json changed");
   });
   if (version !== pin.version) {
@@ -122,7 +175,7 @@ export async function fingerprintAdapterPackage(packageRoot: string): Promise<st
   return digest.digest("hex");
 }
 
-async function readAdapterVersion(root: string): Promise<string> {
+async function readAdapterVersion(root: string, spec: AdapterPackageSpec): Promise<string> {
   let manifest: unknown;
   try {
     manifest = JSON.parse(await readFile(join(root, "package.json"), "utf8"));
@@ -130,8 +183,8 @@ async function readAdapterVersion(root: string): Promise<string> {
     throw new AdapterPinError("adapter_missing", "adapter package.json could not be read");
   }
   const record = manifest !== null && typeof manifest === "object" ? manifest as Record<string, unknown> : {};
-  if (record["name"] !== CLAUDE_ADAPTER_PACKAGE_NAME || typeof record["version"] !== "string") {
-    throw new AdapterPinError("adapter_missing", "directory is not the Claude ACP adapter package");
+  if (record["name"] !== spec.packageName || typeof record["version"] !== "string") {
+    throw new AdapterPinError("adapter_missing", `directory is not the ${spec.packageName} package`);
   }
   return record["version"];
 }

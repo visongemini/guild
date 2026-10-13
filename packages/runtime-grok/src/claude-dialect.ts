@@ -30,12 +30,15 @@ export type ClaudeAuthStatus = Readonly<{
   plan?: string;
 }>;
 
+/** The engines whose adapters send these signals (every engine but Grok). */
+export type AdapterEngineName = "claude" | "codex";
+
 /** Display-only engine signals that are not `_x.ai/*` signals. Never persisted, never awaited. */
 export type EngineSignal =
-  | Readonly<{ type: "auth_status"; engine: "claude"; status: ClaudeAuthStatus }>
+  | Readonly<{ type: "auth_status"; engine: AdapterEngineName; status: ClaudeAuthStatus }>
   | Readonly<{
       type: "late_update_dropped";
-      engine: "claude";
+      engine: AdapterEngineName;
       sessionId: string;
       /** The ACP `sessionUpdate` discriminator, bounded; never content. */
       discriminator: string;

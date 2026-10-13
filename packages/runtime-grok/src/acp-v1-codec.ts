@@ -1,5 +1,5 @@
 import { isAbsolute, normalize } from "node:path";
-import type { AcpDialect } from "./engine-profile.js";
+import { isAdapterDialect, type AcpDialect } from "./engine-profile.js";
 import {
   ACP_PERMISSION_OPTION_KINDS,
   ACP_PROMPT_STOP_REASONS,
@@ -200,8 +200,9 @@ export type AcpV1DecodedUpdate =
 export function encodeInitializeParams(dialect: AcpDialect = "grok"): Readonly<Record<string, unknown>> {
   return deepFreeze({
     protocolVersion: 1,
-    // The Claude adapter was verified with no optional client capability (docs/20 section 2).
-    clientCapabilities: dialect === "claude"
+    // The Claude and Codex adapters were verified with no optional client capability (docs/20 section 2,
+    // docs/21 section 2).
+    clientCapabilities: isAdapterDialect(dialect)
       ? {}
       : { session: { configOptions: { boolean: {} } } },
     clientInfo: ACP_V1_CLIENT_INFO,
@@ -257,9 +258,11 @@ function sessionStartMeta(
   options: AcpV1SessionStartOptions | undefined,
   dialect: AcpDialect,
 ): Readonly<Record<string, unknown>> {
-  if (dialect === "claude") {
-    // Effort is a config option for Claude (set after the session starts), never `_meta`.
+  if (isAdapterDialect(dialect)) {
+    // Effort is a config option for the adapters (set after the session starts), never `_meta`.
     if (options?.claudeCodeOptions === undefined) return {};
+    // `_meta.claudeCode.options` is the Claude adapter's; the Codex adapter takes no start options.
+    if (dialect !== "claude") throw new AcpV1CodecError("invalid_value", "$.claudeCodeOptions");
     boundedJson(options.claudeCodeOptions);
     record(options.claudeCodeOptions, "$.claudeCodeOptions");
     const copy = JSON.parse(JSON.stringify(options.claudeCodeOptions)) as unknown;
@@ -338,8 +341,8 @@ export function encodeLoadSessionParams(
   options?: AcpV1SessionStartOptions,
   dialect: AcpDialect = "grok",
 ): Readonly<Record<string, unknown>> {
-  // Grok's session/load keeps its 2.x shape; only the Claude dialect carries the resume options on load.
-  if (dialect !== "claude") {
+  // Grok's session/load keeps its 2.x shape; the adapter dialects carry the resume options on load.
+  if (!isAdapterDialect(dialect)) {
     return deepFreeze({
       sessionId: identifier(sessionId, "$.sessionId"),
       cwd: canonicalAbsolutePath(cwd, "$.cwd"),
@@ -466,9 +469,9 @@ export function decodeInitializeResult(
     const advertised = array(rec["authMethods"], "$.authMethods", ACP_V1_CODEC_LIMITS.maxContentCollectionItems);
     for (const [index, entry] of advertised.entries()) {
       const path = `$.authMethods[${index}]`;
-      // The Claude adapter advertises terminal login methods; Guild never authenticates for it, so
+      // The Claude adapter advertises terminal login methods; Guild never authenticates for an adapter, so
       // any method that is not a plain agent method is counted and ignored instead of aborting.
-      if (dialect === "claude" && isNonAgentAuthMethod(entry)) {
+      if (isAdapterDialect(dialect) && isNonAgentAuthMethod(entry)) {
         unusableAuthMethodCount += 1;
         continue;
       }
@@ -758,6 +761,104 @@ export function deriveClaudeModelCatalog(
     return freezeModelCatalog("claude", {
       engine: "claude",
       models,
+      ...(seen.has(modelOption.currentValue) ? { runtimeDefaultModelId: modelOption.currentValue } : {}),
+    });
+  } catch {
+    // The catalog is advisory display data: a list the contracts refuse must not fault the session.
+    return undefined;
+  }
+}
+
+const CODEX_MODEL_EFFORT_ID = /^(.{1,128})\[([a-z][a-z0-9_-]{0,31})\]$/u;
+
+/**
+ * The Codex adapter's legacy `models.availableModels` repeats every model once per reasoning effort as
+ * `<model>[<effort>]` (`gpt-6.1-sol[low]`). It is the only place that names a model's efforts before that model is
+ * selected, so the efforts of every model are read from it, in the adapter's order. Advisory: anything that does not
+ * look like that is skipped and the result may be empty; this never throws.
+ */
+export function decodeCodexModelEfforts(models: unknown): ReadonlyMap<string, readonly string[]> {
+  const efforts = new Map<string, string[]>();
+  try {
+    const available = (models as { readonly availableModels?: unknown } | null)?.availableModels;
+    if (!Array.isArray(available)) return efforts;
+    for (const entry of available.slice(0, ACP_V1_CODEC_LIMITS.maxContentCollectionItems)) {
+      const modelId = (entry as { readonly modelId?: unknown } | null)?.modelId;
+      const match = typeof modelId === "string" ? CODEX_MODEL_EFFORT_ID.exec(modelId) : null;
+      if (match === null) continue;
+      const list = efforts.get(match[1]!) ?? [];
+      if (!list.includes(match[2]!)) list.push(match[2]!);
+      efforts.set(match[1]!, list);
+    }
+  } catch {
+    // An unexpected shape is a missing list, not a failed session.
+  }
+  return efforts;
+}
+
+/**
+ * Builds the model catalog of a Codex session from its `model` (category `model`) and effort (category
+ * `thought_level`) config options, plus the per-model effort lists of `models` when the session response carried
+ * them. Without `models`, efforts are attached only to the model that is currently selected (the adapter rebuilds
+ * the effort option for every selected model), so a caller keeps what it learned about the others. Every model is in
+ * the `codex` picker group. The engine's runtime default model and its default effort are the selected model and
+ * effort at the time of the call: callers pass the options of a session start, where they are the user's own Codex
+ * defaults. Codex has one configured effort, not one per model, so the default effort is marked on every model that
+ * offers it.
+ * An `unlisted` current value is never a model. Validated by `freezeModelCatalog("codex", ...)`; returns `undefined`
+ * when no usable model option is present.
+ */
+export function deriveCodexModelCatalog(
+  options: readonly RuntimeConfigOption[],
+  models?: unknown,
+): ModelCatalog | undefined {
+  const modelOption = options.find((option) => option.type === "select" && option.category === "model");
+  if (modelOption === undefined || modelOption.type !== "select") return undefined;
+  const effortOption = options.find((option) => option.type === "select" && option.category === "thought_level");
+  const limits = GUILD_GROK_IDENTIFIER_LIMITS;
+  const effortChoices = effortOption !== undefined && effortOption.type === "select" ? flatChoices(effortOption.choices) : [];
+  const effortText = new Map(effortChoices.map((choice) => [choice.value, choice] as const));
+  const currentEffort = effortOption !== undefined && effortOption.type === "select" ? effortOption.currentValue : undefined;
+  const known = decodeCodexModelEfforts(models);
+  const descriptorsOf = (effortIds: readonly string[]): GrokReasoningEffortDescriptor[] => {
+    const result: GrokReasoningEffortDescriptor[] = [];
+    for (const id of effortIds) {
+      if (result.length >= limits.maxEffortsPerModel) break;
+      if (!isClaudeReasoningEffort(id) || result.some((effort) => effort.id === id)) continue;
+      const choice = effortText.get(id);
+      const description = catalogText(choice?.description, limits.maxEffortDescriptionLength);
+      result.push({
+        id,
+        label: catalogText(choice?.name, limits.maxEffortLabelLength) ?? `${id.charAt(0).toUpperCase()}${id.slice(1)}`,
+        ...(description === undefined ? {} : { description }),
+        isDefault: id === currentEffort,
+      });
+    }
+    return result;
+  };
+  const catalogModels: ModelDescriptor[] = [];
+  const seen = new Set<string>();
+  for (const choice of flatChoices(modelOption.choices)) {
+    if (catalogModels.length >= GUILD_CLAUDE_IDENTIFIER_LIMITS.maxModels) break;
+    if (!isClaudeModelId(choice.value) || seen.has(choice.value)) continue;
+    seen.add(choice.value);
+    const description = catalogText(choice.description, limits.maxDescriptionLength);
+    const effortIds = known.get(choice.value) ??
+      (choice.value === modelOption.currentValue ? effortChoices.map((effort) => effort.value) : []);
+    catalogModels.push({
+      id: choice.value,
+      name: catalogText(choice.name, limits.maxNameLength) ?? choice.value,
+      ...(description === undefined ? {} : { description }),
+      group: "codex",
+      reasoningEfforts: descriptorsOf(effortIds),
+      contextWindows: [],
+    });
+  }
+  if (catalogModels.length === 0) return undefined;
+  try {
+    return freezeModelCatalog("codex", {
+      engine: "codex",
+      models: catalogModels,
       ...(seen.has(modelOption.currentValue) ? { runtimeDefaultModelId: modelOption.currentValue } : {}),
     });
   } catch {
@@ -1059,8 +1160,9 @@ function parseSessionStateRecord(
   path: string,
   dialect: AcpDialect,
 ): AcpV1SessionState {
-  // Claude has no `models` extension: its catalog is derived from the `model` config option below.
-  const result: Record<string, unknown> = dialect === "claude" ? {} : { ...parseSessionContextWindow(rec) };
+  // The adapters have no `models` extension of the Grok kind: their catalog is derived from the `model` config
+  // option below (the Codex adapter's `models` list only tells each model's efforts).
+  const result: Record<string, unknown> = isAdapterDialect(dialect) ? {} : { ...parseSessionContextWindow(rec) };
   if (dialect === "grok") {
     const modelCatalog = decodeModelState(rec["models"], `${path}.models`);
     if (modelCatalog !== undefined) result["modelCatalog"] = modelCatalog;
@@ -1075,6 +1177,10 @@ function parseSessionStateRecord(
     result["configOptions"] = configOptions;
     if (dialect === "claude" && configOptions !== null) {
       const modelCatalog = deriveClaudeModelCatalog(configOptions);
+      if (modelCatalog !== undefined) result["modelCatalog"] = modelCatalog;
+    }
+    if (dialect === "codex" && configOptions !== null) {
+      const modelCatalog = deriveCodexModelCatalog(configOptions, rec["models"]);
       if (modelCatalog !== undefined) result["modelCatalog"] = modelCatalog;
     }
   }
@@ -1641,10 +1747,11 @@ function parseUsage(
 }
 
 /**
- * Claude dialect only: a select option of category `model` may name a current value that is none of its choices and
- * then carries `unlisted: true`. The adapter restores the model of the transcript's last turn when it resumes a
- * session, and after routed turns that is an Online / Local id a native session does not list. Every other select
- * option, and every option of the Grok dialect, keeps the strict rule that the current value is a choice.
+ * Adapter dialects only: a select option of category `model` may name a current value that is none of its choices and
+ * then carries `unlisted: true`. The Claude adapter restores the model of the transcript's last turn when it resumes a
+ * session, and after routed turns that is an Online / Local id a native session does not list; the Codex adapter
+ * reports the user's configured default, which an account may no longer offer. Every other select option, and every
+ * option of the Grok dialect, keeps the strict rule that the current value is a choice.
  */
 function parseConfigOptions(value: unknown, path: string, dialect: AcpDialect = "grok"): readonly RuntimeConfigOption[] {
   const options = array(value, path, ACP_V1_CODEC_LIMITS.maxContentCollectionItems).map((entry, index) => {
@@ -1669,7 +1776,7 @@ function parseConfigOptions(value: unknown, path: string, dialect: AcpDialect = 
           : choices.groups.flatMap((group) => group.options.map((choice) => choice.value));
       assertUniqueIds(values, `${itemPath}.options.value`);
       const listed = values.includes(currentValue);
-      if (!listed && !(dialect === "claude" && result["category"] === "model")) {
+      if (!listed && !(isAdapterDialect(dialect) && result["category"] === "model")) {
         throw new AcpV1CodecError("invalid_value", `${itemPath}.currentValue`);
       }
       result["currentValue"] = currentValue;
