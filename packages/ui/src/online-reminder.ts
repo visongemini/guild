@@ -30,15 +30,24 @@ export function onlineReminderNeeded(input: OnlineReminderInput): boolean {
 }
 
 /**
- * The vendor a model belongs to: the id of the model source that lists it, else a key made from the model id
- * (a model no source lists still gets one stable key, so it is asked about once, not on every switch).
+ * The vendor a model belongs to: the model source that lists it, together with the host that source sends to
+ * (an agreement for one host says nothing about another, so a source edited to a new address, or deleted and
+ * recreated under the same id elsewhere, asks again), else a key made from the model id (a model no source
+ * lists still gets one stable key, so it is asked about once, not on every switch).
  */
 export function onlineSourceKey(
   modelId: string,
-  sources: readonly Pick<ModelSourceProjection, "id" | "models">[],
+  sources: readonly (Pick<ModelSourceProjection, "id" | "models"> & Partial<Pick<ModelSourceProjection, "baseUrl">>)[],
 ): string {
   const source = sources.find((candidate) => candidate.models.some((model) => model.id === modelId));
-  return source === undefined ? `model:${modelId}` : `source:${source.id}`;
+  if (source === undefined) return `model:${modelId}`;
+  let host = "";
+  try {
+    host = source.baseUrl === undefined ? "" : new URL(source.baseUrl).host.toLowerCase();
+  } catch {
+    host = "";
+  }
+  return host === "" ? `source:${source.id}` : `source:${source.id}@${host}`;
 }
 
 /** Which vendors each task agreed to send to; survives a restart when a store is given. */
@@ -86,9 +95,12 @@ export function createOnlineConsentLedger(storage?: Pick<Storage, "getItem" | "s
       const agreed = byTask.get(taskId) ?? new Set<string>();
       if (agreed.has(sourceKey)) return;
       agreed.add(sourceKey);
+      // Both caps hold in memory too, so a long-running window cannot grow without bound.
+      while (agreed.size > ONLINE_CONSENT_MAX_SOURCES) agreed.delete(agreed.values().next().value as string);
       // Re-inserting moves the task to the newest end, so the cap drops the least recent agreements.
       byTask.delete(taskId);
       byTask.set(taskId, agreed);
+      while (byTask.size > ONLINE_CONSENT_MAX_TASKS) byTask.delete(byTask.keys().next().value as string);
       persist();
     },
   });

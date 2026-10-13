@@ -52,8 +52,8 @@ test("Claude, Local and Grok models never ask", () => {
 
 test("a model belongs to the source that lists it, else it is its own key", () => {
   const sources = [source("DeepSeek", ["deepseek-v4-flash", "deepseek-v4-reasoner"]), source("Other", ["other-1"])];
-  assert.equal(onlineSourceKey("deepseek-v4-reasoner", sources), "source:deepseek");
-  assert.equal(onlineSourceKey("other-1", sources), "source:other");
+  assert.equal(onlineSourceKey("deepseek-v4-reasoner", sources), "source:deepseek@api.example.com");
+  assert.equal(onlineSourceKey("other-1", sources), "source:other@api.example.com");
   assert.equal(onlineSourceKey("ghost", sources), "model:ghost");
   assert.equal(onlineSourceKey("ghost", []), "model:ghost");
 });
@@ -245,4 +245,20 @@ test("a task's agreement survives a restart through the store, and a broken stor
   const reread = createOnlineConsentLedger(cappedStore);
   assert.equal(reread.agreedSources("task-0").size, 0, "the oldest agreements are dropped first");
   assert.equal(reread.agreedSources("task-519").size, 1);
+});
+
+test("an agreement is bound to the host the source sends to, and the in-memory ledger is capped too [D-065]", () => {
+  const deepseek = { id: "deepseek", models: [{ id: "ds-flash" }], baseUrl: "https://api.deepseek.com/anthropic" };
+  const moved = { ...deepseek, baseUrl: "https://elsewhere.example/anthropic" };
+  const key = onlineSourceKey("ds-flash", [deepseek] as never);
+  assert.equal(key, "source:deepseek@api.deepseek.com");
+  assert.notEqual(onlineSourceKey("ds-flash", [moved] as never), key, "a new address is a new vendor to agree to");
+  const ledger = createOnlineConsentLedger();
+  ledger.agree("task-1", key);
+  assert.equal(ledger.agreedSources("task-1").has(onlineSourceKey("ds-flash", [moved] as never)), false);
+  for (let index = 0; index < 40; index += 1) ledger.agree("task-1", `source:s${index}@h${index}`);
+  assert.ok(ledger.agreedSources("task-1").size <= 32);
+  for (let index = 0; index < 520; index += 1) ledger.agree(`task-x${index}`, key);
+  assert.equal(ledger.agreedSources("task-x0").size, 0, "the in-memory ledger drops the least recent tasks");
+  assert.equal(ledger.agreedSources("task-x519").size, 1);
 });
