@@ -96,3 +96,13 @@ test("new controls honor the 28 px minimum", () => {
   assert.match(cssBlock(".guild-steer"), /height:\s*32px/u);
   assert.match(cssBlock(".guild-queued-turn"), /min-height:\s*28px/u);
 });
+
+test("a draft can only be saved into the task it belongs to; archiving the open task loads the next task's draft first", () => {
+  // Owner check: the debounced save skips while the projection's active task is not the composer's task.
+  assert.match(app, /useEffect\(\(\) => \{\s*\n\s*const taskId = projection\?\.activeTask\?\.task\.taskId;\s*\n\s*if \(taskId !== activeTaskIdRef\.current\) return;/u);
+  // Reconciliation: any projection that changes the active task loads that task's draft into the composer.
+  assert.match(app, /const nextTaskId = projection\?\.activeTask\?\.task\.taskId;\s*\n\s*if \(nextTaskId === activeTaskIdRef\.current\) return;\s*\n\s*activeTaskIdRef\.current = nextTaskId;\s*\n\s*setDraft\(projection\?\.activeTask\?\.draft \?\? ""\);/u);
+  // The text of the task being archived, restored or deleted is saved to that task before the projection moves on.
+  assert.match(app, /async function updateContext\(action[^)]*\) \{[\s\S]{0,200}await run\(async \(\) => \{\s*\n\s*await persistCurrentDraft\(\);/u);
+  assert.match(app, /if \(action === "archive"\) await persistCurrentDraft\(\);\s*\n\s*setProjection\(await api\.updateTask\(\{ taskId: task\.taskId, action \}\)\);/u);
+});

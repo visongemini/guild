@@ -726,8 +726,19 @@ export function GuildApp({ api }: GuildAppProps) {
     });
   }, [api, draft, projection?.activeTask?.availableCommands, projection?.activeTask?.task.taskId]);
 
+  // The composer text belongs to activeTaskIdRef's task. Any projection that changes the active task by another
+  // path (archive, delete, restore, a workspace action) loads the new task's draft first; until it has, nothing is
+  // saved, so the text of the task that was left can never overwrite another task's draft.
+  useEffect(() => {
+    const nextTaskId = projection?.activeTask?.task.taskId;
+    if (nextTaskId === activeTaskIdRef.current) return;
+    activeTaskIdRef.current = nextTaskId;
+    setDraft(projection?.activeTask?.draft ?? "");
+  }, [projection?.activeTask?.task.taskId, projection?.activeTask?.draft]);
+
   useEffect(() => {
     const taskId = projection?.activeTask?.task.taskId;
+    if (taskId !== activeTaskIdRef.current) return;
     const preservingSubmittedDraft = taskId !== undefined &&
       pendingSends.has(taskId) &&
       draft.length === 0;
@@ -1482,6 +1493,7 @@ export function GuildApp({ api }: GuildAppProps) {
     setConfirmDelete(false);
     if (menu === undefined) return;
     await run(async () => {
+      await persistCurrentDraft();
       const next = menu.type === "workspace"
         ? await api.updateWorkspace({ workspaceId: menu.workspace.workspaceId, action })
         : await api.updateTask({ taskId: menu.task.taskId, action });
@@ -1504,6 +1516,7 @@ export function GuildApp({ api }: GuildAppProps) {
   ) {
     if (isTaskManagementBlocked(task) || pendingSends.has(task.taskId)) return;
     await run(async () => {
+      if (action === "archive") await persistCurrentDraft();
       setProjection(await api.updateTask({ taskId: task.taskId, action }));
     });
   }
