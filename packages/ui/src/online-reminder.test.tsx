@@ -7,6 +7,7 @@ import { messagesFor } from "./locales.js";
 import {
   agreedSourcesOf,
   createOnlineConsentLedger,
+  ONLINE_CONSENT_STORAGE_KEY,
   onlineReminderNeeded,
   onlineSourceKey,
   vendorLabelFor,
@@ -196,7 +197,7 @@ test("the reminder flow in the app follows PC-PRIV-001", async () => {
   assert.match(flow, /\(change\.group === "online" \|\| change\.group === "local"\) && !\(await confirmModelSwitch\(task, change\)\)\) return undefined/u);
   assert.ok(flow.indexOf("confirmModelSwitch(task") < flow.indexOf("applyModelSelectionChange("));
   // Agreement is kept per task and per vendor, in the ledger; the vendor is the source that lists the model.
-  assert.match(app, /const onlineConsent = useRef\(createOnlineConsentLedger\(\)\);/u);
+  assert.match(app, /const onlineConsent = useRef\(createOnlineConsentLedger\(typeof window === "undefined" \? undefined : window\.localStorage\)\);/u);
   assert.match(flow, /const targetSource = onlineSourceKey\(modelId \?\? "", sources\);/u);
   assert.match(flow, /agreedSourcesOf\(\{\s*\n\s*ledger: onlineConsent\.current,\s*\n\s*taskId,\s*\n\s*currentModelId: task\.modelSelection\.modelId,/u);
   // The workspace preference is read only when this vendor is not agreed yet; the checkbox writes it back.
@@ -210,4 +211,38 @@ test("the reminder flow in the app follows PC-PRIV-001", async () => {
   assert.match(flow, /if \(!answer\.confirmed\) return false;\s*\n\s*if \(change\.group === "online"\) onlineConsent\.current\.agree\(taskId, targetSource\);/u);
   assert.doesNotMatch(app, /onlineRemindedTaskIds/u);
   assert.match(app, /<OnlineReminderDialog\s*\n\s*messages=\{baseMessages\}/u);
+});
+
+test("a task's agreement survives a restart through the store, and a broken store only asks again [D-065]", () => {
+  const data = new Map<string, string>();
+  const store = { getItem: (key: string) => data.get(key) ?? null, setItem: (key: string, value: string) => void data.set(key, value) };
+  const first = createOnlineConsentLedger(store);
+  first.agree("task-1", "source:deepseek");
+  first.agree("task-1", "source:deepseek");
+  first.agree("task-2", "source:other");
+  const restarted = createOnlineConsentLedger(store);
+  assert.deepEqual([...restarted.agreedSources("task-1")], ["source:deepseek"]);
+  assert.deepEqual([...restarted.agreedSources("task-2")], ["source:other"]);
+  assert.equal(restarted.agreedSources("task-3").size, 0);
+  // Callers cannot change the ledger through the returned set.
+  (restarted.agreedSources("task-1") as Set<string>).add("source:sneaky");
+  assert.equal(restarted.agreedSources("task-1").has("source:sneaky"), false);
+
+  data.set(ONLINE_CONSENT_STORAGE_KEY, "{not json");
+  assert.equal(createOnlineConsentLedger(store).agreedSources("task-1").size, 0);
+  data.set(ONLINE_CONSENT_STORAGE_KEY, JSON.stringify([["task-1", ["source:deepseek", 7]], ["bad"], 3]));
+  assert.deepEqual([...createOnlineConsentLedger(store).agreedSources("task-1")], ["source:deepseek"]);
+
+  const throwing = { getItem: () => { throw new Error("blocked"); }, setItem: () => { throw new Error("blocked"); } };
+  const ledger = createOnlineConsentLedger(throwing);
+  ledger.agree("task-1", "source:deepseek");
+  assert.ok(ledger.agreedSources("task-1").has("source:deepseek"), "still remembered for the life of the window");
+
+  const capped = new Map<string, string>();
+  const cappedStore = { getItem: (key: string) => capped.get(key) ?? null, setItem: (key: string, value: string) => void capped.set(key, value) };
+  const many = createOnlineConsentLedger(cappedStore);
+  for (let index = 0; index < 520; index += 1) many.agree(`task-${index}`, "source:deepseek");
+  const reread = createOnlineConsentLedger(cappedStore);
+  assert.equal(reread.agreedSources("task-0").size, 0, "the oldest agreements are dropped first");
+  assert.equal(reread.agreedSources("task-519").size, 1);
 });

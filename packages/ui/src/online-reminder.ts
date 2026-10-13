@@ -5,7 +5,8 @@ import type { ModelGroup, ModelSourceProjection } from "@guild/contracts";
  * what leaves this Mac. The agreement is per task and per vendor (model source): agreeing to one vendor says
  * nothing about another, and going Online A -> Claude -> Online B asks again for B. Claude and Local models
  * never ask. "Don't remind me again in this workspace" is a workspace preference kept by the main process and
- * silences every reminder; which vendors a task agreed to is plain renderer state for the life of the window.
+ * silences every reminder. Which vendors a task agreed to is renderer state kept in localStorage (D-065), so a
+ * Guild restart does not ask again for a vendor the task already agreed to; a blocked store only forgets it.
  */
 
 export type OnlineReminderInput = Readonly<{
@@ -40,20 +41,55 @@ export function onlineSourceKey(
   return source === undefined ? `model:${modelId}` : `source:${source.id}`;
 }
 
-/** Which vendors each task agreed to send to since the window opened. */
+/** Which vendors each task agreed to send to; survives a restart when a store is given. */
 export type OnlineConsentLedger = Readonly<{
   agreedSources: (taskId: string) => ReadonlySet<string>;
   agree: (taskId: string, sourceKey: string) => void;
 }>;
 
-export function createOnlineConsentLedger(): OnlineConsentLedger {
+export const ONLINE_CONSENT_STORAGE_KEY = "guild.onlineConsent.v1";
+/** Tasks remembered; the oldest agreements are dropped first. */
+const ONLINE_CONSENT_MAX_TASKS = 500;
+const ONLINE_CONSENT_MAX_SOURCES = 32;
+
+function readOnlineConsent(storage: Pick<Storage, "getItem"> | undefined): Map<string, Set<string>> {
   const byTask = new Map<string, Set<string>>();
+  if (storage === undefined) return byTask;
+  try {
+    const parsed = JSON.parse(storage.getItem(ONLINE_CONSENT_STORAGE_KEY) ?? "[]") as unknown;
+    if (!Array.isArray(parsed)) return byTask;
+    for (const entry of parsed.slice(-ONLINE_CONSENT_MAX_TASKS)) {
+      if (!Array.isArray(entry) || typeof entry[0] !== "string" || !Array.isArray(entry[1])) continue;
+      const keys = (entry[1] as unknown[]).filter((key): key is string => typeof key === "string" && key.length <= 256);
+      if (keys.length > 0) byTask.set(entry[0], new Set(keys.slice(0, ONLINE_CONSENT_MAX_SOURCES)));
+    }
+  } catch {
+    // A damaged or blocked store only means the reminder asks again.
+  }
+  return byTask;
+}
+
+export function createOnlineConsentLedger(storage?: Pick<Storage, "getItem" | "setItem">): OnlineConsentLedger {
+  const byTask = readOnlineConsent(storage);
+  const persist = (): void => {
+    if (storage === undefined) return;
+    try {
+      const entries = [...byTask].slice(-ONLINE_CONSENT_MAX_TASKS).map(([taskId, keys]) => [taskId, [...keys]]);
+      storage.setItem(ONLINE_CONSENT_STORAGE_KEY, JSON.stringify(entries));
+    } catch {
+      // The agreement is a convenience; a full or blocked store only loses it on restart.
+    }
+  };
   return Object.freeze({
-    agreedSources: (taskId) => byTask.get(taskId) ?? new Set<string>(),
+    agreedSources: (taskId) => new Set(byTask.get(taskId) ?? []),
     agree: (taskId, sourceKey) => {
       const agreed = byTask.get(taskId) ?? new Set<string>();
+      if (agreed.has(sourceKey)) return;
       agreed.add(sourceKey);
+      // Re-inserting moves the task to the newest end, so the cap drops the least recent agreements.
+      byTask.delete(taskId);
       byTask.set(taskId, agreed);
+      persist();
     },
   });
 }

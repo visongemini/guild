@@ -318,7 +318,7 @@ export function GuildApp({ api }: GuildAppProps) {
   // The Online-model reminder (PC-PRIV-001): the open dialog, the way to answer it, and the vendors each task agreed to in this window.
   const [onlineReminder, setOnlineReminder] = useState<OnlineReminderRequest>();
   const onlineReminderAnswer = useRef<((answer: OnlineReminderAnswer) => void) | undefined>(undefined);
-  const onlineConsent = useRef(createOnlineConsentLedger());
+  const onlineConsent = useRef(createOnlineConsentLedger(typeof window === "undefined" ? undefined : window.localStorage));
   // A switch between a Claude model and an Online / Local one restarts the engine and takes a while (D-062).
   const [modelSwitch, setModelSwitch] = useState<ModelSwitchState>();
   const [claudeSettingsFailed, setClaudeSettingsFailed] = useState(false);

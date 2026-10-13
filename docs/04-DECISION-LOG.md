@@ -1225,3 +1225,14 @@ Decisions
 Consequences
 - `requirements/requirements.yml` is unchanged: the statements already cover these behaviours; the commits cite
   the requirement IDs.
+
+## D-065 — A task's agreement to an Online vendor survives a restart
+
+- Date: 2026-10-13
+- Status: accepted
+- Context: D-063 kept the per-task, per-vendor agreement of the Online reminder in renderer memory only. On the
+  owner's machine, after a Guild restart the reminder asked again for a vendor the same task had already agreed to.
+- Decision: the ledger is kept in the renderer's localStorage (`guild.onlineConsent.v1`, task ids and source keys
+  only, at most 500 tasks, the least recent dropped first). A blocked or damaged store falls back to memory, which
+  only means the reminder asks again. The workspace "don't remind me again" preference is unchanged.
+- Requirements: PC-PRIV-001.
