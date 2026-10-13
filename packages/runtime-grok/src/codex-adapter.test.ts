@@ -176,7 +176,7 @@ async function startCodex(
   assert.deepEqual(initialize.params, {
     protocolVersion: 1,
     clientCapabilities: {},
-    clientInfo: { name: "guild", title: "Guild", version: "3.0.5" },
+    clientInfo: { name: "guild", title: "Guild", version: "3.1.0" },
   });
   process.emitMessages({ jsonrpc: "2.0", id: initialize.id, result: initializeResult } as WireMessage);
   await starting;

@@ -1,6 +1,6 @@
 {
   "name": "@guild/desktop",
-  "version": "3.0.5",
+  "version": "3.1.0",
   "author": "BDV",
   "description": "An independent desktop client for the official Grok agent process and the user-installed Claude Code engine.",
   "license": "MIT",
