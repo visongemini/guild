@@ -166,7 +166,7 @@ const ROUTED_AUTH_TOKEN_PATTERN = /^guild-router-[0-9a-f]{32}$/u;
 export const GROK_ENVIRONMENT_POLICY_VERSION = "macos-posix-v3";
 export const CLAUDE_ENVIRONMENT_POLICY_VERSION = "macos-posix-claude-v1";
 export const CODEX_ENVIRONMENT_POLICY_VERSION = "macos-posix-codex-v1";
-export const GEMINI_ENVIRONMENT_POLICY_VERSION = "macos-posix-gemini-v1";
+export const GEMINI_ENVIRONMENT_POLICY_VERSION = "macos-posix-gemini-v2";
 
 /**
  * Grok: OpenViking memory is for Claude Code and Codex only (owner decision, 2026-10-10), but grok
@@ -278,14 +278,47 @@ export const CODEX_ENVIRONMENT_POLICY: EnvironmentPolicy = Object.freeze({
  * `GEMINI_CLI_HOME` and more from its environment, and the allowlist drops all of them). Guild-owned values:
  * `HOME` and `GEMINI_CLI_HOME` (set per launch), `GEMINI_CLI_NO_RELAUNCH=1` (one process: the CLI otherwise relaunches
  * a child that a SIGKILL of the parent orphans), `NODE_USE_ENV_PROXY=1` (node 26 ignores HTTPS_PROXY otherwise) and the
- * OpenViking guard block. The API key is the one per-spawn variable. `GOOGLE_GENAI_USE_GCA` and `GOOGLE_GEMINI_BASE_URL`
- * are never set, and a built environment that carries any variable of the two families beyond the three Guild sets is
- * refused outright (`assertGeminiEnvironment`).
+ * OpenViking guard block. The API key is the one per-spawn variable.
+ *
+ * The CLI loads a `.env` file from the user's project folders (it runs with `--skip-trust`) and copies a variable from it
+ * only when the environment does not already have that variable (`Object.hasOwn(process.env, key)`, gemini-cli 0.63.0
+ * `loadEnvironment`). So every variable that could move the key, change the sign-in method or reach a Google service other
+ * than the API is present in the child's environment with a value Guild chose, `GEMINI_NEUTRAL_ENVIRONMENT`: an empty
+ * string where the CLI tests the variable for truth (an empty string is false there), and the default value where it
+ * tests for absence (`GOOGLE_CLOUD_UNIVERSE_DOMAIN`, `NODE_TLS_REJECT_UNAUTHORIZED`). A file therefore cannot supply any of
+ * them, and the file check of gemini-env-guard.ts only adds a clear refusal. The bundle was read for each of them and the
+ * values were run against the CLI (docs/21 8.1). A built environment that carries any other `GEMINI_` or `GOOGLE_` variable,
+ * or one of these with another value, is refused outright (`assertGeminiEnvironment`).
  */
 export const GEMINI_API_KEY_VARIABLE = "GEMINI_API_KEY";
 const GEMINI_ALLOWED_OWN_VARIABLES: ReadonlySet<string> = new Set([
   GEMINI_API_KEY_VARIABLE, "GEMINI_CLI_HOME", "GEMINI_CLI_NO_RELAUNCH",
 ]);
+
+export const GEMINI_NEUTRAL_ENVIRONMENT: Readonly<Record<string, string>> = Object.freeze({
+  // Where the key goes: both base URLs (a set one sends the key there and, for the Gemini one, flips the sign-in to `gateway`).
+  GOOGLE_GEMINI_BASE_URL: "",
+  GOOGLE_VERTEX_BASE_URL: "",
+  // How the CLI signs in: the account sign-in and Vertex switches, a key for Vertex, service-account and token credentials.
+  GOOGLE_GENAI_USE_GCA: "",
+  GOOGLE_GENAI_USE_VERTEXAI: "",
+  GOOGLE_API_KEY: "",
+  GOOGLE_APPLICATION_CREDENTIALS: "",
+  GOOGLE_CLOUD_ACCESS_TOKEN: "",
+  GOOGLE_CLOUD_PROJECT: "",
+  GOOGLE_CLOUD_PROJECT_ID: "",
+  GOOGLE_CLOUD_LOCATION: "",
+  CLOUD_SHELL: "",
+  GEMINI_CLI_USE_COMPUTE_ADC: "",
+  GEMINI_CLI_AUTH_OVERRIDE: "",
+  // Google hosts other than the API: the universe domain is tested for absence, so it carries its default; Code Assist is
+  // never used, so a request that slipped through would meet a closed local port instead of a Google host.
+  GOOGLE_CLOUD_UNIVERSE_DOMAIN: "googleapis.com",
+  CODE_ASSIST_ENDPOINT: "http://127.0.0.1:9",
+  // Certificate checking stays on, and a sign-in that did slip through could not open a browser.
+  NODE_TLS_REJECT_UNAUTHORIZED: "1",
+  NO_BROWSER: "true",
+});
 
 /** A key is printable ASCII without spaces, 8 to 512 characters: it must never be able to end the variable or add one. */
 const GEMINI_API_KEY_PATTERN = /^[\x21-\x7e]{8,512}$/u;
@@ -303,6 +336,7 @@ export const GEMINI_ENVIRONMENT_POLICY: EnvironmentPolicy = Object.freeze({
   pathHomeDirectories: Object.freeze([join(".local", "bin")]),
   fixedValues: Object.freeze({
     ...GROK_OPENVIKING_OFF_ENVIRONMENT,
+    ...GEMINI_NEUTRAL_ENVIRONMENT,
     GEMINI_CLI_NO_RELAUNCH: "1",
     NODE_USE_ENV_PROXY: "1",
   }),
@@ -313,11 +347,19 @@ export const GEMINI_ENVIRONMENT_POLICY: EnvironmentPolicy = Object.freeze({
 
 /**
  * Refuses an environment that would change where the key goes or how the CLI signs in: any `GEMINI_` or `GOOGLE_`
- * variable other than the three Guild sets. Throws without echoing a value.
+ * variable other than the ones Guild sets (the key, the home, the single-process switch and the neutral values), and a
+ * neutral variable with another value. Throws without echoing a value.
  */
 export function assertGeminiEnvironment(environment: Readonly<Record<string, string>>): void {
-  for (const key of Object.keys(environment)) {
-    if ((key.startsWith("GEMINI_") || key.startsWith("GOOGLE_")) && !GEMINI_ALLOWED_OWN_VARIABLES.has(key)) {
+  for (const [key, value] of Object.entries(environment)) {
+    if (Object.hasOwn(GEMINI_NEUTRAL_ENVIRONMENT, key)) {
+      if (value !== GEMINI_NEUTRAL_ENVIRONMENT[key]) {
+        throw new TypeError(`child environment carries a forbidden variable: ${key.slice(0, 64)}`);
+      }
+      continue;
+    }
+    const upper = key.toUpperCase();
+    if ((upper.startsWith("GEMINI_") || upper.startsWith("GOOGLE_")) && !GEMINI_ALLOWED_OWN_VARIABLES.has(key)) {
       throw new TypeError(`child environment carries a forbidden variable: ${key.slice(0, 64)}`);
     }
   }

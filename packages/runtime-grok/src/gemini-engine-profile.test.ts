@@ -10,6 +10,7 @@ import {
   GEMINI_ENGINE_PROFILE,
   GEMINI_ENVIRONMENT_POLICY,
   GEMINI_ENVIRONMENT_POLICY_VERSION,
+  GEMINI_NEUTRAL_ENVIRONMENT,
   assertGeminiEnvironment,
   buildEngineEnvironment,
   engineProfileFor,
@@ -115,30 +116,58 @@ describe("Gemini engine profile (PC-ENG-004)", () => {
     assert.equal(isPlausibleGeminiApiKey("a".repeat(512)), true);
   });
 
-  it("allowlists the documented keys and strips every credential, endpoint, sign-in and loader variable", () => {
+  it("allowlists the documented keys and replaces every credential, endpoint and sign-in variable with Guild's own neutral value", () => {
     const environment = buildEngineEnvironment(GEMINI_ENVIRONMENT_POLICY, rich);
-    const kept = Object.keys(environment).filter((key) => !key.startsWith("OPENVIKING_")).sort();
+    const kept = Object.keys(environment).filter((key) => !key.startsWith("OPENVIKING_") && !Object.hasOwn(GEMINI_NEUTRAL_ENVIRONMENT, key)).sort();
     assert.deepEqual(kept, [
       "GEMINI_CLI_NO_RELAUNCH", "HOME", "HTTPS_PROXY", "LANG", "LC_ALL", "LOGNAME", "NODE_USE_ENV_PROXY", "NO_PROXY", "PATH",
       "SSL_CERT_FILE", "TMPDIR", "USER", "http_proxy", "no_proxy",
     ].sort());
+    // Nothing the parent had survives: each of these is absent, or present only with the value Guild chose.
     for (const stripped of ["GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_GEMINI_BASE_URL", "GOOGLE_GENAI_USE_GCA", "GOOGLE_GENAI_USE_VERTEXAI",
       "GOOGLE_CLOUD_PROJECT", "GOOGLE_APPLICATION_CREDENTIALS", "GEMINI_CLI_HOME", "GEMINI_MODEL", "GEMINI_SANDBOX", "GEMINI_TELEMETRY_ENABLED",
       "GEMINI_SYSTEM_MD", "NO_BROWSER", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "NODE_OPTIONS", "NODE_PATH", "ELECTRON_RUN_AS_NODE",
       "DYLD_INSERT_LIBRARIES", "LD_PRELOAD", "BASH_ENV"]) {
-      assert.equal(stripped in environment, false, stripped);
+      assert.equal(stripped in environment ? environment[stripped] === GEMINI_NEUTRAL_ENVIRONMENT[stripped] : true, true, stripped);
+      assert.notEqual(environment[stripped], (rich as Record<string, string>)[stripped], stripped);
+    }
+    for (const gone of ["GEMINI_API_KEY", "GEMINI_CLI_HOME", "GEMINI_MODEL", "GEMINI_SANDBOX", "GEMINI_TELEMETRY_ENABLED", "GEMINI_SYSTEM_MD", "OPENAI_API_KEY",
+      "ANTHROPIC_API_KEY", "NODE_OPTIONS", "NODE_PATH", "ELECTRON_RUN_AS_NODE", "DYLD_INSERT_LIBRARIES", "LD_PRELOAD", "BASH_ENV"]) {
+      assert.equal(gone in environment, false, gone);
     }
     assert.equal(environment.GEMINI_CLI_NO_RELAUNCH, "1", "one process: a relaunched child would outlive a SIGKILL of its parent");
     assert.equal(environment.NODE_USE_ENV_PROXY, "1", "node 26 ignores HTTPS_PROXY otherwise");
     assert.equal(Object.isFrozen(environment), true);
   });
 
-  it("switches the OpenViking guard block on and sets no Google variable of its own", () => {
+  it("holds every variable a .env could use to move the key or change the sign-in at a value of Guild's choosing [finding: dotenv colon form]", () => {
+    const environment = buildEngineEnvironment(GEMINI_ENVIRONMENT_POLICY, rich);
+    // The CLI copies a .env variable only when the environment does not have it, so presence is what protects.
+    for (const name of ["GOOGLE_GEMINI_BASE_URL", "GOOGLE_VERTEX_BASE_URL", "GOOGLE_GENAI_USE_GCA", "GOOGLE_GENAI_USE_VERTEXAI", "GOOGLE_API_KEY",
+      "GOOGLE_APPLICATION_CREDENTIALS", "GOOGLE_CLOUD_ACCESS_TOKEN", "GOOGLE_CLOUD_PROJECT", "GOOGLE_CLOUD_LOCATION", "CLOUD_SHELL",
+      "GEMINI_CLI_USE_COMPUTE_ADC", "GEMINI_CLI_AUTH_OVERRIDE", "GOOGLE_CLOUD_UNIVERSE_DOMAIN", "CODE_ASSIST_ENDPOINT", "NODE_TLS_REJECT_UNAUTHORIZED", "NO_BROWSER"]) {
+      assert.equal(Object.hasOwn(environment, name), true, name);
+      assert.equal(environment[name], GEMINI_NEUTRAL_ENVIRONMENT[name], name);
+    }
+    // Empty means false to the CLI's own tests; two variables are tested for absence and carry their default instead.
+    assert.equal(environment.GOOGLE_GEMINI_BASE_URL, "");
+    assert.equal(environment.GOOGLE_GENAI_USE_GCA, "");
+    assert.equal(environment.GOOGLE_CLOUD_UNIVERSE_DOMAIN, "googleapis.com");
+    assert.equal(environment.NODE_TLS_REJECT_UNAUTHORIZED, "1");
+    assert.equal(environment.CODE_ASSIST_ENDPOINT, "http://127.0.0.1:9", "a closed local port: Code Assist is never reached");
+    assert.equal(environment.NO_BROWSER, "true");
+    assert.equal(Object.isFrozen(GEMINI_NEUTRAL_ENVIRONMENT), true);
+    assert.equal(JSON.stringify(environment).includes("evil.invalid"), false);
+  });
+
+  it("switches the OpenViking guard block on and gives the Google variables no value but the neutral ones", () => {
     const environment = buildEngineEnvironment(GEMINI_ENVIRONMENT_POLICY, rich);
     assert.equal(environment.OPENVIKING_MEMORY_ENABLED, "0");
     assert.equal(environment.OPENVIKING_CONFIG_FILE, "/dev/null");
     assert.equal(environment.OPENVIKING_URL, "http://127.0.0.1:9");
-    for (const key of Object.keys(environment)) assert.equal(key.startsWith("GOOGLE_"), false, key);
+    for (const key of Object.keys(environment).filter((name) => name.startsWith("GOOGLE_"))) {
+      assert.equal(environment[key], GEMINI_NEUTRAL_ENVIRONMENT[key], key);
+    }
     assert.deepEqual(Object.keys(GEMINI_ENVIRONMENT_POLICY.perSpawnKeys), ["GEMINI_API_KEY"]);
   });
 
@@ -156,7 +185,10 @@ describe("Gemini engine profile (PC-ENG-004)", () => {
     assert.equal(environment.GEMINI_API_KEY, KEY);
     assert.equal(environment.USER, "someone");
     assert.equal(plan.environmentPolicyVersion, GEMINI_ENVIRONMENT_POLICY_VERSION);
-    assert.deepEqual(Object.keys(environment).filter((key) => /^(GEMINI_|GOOGLE_)/u.test(key)).sort(), ["GEMINI_API_KEY", "GEMINI_CLI_HOME", "GEMINI_CLI_NO_RELAUNCH"]);
+    assert.deepEqual(
+      Object.keys(environment).filter((key) => /^(GEMINI_|GOOGLE_)/u.test(key) && !Object.hasOwn(GEMINI_NEUTRAL_ENVIRONMENT, key)).sort(),
+      ["GEMINI_API_KEY", "GEMINI_CLI_HOME", "GEMINI_CLI_NO_RELAUNCH"],
+    );
     assert.equal(JSON.stringify(plan.argv).includes(KEY), false);
   });
 
@@ -168,9 +200,18 @@ describe("Gemini engine profile (PC-ENG-004)", () => {
 
   it("refuses an environment that carries a forbidden variable, naming it but never a value", () => {
     assertGeminiEnvironment({ HOME: "/h", GEMINI_API_KEY: KEY, GEMINI_CLI_HOME: "/h", GEMINI_CLI_NO_RELAUNCH: "1", PATH: "/bin" });
-    for (const key of ["GOOGLE_GENAI_USE_GCA", "GOOGLE_GEMINI_BASE_URL", "GOOGLE_API_KEY", "GEMINI_MODEL", "GEMINI_SANDBOX", "GOOGLE_CLOUD_PROJECT"]) {
+    assertGeminiEnvironment({ PATH: "/bin", ...GEMINI_NEUTRAL_ENVIRONMENT });
+    for (const key of ["GOOGLE_GENAI_USE_GCA", "GOOGLE_GEMINI_BASE_URL", "GOOGLE_API_KEY", "GEMINI_MODEL", "GEMINI_SANDBOX", "GOOGLE_CLOUD_PROJECT", "google_cloud_project", "GOOGLE_NEW_THING"]) {
       assert.throws(
         () => assertGeminiEnvironment({ PATH: "/bin", [key]: "secret-value-123" }),
+        (cause: unknown) => cause instanceof TypeError && cause.message.includes(key) && !cause.message.includes("secret-value-123"),
+        key,
+      );
+    }
+    // A neutral variable with any other value is refused too, wherever the value came from.
+    for (const key of Object.keys(GEMINI_NEUTRAL_ENVIRONMENT)) {
+      assert.throws(
+        () => assertGeminiEnvironment({ PATH: "/bin", ...GEMINI_NEUTRAL_ENVIRONMENT, [key]: "https://evil.invalid/secret-value-123" }),
         (cause: unknown) => cause instanceof TypeError && cause.message.includes(key) && !cause.message.includes("secret-value-123"),
         key,
       );
