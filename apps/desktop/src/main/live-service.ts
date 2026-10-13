@@ -459,7 +459,8 @@ export type LiveDesktopServiceOptions = {
   /** Shows the native dialog that binds an engine's API key to its host and resolves true only for "Allow". Absent: nothing can be confirmed. */
   readonly confirmEngineKey?: (prompt: HostConfirmationPrompt) => Promise<boolean>;
   /** Applies the Dock icon the user chose (PC-SET-002); called at startup and whenever the setting changes. */
-  readonly applyDockIcon?: (icon: GuildDockIcon) => void;
+  /** Sets the Dock icon; false when nothing was set (not macOS, a missing or empty file). */
+  readonly applyDockIcon?: (icon: GuildDockIcon) => boolean | void;
   /** Online / Local models behind the loopback router (docs/20 3.3, 3.4). Absent: Claude tasks stay native. */
   readonly modelRouterHost?: ModelRouterHostPort;
   /** Loopback browser MCP server handed to engines that advertise HTTP MCP (docs/20 3.5). */
@@ -937,8 +938,10 @@ export function createLiveDesktopService(
 
   /** The Dock icon is the main process's to set; a failure there never reaches the settings. */
   function applyDockIcon(icon: GuildDockIcon): void {
+    if (options.applyDockIcon === undefined) return;
     try {
-      options.applyDockIcon?.(icon);
+      const applied = options.applyDockIcon(icon);
+      logRuntime({ category: "runtime", event: applied === false ? "dock_icon_not_applied" : "dock_icon_applied" });
     } catch {
       logRuntime({ category: "runtime", event: "dock_icon_failed" });
     }

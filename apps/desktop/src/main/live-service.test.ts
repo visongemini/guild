@@ -1265,6 +1265,34 @@ describe("live desktop service", () => {
     );
   });
 
+  it("records whether the Dock icon was applied, and a Dock that refuses or fails never turns the saved choice into an error [PC-SET-002]", async () => {
+    const root = await mkdtemp(join(tmpdir(), "guild-live-service-dock-diagnostics-"));
+    const outcomes: Array<"refuse" | "throw" | "apply"> = ["refuse", "throw", "apply"];
+    const service = createLiveDesktopService({
+      appVersion: "2.0.0-test",
+      databasePath: join(root, "guild.sqlite3"),
+      stagingRoot: join(root, "staging"),
+      chooseWorkspace: async () => undefined,
+      applyDockIcon: () => {
+        const outcome = outcomes.shift();
+        if (outcome === "throw") throw new Error("dock_unavailable /secret/path");
+        return outcome === "apply";
+      },
+      runtimeFactory: fakeRuntimeFactory(),
+    });
+    services.push(service);
+    await service.bootstrap();
+    for (const icon of ["light", "dark", "light"] as const) {
+      assert.equal((await service.setGeneralSettings(true, "ask", true, true, icon)).generalSettings.dockIcon, icon);
+    }
+    await waitForText(join(root, "diagnostics", "runtime.jsonl"), "dock_icon_applied");
+    const events = (await readFile(join(root, "diagnostics", "runtime.jsonl"), "utf8")).split("\n")
+      .filter((line) => line.includes("dock_icon"))
+      .map((line) => (JSON.parse(line) as { event: string }).event);
+    assert.deepEqual(events, ["dock_icon_not_applied", "dock_icon_failed", "dock_icon_applied"]);
+    assert.equal((await readFile(join(root, "diagnostics", "runtime.jsonl"), "utf8")).includes("secret"), false, "no error text or path is kept");
+  });
+
   it("persists nickname, copied avatar, and general settings across restart", async () => {
     const root = await mkdtemp(join(tmpdir(), "guild-live-service-profile-"));
     const workspace = join(root, "Workspace");

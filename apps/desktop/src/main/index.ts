@@ -195,9 +195,7 @@ app.whenReady().then(async () => {
         ...(devHooks.geminiCliRoot === undefined ? {} : { geminiCliRoot: devHooks.geminiCliRoot }),
         defaultKeyFile,
         confirmEngineKey: confirmHost,
-        applyDockIcon: (icon) => {
-          dockIcons.apply(icon);
-        },
+        applyDockIcon: (icon) => dockIcons.apply(icon),
         appVersion: app.getVersion(),
         databasePath: join(app.getPath("userData"), "guild.sqlite3"),
         initialLocale: app.getLocale().toLowerCase().startsWith("zh") ? "zh-CN" : "en-US",
