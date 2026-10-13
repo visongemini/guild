@@ -63,6 +63,22 @@ test("each status has its own line, with the command Terminal needs for a missin
   assert.match(EN.enginesAddonIntro("codex"), /no API key field/u);
 });
 
+test("an add-on install that others could change names its path and offers no command to run [PC-SEC-001]", () => {
+  const path = "/usr/local/lib/node_modules/@agentclientprotocol/codex-acp";
+  const status = addonStatusOf({ status: "install_not_private", installPath: path });
+  assert.deepEqual(status, { state: "install_not_private", installPath: path });
+  const shown = addonStatusText(EN, "codex", status!);
+  assert.ok(shown.text.includes(path));
+  assert.match(shown.text, /Codex from/u);
+  assert.match(shown.text, /someone other than you/u);
+  assert.equal(shown.command, undefined);
+  const chinese = addonStatusText(ZH, "codex", status!);
+  assert.ok(chinese.text.includes(path));
+  assert.match(chinese.text, /Codex/u);
+  assert.match(chinese.text, /除你本人之外还有人可能改动/u);
+  assert.equal(addonStatusText(EN, "codex", { state: "install_not_private" }).text, EN.addonStatusUnavailable("codex"));
+});
+
 test("the default-model control lists Codex's own models and the efforts of the stored one, strongest first", () => {
   const none = addonDefaultsView({ catalog: CODEX, model: null, reasoningEffort: null });
   assert.deepEqual(none.models.map((model) => model.id), ["gpt-6.1-sol", "gpt-6-luna"]);

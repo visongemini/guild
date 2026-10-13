@@ -15,6 +15,13 @@ export const CLAUDE_LOGIN_REQUIRED = "claude_login_required";
  */
 export const ENGINE_INTEGRITY_CHANGED = "engine_integrity_changed";
 /**
+ * PC-SEC-001, PC-ENG-002, PC-ENG-003: a file Guild would run in place for the Claude or Codex engine (the claude binary, the
+ * adapter package, the Codex core) or a folder above it is owned by someone else or writable by group or others, so Guild
+ * refuses to start it. Settings > Engines names the path and says that only the user may be able to change it
+ * (`claudeStatusInstallNotPrivate`, `addonStatusInstallNotPrivate`); the error carries no path.
+ */
+export const ENGINE_INSTALL_NOT_PRIVATE = "engine_install_not_private";
+/**
  * PC-ENG-002: Claude did not answer within its start window (the adapter, the claude binary, plugins
  * and connectors can take minutes under load). Nothing was lost: the task keeps its session id and
  * the next send resumes it. The wording is `claudeStartTimeout`.
@@ -78,7 +85,8 @@ export function toDesktopIpcFailure(cause: unknown): Error {
     message === MODEL_ROUTER_UNAVAILABLE ||
     message === MODEL_SELECTION_FAILED ||
     message === CLAUDE_DEFAULT_MUST_BE_NATIVE ||
-    message === ENGINE_INTEGRITY_CHANGED
+    message === ENGINE_INTEGRITY_CHANGED ||
+    message === ENGINE_INSTALL_NOT_PRIVATE
   ) {
     return new Error(message);
   }

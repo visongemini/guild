@@ -46,6 +46,9 @@ export type ModelPickerProps = Readonly<{
   claudeState?: ClaudeStatusState;
   /** Codex's state, when the main process reports one (the ChatGPT group); the same rules as `claudeState`. */
   codexState?: ClaudeStatusState;
+  /** The path an `install_not_private` state names, shown in the unavailable text of the Claude and ChatGPT groups. */
+  claudeInstallPath?: string;
+  codexInstallPath?: string;
   /** A switch between a Claude model and an Online / Local one is running for this task (D-062): the trigger says so. */
   switching?: boolean;
   /**
@@ -110,6 +113,8 @@ export function ModelPicker({
   engineFixed,
   claudeState,
   codexState,
+  claudeInstallPath,
+  codexInstallPath,
   switching = false,
   modalOpen = false,
   onApply,
@@ -140,6 +145,8 @@ export function ModelPicker({
     ...(olderOpen === undefined ? {} : { olderExpanded: olderOpen }),
     ...(claudeState === undefined ? {} : { claudeState }),
     ...(codexState === undefined ? {} : { codexState }),
+    ...(claudeInstallPath === undefined ? {} : { claudeInstallPath }),
+    ...(codexInstallPath === undefined ? {} : { codexInstallPath }),
   });
   const locked = pickerIsLocked(view.disabledReason);
   const panelOpen = open && !locked;

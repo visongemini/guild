@@ -96,6 +96,23 @@ created and never changes. Process topology stays one engine process per task (D
   in a directory others can write between the check and the first run therefore makes the staging fail instead of run. An unpackaged development run keeps the old `PATH` search and skips the checks (the QA scripts
   need it); only the main process switches that on, and only when `app.isPackaged` is false. A node or adapter the
   checks refuse reads as not found.
+- Staging root (D-070): the directory those copies live in (`<temp>/guild-v2-runtime`, shared with Grok's) is checked by
+  one rule when it is created and again before every stage and every spawn: a real directory, owned by the current user,
+  mode 0700 (looser but ours: tightened; not ours or a link: refused), in a parent that is owned by the user or root and
+  not writable by group or others unless sticky. A refusal names `staging_root_unsafe` and nothing is copied or run.
+- Private install (D-070): what a launch runs in place cannot be copied (the `claude` binary keeps its keychain and
+  auto-update behaviour where it is; `node` loads the adapter package in place; the Codex adapter spawns the native core
+  and its helpers), so a packaged app requires that nobody but the user and root can rewrite it: the real path, every
+  folder above it, and every entry of the adapter packages (with their `node_modules`, following links that leave them)
+  and of the Codex core's `vendor/<triple>` folder must be owned by the current user or root and writable by neither
+  group nor others. There is **no** `admin`-group or sticky exemption here; `node` alone keeps the Homebrew allowance,
+  because it runs from its verified staged copy. The locators skip a candidate that fails it and, when no other exists,
+  report `install_not_private` with the path; the launch repeats the check in `verifyBeforeSpawn` (before the pin is read),
+  so it is proven right before each spawn. Settings > Engines then reads "Guild will not run Claude Code from <path>: that
+  location, or a folder above it, may be changeable by someone other than you. Guild only runs engine files that only you
+  can change ...", the picker's group says the same, and a send fails with `engine_install_not_private` (no path in the
+  error). A development run skips the rule. On a Mac where Homebrew owns the prefix (`drwxrwxr-x user admin`) the engines
+  must be installed under the user's home (`~/.local`, `~/.npm-global`).
 - Env (allowlist + Guild-owned values): PATH, HOME, USER, LOGNAME (claude looks up its Keychain login by account name; without USER it reports "not logged in" [WP-A smoke]), LANG/LC_*, TMPDIR, proxy vars, SSL vars,
   `NO_PROXY=127.0.0.1,localhost` (always), `CLAUDE_CODE_EXECUTABLE=<pinned claude>`. Strip every
   inherited `ANTHROPIC_*` and `CLAUDE_CODE_*` variable first. Do NOT inject the Grok OpenViking

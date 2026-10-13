@@ -14,8 +14,9 @@ import {
   type ClaudeAdapterPin,
   type CodexAdapterPin,
 } from "./adapter-pin.js";
-import { verifyCodexCorePin, type CodexCorePin } from "./codex-core-pin.js";
+import { codexCoreInstallRoot, verifyCodexCorePin, type CodexCorePin } from "./codex-core-pin.js";
 import { isMachOExecutableFile } from "./executable-pin.js";
+import { assertPrivateInstall, type PrivateInstallIo } from "./private-install.js";
 import {
   GROK_ACP_PRODUCTION_ARGV,
   createGrokAcpProductionArgv,
@@ -92,6 +93,12 @@ export type ClaudeLaunch = Readonly<{
   /** Real path of the located `claude` binary; becomes CLAUDE_CODE_EXECUTABLE. */
   claudeExecutablePath: string;
   /**
+   * A packaged app sets this: the `claude` binary and the adapter package run where they are, so before every spawn
+   * their real paths, every folder above them and every entry of the package must be owned by the user or root and
+   * writable by neither group nor others (`private-install.ts`). Absent in a development run.
+   */
+  privateInstall?: PrivateInstallRule;
+  /**
    * Per-spawn variables of a routed session (see `CLAUDE_PER_SPAWN_ENVIRONMENT`). Keys outside the profile
    * allowlist are rejected.
    */
@@ -103,7 +110,12 @@ export type CodexLaunch = Readonly<{
   adapter: CodexAdapterPin;
   /** The Codex core the adapter ships; becomes CODEX_PATH, so the checked file is the one that runs. */
   core: CodexCorePin;
+  /** As for Claude: the core's folder and the adapter package must be private to the user before every spawn. */
+  privateInstall?: PrivateInstallRule;
 }>;
+
+/** `required` is what a packaged app passes; `io` replaces the owner and mode source, for tests. */
+export type PrivateInstallRule = Readonly<{ required: true; io?: PrivateInstallIo }>;
 
 export type EngineLaunch = GrokLaunch | ClaudeLaunch | CodexLaunch;
 
@@ -440,6 +452,13 @@ export const CLAUDE_ENGINE_PROFILE: EngineProfile = Object.freeze({
         ...(claude.extraEnvironment === undefined ? {} : { extraEnvironment: claude.extraEnvironment }),
       }),
       verifyBeforeSpawn: async () => {
+        // First: nothing here is read or hashed, let alone run, from files that others could rewrite.
+        if (claude.privateInstall?.required === true) {
+          await assertPrivateInstall(
+            { files: [claude.claudeExecutablePath], trees: [claude.adapter.packageRoot] },
+            claude.privateInstall.io,
+          );
+        }
         await verifyClaudeAdapterPin(claude.adapter);
         await verifyClaudeExecutable(claude.claudeExecutablePath);
       },
@@ -481,6 +500,12 @@ export const CODEX_ENGINE_PROFILE: EngineProfile = Object.freeze({
         fixedValues: { CODEX_PATH: codex.core.executablePath },
       }),
       verifyBeforeSpawn: async () => {
+        if (codex.privateInstall?.required === true) {
+          await assertPrivateInstall(
+            { files: [codex.core.executablePath], trees: [codex.adapter.packageRoot, codexCoreInstallRoot(codex.core)] },
+            codex.privateInstall.io,
+          );
+        }
         await verifyCodexAdapterPin(codex.adapter);
         await verifyCodexCorePin(codex.core);
       },

@@ -35,6 +35,11 @@ export function addonStatusText(
     case "not_logged_in": return Object.freeze({ text: messages.addonStatusNotLoggedIn(engine), command: messages.addonLoginCommand(engine) });
     case "unavailable": return Object.freeze({ text: messages.addonStatusUnavailable(engine) });
     case "integrity_changed": return Object.freeze({ text: messages.addonStatusIntegrityChanged(engine) });
+    case "install_not_private": return Object.freeze({
+      text: status.installPath === undefined
+        ? messages.addonStatusUnavailable(engine)
+        : messages.addonStatusInstallNotPrivate(engine, status.installPath),
+    });
   }
 }
 

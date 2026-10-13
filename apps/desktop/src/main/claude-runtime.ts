@@ -6,12 +6,14 @@ import {
   type AcpV1AdapterSink,
   type AcpV1ProcessPort,
   type EngineProcessHostOptions,
+  type PrivateInstallRule,
   type ProcessHostEvent,
 } from "@guild/runtime-grok";
 import {
   ClaudeEngineIntegrityError,
   invalidateClaudeLocatorCache,
   locateClaudeEngine,
+  privateInstallRuleForLaunch,
   unexpectedEngineChange,
   type LocatedClaudeEngine,
 } from "./claude-locator.js";
@@ -50,6 +52,8 @@ export type ClaudeRuntimeDependencies = Readonly<{
   invalidateLocatorCache?: () => void;
   createHost?: (options: EngineProcessHostOptions) => EngineProcessHost;
   baseEnvironment?: () => Promise<Readonly<Record<string, string | undefined>>>;
+  /** The private-install rule of the launch; defaults to the packaged app's (on) and a development run's (absent). */
+  privateInstallRule?: () => PrivateInstallRule | undefined;
 }>;
 
 export type ClaudeRuntime = Readonly<{
@@ -61,6 +65,11 @@ export type ClaudeRuntime = Readonly<{
    * every failed start the same way, so the owner asks here to name the reason.
    */
   refusedForIntegrity: () => boolean;
+  /**
+   * The file or folder that made the process refuse to start because someone other than the user could change it
+   * (packaged apps only); undefined otherwise. The adapter reports every failed start the same way, so the owner asks here.
+   */
+  refusedForInstall: () => string | undefined;
 }>;
 
 export async function createClaudeRuntime(
@@ -84,10 +93,12 @@ export async function createClaudeRuntime(
           profile: CLAUDE_ENGINE_PROFILE,
         }),
         refusedForIntegrity: () => true,
+        refusedForInstall: () => undefined,
       });
     }
     throw cause;
   }
+  const privateInstall = (dependencies.privateInstallRule ?? privateInstallRuleForLaunch)();
   const buildHost = (engine: LocatedClaudeEngine): EngineProcessHost => {
     const options: EngineProcessHostOptions = {
       profile: CLAUDE_ENGINE_PROFILE,
@@ -95,6 +106,7 @@ export async function createClaudeRuntime(
         engine: "claude",
         adapter: engine.adapter,
         claudeExecutablePath: engine.claude.executablePath,
+        ...(privateInstall === undefined ? {} : { privateInstall }),
         ...(input.extraEnvironment === undefined ? {} : { extraEnvironment: input.extraEnvironment }),
       },
       executablePath: engine.node.executablePath,
@@ -128,6 +140,7 @@ export async function createClaudeRuntime(
     }),
     runtimeVersion: `Claude Code ${located.claude.version}`,
     refusedForIntegrity: () => process.refusal !== undefined,
+    refusedForInstall: () => process.installPath,
   });
 }
 
@@ -157,6 +170,8 @@ export class RelocatingEngineProcess implements AcpV1ProcessPort {
   private relocated = false;
   /** Set when the pieces changed without an update; the process never starts after that. */
   refusal: ClaudeEngineIntegrityError | undefined;
+  /** Set when a start was refused because someone other than the user could change the engine's files. */
+  installPath: string | undefined;
   private readonly listeners = new Set<(event: ProcessHostEvent) => void>();
 
   constructor(
@@ -179,6 +194,7 @@ export class RelocatingEngineProcess implements AcpV1ProcessPort {
     try {
       return await this.host.start();
     } catch (cause: unknown) {
+      this.noteInstallRefusal(cause);
       if (this.relocated || !isRelocatablePreflightFailure(cause)) throw cause;
       this.relocated = true;
       this.unsubscribe();
@@ -189,13 +205,32 @@ export class RelocatingEngineProcess implements AcpV1ProcessPort {
         throw relocation;
       }
       this.unsubscribe = this.attach(this.host);
-      return this.host.start();
+      return this.host.start().catch((later: unknown) => {
+        this.noteInstallRefusal(later);
+        throw later;
+      });
     }
   };
 
   readonly stop = () => this.host.stop();
   readonly waitForTermination = () => this.host.waitForTermination();
   readonly write = (data: string | Uint8Array) => this.host.write(data);
+
+
+  /**
+   * Remembers the path of a launch that was refused because the engine's files are not private to the user, so the
+   * owner can name it: the adapter reports every failed start alike and keeps no cause.
+   */
+  private noteInstallRefusal(cause: unknown): void {
+    if (
+      cause instanceof GrokProcessHostError &&
+      cause.failure.type === "preflight_failure" &&
+      cause.failure.code === "install_not_private" &&
+      cause.failure.path !== undefined
+    ) {
+      this.installPath = cause.failure.path;
+    }
+  }
 
   private attach(host: EngineProcessHost): () => void {
     return host.onEvent((event) => {

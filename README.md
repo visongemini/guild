@@ -140,7 +140,9 @@ Apple Silicon users can download `Guild-2.2.1-arm64.dmg` from GitHub Releases. T
 build is not Apple-notarized; on first launch, use Finder's **Open** context-menu action and
 confirm macOS's warning. An installed Guild looks for `node`, the adapters and `claude` only in fixed places (`~/.local/bin`, `~/.npm-global/bin`, the Homebrew and
 system directories, and the newest releases of nvm, Volta, asdf, fnm and mise): it does not read the `PATH` it was started with and does not
-use a file that others can write or that sits in a temporary directory.
+use a file that others can write or that sits in a temporary directory. The files it runs in place (`claude`, the adapter packages and the Codex core)
+must also be owned by you or root and writable by neither group nor others, with every folder above them: a Homebrew prefix that the admin group can write does not qualify,
+so install those under your home folder (Settings > Engines names the path when Guild refuses one).
 
 Building from source needs Node.js 24 and npm 11, plus at least one
 user-installed and logged-in engine: the official `grok` CLI, and/or `claude` (Claude Code) with the

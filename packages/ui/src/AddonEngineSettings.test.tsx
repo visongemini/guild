@@ -92,6 +92,12 @@ test("a missing adapter or login shows the command to run in Terminal and no cre
   for (const markup of [missing, loggedOut, render()]) {
     assert.doesNotMatch(markup, /<input|<textarea|type="password"/u, "no field takes a key or a password");
   }
+  // Files others could change: the path and the reason, nothing to run, and the state has its own look.
+  const shared = render({ settings: { status: "install_not_private", installPath: "/usr/local/lib/node_modules/@agentclientprotocol/codex-acp" } });
+  assert.match(shared, /class="guild-engine-status install_not_private"/u);
+  assert.match(shared, /\/usr\/local\/lib\/node_modules\/@agentclientprotocol\/codex-acp/u);
+  assert.match(shared, /someone other than you/u);
+  assert.doesNotMatch(shared, /guild-engine-command/u);
   // Integrity: the text only, nothing to run.
   const changed = render({ settings: { status: "integrity_changed" } });
   assert.match(changed, /restart Guild to accept updated engine files/u);

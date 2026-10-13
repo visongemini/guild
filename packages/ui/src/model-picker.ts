@@ -326,6 +326,8 @@ function groupEmptyView(
   claudeState: ClaudeStatusState | undefined,
   codexAvailable = true,
   codexState?: ClaudeStatusState,
+  claudeInstallPath?: string,
+  codexInstallPath?: string,
 ): ModelGroupEmptyView {
   if (group === "online" || group === "local") {
     return Object.freeze({
@@ -338,12 +340,16 @@ function groupEmptyView(
     if (codexAvailable) {
       return Object.freeze({ kind: "not_started", text: messages.modelPickerAddonNotStarted(CODEX_ENGINE) });
     }
-    return codexState === "unavailable" || codexState === "integrity_changed"
+    return codexState === "unavailable" || codexState === "integrity_changed" || codexState === "install_not_private"
       ? Object.freeze({
           kind: "claude_unavailable",
           text: codexState === "unavailable"
             ? messages.addonStatusUnavailable(CODEX_ENGINE)
-            : messages.addonStatusIntegrityChanged(CODEX_ENGINE),
+            : codexState === "install_not_private"
+              ? codexInstallPath === undefined
+                ? messages.addonStatusUnavailable(CODEX_ENGINE)
+                : messages.addonStatusInstallNotPrivate(CODEX_ENGINE, codexInstallPath)
+              : messages.addonStatusIntegrityChanged(CODEX_ENGINE),
         })
       : Object.freeze({
           kind: "claude_unavailable",
@@ -354,10 +360,16 @@ function groupEmptyView(
   if (group === "claude" && !claudeAvailable) {
     // "Not found or not logged in" is only true when nothing says otherwise; a Claude Code that is
     // installed but cannot run (for example an unsupported adapter) gets the generic wording.
-    return claudeState === "unavailable" || claudeState === "integrity_changed"
+    return claudeState === "unavailable" || claudeState === "integrity_changed" || claudeState === "install_not_private"
       ? Object.freeze({
           kind: "claude_unavailable",
-          text: claudeState === "unavailable" ? messages.claudeStatusUnavailable : messages.claudeStatusIntegrityChanged,
+          text: claudeState === "unavailable"
+            ? messages.claudeStatusUnavailable
+            : claudeState === "install_not_private"
+              ? claudeInstallPath === undefined
+                ? messages.claudeStatusUnavailable
+                : messages.claudeStatusInstallNotPrivate(claudeInstallPath)
+              : messages.claudeStatusIntegrityChanged,
         })
       : Object.freeze({
           kind: "claude_unavailable",
@@ -389,6 +401,9 @@ export function modelPickerView(input: {
   readonly claudeState?: ClaudeStatusState;
   /** Codex's state, when the main process reports one; the same rules as `claudeState` for the ChatGPT group. */
   readonly codexState?: ClaudeStatusState;
+  /** The path named by `install_not_private`, for the unavailable text of the Claude and ChatGPT groups. */
+  readonly claudeInstallPath?: string;
+  readonly codexInstallPath?: string;
   /** A cross-mode switch (Claude model to Online / Local or back) of this task is running (D-062). */
   readonly switching?: boolean;
   /**
@@ -569,7 +584,16 @@ export function modelPickerView(input: {
             }),
           }),
       ...(entry.catalogRows === 0
-        ? { empty: groupEmptyView(messages, entry.group, claudeAvailable, input.claudeState, codexAvailable, input.codexState) }
+        ? { empty: groupEmptyView(
+          messages,
+          entry.group,
+          claudeAvailable,
+          input.claudeState,
+          codexAvailable,
+          input.codexState,
+          input.claudeInstallPath,
+          input.codexInstallPath,
+        ) }
         : {}),
     });
   });

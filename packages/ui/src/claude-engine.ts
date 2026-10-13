@@ -10,17 +10,25 @@ import { MODEL_PICKER_SEPARATOR, effortsDescending, globalDefaultView } from "./
  * what the main process supplies; Guild never reads a Claude credential.
  */
 
-export type ClaudeStatusState = "ready" | "not_found" | "not_logged_in" | "unavailable" | "integrity_changed";
+export type ClaudeStatusState = "ready" | "not_found" | "not_logged_in" | "unavailable" | "integrity_changed" | "install_not_private";
 
 export type ClaudeStatusView = Readonly<{
   state: ClaudeStatusState;
   /** The plan label the adapter reported, for example "Claude Max". Never an email address. */
   accountLabel?: string;
   version?: string;
+  /** With `install_not_private`: the absolute path that someone other than the user may be able to change. */
+  installPath?: string;
 }>;
 
-const STATUS_STATES: readonly string[] = ["ready", "not_found", "not_logged_in", "unavailable", "integrity_changed"];
+const STATUS_STATES: readonly string[] = ["ready", "not_found", "not_logged_in", "unavailable", "integrity_changed", "install_not_private"];
 const MAX_LABEL = 80;
+const MAX_PATH = 1024;
+
+function plainPath(value: unknown): string | undefined {
+  if (typeof value !== "string" || value.length === 0 || value.length > MAX_PATH || !value.startsWith("/")) return undefined;
+  return /[\u0000-\u001F\u007F]/u.test(value) ? undefined : value;
+}
 
 function plainLabel(value: unknown): string | undefined {
   if (typeof value !== "string") return undefined;
@@ -34,8 +42,8 @@ function plainLabel(value: unknown): string | undefined {
 
 /**
  * Reads `runtimeSettings.claude` defensively. The contract lists only the defaults today; the main
- * process adds `status` ("ready" | "not_found" | "not_logged_in" | "unavailable" | "integrity_changed"), `accountLabel`
- * and `version` as optional strings. Anything else, or nothing, yields `undefined` and the UI then
+ * process adds `status` ("ready" | "not_found" | "not_logged_in" | "unavailable" | "integrity_changed" |
+ * "install_not_private"), `accountLabel`, `version` and, for the last status, `installPath` as optional strings. Anything else, or nothing, yields `undefined` and the UI then
  * falls back to what it can see (an empty Claude catalog).
  */
 export function claudeStatusOf(claude: unknown): ClaudeStatusView | undefined {
@@ -45,10 +53,12 @@ export function claudeStatusOf(claude: unknown): ClaudeStatusView | undefined {
   if (typeof state !== "string" || !STATUS_STATES.includes(state)) return undefined;
   const accountLabel = plainLabel(record["accountLabel"]);
   const version = plainLabel(record["version"]);
+  const installPath = state === "install_not_private" ? plainPath(record["installPath"]) : undefined;
   return Object.freeze({
     state: state as ClaudeStatusState,
     ...(accountLabel === undefined ? {} : { accountLabel }),
     ...(version === undefined ? {} : { version }),
+    ...(installPath === undefined ? {} : { installPath }),
   });
 }
 
@@ -138,5 +148,8 @@ export function claudeStatusText(messages: GuildMessages, status: ClaudeStatusVi
     case "not_logged_in": return messages.claudeStatusNotLoggedIn;
     case "unavailable": return messages.claudeStatusUnavailable;
     case "integrity_changed": return messages.claudeStatusIntegrityChanged;
+    // Without a path the main process sent nothing to name; the generic unavailable text says no more than that.
+    case "install_not_private":
+      return status.installPath === undefined ? messages.claudeStatusUnavailable : messages.claudeStatusInstallNotPrivate(status.installPath);
   }
 }

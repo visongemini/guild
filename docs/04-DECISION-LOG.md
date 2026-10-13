@@ -1351,3 +1351,42 @@ Consequences
   - D-067 and D-068 stay in the log as the record of what was decided and reviewed; their Gemini parts are marked withdrawn.
     The branch history still holds the design, the spike findings and the three security reviews.
 - Requirements: PC-ENG-001, PC-ENG-002, PC-ENG-003, PC-MODEL-001, PC-SET-002.
+
+## D-070 — Guild 3.1: the staging root is the user's alone, and what runs in place must be private to the user
+
+- Date: 2026-10-13
+- Status: accepted
+- Context: a second review of the locator work (D-068, D-069) found two P1 weaknesses.
+  (a) The directory that Grok, `node` and the probe copy of `claude` are copied into was only checked to be a directory, and the callers
+  made it with a bare `mkdir`. Where the temp directory is a shared `/tmp`, another account could create `guild-v2-runtime` first, or
+  replace it after a copy was verified, and the verified copy would not be what runs.
+  (b) The Claude launch runs the original `claude` binary (the adapter gets its path as `CLAUDE_CODE_EXECUTABLE`) and `node` loads the
+  adapter package in place, and the Codex adapter and the native Codex core are run in place as well. The locator accepted a
+  directory that only the macOS `admin` group can write (a Homebrew prefix), so another administrator could swap a file after the
+  locate, and the launch only re-checked the path and the Mach-O magic.
+- Decision
+  - (a) One rule, `secureStagingRoot` (`packages/runtime-grok/src/staging-root.ts`), shared by every pin, so Grok, `node` and `claude`
+    all get it: the root is a real directory (a link or a file is refused), owned by the current user, mode 0700 (one that is ours but
+    looser is tightened and read back; one that is not ours is refused), and its parent is owned by the user or root and not writable by
+    group or others unless it has the sticky bit (as `/tmp` does). It runs when a stage is created and again inside every
+    `verifyForSpawn`, so a root swapped for a link after the copy was verified stops the spawn. Owner and mode come through an injectable
+    `StagingRootIo`, so the tests cover a root owned by someone else, a symlinked root, a 0777 root and a non-sticky world-writable parent.
+  - (b) No copy of `claude` is made for launches (how a moved native binary behaves with the keychain and auto-update is unproven).
+    Instead, in a packaged app, every file Guild launches or has `node` load that is not run from a verified staged copy must be private
+    to the user: the `claude` binary, the Claude adapter package (its `node_modules` included), the Codex adapter package, and the Codex
+    core with the folder it starts its helpers from. The real path of each, every folder above it and every entry of a package must be
+    owned by the current user or root and writable by neither group nor others, with **no** exemption for the `admin` group or for sticky
+    folders; links that leave a package are followed and judged the same way. `node` keeps the Homebrew allowance of D-068 because it runs
+    from its verified staged copy.
+  - The locators apply the rule as part of discovery: a candidate that fails is skipped like any untrusted one, and when nothing else is
+    found the locator reports `install_not_private` with the path instead of "not found". The launch repeats the check in
+    `verifyBeforeSpawn`, before the pin is read, so it runs right before each spawn. A development run (unpackaged, switched on by the
+    main process) skips it, as it skips the other trust rules.
+  - Settings > Engines (and the picker's empty group) shows `install_not_private` with the path and says that only the user may be able to
+    change it; the send fails with the code `engine_install_not_private`, which carries no path. The status clears when the install is
+    private again (the probe re-checks, and a session that starts clears it).
+  - Not covered, stated plainly: access control lists are not read (owner and mode bits only, as before); the check cannot make the
+    check-to-exec window zero (it makes sure nobody but the user and root could have written during it); a dependency that a package
+    resolves from a folder outside the package (a hoisted `node_modules`) is judged only through the package's links and the Codex core's
+    own folder, not as a whole.
+- Requirements: PC-ENG-002, PC-ENG-003, PC-SEC-001.

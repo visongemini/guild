@@ -101,6 +101,10 @@ Claude-only machinery (router, native and routed processes, `modelPicker`, OpenV
   neighbouring `codex-package.json` (never by running it). It is pinned by real path, version and size (241 MB is not
   hashed at every spawn, like the 200 MB `claude`), handed to the adapter as `CODEX_PATH`, so the binary Guild checked is
   the binary that runs. A locate after a failed check accepts a core only when the adapter's version changed.
+  In a packaged app the core, the `vendor/<triple>` folder it starts its helpers from (`codex-path`, `codex-resources`),
+  every folder above them and the whole adapter package must be private to the user (owned by the user or root, writable by
+  neither group nor others, no `admin` exemption), at locate time and again right before each spawn (D-070,
+  `docs/20` section 3.2); otherwise Codex shows `install_not_private` with the path.
 - Environment: the Claude allowlist (PATH, LANG, LC_*, TMPDIR, proxy and SSL variables, `USER`, `LOGNAME`;
   `NO_PROXY=127.0.0.1,localhost` always), no inherited `CODEX_*` or `OPENAI_*` variable, so `CODEX_HOME` is never
   redirected and no API key can reach the adapter. Guild-owned values: `CODEX_PATH`, `OPENVIKING_AUTO_RECALL=false`,

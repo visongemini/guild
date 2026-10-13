@@ -1750,6 +1750,66 @@ describe("dual engine orchestration [PC-ENG-001, PC-MODEL-001]", () => {
     assert.equal((await h.service.bootstrap()).runtimeSettings.claude?.status, "ready");
   });
 
+  it("names the path when the Claude install could be changed by others: from the probe, from the locator at start, and from the launch check [PC-SEC-001]", async () => {
+    const path = "/opt/homebrew/lib/node_modules/@agentclientprotocol/claude-agent-acp";
+    const probed = await harness({
+      claudeEngineProbe: async () => { throw new ClaudeLocatorError("install_not_private", undefined, path); },
+    });
+    const shared = await eventuallyValue(async () => {
+      const claude = (await probed.service.bootstrap()).runtimeSettings.claude;
+      return claude?.status === "install_not_private" ? claude : undefined;
+    });
+    assert.equal(shared.installPath, path);
+    // Any other locator error stays "not found", and no path rides along.
+    const missing = await harness({ claudeEngineProbe: async () => { throw new ClaudeLocatorError("claude_missing"); } });
+    await eventually(async () => (await missing.service.bootstrap()).runtimeSettings.claude?.status === "not_found");
+    assert.equal((await missing.service.bootstrap()).runtimeSettings.claude?.installPath, undefined);
+
+    // The locator refuses at start: the same status with the path, and the IPC code that carries none.
+    const located = await harness({
+      runtimeFactory: async () => { throw new ClaudeLocatorError("install_not_private", undefined, path); },
+    });
+    const task = await located.service.createTask(located.workspaceId, undefined, "claude");
+    const refused = await located.send(task.task.taskId, "x").then(() => undefined, (cause: unknown) => cause);
+    assert.match(String(refused), /^Error: engine_install_not_private$/u);
+    assert.equal(toDesktopIpcFailure(refused).message, "engine_install_not_private", "the code survives the IPC allowlist");
+    assert.equal(String(refused).includes(path), false, "the error carries no path");
+    const after = (await located.service.bootstrap()).runtimeSettings.claude;
+    assert.equal(after?.status, "install_not_private");
+    assert.equal(after?.installPath, path);
+  });
+
+  it("refuses a Claude start whose launch check found files others could change, names the path and the IPC code, then recovers [PC-SEC-001]", async () => {
+    const path = "/Users/me/.local/share/claude/versions/2.1.296";
+    const world = newWorld();
+    const base = engineFactory(world, {});
+    let refuse = true;
+    const h = await harness({
+      runtimeFactory: async (input) => {
+        const created = await base(input);
+        if (input.engine !== "claude" || !refuse) return created;
+        // The real process port fails its start and remembers why; the adapter reports it as a plain failure.
+        (created.adapter as EngineFake).start = async () => { throw new AcpV1AdapterError("operation_failed"); };
+        return { ...created, refusedForInstall: () => path };
+      },
+    });
+    const task = await h.service.createTask(h.workspaceId, undefined, "claude");
+    const refused = await h.send(task.task.taskId, "x").then(() => undefined, (cause: unknown) => cause);
+    assert.match(String(refused), /^Error: engine_install_not_private$/u);
+    assert.equal(toDesktopIpcFailure(refused).message, "engine_install_not_private");
+    const claude = (await h.service.bootstrap()).runtimeSettings.claude;
+    assert.equal(claude?.status, "install_not_private");
+    assert.equal(claude?.installPath, path);
+    assert.equal(world.adapters[0]!.prompts.length, 0, "nothing was run");
+
+    refuse = false;
+    await h.send(task.task.taskId, "again");
+    await h.completed();
+    const recovered = (await h.service.bootstrap()).runtimeSettings.claude;
+    assert.equal(recovered?.status, "ready");
+    assert.equal(recovered?.installPath, undefined, "the path goes with the state");
+  });
+
   it("shows the permission mode of a Claude session as its session mode [PC-SET-002]", async () => {
     const h = await harness();
     await h.service.setClaudeSettings(null, null, "plan");
@@ -2961,6 +3021,56 @@ describe("Codex engine orchestration [PC-ENG-003]", () => {
     const failingTask = await failing.service.createTask(failing.workspaceId, undefined, "codex");
     await assert.rejects(failing.send(failingTask.task.taskId, "x"), /runtime_start_runtime_factory/u);
     assert.equal((await codexSettings(failing))?.status, "not_found");
+  });
+
+  it("names the path when the Codex install could be changed by others, from the probe, the locator and the launch check [PC-SEC-001]", async () => {
+    const path = "/usr/local/lib/node_modules/@agentclientprotocol/codex-acp";
+    const probed = await harness({
+      addonEngineProbes: { codex: async () => { throw new CodexLocatorError("install_not_private", undefined, path); } },
+    });
+    const shared = await eventuallyValue(async () => {
+      const codex = await codexSettings(probed);
+      return codex?.status === "install_not_private" ? codex : undefined;
+    });
+    assert.equal(shared.installPath, path);
+
+    const located = await harness({
+      runtimeFactory: async (input) => {
+        if (input.engine === "codex") throw new CodexLocatorError("install_not_private", undefined, path);
+        throw new Error("unexpected");
+      },
+    });
+    const task = await located.service.createTask(located.workspaceId, undefined, "codex");
+    const refused = await located.send(task.task.taskId, "x").then(() => undefined, (cause: unknown) => cause);
+    assert.match(String(refused), /^Error: engine_install_not_private$/u);
+    assert.equal(toDesktopIpcFailure(refused).message, "engine_install_not_private");
+    const after = await codexSettings(located);
+    assert.equal(after?.status, "install_not_private");
+    assert.equal(after?.installPath, path);
+    assert.equal((await located.service.bootstrap()).runtimeSettings.claude?.status, undefined, "Claude's state is its own");
+
+    // The launch check names the core's folder the same way, and a later private start clears it.
+    const world = newWorld();
+    const base = engineFactory(world, {});
+    let refuse = true;
+    const launched = await harness({
+      runtimeFactory: async (input) => {
+        const created = await base(input);
+        if (input.engine !== "codex" || !refuse) return created;
+        (created.adapter as EngineFake).start = async () => { throw new AcpV1AdapterError("operation_failed"); };
+        return { ...created, refusedForInstall: () => path };
+      },
+    });
+    const second = await launched.service.createTask(launched.workspaceId, undefined, "codex");
+    await assert.rejects(launched.send(second.task.taskId, "x"), /engine_install_not_private/u);
+    assert.equal((await codexSettings(launched))?.installPath, path);
+    assert.equal(world.adapters[0]!.prompts.length, 0, "nothing was run");
+    refuse = false;
+    await launched.send(second.task.taskId, "again");
+    await launched.completed();
+    const recovered = await codexSettings(launched);
+    assert.equal(recovered?.status, "ready");
+    assert.equal(recovered?.installPath, undefined);
   });
 
   it("refuses a Codex start whose pinned files changed, names the reduced state and the IPC code, then recovers [PC-ENG-003]", async () => {

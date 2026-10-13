@@ -48,6 +48,11 @@ test("names an add-on engine start that is still going on the same way (PC-ENG-0
     "engine_start",
   );
   assert.equal(classifyComposerSendFailure("engine_start_timeout"), "engine_start");
+  // PC-SEC-001: an engine whose files others could change is not started; the composer points to Settings > Engines.
+  assert.equal(
+    classifyComposerSendFailure(new Error("Error invoking remote method 'guild:v1:run:send': Error: engine_install_not_private")),
+    "engine_install",
+  );
   // A missing login is not a send failure the composer names: the error entry in the conversation says it.
   assert.equal(classifyComposerSendFailure(new Error("engine_login_required")), "runtime");
 });

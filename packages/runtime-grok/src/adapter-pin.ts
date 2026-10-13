@@ -22,7 +22,8 @@ export type AdapterPinFailureCode =
   | "adapter_missing"
   | "adapter_version_unsupported"
   | "claude_executable_invalid"
-  | "engine_core_invalid";
+  | "engine_core_invalid"
+  | "install_not_private";
 
 /** What distinguishes one adapter package from another: its name and the versions Guild runs. */
 export type AdapterPackageSpec = Readonly<{

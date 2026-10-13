@@ -22,6 +22,8 @@ export class RelocatingEngineProcess<Refusal extends Error> implements AcpV1Proc
   private relocated = false;
   /** Set when the pieces changed without an update; the process never starts after that. */
   refusal: Refusal | undefined;
+  /** Set when a start was refused because someone other than the user could change the engine's files. */
+  installPath: string | undefined;
   private readonly listeners = new Set<(event: ProcessHostEvent) => void>();
 
   constructor(
@@ -47,6 +49,7 @@ export class RelocatingEngineProcess<Refusal extends Error> implements AcpV1Proc
     try {
       return await this.host.start();
     } catch (cause: unknown) {
+      this.noteInstallRefusal(cause);
       if (this.relocated || !this.isRelocatablePreflightFailure(cause)) throw cause;
       this.relocated = true;
       this.unsubscribe();
@@ -57,13 +60,32 @@ export class RelocatingEngineProcess<Refusal extends Error> implements AcpV1Proc
         throw relocation;
       }
       this.unsubscribe = this.attach(this.host);
-      return this.host.start();
+      return this.host.start().catch((later: unknown) => {
+        this.noteInstallRefusal(later);
+        throw later;
+      });
     }
   };
 
   readonly stop = () => this.host.stop();
   readonly waitForTermination = () => this.host.waitForTermination();
   readonly write = (data: string | Uint8Array) => this.host.write(data);
+
+
+  /**
+   * Remembers the path of a launch that was refused because the engine's files are not private to the user, so the
+   * owner can name it: the adapter reports every failed start alike and keeps no cause.
+   */
+  private noteInstallRefusal(cause: unknown): void {
+    if (
+      cause instanceof GrokProcessHostError &&
+      cause.failure.type === "preflight_failure" &&
+      cause.failure.code === "install_not_private" &&
+      cause.failure.path !== undefined
+    ) {
+      this.installPath = cause.failure.path;
+    }
+  }
 
   private attach(host: EngineProcessHost): () => void {
     return host.onEvent((event) => {

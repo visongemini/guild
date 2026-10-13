@@ -229,6 +229,8 @@ export type GuildMessages = WorkshopMessages & ChangeMessages & {
   readonly claudeStatusNotLoggedIn: string;
   readonly claudeStatusUnavailable: string;
   readonly claudeStatusIntegrityChanged: string;
+  /** PC-SEC-001: Guild will not run Claude Code from a path others could change; names the path. */
+  readonly claudeStatusInstallNotPrivate: (path: string) => string;
   // Guild 3.1 add-on engines (Codex): the wording that depends on the engine, looked up by engine (PC-ENG-003, PC-SET-002)
   readonly addonEngineName: (engine: GuildAddonEngine) => string;
   readonly modelPickerAddonUnavailable: (engine: GuildAddonEngine) => string;
@@ -249,6 +251,8 @@ export type GuildMessages = WorkshopMessages & ChangeMessages & {
   readonly addonStatusNotLoggedIn: (engine: GuildAddonEngine) => string;
   readonly addonStatusUnavailable: (engine: GuildAddonEngine) => string;
   readonly addonStatusIntegrityChanged: (engine: GuildAddonEngine) => string;
+  /** PC-SEC-001: the same for an add-on engine; names the path. */
+  readonly addonStatusInstallNotPrivate: (engine: GuildAddonEngine, path: string) => string;
   readonly addonInstallCommand: (engine: GuildAddonEngine) => string;
   readonly addonLoginCommand: (engine: GuildAddonEngine) => string;
   readonly usageAddonHeading: (engine: GuildAddonEngine) => string;
@@ -374,6 +378,8 @@ export type GuildMessages = WorkshopMessages & ChangeMessages & {
   readonly runtimeUnavailable: string;
   /** Claude did not answer within its start window; the task keeps its session and the next send retries (docs/20 3.2). */
   readonly claudeStartTimeout: string;
+  /** The send failed because an engine's files are not private to the user; Settings > Engines names the path. */
+  readonly engineInstallNotPrivate: string;
   readonly workspaceFolderMissing: string;
   readonly messageTooLong: string;
   readonly sessionReplacementTitle: string;
@@ -922,6 +928,7 @@ const ZH_CN: GuildMessages = Object.freeze({
   claudeStatusNotLoggedIn: "尚未登录。请在终端运行一次 claude 完成登录。",
   claudeStatusUnavailable: "暂时无法使用，稍后再试。",
   claudeStatusIntegrityChanged: "Claude 引擎文件被意外改动，Guild 已拒绝运行。若是你刚更新了引擎，请重启 Guild 以接受更新后的引擎文件；否则请重新安装 claude-agent-acp。",
+  claudeStatusInstallNotPrivate: (path) => `Guild 不会运行位于 ${path} 的 Claude Code：这个位置或它上层的某个文件夹，除你本人之外还有人可能改动它。Guild 只运行只有你本人能改动的引擎文件。请去掉该路径及其上层文件夹的组和其他用户写权限，并把属主改为你自己；或把引擎重新安装到你的用户目录下。`,
   addonEngineName: (engine) => ZH_ADDON[engine].name,
   modelPickerAddonUnavailable: (engine) => ZH_ADDON[engine].pickerUnavailable,
   modelPickerAddonUnavailableHelp: (engine) => ZH_ADDON[engine].pickerUnavailableHelp,
@@ -939,6 +946,7 @@ const ZH_CN: GuildMessages = Object.freeze({
   addonStatusNotLoggedIn: () => "尚未登录。请在终端运行：",
   addonStatusUnavailable: () => "暂时无法使用，稍后再试。",
   addonStatusIntegrityChanged: (engine) => ZH_ADDON[engine].integrityChanged,
+  addonStatusInstallNotPrivate: (engine, path) => `Guild 不会运行位于 ${path} 的 ${ZH_ADDON[engine].name}：这个位置或它上层的某个文件夹，除你本人之外还有人可能改动它。Guild 只运行只有你本人能改动的引擎文件。请去掉该路径及其上层文件夹的组和其他用户写权限，并把属主改为你自己；或把引擎重新安装到你的用户目录下。`,
   addonInstallCommand: (engine) => ADDON_COMMANDS[engine].install,
   addonLoginCommand: (engine) => ADDON_COMMANDS[engine].login,
   usageAddonHeading: (engine) => ZH_ADDON[engine].usageHeading,
@@ -1114,6 +1122,7 @@ const ZH_CN: GuildMessages = Object.freeze({
   removeAttachment: (name) => `移除 ${name}`,
   runtimeUnavailable: "Grok 运行时暂时不可用",
   claudeStartTimeout: "Claude 仍在启动（插件和连接器可能需要一些时间）。请稍后再试一次。",
+  engineInstallNotPrivate: "Guild 没有启动这个引擎：它的文件不是只有你本人能改动。到“设置 > 引擎”查看具体路径和处理办法。",
   workspaceFolderMissing: "工作区文件夹已不存在。请重新选择该文件夹，或换一个仍在磁盘上的工作区。",
   messageTooLong: "这条消息太长，请删短后再发送。",
   sessionReplacementTitle: "原 Grok 会话无法继续",
@@ -1521,6 +1530,7 @@ const EN_US: GuildMessages = Object.freeze({
   claudeStatusNotLoggedIn: "Not logged in. Run `claude` once in Terminal and log in.",
   claudeStatusUnavailable: "Not available right now. Try again in a moment.",
   claudeStatusIntegrityChanged: "Claude engine files changed unexpectedly; restart Guild to accept updated engine files, or reinstall claude-agent-acp.",
+  claudeStatusInstallNotPrivate: (path) => `Guild will not run Claude Code from ${path}: that location, or a folder above it, may be changeable by someone other than you. Guild only runs engine files that only you can change. Remove group and other write access from that path and the folders above it and make yourself the owner, or reinstall the engine under your home folder.`,
   addonEngineName: (engine) => EN_ADDON[engine].name,
   modelPickerAddonUnavailable: (engine) => EN_ADDON[engine].pickerUnavailable,
   modelPickerAddonUnavailableHelp: (engine) => EN_ADDON[engine].pickerUnavailableHelp,
@@ -1538,6 +1548,7 @@ const EN_US: GuildMessages = Object.freeze({
   addonStatusNotLoggedIn: () => "Not logged in. Run this in Terminal:",
   addonStatusUnavailable: () => "Not available right now. Try again in a moment.",
   addonStatusIntegrityChanged: (engine) => EN_ADDON[engine].integrityChanged,
+  addonStatusInstallNotPrivate: (engine, path) => `Guild will not run ${EN_ADDON[engine].name} from ${path}: that location, or a folder above it, may be changeable by someone other than you. Guild only runs engine files that only you can change. Remove group and other write access from that path and the folders above it and make yourself the owner, or reinstall the engine under your home folder.`,
   addonInstallCommand: (engine) => ADDON_COMMANDS[engine].install,
   addonLoginCommand: (engine) => ADDON_COMMANDS[engine].login,
   usageAddonHeading: (engine) => EN_ADDON[engine].usageHeading,
@@ -1706,6 +1717,7 @@ const EN_US: GuildMessages = Object.freeze({
   removeAttachment: (name) => `Remove ${name}`,
   runtimeUnavailable: "The Grok runtime is temporarily unavailable",
   claudeStartTimeout: "Claude is still starting (plugins and connectors can take a while). Try again in a moment.",
+  engineInstallNotPrivate: "Guild did not start this engine: its files are not changeable by you alone. Settings > Engines shows the path and what to do.",
   workspaceFolderMissing: "The workspace folder is gone. Choose that folder again, or switch to a workspace that still exists.",
   messageTooLong: "That message is too long. Shorten it before sending.",
   sessionReplacementTitle: "The previous Grok session cannot continue",

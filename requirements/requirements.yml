@@ -1021,6 +1021,12 @@ requirements:
       and CLAUDE_CODE_ variable stripped. A packaged app never searches the PATH it was started
       with for node, the adapter or claude: it uses fixed directories and only files whose real path
       is trusted (not in a temporary directory, owned by the user or root, not writable by others).
+      The claude binary and the adapter package, which run where they are, must in a packaged app have
+      their real path, every folder above it and every entry of the package owned by the user or root and
+      writable by neither group nor others, with no administrator-group exemption, checked again right
+      before every spawn; otherwise the engine is refused with a status that names the path. The copies
+      of node and of the probe run from a staging directory that is the user's alone (not a link, owned by
+      the user, mode 0700, in a parent others cannot rewrite), checked before every stage and spawn.
       Guild never reads Claude credentials and never calls the adapter's authenticate method; a
       missing login is shown as a named reduced state.
     severity: P0
@@ -1038,7 +1044,9 @@ requirements:
       it. The adapter is pinned by a version range and a SHA-256 over its installed package.json and dist
       tree, its Codex core by real path, version and size, and a mismatch refuses to start with a named
       error. The same locator rules as the Claude engine apply: a packaged app never searches the PATH it
-      was started with. The child environment is an allowlist with no inherited CODEX_ or OPENAI_ variable, and
+      was started with, and the adapter package, the Codex core and the folder it starts its helpers from
+      must be private to the user (owned by the user or root, writable by neither group nor others, no
+      administrator-group exemption), checked again right before every spawn. The child environment is an allowlist with no inherited CODEX_ or OPENAI_ variable, and
       OpenViking recall and capture are switched off. Guild never reads Codex credentials, never calls the
       adapter's authenticate method and offers no API key field; a missing login is shown as a named
       reduced state with the command to run. The model, reasoning effort and permission mode are applied

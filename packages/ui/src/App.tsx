@@ -240,7 +240,7 @@ type ContextMenu =
   | { readonly type: "workspace"; readonly workspace: WorkspaceProjection; readonly x: number; readonly y: number }
   | { readonly type: "task"; readonly task: TaskSummaryProjection; readonly x: number; readonly y: number };
 
-type UiError = "bootstrap" | "claude_start" | "engine_start" | "message" | "operation" | "recovery" | "runtime" | "workspace";
+type UiError = "bootstrap" | "claude_start" | "engine_install" | "engine_start" | "message" | "operation" | "recovery" | "runtime" | "workspace";
 type SettingsTab = "general" | "engines" | "sources" | "privacy" | "about";
 const SETTINGS_TABS: readonly SettingsTab[] = Object.freeze(["general", "engines", "sources", "privacy", "about"]);
 type OnlineReminderRequest = Readonly<{ vendorLabel: string }>;
@@ -2553,6 +2553,8 @@ export function GuildApp({ api }: GuildAppProps) {
                   ? messages.claudeStartTimeout
                 : error === "engine_start"
                   ? messages.addonStartTimeout(activeEngine === "codex" ? activeEngine : "codex")
+                : error === "engine_install"
+                  ? messages.engineInstallNotPrivate
                 : error === "recovery"
                   ? messages.sessionRecoveryContextRequired
                 : error === "workspace"
@@ -2824,6 +2826,8 @@ export function GuildApp({ api }: GuildAppProps) {
                 modalOpen={onlineReminder !== undefined}
                 {...(claudeStatus === undefined ? {} : { claudeState: claudeStatus.state })}
                 {...(codexStatus === undefined ? {} : { codexState: codexStatus.state })}
+                {...(claudeStatus?.installPath === undefined ? {} : { claudeInstallPath: claudeStatus.installPath })}
+                {...(codexStatus?.installPath === undefined ? {} : { codexInstallPath: codexStatus.installPath })}
                 onApply={applyTaskRuntimeSettings}
                 onOpenModelSources={() => openSettings("sources")}
               />

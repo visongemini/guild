@@ -33,6 +33,7 @@ export type {
   EngineProfile,
   EnvironmentPolicy,
   GrokLaunch,
+  PrivateInstallRule,
 } from "./engine-profile.js";
 export * from "./grok-acp-profile.js";
 export * from "./json-rpc-peer.js";
@@ -40,6 +41,21 @@ export * from "./json-value.js";
 export * from "./ndjson.js";
 export * from "./xai-extensions.js";
 export { isMachOExecutableFile, pinExecutable, pinExecutableShared, pruneStalePinnedExecutables } from "./executable-pin.js";
+export {
+  DEFAULT_PRIVATE_INSTALL_IO,
+  InstallNotPrivateError,
+  PRIVATE_INSTALL_ENTRY_LIMIT,
+  assertPrivateInstall,
+  findPrivateInstallProblem,
+  privateInstallProblemOfStats,
+} from "./private-install.js";
+export type {
+  PrivateInstallFinding,
+  PrivateInstallIo,
+  PrivateInstallProblem,
+  PrivateInstallStats,
+  PrivateInstallSubject,
+} from "./private-install.js";
 export { StagingRootError, secureStagingRoot } from "./staging-root.js";
 export type { StagingRootIo, StagingRootProblem } from "./staging-root.js";
 export {

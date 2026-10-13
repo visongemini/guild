@@ -1,5 +1,6 @@
 import {
   AdapterPinError,
+  codexCoreInstallRoot,
   pinCodexAdapter,
   pinCodexCore,
   type CodexAdapterPin,
@@ -10,6 +11,7 @@ import {
   ClaudeLocatorError,
   adapterPackageRoot,
   findCandidates,
+  findInstallNotPrivate,
   locateNode,
   resolveContext,
   type ClaudeLocatorOptions,
@@ -29,18 +31,22 @@ export type CodexLocatorErrorCode =
   | "node_too_old"
   | "adapter_missing"
   | "adapter_version_unsupported"
-  | "core_missing";
+  | "core_missing"
+  | "install_not_private";
 
 export class CodexLocatorError extends Error {
   readonly code: CodexLocatorErrorCode;
   /** The version that was found, for `node_too_old` and `adapter_version_unsupported`. */
   readonly foundVersion: string | undefined;
+  /** For `install_not_private`: the file or folder that someone other than the user may be able to change. */
+  readonly path: string | undefined;
 
-  constructor(code: CodexLocatorErrorCode, foundVersion?: string) {
+  constructor(code: CodexLocatorErrorCode, foundVersion?: string, path?: string) {
     super(code);
     this.name = "CodexLocatorError";
     this.code = code;
     this.foundVersion = foundVersion;
+    this.path = path;
   }
 }
 
@@ -103,6 +109,7 @@ export function unexpectedCodexEngineChange(
 export async function locateCodexAdapter(options: CodexLocatorOptions = {}): Promise<CodexAdapterPin> {
   const context = resolveContext(options);
   let unsupported: string | undefined;
+  let notPrivate: string | undefined;
   const seenRoots = new Set<string>();
   // The dev-only adapter root is honoured only in a development run, whatever the caller passed.
   const roots: Array<{ readonly root: string; readonly entryPath: string | undefined }> = [
@@ -115,6 +122,12 @@ export async function locateCodexAdapter(options: CodexLocatorOptions = {}): Pro
   for (const { root, entryPath } of roots) {
     if (seenRoots.has(root)) continue;
     seenRoots.add(root);
+    // The package runs under node where it is: one that others could rewrite is neither read nor pinned.
+    const shared = await findInstallNotPrivate(context, { trees: [root] });
+    if (shared !== undefined) {
+      notPrivate ??= shared;
+      continue;
+    }
     try {
       const pin = await pinCodexAdapter(root);
       // A command on the search path must be the package's own entry script, which is what the pin verifies.
@@ -125,18 +138,29 @@ export async function locateCodexAdapter(options: CodexLocatorOptions = {}): Pro
       }
     }
   }
+  if (notPrivate !== undefined && unsupported === undefined) throw new CodexLocatorError("install_not_private", undefined, notPrivate);
   throw unsupported === undefined
     ? new CodexLocatorError("adapter_missing")
     : new CodexLocatorError("adapter_version_unsupported", unsupported);
 }
 
-/** The Codex core the adapter ships; nothing is run to read it. */
-export async function locateCodexCore(adapter: CodexAdapterPin): Promise<CodexCorePin> {
+/**
+ * The Codex core the adapter ships; nothing is run to read it. In a packaged app the core and the folder it starts its
+ * helpers from must be private to the user too: it can be found outside the adapter's own folder.
+ */
+export async function locateCodexCore(adapter: CodexAdapterPin, options: CodexLocatorOptions = {}): Promise<CodexCorePin> {
+  let core: CodexCorePin;
   try {
-    return await pinCodexCore(adapter.packageRoot);
+    core = await pinCodexCore(adapter.packageRoot);
   } catch {
     throw new CodexLocatorError("core_missing");
   }
+  const notPrivate = await findInstallNotPrivate(resolveContext(options), {
+    files: [core.executablePath],
+    trees: [codexCoreInstallRoot(core)],
+  });
+  if (notPrivate !== undefined) throw new CodexLocatorError("install_not_private", undefined, notPrivate);
+  return core;
 }
 
 /**
@@ -153,6 +177,6 @@ export async function locateCodexEngine(options: CodexLocatorOptions = {}): Prom
     throw cause;
   });
   const adapter = await locateCodexAdapter(options);
-  const core = await locateCodexCore(adapter);
+  const core = await locateCodexCore(adapter, options);
   return Object.freeze({ node, adapter, core });
 }

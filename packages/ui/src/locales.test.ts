@@ -83,7 +83,7 @@ test("Guild 3.0 strings exist, are non-empty and mention no undefined in both ca
       messages.privacyOnlineReminder, messages.privacyOnlineReminderHelp, messages.privacyOnlineReminderNoWorkspace, messages.privacyOnlineReminderFailed,
       messages.claudeDefaultModelOption, messages.claudeSettingsHelp, messages.claudeSettingsFailed, messages.claudeStatusLabel,
       messages.claudeStatusReady(undefined), messages.claudeStatusReady("Claude Max"), messages.claudeStatusNotFound,
-      messages.claudeStatusNotLoggedIn, messages.claudeStatusUnavailable, messages.claudeStatusIntegrityChanged, messages.grokToolsGrokOnly,
+      messages.claudeStatusNotLoggedIn, messages.claudeStatusUnavailable, messages.claudeStatusIntegrityChanged, messages.claudeStatusInstallNotPrivate("/Users/me/claude"), messages.engineInstallNotPrivate, messages.grokToolsGrokOnly,
       messages.usageClaudeHeading, messages.usageClaudeAccountUnknown, messages.usageClaudeQuota,
       messages.sourcesIntro, messages.sourcesLoading, messages.sourcesLoadFailed, messages.sourcesEmpty,
       messages.sourcesAdd, messages.sourcesEdit, messages.sourcesEditTitle, messages.sourcesAddTitle,
@@ -204,7 +204,7 @@ test("Guild 3.1 add-on engine strings exist, are non-empty and mention no undefi
         messages.modelPickerAddonNotStarted(engine), messages.modelPickerAddonDefault(engine),
         messages.addonStatusReady(engine, undefined), messages.addonStatusReady(engine, "ChatGPT Plus"),
         messages.addonStatusNotFound(engine), messages.addonStatusNotLoggedIn(engine), messages.addonStatusUnavailable(engine),
-        messages.addonStatusIntegrityChanged(engine), messages.usageAddonHeading(engine),
+        messages.addonStatusIntegrityChanged(engine), messages.addonStatusInstallNotPrivate(engine, "/Users/me/codex-acp"), messages.usageAddonHeading(engine),
         messages.usageAddonAccountManaged(engine), messages.usageAddonQuota(engine),
         messages.taskEngineName(engine), messages.taskEngineMarkerTitle(engine),
       );

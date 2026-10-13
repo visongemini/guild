@@ -1,6 +1,13 @@
 import { GUILD_MAX_MESSAGE_LENGTH } from "@guild/contracts/desktop-ipc";
 
-export type ComposerSendFailure = "claude_start" | "engine_start" | "message" | "recovery" | "runtime" | "workspace";
+export type ComposerSendFailure =
+  | "claude_start"
+  | "engine_install"
+  | "engine_start"
+  | "message"
+  | "recovery"
+  | "runtime"
+  | "workspace";
 
 export function isComposerTextTooLong(text: string): boolean {
   return text.length > GUILD_MAX_MESSAGE_LENGTH;
@@ -14,6 +21,8 @@ export function classifyComposerSendFailure(cause: unknown): ComposerSendFailure
   if (text.includes("claude_start_timeout")) return "claude_start";
   // PC-ENG-003: the same for an add-on engine (Codex); the task says which engine it is.
   if (text.includes("engine_start_timeout")) return "engine_start";
+  // PC-SEC-001: the engine's files are not private to the user; Settings > Engines names the path.
+  if (text.includes("engine_install_not_private")) return "engine_install";
   if (
     text.includes("invalid_draft") ||
     text.includes("invalid_message") ||

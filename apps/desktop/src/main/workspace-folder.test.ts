@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { describe, it } from "node:test";
 import {
   CLAUDE_START_TIMEOUT,
+  ENGINE_INSTALL_NOT_PRIVATE,
   ENGINE_INTEGRITY_CHANGED,
   ENGINE_LOGIN_REQUIRED,
   ENGINE_START_TIMEOUT,
@@ -40,6 +41,8 @@ describe("workspace folder presence", () => {
     );
     assert.equal(toDesktopIpcFailure(new Error(MESSAGE_TOO_LONG)).message, MESSAGE_TOO_LONG);
     assert.equal(ENGINE_INTEGRITY_CHANGED, "engine_integrity_changed");
+    assert.equal(ENGINE_INSTALL_NOT_PRIVATE, "engine_install_not_private");
+    assert.equal(toDesktopIpcFailure(new Error(ENGINE_INSTALL_NOT_PRIVATE)).message, "engine_install_not_private");
     assert.equal(toDesktopIpcFailure(new Error(ENGINE_INTEGRITY_CHANGED)).message, ENGINE_INTEGRITY_CHANGED);
     assert.equal(CLAUDE_START_TIMEOUT, "claude_start_timeout");
     assert.equal(toDesktopIpcFailure(new Error(CLAUDE_START_TIMEOUT)).message, CLAUDE_START_TIMEOUT);

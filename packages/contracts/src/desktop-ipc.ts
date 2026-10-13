@@ -532,10 +532,13 @@ export type RuntimeSettingsProjection = {
  * Whether Claude Code can run on this machine (PC-ENG-002): `not_found` when node, the ACP adapter
  * or the `claude` binary is missing or unsupported, `not_logged_in` when the engine reported that
  * nobody is logged in, `unavailable` when it is installed but could not be checked, and
- * `integrity_changed` when its pinned files changed without an update and Guild refuses to run them.
+ * `integrity_changed` when its pinned files changed without an update and Guild refuses to run them, and
+ * `install_not_private` when a file Guild would run in place (the `claude` binary, the adapter package, the Codex core)
+ * or a folder above it is owned by someone else or writable by group or others, so only the user may change it
+ * (the projection then carries `installPath`).
  */
 export const GUILD_CLAUDE_ENGINE_STATUSES = Object.freeze([
-  "ready", "not_found", "not_logged_in", "unavailable", "integrity_changed",
+  "ready", "not_found", "not_logged_in", "unavailable", "integrity_changed", "install_not_private",
 ] as const);
 export type GuildClaudeEngineStatus = (typeof GUILD_CLAUDE_ENGINE_STATUSES)[number];
 
@@ -553,6 +556,8 @@ export type AddonEngineSettingsProjection = {
   readonly accountLabel?: string;
   /** Version of the engine's core, for example the installed Codex. */
   readonly version?: string;
+  /** With `install_not_private`: the absolute path that someone other than the user may be able to change. */
+  readonly installPath?: string;
   /** Default model id; null follows the engine's own default. */
   readonly model: string | null;
   /** Default effort; null follows the engine. */
@@ -569,6 +574,8 @@ export type ClaudeEngineSettingsProjection = {
   readonly accountLabel?: string;
   /** Version of the installed `claude` binary. */
   readonly version?: string;
+  /** With `install_not_private`: the absolute path that someone other than the user may be able to change. */
+  readonly installPath?: string;
   /** Default model id; null follows the adapter's own default. */
   readonly model: string | null;
   /** Default effort (`default`, `low`, `medium`, `high`, `xhigh`, `max`); null follows the adapter. */

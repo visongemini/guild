@@ -218,6 +218,7 @@ import {
   CLAUDE_DEFAULT_MUST_BE_NATIVE,
   CLAUDE_LOGIN_REQUIRED,
   CLAUDE_START_TIMEOUT,
+  ENGINE_INSTALL_NOT_PRIVATE,
   ENGINE_INTEGRITY_CHANGED,
   ENGINE_LOGIN_REQUIRED,
   ENGINE_START_TIMEOUT,
@@ -389,8 +390,13 @@ export type RuntimeFactory = (input: {
 }) => Promise<{
   readonly adapter: RuntimeAdapterPort;
   readonly runtimeVersion?: string;
-  /** Claude only: true when the process refused to run because its pinned files changed (PC-ENG-002). */
+  /** Claude and Codex: true when the process refused to run because its pinned files changed (PC-ENG-002). */
   readonly refusedForIntegrity?: () => boolean;
+  /**
+   * Claude and Codex: the file or folder that made the process refuse to start because someone other than the user could
+   * change it (PC-SEC-001); undefined when the start was not refused for that.
+   */
+  readonly refusedForInstall?: () => string | undefined;
 }>;
 
 export type LiveDesktopServiceOptions = {
@@ -703,7 +709,11 @@ export function createLiveDesktopService(
   // What the Claude engine last said about its login. Account-level: one login serves every Claude task.
   let claudeAuth: Readonly<{ kind: string; label?: string }> | undefined;
   // What was found of the Claude installation; undefined until something looked.
-  let claudeInstall: Readonly<{ status: "ready" | "not_found" | "unavailable" | "integrity_changed"; version?: string }> | undefined;
+  let claudeInstall: Readonly<{
+    status: "ready" | "not_found" | "unavailable" | "integrity_changed" | "install_not_private";
+    version?: string;
+    installPath?: string;
+  }> | undefined;
   let claudeProbeAtMs = 0;
   let claudeProbeOperation: Promise<void> | undefined;
   const claudeProbe = options.claudeEngineProbe ?? (options.runtimeFactory === undefined
@@ -875,7 +885,12 @@ export function createLiveDesktopService(
           // shows the integrity text (PC-ENG-002).
           status: cause instanceof ClaudeEngineIntegrityError
             ? "integrity_changed" as const
-            : cause instanceof ClaudeLocatorError ? "not_found" as const : "unavailable" as const,
+            : cause instanceof ClaudeLocatorError && cause.code === "install_not_private" && cause.path !== undefined
+              ? "install_not_private" as const
+              : cause instanceof ClaudeLocatorError ? "not_found" as const : "unavailable" as const,
+          ...(cause instanceof ClaudeLocatorError && cause.code === "install_not_private" && cause.path !== undefined
+            ? { installPath: cause.path }
+            : {}),
         });
       }
       // A refusal to run changed files stays until a Claude session opens again; a probe that only
@@ -921,7 +936,12 @@ export function createLiveDesktopService(
           // shows the integrity text (PC-ENG-003).
           status: cause instanceof CodexEngineIntegrityError
             ? "integrity_changed" as const
-            : cause instanceof CodexLocatorError ? "not_found" as const : "unavailable" as const,
+            : cause instanceof CodexLocatorError && cause.code === "install_not_private" && cause.path !== undefined
+              ? "install_not_private" as const
+              : cause instanceof CodexLocatorError ? "not_found" as const : "unavailable" as const,
+          ...(cause instanceof CodexLocatorError && cause.code === "install_not_private" && cause.path !== undefined
+            ? { installPath: cause.path }
+            : {}),
         });
       }
       // A refusal to run changed files stays until a session of the engine opens again; a probe that only finds
@@ -948,22 +968,29 @@ export function createLiveDesktopService(
 
   function noteAddonInstall(engine: GuildAddonEngine, next: AddonInstall): void {
     const state = addonState(engine);
-    if (closed || closing || (state.install?.status === next.status && state.install.version === next.version)) return;
+    if (
+      closed || closing ||
+      (state.install?.status === next.status && state.install.version === next.version && state.install.installPath === next.installPath)
+    ) return;
     state.install = next;
     schedulePhasePublish();
   }
 
   function noteClaudeInstall(next: NonNullable<typeof claudeInstall>): void {
-    if (closed || closing || (claudeInstall?.status === next.status && claudeInstall.version === next.version)) return;
+    if (
+      closed || closing ||
+      (claudeInstall?.status === next.status && claudeInstall.version === next.version && claudeInstall.installPath === next.installPath)
+    ) return;
     claudeInstall = next;
     schedulePhasePublish();
   }
 
   /** `status`, `accountLabel` and `version` of `runtimeSettings.claude` (docs/20 3.2, 3.8). */
   function claudeEngineReport(): Readonly<{
-    status?: "ready" | "not_found" | "not_logged_in" | "unavailable" | "integrity_changed";
+    status?: "ready" | "not_found" | "not_logged_in" | "unavailable" | "integrity_changed" | "install_not_private";
     accountLabel?: string;
     version?: string;
+    installPath?: string;
   }> {
     const loginRequired = claudeAuth?.kind === "none";
     const status = claudeInstall !== undefined && claudeInstall.status !== "ready"
@@ -975,6 +1002,7 @@ export function createLiveDesktopService(
       ...(status === undefined ? {} : { status }),
       ...(claudeAuth?.label === undefined || loginRequired ? {} : { accountLabel: claudeAuth.label }),
       ...(claudeInstall?.version === undefined ? {} : { version: claudeInstall.version }),
+      ...(status !== "install_not_private" || claudeInstall?.installPath === undefined ? {} : { installPath: claudeInstall.installPath }),
     });
   }
 
@@ -1749,6 +1777,14 @@ export function createLiveDesktopService(
     if (!isAdapterEngine(controller.engine) || !(cause instanceof AcpV1AdapterError)) return false;
     if (cause.code === "request_timeout") return true;
     return cause.code === "transport_lost" && (startStage === "session_resume" || startStage === "session_load");
+  }
+
+  /** The path a locator named when it refused an install that others could change; undefined for every other failure. */
+  function installPathOf(cause: unknown): string | undefined {
+    if (cause instanceof ClaudeLocatorError || cause instanceof CodexLocatorError) {
+      return cause.code === "install_not_private" ? cause.path : undefined;
+    }
+    return undefined;
   }
 
   function noteLoginRequired(engine: GuildEngine): void {
@@ -5200,6 +5236,15 @@ export function createLiveDesktopService(
       if (isAuthRequired(controller, cause)) {
         noteLoginRequired(controller.engine);
         throw new Error(isAddonEngine(controller.engine) ? ENGINE_LOGIN_REQUIRED : CLAUDE_LOGIN_REQUIRED);
+      }
+      // Files that others could change: found, but never run. The path is the owner's to show in Settings > Engines; the
+      // error that reaches the renderer carries none (and the log line above only the code).
+      const notPrivatePath = installPathOf(cause) ?? created?.refusedForInstall?.();
+      if (notPrivatePath !== undefined && (controller.engine === "claude" || isAddonEngine(controller.engine))) {
+        const next = Object.freeze({ status: "install_not_private" as const, installPath: notPrivatePath });
+        if (controller.engine === "claude") noteClaudeInstall(next);
+        else noteAddonInstall(controller.engine, next);
+        throw new Error(ENGINE_INSTALL_NOT_PRIVATE);
       }
       if (controller.engine === "claude" && cause instanceof ClaudeLocatorError) {
         noteClaudeInstall(Object.freeze({ status: "not_found" as const }));

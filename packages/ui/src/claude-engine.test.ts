@@ -20,6 +20,27 @@ test("the status is read defensively from the Claude settings the main process s
   }
 });
 
+test("an install that others could change names its path, in both languages, and is read defensively [PC-SEC-001]", () => {
+  const path = "/opt/homebrew/lib/node_modules/@agentclientprotocol/claude-agent-acp";
+  assert.deepEqual(claudeStatusOf({ status: "install_not_private", installPath: path }), { state: "install_not_private", installPath: path });
+  // The path is shown only for that status, and only when it is an absolute, single-line path of sane length.
+  assert.equal(claudeStatusOf({ status: "ready", installPath: path })?.installPath, undefined);
+  for (const bad of ["relative/path", "", "/a\nb", "/a\u0000b", "/" + "x".repeat(1100), 7, null]) {
+    assert.equal(claudeStatusOf({ status: "install_not_private", installPath: bad })?.installPath, undefined, String(bad));
+  }
+  const english = claudeStatusText(EN, { state: "install_not_private", installPath: path });
+  assert.ok(english.includes(path));
+  assert.match(english, /will not run/u);
+  assert.match(english, /someone other than you/u);
+  assert.match(english, /only you can change/u);
+  const chinese = claudeStatusText(messagesFor("zh-CN"), { state: "install_not_private", installPath: path });
+  assert.ok(chinese.includes(path));
+  assert.match(chinese, /除你本人之外还有人可能改动/u);
+  assert.match(chinese, /只有你本人能改动/u);
+  // With no path to name, the generic line is all there is to say.
+  assert.equal(claudeStatusText(EN, { state: "install_not_private" }), EN.claudeStatusUnavailable);
+});
+
 test("an account label that could be an email, or is junk, is never shown", () => {
   assert.equal(claudeStatusOf({ status: "ready", accountLabel: "person@example.com" })?.accountLabel, undefined);
   assert.equal(claudeStatusOf({ status: "ready", accountLabel: "Claude Max (me@x.io)" })?.accountLabel, undefined);

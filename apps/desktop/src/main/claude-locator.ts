@@ -6,11 +6,15 @@ import { homedir, tmpdir } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, join } from "node:path";
 import {
   AdapterPinError,
+  findPrivateInstallProblem,
   isMachOExecutableFile,
   pinClaudeAdapter,
   pinExecutable,
   pinExecutableShared,
   type ClaudeAdapterPin,
+  type PrivateInstallIo,
+  type PrivateInstallRule,
+  type PrivateInstallSubject,
 } from "@guild/runtime-grok";
 import {
   defaultPathTrustPolicy,
@@ -34,6 +38,12 @@ import {
  * descriptor copy that fails if the source changed meanwhile), the copy is hashed again against the first hash, and only the
  * verified staged copy answers `--version`: a file swapped into a directory that others (the macOS admin group) can write
  * after the trust check cannot win the first execution. Launches already run the staged copy (the process host pins it).
+ *
+ * What a launch runs in place instead (the `claude` binary, the adapter package that `node` loads) cannot be copied, so a
+ * packaged app also requires that nobody but the user and root could rewrite it: owner and mode of the real path, of every
+ * folder above it and of every entry of the package, with no exemption for the macOS admin group (runtime-grok
+ * private-install.ts). A candidate that fails is skipped like any untrusted one; when nothing else is found the locator says
+ * `install_not_private` and names the path, and the launch checks again right before every spawn.
  */
 
 export type ClaudeLocatorErrorCode =
@@ -41,18 +51,22 @@ export type ClaudeLocatorErrorCode =
   | "node_too_old"
   | "adapter_missing"
   | "adapter_version_unsupported"
-  | "claude_missing";
+  | "claude_missing"
+  | "install_not_private";
 
 export class ClaudeLocatorError extends Error {
   readonly code: ClaudeLocatorErrorCode;
   /** The version that was found, for `node_too_old` and `adapter_version_unsupported`. */
   readonly foundVersion: string | undefined;
+  /** For `install_not_private`: the file or folder that someone other than the user may be able to change. */
+  readonly path: string | undefined;
 
-  constructor(code: ClaudeLocatorErrorCode, foundVersion?: string) {
+  constructor(code: ClaudeLocatorErrorCode, foundVersion?: string, path?: string) {
     super(code);
     this.name = "ClaudeLocatorError";
     this.code = code;
     this.foundVersion = foundVersion;
+    this.path = path;
   }
 }
 
@@ -158,6 +172,13 @@ export type ClaudeLocatorOptions = Readonly<{
   stagingRoot?: string;
   /** Replaces the staging of the probe; tests only. A development run probes the file itself. */
   stageExecutable?: ProbeStager;
+  /**
+   * Whether the files that run in place must be private to the user (see the header). Absent means a packaged app
+   * requires it and a development run does not; tests only.
+   */
+  requirePrivateInstall?: boolean;
+  /** Replaces the owner and mode source of that check; tests only. */
+  privateInstallIo?: PrivateInstallIo;
 }>;
 
 /** A file Guild may run `--version` on: the path to execute and the release of what was made to get it. */
@@ -346,11 +367,18 @@ async function reverifyLaunchNode(pinned: LocatedNode): Promise<LocatedNode> {
 export async function locateClaudeAdapter(options: ClaudeLocatorOptions = {}): Promise<ClaudeAdapterPin> {
   const context = resolveContext(options);
   let unsupported: string | undefined;
+  let notPrivate: string | undefined;
   const seenRoots = new Set<string>();
   for (const candidate of await findCandidates("adapter", "claude-agent-acp", context)) {
     const root = adapterPackageRoot(candidate);
     if (root === undefined || seenRoots.has(root)) continue;
     seenRoots.add(root);
+    // A package others could rewrite is not read, let alone pinned; another install may still be fine.
+    const shared = await findInstallNotPrivate(context, { trees: [root] });
+    if (shared !== undefined) {
+      notPrivate ??= shared;
+      continue;
+    }
     try {
       const pin = await pinClaudeAdapter(root);
       // The command must be the package's own entry script, which is what the pin verifies.
@@ -361,6 +389,7 @@ export async function locateClaudeAdapter(options: ClaudeLocatorOptions = {}): P
       }
     }
   }
+  if (notPrivate !== undefined && unsupported === undefined) throw new ClaudeLocatorError("install_not_private", undefined, notPrivate);
   throw unsupported === undefined
     ? new ClaudeLocatorError("adapter_missing")
     : new ClaudeLocatorError("adapter_version_unsupported", unsupported);
@@ -376,8 +405,16 @@ export async function locateClaudeBinary(
   previous?: LocatedClaudeBinary,
 ): Promise<LocatedClaudeBinary> {
   const context = resolveContext(options);
+  let notPrivate: string | undefined;
   for (const candidate of await findCandidates("claude", "claude", context)) {
     if (!(await isMachOExecutableFile(candidate))) continue;
+    // Checked on every call, before the cache: the binary runs where it is, so it and every folder above it must be the
+    // user's alone. One that is not is neither probed nor used; another install may be.
+    const shared = await findInstallNotPrivate(context, { files: [candidate] });
+    if (shared !== undefined) {
+      notPrivate ??= shared;
+      continue;
+    }
     if (previous !== undefined) {
       return candidate === previous.executablePath ? previous : acceptClaudeReplacement(previous, candidate);
     }
@@ -395,7 +432,9 @@ export async function locateClaudeBinary(
     }
     return located;
   }
-  throw new ClaudeLocatorError("claude_missing");
+  throw notPrivate === undefined
+    ? new ClaudeLocatorError("claude_missing")
+    : new ClaudeLocatorError("install_not_private", undefined, notPrivate);
 }
 
 /**
@@ -454,6 +493,8 @@ export type LocatorContext = Readonly<{
   pathTrust: PathTrustPolicy | undefined;
   /** Makes the file a version probe may execute from a candidate: a verified staged copy (packaged) or the file itself. */
   stage: ProbeStager;
+  /** Present when files that run in place must be private to the user (a packaged app); `io` is for tests. */
+  privateInstall: Readonly<{ io: PrivateInstallIo | undefined }> | undefined;
 }>;
 
 export function resolveContext(options: ClaudeLocatorOptions): LocatorContext {
@@ -475,7 +516,31 @@ export function resolveContext(options: ClaudeLocatorOptions): LocatorContext {
     stage: options.stageExecutable ?? (allowEnvironmentPath
       ? probeInPlace
       : createProbeStager(options.stagingRoot ?? defaultProbeStagingRoot())),
+    privateInstall: (options.requirePrivateInstall ?? !allowEnvironmentPath)
+      ? Object.freeze({ io: options.privateInstallIo })
+      : undefined,
   });
+}
+
+/**
+ * The launch's version of the same rule: set on every Claude and Codex launch of a packaged app, absent in a development
+ * run. The process host proves it again right before each spawn.
+ */
+export function privateInstallRuleForLaunch(): PrivateInstallRule | undefined {
+  return developmentLocatorSearch ? undefined : Object.freeze({ required: true });
+}
+
+/**
+ * The first path of `subject` that someone other than the user could change, or undefined when it is private or the rule is
+ * off (a development run). Metadata only; nothing is opened or run.
+ */
+export async function findInstallNotPrivate(
+  context: LocatorContext,
+  subject: PrivateInstallSubject,
+): Promise<string | undefined> {
+  if (context.privateInstall === undefined) return undefined;
+  const finding = await findPrivateInstallProblem(subject, context.privateInstall.io);
+  return finding?.path;
 }
 
 /** `candidate --version` on the file the context allows to run, or "" when it cannot be made or does not answer. */

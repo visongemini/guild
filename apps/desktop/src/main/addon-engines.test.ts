@@ -75,7 +75,7 @@ describe("add-on engine report [PC-ENG-003]", () => {
   });
 
   it("lets a reduced install state win over a missing login, and never shows a plan then", () => {
-    for (const status of ["not_found", "unavailable", "integrity_changed"] as const) {
+    for (const status of ["not_found", "unavailable", "integrity_changed", "install_not_private"] as const) {
       const report = addonEngineReport(stateWith({
         install: { status },
         auth: { kind: "none" },
@@ -88,6 +88,17 @@ describe("add-on engine report [PC-ENG-003]", () => {
       "ChatGPT Pro",
       "a stale account label is not hidden by the install state alone",
     );
+  });
+
+  it("carries the path of an install that others could change, and only then [PC-SEC-001]", () => {
+    const path = "/usr/local/lib/node_modules/@agentclientprotocol/codex-acp";
+    assert.deepEqual(
+      addonEngineReport(stateWith({ install: { status: "install_not_private", installPath: path }, auth: { kind: "none" } })),
+      { status: "install_not_private", installPath: path },
+    );
+    assert.deepEqual(addonEngineReport(stateWith({ install: { status: "ready", version: "0.160.1" } })), { status: "ready", version: "0.160.1" });
+    // A path left over from before never rides along with another state.
+    assert.equal(addonEngineReport(stateWith({ install: { status: "ready", installPath: path } })).installPath, undefined);
   });
 
   it("returns frozen, plain data", () => {

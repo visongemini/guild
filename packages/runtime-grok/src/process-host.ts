@@ -8,6 +8,7 @@ import type {
   GuildGrokStartupSettings,
 } from "@guild/contracts";
 import { AdapterPinError, type AdapterPinFailureCode } from "./adapter-pin.js";
+import { InstallNotPrivateError } from "./private-install.js";
 import {
   CLAUDE_ENVIRONMENT_POLICY_VERSION,
   CODEX_ENVIRONMENT_POLICY_VERSION,
@@ -50,7 +51,13 @@ export type ProcessGroupSignalEvidence = {
 export type ProcessGroupProbeEvidence = "present" | "already_gone" | "failed";
 
 export type ProcessHostFailure =
-  | { readonly type: "preflight_failure"; readonly code: ProcessHostPreflightCode; readonly message: string }
+  | {
+    readonly type: "preflight_failure";
+    readonly code: ProcessHostPreflightCode;
+    readonly message: string;
+    /** Only for `install_not_private`: the file or folder that someone other than the user may be able to change. */
+    readonly path?: string;
+  }
   | { readonly type: "process_error"; readonly message: string }
   | {
     readonly type: "reap_timeout";
@@ -1015,6 +1022,9 @@ async function resolveWorkingDirectory(path: string): Promise<string> {
 function normalizePreflightFailure(cause: unknown): Extract<ProcessHostFailure, { type: "preflight_failure" }> {
   if (cause instanceof GrokProcessHostError && cause.failure.type === "preflight_failure") {
     return cause.failure;
+  }
+  if (cause instanceof InstallNotPrivateError) {
+    return { type: "preflight_failure", code: cause.code, message: cause.message, path: cause.path };
   }
   if (cause instanceof ExecutablePinError || cause instanceof AdapterPinError) {
     return { type: "preflight_failure", code: cause.code, message: cause.message };

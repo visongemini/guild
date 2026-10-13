@@ -3,7 +3,7 @@ import { chmod, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { after, afterEach, describe, it } from "node:test";
-import { codexPlatformTarget } from "@guild/runtime-grok";
+import { DEFAULT_PRIVATE_INSTALL_IO, codexPlatformTarget, type PrivateInstallIo } from "@guild/runtime-grok";
 import {
   invalidateClaudeLocatorCache,
   resetClaudeLaunchPinsForTesting,
@@ -241,7 +241,7 @@ describe("Codex locator: core", () => {
     const { packageRoot } = await installAdapter(join(box.home, ".npm-global"), "2.2.2");
     const executable = await writeCore(packageRoot, "0.160.1", "core-bytes");
     const adapter = await locateCodexAdapter(box.options());
-    const core = await locateCodexCore(adapter);
+    const core = await locateCodexCore(adapter, box.options());
     assert.equal(core.executablePath, executable);
     assert.equal(core.version, "0.160.1");
     assert.equal(core.sizeBytes, 4 + "core-bytes".length);
@@ -252,10 +252,10 @@ describe("Codex locator: core", () => {
     const box = await sandbox();
     const { packageRoot } = await installAdapter(join(box.home, ".npm-global"), "2.2.2");
     const adapter = await locateCodexAdapter(box.options());
-    await expectLocatorError(locateCodexCore(adapter), "core_missing");
+    await expectLocatorError(locateCodexCore(adapter, box.options()), "core_missing");
     const executable = await writeCore(packageRoot);
     await writeFile(executable, "#!/bin/sh\necho not the core\n");
-    await expectLocatorError(locateCodexCore(adapter), "core_missing");
+    await expectLocatorError(locateCodexCore(adapter, box.options()), "core_missing");
   });
 });
 
@@ -397,5 +397,109 @@ describe("Codex locator: a packaged app takes nothing from the PATH it was start
     assert.equal(executed.length, 1);
     assert.notEqual(executed[0], node);
     assert.ok(executed[0]!.startsWith(`${staging}/.grok-pin-`) && executed[0]!.endsWith("/node"), executed[0]);
+  });
+});
+
+describe("Codex locator: files that run in place are private to the user (packaged) [PC-SEC-001, PC-ENG-003]", () => {
+  /** The real file system under `root`, with everything above it shown as root's 0755: the temp directory is not the subject. */
+  function sandboxIo(root: string): PrivateInstallIo {
+    return {
+      ...DEFAULT_PRIVATE_INSTALL_IO,
+      lstat: async (path) => path === root || path.startsWith(`${root}/`)
+        ? DEFAULT_PRIVATE_INSTALL_IO.lstat(path)
+        : { uid: 0, mode: 0o40755, isDirectory: true, isSymbolicLink: false },
+    };
+  }
+
+  /** A packaged app: no PATH, the fixed directories only, the private-install rule at its default (on). */
+  async function packaged(box: Sandbox): Promise<CodexLocatorOptions> {
+    const uid = process.getuid?.() ?? 0;
+    return {
+      environment: {},
+      homeDirectory: box.home,
+      fallbackDirectories: [],
+      allowEnvironmentPath: false,
+      pathTrust: Object.freeze({ currentUid: uid, adminGid: undefined, rejectedRoots: Object.freeze([]) }),
+      privateInstallIo: sandboxIo(box.root),
+    };
+  }
+
+  async function expectNotPrivate(operation: Promise<unknown>, path: string): Promise<void> {
+    await assert.rejects(operation, (cause: unknown) => {
+      assert.ok(cause instanceof CodexLocatorError, String(cause));
+      assert.equal(cause.code, "install_not_private");
+      assert.equal(cause.path, path);
+      return true;
+    });
+  }
+
+  it("passes an install only the user can write", async () => {
+    const box = await sandbox();
+    const { packageRoot } = await installAdapter(join(box.home, ".npm-global"), "2.2.2");
+    const executable = await writeCore(packageRoot);
+    const options = await packaged(box);
+    const adapter = await locateCodexAdapter(options);
+    assert.equal((await locateCodexCore(adapter, options)).executablePath, executable);
+  });
+
+  it("refuses an adapter package with an entry others could write, even in node_modules, naming it", async () => {
+    const box = await sandbox();
+    const { packageRoot } = await installAdapter(join(box.home, ".npm-global"), "2.2.2");
+    await writeCore(packageRoot);
+    const dependency = join(packageRoot, "node_modules", "dep", "index.js");
+    await mkdir(join(dependency, ".."), { recursive: true });
+    await writeFile(dependency, "module.exports = 1;\n");
+    await chmod(dependency, 0o666);
+    await expectNotPrivate(locateCodexAdapter(await packaged(box)), dependency);
+    await chmod(dependency, 0o644);
+    assert.equal((await locateCodexAdapter(await packaged(box))).version, "2.2.2");
+  });
+
+  it("refuses the core when it, the folder it starts helpers from, or a folder above it could be rewritten", async () => {
+    const box = await sandbox();
+    const { packageRoot } = await installAdapter(join(box.home, ".npm-global"), "2.2.2");
+    const executable = await writeCore(packageRoot);
+    const options = await packaged(box);
+    const adapter = await locateCodexAdapter(options);
+    const triple = join(executable, "..", "..");
+    const helper = join(triple, "codex-resources", "rg");
+    await mkdir(join(helper, ".."), { recursive: true });
+    await writeFile(helper, "helper");
+    await chmod(helper, 0o755);
+    await chmod(join(helper, ".."), 0o755);
+    assert.equal((await locateCodexCore(adapter, options)).executablePath, executable);
+    await chmod(helper, 0o775);
+    await expectNotPrivate(locateCodexCore(adapter, options), helper);
+    await chmod(helper, 0o755);
+    await chmod(join(executable, ".."), 0o777);
+    await expectNotPrivate(locateCodexCore(adapter, options), join(executable, ".."));
+    await chmod(join(executable, ".."), 0o755);
+    await chmod(executable, 0o775);
+    await expectNotPrivate(locateCodexCore(adapter, options), executable);
+  });
+
+  it("judges a core that npm hoisted out of the adapter's own folder on its own", async () => {
+    const box = await sandbox();
+    const prefix = join(box.home, ".npm-global");
+    const { packageRoot } = await installAdapter(prefix, "2.2.2");
+    // The way Node resolves a dependency: the adapter's node_modules, then those of every folder above the adapter.
+    const hoistedHolder = join(prefix, "lib");
+    const executable = await writeCore(hoistedHolder);
+    assert.ok(!executable.startsWith(`${packageRoot}/`));
+    const options = await packaged(box);
+    const adapter = await locateCodexAdapter(options);
+    assert.equal((await locateCodexCore(adapter, options)).executablePath, executable);
+    const hoisted = join(hoistedHolder, "node_modules", "@openai");
+    await chmod(hoisted, 0o775);
+    await expectNotPrivate(locateCodexCore(adapter, options), hoisted);
+  });
+
+  it("is off in a development run", async () => {
+    const box = await sandbox();
+    const { packageRoot } = await installAdapter(join(box.home, ".npm-global"), "2.2.2");
+    const executable = await writeCore(packageRoot);
+    await chmod(executable, 0o777);
+    const adapter = await locateCodexAdapter(box.options());
+    assert.equal((await locateCodexCore(adapter, { ...box.options(), privateInstallIo: sandboxIo(box.root) })).executablePath, executable);
   });
 });

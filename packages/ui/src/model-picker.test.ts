@@ -445,6 +445,16 @@ test("the Claude group is unavailable when the status says so, or the Claude cat
   assert.equal(groupView(refused, "claude").empty?.kind, "claude_unavailable");
   assert.equal(groupView(refused, "claude").empty?.text, EN.claudeStatusIntegrityChanged);
   assert.match(groupView(refused, "claude").empty?.text ?? "", /restart Guild to accept updated engine files/u);
+  // Files that others could change name the path, and the default row is withheld like for any refused engine.
+  const shared = modelPickerView({ ...input, catalogs: emptyClaude, claudeState: "install_not_private", claudeInstallPath: "/opt/homebrew/bin/claude" });
+  assert.equal(groupView(shared, "claude").empty?.kind, "claude_unavailable");
+  assert.equal(groupView(shared, "claude").empty?.text, EN.claudeStatusInstallNotPrivate("/opt/homebrew/bin/claude"));
+  assert.match(groupView(shared, "claude").empty?.text ?? "", /\/opt\/homebrew\/bin\/claude/u);
+  assert.equal(
+    groupView(modelPickerView({ ...input, catalogs: emptyClaude, claudeState: "install_not_private" }), "claude").empty?.text,
+    EN.claudeStatusUnavailable,
+    "without a path there is nothing to name",
+  );
 });
 
 test("an empty Claude catalog offers Claude Code (default model), so a Claude task can still start (PC-ENG-001)", () => {
@@ -466,7 +476,7 @@ test("an empty Claude catalog offers Claude Code (default model), so a Claude ta
   }
   // Missing, unavailable or changed engine files: Guild would refuse to start, so the row is withheld
   // (picking it would bind the task to an engine that cannot run).
-  for (const claudeState of ["not_found", "unavailable", "integrity_changed"] as const) {
+  for (const claudeState of ["not_found", "unavailable", "integrity_changed", "install_not_private"] as const) {
     assert.equal(groupView(modelPickerView({ ...fresh, claudeState }), "claude").models.length, 0, claudeState);
   }
   assert.equal(groupView(modelPickerView({ ...fresh, claudeState: "not_found" }), "claude").empty?.kind, "claude_unavailable");
@@ -656,11 +666,13 @@ test("before Codex has reported models its group offers one 'Codex (default mode
     assert.equal(view.models.some((row) => row.group === "codex" && row.runtimeDefault === true), true);
   }
   // A missing or refused installation offers no row, only the way to fix it.
-  for (const codexState of ["not_found", "unavailable", "integrity_changed"] as const) {
+  for (const codexState of ["not_found", "unavailable", "integrity_changed", "install_not_private"] as const) {
     const codex = groupView(modelPickerView({ ...fresh, codexState }), "codex");
     assert.equal(codex.models.length, 0, codexState);
     assert.equal(codex.empty?.kind, "claude_unavailable", codexState);
   }
+  const sharedCodex = groupView(modelPickerView({ ...fresh, codexState: "install_not_private", codexInstallPath: "/usr/local/lib/node_modules/@agentclientprotocol/codex-acp" }), "codex");
+  assert.equal(sharedCodex.empty?.text, EN.addonStatusInstallNotPrivate("codex", "/usr/local/lib/node_modules/@agentclientprotocol/codex-acp"));
   assert.equal(groupView(modelPickerView({ ...fresh, codexState: "not_found" }), "codex").empty?.text, EN.modelPickerAddonUnavailable("codex"));
   assert.equal(groupView(modelPickerView({ ...fresh, codexState: "not_found" }), "codex").empty?.help, EN.modelPickerAddonUnavailableHelp("codex"));
   assert.equal(groupView(modelPickerView({ ...fresh, codexState: "unavailable" }), "codex").empty?.text, EN.addonStatusUnavailable("codex"));

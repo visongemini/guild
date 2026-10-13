@@ -15,8 +15,10 @@ import {
  */
 
 export type AddonInstall = Readonly<{
-  status: "ready" | "not_found" | "unavailable" | "integrity_changed";
+  status: "ready" | "not_found" | "unavailable" | "integrity_changed" | "install_not_private";
   version?: string;
+  /** With `install_not_private`: the path that someone other than the user may be able to change. */
+  installPath?: string;
 }>;
 
 /** What the engine last said about its account: its kind and, for a ChatGPT account, the plan label. Never an address. */
@@ -42,6 +44,7 @@ export type AddonEngineReport = Readonly<{
   status?: GuildEngineStatus;
   accountLabel?: string;
   version?: string;
+  installPath?: string;
 }>;
 
 /**
@@ -62,6 +65,7 @@ export function addonEngineReport(state: AddonEngineState): AddonEngineReport {
     ...(status === undefined ? {} : { status }),
     ...(accountLabel === undefined ? {} : { accountLabel }),
     ...(state.install?.version === undefined ? {} : { version: state.install.version }),
+    ...(status !== "install_not_private" || state.install?.installPath === undefined ? {} : { installPath: state.install.installPath }),
   });
 }
 

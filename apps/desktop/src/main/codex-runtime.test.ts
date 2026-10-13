@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { describe, it } from "node:test";
+import { afterEach, describe, it } from "node:test";
 import {
   GrokProcessHostError,
   type AcpV1AdapterSink,
@@ -7,6 +7,7 @@ import {
   type EngineProcessHostOptions,
   type ProcessHostEvent,
 } from "@guild/runtime-grok";
+import { allowDevelopmentLocatorSearch, resetDevelopmentLocatorSearchForTesting } from "./claude-locator.js";
 import { CodexEngineIntegrityError, type LocatedCodexEngine } from "./codex-locator.js";
 import { createCodexRuntime } from "./codex-runtime.js";
 import { RelocatingEngineProcess } from "./relocating-engine-process.js";
@@ -44,7 +45,7 @@ function located(
 class FakeHost {
   readonly listeners = new Set<(event: ProcessHostEvent) => void>();
   startCalls = 0;
-  constructor(private readonly failure: { code: string } | undefined) {}
+  constructor(private readonly failure: { code: string; path?: string } | undefined) {}
   onEvent(listener: (event: ProcessHostEvent) => void): () => void {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
@@ -52,7 +53,12 @@ class FakeHost {
   async start(): Promise<unknown> {
     this.startCalls += 1;
     if (this.failure !== undefined) {
-      const failure = { type: "preflight_failure" as const, code: this.failure.code, message: "pin" };
+      const failure = {
+        type: "preflight_failure" as const,
+        code: this.failure.code,
+        message: "pin",
+        ...(this.failure.path === undefined ? {} : { path: this.failure.path }),
+      };
       for (const listener of [...this.listeners]) listener({ type: "preflight_failure", failure } as ProcessHostEvent);
       throw new GrokProcessHostError(failure as never);
     }
@@ -64,6 +70,8 @@ class FakeHost {
 }
 
 const asHost = (host: FakeHost): EngineProcessHost => host as unknown as EngineProcessHost;
+
+afterEach(() => resetDevelopmentLocatorSearchForTesting());
 
 describe("Codex runtime process [PC-ENG-003]", () => {
   it("builds the node plus adapter launch with the pinned adapter and the pinned core, and no routed environment", async () => {
@@ -83,7 +91,8 @@ describe("Codex runtime process [PC-ENG-003]", () => {
     assert.equal(options!.expectedSha256, NODE_SHA);
     assert.equal(options!.workingDirectory, "/tmp/work");
     assert.equal(options!.stagingRoot, "/tmp/staging");
-    assert.deepEqual(options!.launch, { engine: "codex", adapter: located().adapter, core: located().core });
+    // Not a development run: the files that run in place must be private to the user (PC-SEC-001).
+    assert.deepEqual(options!.launch, { engine: "codex", adapter: located().adapter, core: located().core, privateInstall: { required: true } });
     assert.equal(options!.profile.engine, "codex");
     await runtime.adapter.close().catch(() => undefined);
   });
@@ -132,6 +141,28 @@ describe("Codex runtime process [PC-ENG-003]", () => {
     });
     await assert.rejects(direct.start(), GrokProcessHostError);
     assert.equal(relocated, false);
+  });
+
+  it("names the path too when the refusal comes from the host built after a re-locate [PC-SEC-001]", async () => {
+    const path = "/usr/local/lib/node_modules/@agentclientprotocol/codex-acp/dist/index.js";
+    let locates = 0;
+    const hosts: EngineProcessHostOptions[] = [];
+    const runtime = await createCodexRuntime(INPUT, {
+      locate: async () => {
+        locates += 1;
+        return locates === 1 ? located() : located({ adapterVersion: "2.3.0", fingerprint: "d".repeat(64) });
+      },
+      invalidateLocatorCache: () => undefined,
+      baseEnvironment: async () => ({ PATH: "/usr/bin" }),
+      createHost: (options) => {
+        hosts.push(options);
+        return asHost(new FakeHost(hosts.length === 1 ? { code: "adapter_changed" } : { code: "install_not_private", path }));
+      },
+    });
+    await runtime.adapter.start().catch(() => undefined);
+    assert.equal(hosts.length, 2);
+    assert.equal(runtime.refusedForInstall(), path);
+    await runtime.adapter.close().catch(() => undefined);
   });
 
   it("re-pins an adapter that moved to a new version together with its own new core", async () => {
@@ -187,6 +218,43 @@ describe("Codex runtime process [PC-ENG-003]", () => {
       assert.equal(runtime.refusedForIntegrity(), true, component);
       await runtime.adapter.close().catch(() => undefined);
     }
+  });
+
+  it("asks the process host to keep the core, its folder and the adapter private to the user in a packaged app, and not in a development run [PC-SEC-001]", async () => {
+    const launch = async (): Promise<EngineProcessHostOptions["launch"]> => {
+      const hosts: EngineProcessHostOptions[] = [];
+      const runtime = await createCodexRuntime(INPUT, {
+        locate: async () => located(),
+        baseEnvironment: async () => ({ PATH: "/usr/bin" }),
+        createHost: (options) => { hosts.push(options); return asHost(new FakeHost(undefined)); },
+      });
+      await runtime.adapter.close().catch(() => undefined);
+      return hosts[0]!.launch;
+    };
+    const packaged = await launch();
+    assert.deepEqual(packaged.engine === "codex" && packaged.privateInstall, { required: true });
+    allowDevelopmentLocatorSearch();
+    const development = await launch();
+    assert.equal(development.engine === "codex" && "privateInstall" in development, false);
+  });
+
+  it("names the path of a start refused because others could change the install, without locating again [PC-SEC-001]", async () => {
+    const path = "/usr/local/lib/node_modules/@agentclientprotocol/codex-acp";
+    let locates = 0;
+    const hosts: EngineProcessHostOptions[] = [];
+    const runtime = await createCodexRuntime(INPUT, {
+      locate: async () => { locates += 1; return located(); },
+      invalidateLocatorCache: () => undefined,
+      baseEnvironment: async () => ({ PATH: "/usr/bin" }),
+      createHost: (options) => { hosts.push(options); return asHost(new FakeHost({ code: "install_not_private", path })); },
+    });
+    assert.equal(runtime.refusedForInstall(), undefined);
+    await runtime.adapter.start().catch(() => undefined);
+    assert.equal(runtime.refusedForInstall(), path);
+    assert.equal(runtime.refusedForIntegrity(), false);
+    assert.equal(locates, 1);
+    assert.equal(hosts.length, 1);
+    await runtime.adapter.close().catch(() => undefined);
   });
 
   it("hands out a runtime that refuses to start when the pieces already differ at creation", async () => {

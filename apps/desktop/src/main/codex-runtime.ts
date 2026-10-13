@@ -5,6 +5,7 @@ import {
   type AcpV1AdapterSink,
   type AcpV1ProcessPort,
   type EngineProcessHostOptions,
+  type PrivateInstallRule,
 } from "@guild/runtime-grok";
 import {
   CodexEngineIntegrityError,
@@ -13,7 +14,7 @@ import {
   type CodexLocatorOptions,
   type LocatedCodexEngine,
 } from "./codex-locator.js";
-import { invalidateClaudeLocatorCache } from "./claude-locator.js";
+import { invalidateClaudeLocatorCache, privateInstallRuleForLaunch } from "./claude-locator.js";
 import { RelocatingEngineProcess } from "./relocating-engine-process.js";
 import { resolveOfficialGrokEnvironment } from "./runtime-locator.js";
 
@@ -46,6 +47,8 @@ export type CodexRuntimeDependencies = Readonly<{
   invalidateLocatorCache?: () => void;
   createHost?: (options: EngineProcessHostOptions) => EngineProcessHost;
   baseEnvironment?: () => Promise<Readonly<Record<string, string | undefined>>>;
+  /** The private-install rule of the launch; defaults to the packaged app's (on) and a development run's (absent). */
+  privateInstallRule?: () => PrivateInstallRule | undefined;
 }>;
 
 export type CodexRuntime = Readonly<{
@@ -57,6 +60,11 @@ export type CodexRuntime = Readonly<{
    * start the same way, so the owner asks here to name the reason.
    */
   refusedForIntegrity: () => boolean;
+  /**
+   * The file or folder that made the process refuse to start because someone other than the user could change it
+   * (packaged apps only); undefined otherwise.
+   */
+  refusedForInstall: () => string | undefined;
 }>;
 
 export async function createCodexRuntime(
@@ -80,14 +88,21 @@ export async function createCodexRuntime(
           profile: CODEX_ENGINE_PROFILE,
         }),
         refusedForIntegrity: () => true,
+        refusedForInstall: () => undefined,
       });
     }
     throw cause;
   }
+  const privateInstall = (dependencies.privateInstallRule ?? privateInstallRuleForLaunch)();
   const buildHost = (engine: LocatedCodexEngine): EngineProcessHost => {
     const options: EngineProcessHostOptions = {
       profile: CODEX_ENGINE_PROFILE,
-      launch: { engine: "codex", adapter: engine.adapter, core: engine.core },
+      launch: {
+        engine: "codex",
+        adapter: engine.adapter,
+        core: engine.core,
+        ...(privateInstall === undefined ? {} : { privateInstall }),
+      },
       executablePath: engine.node.executablePath,
       expectedSha256: engine.node.sha256,
       workingDirectory: input.workingDirectory,
@@ -120,6 +135,7 @@ export async function createCodexRuntime(
     }),
     runtimeVersion: `Codex ${located.core.version}`,
     refusedForIntegrity: () => process.refusal !== undefined,
+    refusedForInstall: () => process.installPath,
   });
 }
 

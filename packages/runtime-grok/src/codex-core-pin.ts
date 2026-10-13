@@ -84,6 +84,14 @@ async function pinCandidate(packageDirectory: string, target: CodexPlatformTarge
   return Object.freeze({ executablePath, version, sizeBytes: stats.size });
 }
 
+/**
+ * The folder the core runs from: `vendor/<triple>`, which holds `bin/codex` and the helpers and resources it starts
+ * (`codex-path`, `codex-resources`). The same derivation `verifyCodexCorePin` uses for the manifest.
+ */
+export function codexCoreInstallRoot(pin: CodexCorePin): string {
+  return dirname(dirname(pin.executablePath));
+}
+
 /** Re-proves, before a spawn, that the pinned core is still the same file with the same size. */
 export async function verifyCodexCorePin(pin: CodexCorePin): Promise<void> {
   const resolved = await realpath(pin.executablePath).catch(() => undefined);

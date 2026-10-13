@@ -25,6 +25,7 @@ import {
   type LocatedClaudeEngine,
   type ProbeStager,
 } from "./claude-locator.js";
+import { DEFAULT_PRIVATE_INSTALL_IO, type PrivateInstallIo } from "@guild/runtime-grok";
 import { defaultPathTrustPolicy, type PathTrustPolicy } from "./trusted-location.js";
 
 // Nothing here runs a real node, adapter or claude: files carry only a Mach-O magic number (or a
@@ -675,6 +676,8 @@ describe("Claude locator: a packaged app takes nothing from the PATH it was star
         allowEnvironmentPath: false,
         pathTrust: policy,
         stagingRoot: staging,
+        // The temp directory is not what these tests judge; the private-install tests turn the rule on with their own io.
+        requirePrivateInstall: false,
       }),
     };
   }
@@ -836,6 +839,134 @@ describe("Claude locator: a packaged app takes nothing from the PATH it was star
     await expectLocatorError(locateClaudeBinary({ ...box.packaged(refused.execute), stageExecutable: swapped }), "claude_missing");
     assert.deepEqual(refused.runs, []);
     assert.deepEqual(await readdir(box.staging), [], "a failed staging leaves nothing behind either");
+  });
+
+  /** The real file system under `root`, with everything above it shown as root's 0755: the temp directory is not the subject. */
+  function sandboxIo(root: string): PrivateInstallIo {
+    return {
+      ...DEFAULT_PRIVATE_INSTALL_IO,
+      lstat: async (path) => path === root || path.startsWith(`${root}/`)
+        ? DEFAULT_PRIVATE_INSTALL_IO.lstat(path)
+        : { uid: 0, mode: 0o40755, isDirectory: true, isSymbolicLink: false },
+    };
+  }
+
+  /** A policy that accepts a folder only the admin group can write (a Homebrew prefix), as the real one does on macOS. */
+  async function brewPolicy(folder: string): Promise<PathTrustPolicy> {
+    return Object.freeze({ currentUid: uid, adminGid: (await stat(folder)).gid, rejectedRoots: Object.freeze([]) });
+  }
+
+  /** Packaged options with the private-install rule left at its default (on) and the sandbox as its file system. */
+  function withPrivacy(box: PackagedBox, execute?: ClaudeLocatorOptions["execute"], policy?: PathTrustPolicy): ClaudeLocatorOptions {
+    const { requirePrivateInstall: _off, ...packaged } = box.packaged(execute, policy);
+    return { ...packaged, privateInstallIo: sandboxIo(box.root) };
+  }
+
+  async function expectNotPrivate(operation: Promise<unknown>, path: string): Promise<void> {
+    await assert.rejects(operation, (cause: unknown) => {
+      assert.ok(cause instanceof ClaudeLocatorError, String(cause));
+      assert.equal(cause.code, "install_not_private");
+      assert.equal(cause.path, path);
+      return true;
+    });
+  }
+
+  it("refuses a claude binary in a folder the admin group can write: it is found, named, and neither probed nor staged [PC-SEC-001]", async () => {
+    const box = await packagedBox();
+    const claude = join(box.trusted, "claude");
+    await writeMachO(claude, "homebrew-claude");
+    await chmod(box.trusted, 0o775);
+    const policy = await brewPolicy(box.trusted);
+    const probe = probesByPayload({ "homebrew-claude": "2.1.291 (Claude Code)" });
+    await expectNotPrivate(locateClaudeBinary(withPrivacy(box, probe.execute, policy)), box.trusted);
+    assert.deepEqual(probe.runs, [], "nothing was run");
+    assert.deepEqual(await readdir(box.staging), [], "nothing was copied");
+    // The same install is fine once only the user can write the folder.
+    await chmod(box.trusted, 0o755);
+    assert.equal((await locateClaudeBinary(withPrivacy(box, probe.execute, policy))).executablePath, claude);
+  });
+
+  it("prefers a private claude over a not private one found earlier [PC-SEC-001]", async () => {
+    const box = await packagedBox();
+    const first = join(box.home, ".local", "bin", "claude");
+    const second = join(box.trusted, "claude");
+    await writeMachO(first, "shared-claude");
+    await writeMachO(second, "private-claude");
+    await chmod(join(box.home, ".local", "bin"), 0o775);
+    const policy = await brewPolicy(join(box.home, ".local", "bin"));
+    const probe = probesByPayload({ "shared-claude": "9.9.9 (Claude Code)", "private-claude": "2.1.291 (Claude Code)" });
+    const located = await locateClaudeBinary(withPrivacy(box, probe.execute, policy));
+    assert.equal(located.executablePath, second);
+    assert.deepEqual(probe.runs.map((run) => run.payload), ["private-claude"], "the shared one was never run");
+  });
+
+  it("checks claude again on every call, before the cached answer [PC-SEC-001]", async () => {
+    const box = await packagedBox();
+    const claude = join(box.trusted, "claude");
+    await writeMachO(claude, "genuine-claude");
+    const policy = await brewPolicy(box.trusted);
+    const probe = probesByPayload({ "genuine-claude": "2.1.291 (Claude Code)" });
+    const options = withPrivacy(box, probe.execute, policy);
+    assert.equal((await locateClaudeBinary(options)).executablePath, claude);
+    assert.equal(probe.runs.length, 1);
+    await chmod(box.trusted, 0o775);
+    await expectNotPrivate(locateClaudeBinary(options), box.trusted);
+    assert.equal(probe.runs.length, 1, "the cache answered nothing");
+  });
+
+  it("refuses an adapter package with any entry others could write, even deep in node_modules, and uses a private one elsewhere [PC-SEC-001]", async () => {
+    const box = await packagedBox();
+    const shared = await writeAdapterPackage(join(box.home, ".npm-global"), "0.89.1");
+    await mkdir(join(box.home, ".npm-global", "bin"), { recursive: true });
+    await symlink("../lib/node_modules/@agentclientprotocol/claude-agent-acp/dist/index.js", join(box.home, ".npm-global", "bin", "claude-agent-acp"));
+    const dependency = join(shared.packageRoot, "node_modules", "dep", "index.js");
+    await mkdir(join(dependency, ".."), { recursive: true });
+    await writeFile(dependency, "module.exports = 1;\n");
+    await chmod(dependency, 0o664);
+    const options = withPrivacy(box);
+    await expectNotPrivate(locateClaudeAdapter(options), dependency);
+    // A private install in a later place wins.
+    const other = await writeAdapterPackage(join(box.root, "opt-prefix"), "0.89.2");
+    await mkdir(join(box.root, "opt-prefix", "bin"), { recursive: true });
+    await symlink("../lib/node_modules/@agentclientprotocol/claude-agent-acp/dist/index.js", join(box.root, "opt-prefix", "bin", "claude-agent-acp"));
+    const withOther = { ...options, fallbackDirectories: [join(box.root, "opt-prefix", "bin")] };
+    const pin = await locateClaudeAdapter(withOther);
+    assert.equal(pin.packageRoot, other.packageRoot);
+    assert.equal(pin.version, "0.89.2");
+  });
+
+  it("refuses an adapter package whose own folder, or one above it, others could write [PC-SEC-001]", async () => {
+    const box = await packagedBox();
+    const installed = await writeAdapterPackage(join(box.home, ".npm-global"), "0.89.1");
+    await mkdir(join(box.home, ".npm-global", "bin"), { recursive: true });
+    await symlink("../lib/node_modules/@agentclientprotocol/claude-agent-acp/dist/index.js", join(box.home, ".npm-global", "bin", "claude-agent-acp"));
+    const globalModules = join(box.home, ".npm-global", "lib", "node_modules");
+    await chmod(globalModules, 0o775);
+    await expectNotPrivate(locateClaudeAdapter(withPrivacy(box, undefined, await brewPolicy(globalModules))), globalModules);
+    await chmod(globalModules, 0o755);
+    assert.equal((await locateClaudeAdapter(withPrivacy(box))).packageRoot, installed.packageRoot);
+  });
+
+  it("keeps the admin-group allowance for node alone, which runs from a verified staged copy [PC-SEC-001]", async () => {
+    const box = await packagedBox();
+    const node = join(box.trusted, "node");
+    await writeMachO(node, "homebrew-node");
+    await chmod(box.trusted, 0o775);
+    const policy = await brewPolicy(box.trusted);
+    const probe = probesByPayload({ "homebrew-node": "v26.8.1" });
+    const located = await locateNode(withPrivacy(box, probe.execute, policy));
+    assert.equal(located.executablePath, node);
+    assert.ok(probe.runs[0]!.file.startsWith(`${box.staging}/.grok-pin-`), "run from the staged copy, not in place");
+  });
+
+  it("does not apply to a development run, which uses the file where it is [PC-SEC-001]", async () => {
+    const box = await packagedBox();
+    const installed = await writeAdapterPackage(join(box.home, ".npm-global"), "0.89.1");
+    await mkdir(join(box.home, ".npm-global", "bin"), { recursive: true });
+    await symlink("../lib/node_modules/@agentclientprotocol/claude-agent-acp/dist/index.js", join(box.home, ".npm-global", "bin", "claude-agent-acp"));
+    await chmod(installed.entry, 0o666);
+    const dev = { ...withPrivacy(box), allowEnvironmentPath: true, pathTrust: undefined };
+    assert.equal((await locateClaudeAdapter(dev)).packageRoot, installed.packageRoot);
   });
 
   it("a development run still probes the file itself, with no copy", async () => {
