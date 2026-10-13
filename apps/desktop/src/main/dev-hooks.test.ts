@@ -6,7 +6,6 @@ import {
   DEV_CLAUDE_CAPTURE_OFF_VARIABLE,
   DEV_CODEX_ACP_VARIABLE,
   DEV_DATA_DIR_VARIABLE,
-  DEV_GEMINI_CLI_VARIABLE,
   resolveDevHooks,
 } from "./dev-hooks.js";
 
@@ -51,9 +50,8 @@ test("index.ts reads the hooks through resolveDevHooks with app.isPackaged and n
   assert.match(source, /devHooks\.userDataDir \?\? join\(app\.getPath\("appData"\), "Guild-v2"\)/u);
   assert.match(source, /claudeCaptureOff: devHooks\.claudeCaptureOff/u);
   assert.match(source, /codexAdapterRoot: devHooks\.codexAdapterRoot/u);
-  assert.match(source, /geminiCliRoot: devHooks\.geminiCliRoot/u);
   // The variable names are not read directly in the main entry: the only gate is resolveDevHooks.
-  assert.doesNotMatch(source, /GUILD_DEV_DATA_DIR|GUILD_DEV_CLAUDE_CAPTURE_OFF|GUILD_DEV_CODEX_ACP|GUILD_DEV_GEMINI_CLI/u);
+  assert.doesNotMatch(source, /GUILD_DEV_DATA_DIR|GUILD_DEV_CLAUDE_CAPTURE_OFF|GUILD_DEV_CODEX_ACP/u);
 });
 
 test("the capture variable reaches Claude spawns only through the live service option and the routed marker [PC-OV-001]", async () => {
@@ -89,30 +87,4 @@ test("the Codex hook only adds a search root: the locator still pins what it fin
   assert.doesNotMatch(live, /process\.env\["GUILD_DEV/u);
   const locator = await readFile(new URL("../../src/main/codex-locator.ts", import.meta.url), "utf8");
   assert.match(locator, /await pinCodexAdapter\(root\)/u);
-});
-
-test("an unpackaged app takes a scratch Gemini CLI directory; a packaged app ignores it [PC-ENG-004]", () => {
-  assert.equal(DEV_GEMINI_CLI_VARIABLE, "GUILD_DEV_GEMINI_CLI");
-  const hooks = resolveDevHooks({ isPackaged: false, env: { [DEV_GEMINI_CLI_VARIABLE]: "/tmp/guild31-qa/gemini/node_modules/@google/gemini-cli" } });
-  assert.equal(hooks.geminiCliRoot, "/tmp/guild31-qa/gemini/node_modules/@google/gemini-cli");
-  assert.equal(resolveDevHooks({ isPackaged: false, env: {} }).geminiCliRoot, undefined);
-  assert.equal(resolveDevHooks({ isPackaged: false, env: { [DEV_GEMINI_CLI_VARIABLE]: "" } }).geminiCliRoot, undefined);
-  assert.equal(resolveDevHooks({ isPackaged: true, env: { [DEV_GEMINI_CLI_VARIABLE]: "/tmp/x/gemini-cli" } }).geminiCliRoot, undefined);
-  assert.doesNotThrow(() => resolveDevHooks({ isPackaged: true, env: { [DEV_GEMINI_CLI_VARIABLE]: "relative" } }));
-  for (const bad of ["relative/dir", "/tmp/a/../b", "/tmp//double", "/tmp/with\0nul", "~/gemini"]) {
-    assert.throws(
-      () => resolveDevHooks({ isPackaged: false, env: { [DEV_GEMINI_CLI_VARIABLE]: bad } }),
-      /dev_gemini_cli_invalid/u,
-      bad,
-    );
-  }
-});
-
-test("the Gemini hook only adds a search root: the locator still pins what it finds, and no key variable is read from the environment [PC-ENG-004]", async () => {
-  const live = await readFile(new URL("../../src/main/live-service.ts", import.meta.url), "utf8");
-  assert.match(live, /extraPackageRoots: \[options\.geminiCliRoot\]/u);
-  assert.doesNotMatch(live, /process\.env\["GUILD_DEV/u);
-  assert.doesNotMatch(live, /process\.env\["GEMINI|process\.env\.GEMINI|process\.env\["GOOGLE/u);
-  const locator = await readFile(new URL("../../src/main/gemini-locator.ts", import.meta.url), "utf8");
-  assert.match(locator, /await pinGeminiCli\(root\)/u);
 });

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, it } from "node:test";
@@ -12,12 +12,10 @@ import type {
   TaskViewProjection,
   WorkspaceId,
 } from "@guild/contracts";
-import { freezeModelCatalog, sessionSelectionOf, type ModelCatalog } from "@guild/contracts";
+import { freezeModelCatalog, sessionSelectionOf } from "@guild/contracts";
 import {
   AcpV1AdapterError,
   AcpV1ConfigOptionRefusedError,
-  deriveGeminiConfigOptions,
-  deriveGeminiModelCatalog,
   engineProfileFor,
   type AcpV1AdapterSession,
   type AcpV1AdapterSink,
@@ -32,9 +30,6 @@ import {
 } from "@guild/runtime-grok";
 import { ClaudeEngineIntegrityError, ClaudeLocatorError } from "./claude-locator.js";
 import { CodexEngineIntegrityError, CodexLocatorError } from "./codex-locator.js";
-import { GeminiEnvironmentError } from "./gemini-env-guard.js";
-import { GeminiEngineIntegrityError, GeminiLocatorError } from "./gemini-locator.js";
-import { GeminiKeyUnavailableError } from "./gemini-runtime.js";
 import type { GitCheckpointPort } from "./git-checkpoints.js";
 import { toDesktopIpcFailure } from "./workspace-folder.js";
 import type { BrowserMcpPort, ModelRouterHostPort, RoutedModelInfo } from "./engine-ports.js";
@@ -1818,12 +1813,14 @@ describe("dual engine orchestration [PC-ENG-001, PC-MODEL-001]", () => {
   it("serves the engine fields from the fixture service", async () => {
     const fixture = createFixtureDesktopService();
     const projection = await fixture.bootstrap();
-    assert.deepEqual(Object.keys(projection.runtimeSettings.modelCatalogs ?? {}).sort(), ["claude", "codex", "gemini", "grok"]);
+    assert.deepEqual(Object.keys(projection.runtimeSettings.modelCatalogs ?? {}).sort(), ["claude", "codex", "grok"]);
     assert.deepEqual(
       projection.runtimeSettings.modelCatalogs!.claude.models.map((model) => model.group),
       ["claude", "claude", "claude", "claude", "online", "local"],
     );
     assert.equal(projection.runtimeSettings.claude?.permissionMode, "default");
+    assert.equal(projection.generalSettings.dockIcon, "dark");
+    assert.equal((await fixture.setGeneralSettings(true, "ask", false, true, "light")).generalSettings.dockIcon, "light");
     const workspaceId = projection.workspaces[0]!.workspaceId;
     const created = await fixture.createTask(workspaceId, undefined, "claude");
     assert.equal(created.task.engine, "claude");
@@ -1851,456 +1848,6 @@ describe("dual engine orchestration [PC-ENG-001, PC-MODEL-001]", () => {
       ["gpt-5.6-luna", "read-only"],
     );
     assert.equal((await fixture.openTask(codexTask.task.taskId)).modelSelection.modelId, "gpt-5.6-luna");
-  });
-});
-
-describe("Gemini engine orchestration [PC-ENG-004]", () => {
-  const geminiSettings = async (h: Harness) => (await h.service.bootstrap()).runtimeSettings.engines?.gemini;
-  const sessionLog = (h: Harness, index = 0) => h.world.adapters[index]!.log;
-  /** The CLI advertises `session/load` and no `session/resume`. */
-  const loadOnly = { loadSession: true, resume: false } as const;
-  const KEY_HOST = "generativelanguage.googleapis.com";
-  const KEY = "AIzaSy-test-key-0123456789abcdefghijk";
-
-  async function keyFile(contents: string): Promise<string> {
-    const root = await mkdtemp(join(tmpdir(), "guild-gemini-keys-"));
-    const path = join(root, "keys.env");
-    await writeFile(path, contents, { mode: 0o600 });
-    return path;
-  }
-
-  it("creates Gemini tasks, fixes the engine at the first turn and loads the same session after a restart [PC-ENG-004]", async () => {
-    const h = await harness({}, { gemini: loadOnly });
-    const task = await h.service.createTask(h.workspaceId, undefined, "gemini");
-    assert.equal(task.task.engine, "gemini");
-    assert.equal((await h.service.setTaskEngine(task.task.taskId, "grok")).task.engine, "grok");
-    assert.equal((await h.service.setTaskEngine(task.task.taskId, "gemini")).task.engine, "gemini");
-
-    await h.send(task.task.taskId, "hello");
-    await h.completed();
-    const sidebar = (await h.service.bootstrap()).workspaces[0]!.tasks;
-    assert.equal(sidebar.find((entry) => entry.taskId === task.task.taskId)?.engine, "gemini");
-    await assert.rejects(h.service.setTaskEngine(task.task.taskId, "claude"), /task_engine_locked/u);
-
-    await h.restart();
-    assert.equal((await h.service.openTask(task.task.taskId)).task.engine, "gemini");
-    await h.send(task.task.taskId, "again");
-    await h.completed(2);
-    // The CLI has no resume: a restart goes through session/load, which is all it offers.
-    assert.deepEqual(h.world.adapters[0]!.startCalls.map((call) => call.kind), ["load"]);
-    assert.equal(h.world.inputs[0]!.engine, "gemini");
-  });
-
-  it("accepts a session/load replay that carries the task's prompts although its tools, thoughts and answers differ from the live turns [PC-ENG-004]", async () => {
-    const h = await harness({}, { gemini: { ...loadOnly, geminiReplay: [{ user: "one" }, { user: "two" }] } });
-    const task = await h.service.createTask(h.workspaceId, undefined, "gemini");
-    await h.send(task.task.taskId, "one");
-    await h.completed();
-    await h.idle();
-    await h.send(task.task.taskId, "two");
-    await h.completed(2);
-    await h.idle();
-
-    await h.restart();
-    await h.send(task.task.taskId, "three");
-    await h.completed(3);
-    assert.deepEqual(h.world.adapters[0]!.startCalls.map((call) => call.kind), ["load"]);
-    assert.deepEqual(h.world.adapters[0]!.prompts, ["three"]);
-    const view = await h.service.openTask(task.task.taskId);
-    const users = view.timeline.flatMap((item) => item.kind === "user" ? [item.text] : []);
-    assert.deepEqual(users, ["one", "two", "three"], "the replay adds nothing to the conversation");
-    assert.equal(view.timeline.some((item) => item.kind === "assistant" && item.text.startsWith("replayed answer")), false);
-  });
-
-  it("refuses a session/load replay that omits or changes a completed prompt of the task [PC-ENG-004]", async () => {
-    for (const replay of [[{ user: "one" }], [{ user: "one" }, { user: "tw0" }], [] as Array<{ user: string }>]) {
-      const h = await harness({}, { gemini: { ...loadOnly, geminiReplay: replay } });
-      const task = await h.service.createTask(h.workspaceId, undefined, "gemini");
-      await h.send(task.task.taskId, "one");
-      await h.completed();
-      await h.idle();
-      await h.send(task.task.taskId, "two");
-      await h.completed(2);
-      await h.idle();
-      await h.restart();
-      await assert.rejects(h.send(task.task.taskId, "three"), /session_replacement_requires_user_authorization/u, JSON.stringify(replay));
-      assert.deepEqual(h.world.adapters[0]!.prompts, [], "nothing was sent into a session that is not this task's");
-      assert.equal((await h.service.bootstrap()).activeTask?.sessionRecovery, "replacement_required");
-    }
-  });
-
-  it("starts the process with no per-spawn environment, router, authentication or _x.ai request [PC-ENG-004]", async () => {
-    const router = new FakeRouterHost([DEEPSEEK]);
-    const h = await harness({ modelRouterHost: router, claudeCaptureOff: true }, { gemini: { ...loadOnly, advertiseAuthMethod: true } });
-    const task = await h.service.createTask(h.workspaceId, undefined, "gemini");
-    await h.send(task.task.taskId, "x");
-    await h.completed();
-    assert.equal(h.world.inputs[0]!.extraEnvironment, undefined);
-    assert.equal(h.world.adapters[0]!.authenticateCalls, 0, "Guild never authenticates for Gemini: the API key is the only way in");
-    assert.equal(router.calls, 0, "no model router for Gemini");
-    assert.equal(h.world.adapters[0]!.extensionCalls, 0);
-    assert.equal(h.world.adapters[0]!.billingCalls, 0);
-    assert.equal(h.world.adapters[0]!.features.steer, false);
-  });
-
-  it("selects the cheapest listed model before the first prompt even when nothing is pinned, and again after a load [PC-ENG-004]", async () => {
-    const h = await harness({}, { gemini: loadOnly });
-    const task = await h.service.createTask(h.workspaceId, undefined, "gemini");
-    // Nothing is known about Gemini's models until a session listed them.
-    assert.deepEqual((await h.service.bootstrap()).runtimeSettings.modelCatalogs!.gemini.models, []);
-    assert.equal(h.world.inputs.length, 0);
-    await h.send(task.task.taskId, "one");
-    await h.completed();
-    await h.idle();
-    // The session came up on `auto` (it can route to Pro): the cheapest Flash model is chosen explicitly, then the turn runs.
-    assert.deepEqual(sessionLog(h).slice(0, 3), ["new", "config:model=gemini-3.5-flash-lite", "prompt:one"]);
-    assert.equal(h.world.inputs[0]!.model, undefined, "the list was not known at the first start, so the settings name no model");
-    const view = await h.service.openTask(task.task.taskId);
-    assert.deepEqual([view.modelSelection.modelId, view.modelSelection.source], ["gemini-3.5-flash-lite", "runtime"]);
-
-    // A load brings the CLI back on `auto`: the model is applied again before the next prompt, and the settings name it.
-    await h.restart();
-    await h.send(task.task.taskId, "two");
-    await h.completed(2);
-    const loaded = h.world.adapters[0]!;
-    assert.equal(loaded.startCalls[0]!.kind, "load");
-    const afterLoad = loaded.log.slice(loaded.log.indexOf("load"));
-    assert.deepEqual(afterLoad.slice(0, 3), ["load", "config:model=gemini-3.5-flash-lite", "prompt:two"]);
-    assert.equal(h.world.inputs[0]!.model, "gemini-3.5-flash-lite", "the process is told the model the task runs on");
-  });
-
-  it("applies the setting's mode by the CLI's own id before the model, and never leaves a session looser than it [PC-ENG-004]", async () => {
-    const h = await harness({}, { gemini: loadOnly });
-    assert.equal((await geminiSettings(h))?.permissionMode, "default", "Guild's default asks first");
-    assert.deepEqual((await geminiSettings(h))?.availablePermissionModes, ["default", "autoEdit", "yolo", "plan"]);
-    await h.service.setEngineSettings("gemini", null, null, "autoEdit");
-    const task = await h.service.createTask(h.workspaceId, undefined, "gemini");
-    await h.send(task.task.taskId, "one");
-    await h.completed();
-    await h.idle();
-    assert.deepEqual(h.world.adapters[0]!.log.slice(0, 4), ["new", "mode=autoEdit", "config:model=gemini-3.5-flash-lite", "prompt:one"]);
-    assert.equal((await h.service.openTask(task.task.taskId)).sessionModes?.currentModeId, "autoEdit");
-    // A mode change in Settings applies at the next turn, and a load comes back in the default mode.
-    await h.service.setEngineSettings("gemini", null, null, "plan");
-    await h.send(task.task.taskId, "two");
-    await h.completed(2);
-    assert.ok(h.world.adapters[0]!.log.includes("mode=plan"));
-    await h.restart();
-    await h.send(task.task.taskId, "three");
-    await h.completed(3);
-    const loaded = h.world.adapters[0]!;
-    assert.deepEqual(loaded.log.slice(loaded.log.indexOf("load"), loaded.log.indexOf("load") + 3), ["load", "mode=plan", "config:model=gemini-3.5-flash-lite"]);
-
-    // A refused mode stops the start rather than running looser.
-    const refusing = await harness({}, { gemini: { ...loadOnly, refuseMode: true } });
-    await refusing.service.setEngineSettings("gemini", null, null, "plan");
-    const other = await refusing.service.createTask(refusing.workspaceId, undefined, "gemini");
-    await assert.rejects(refusing.send(other.task.taskId, "x"), /runtime_start_session_permission_mode/u);
-    assert.deepEqual(refusing.world.adapters[0]!.prompts, []);
-  });
-
-  it("does not send a turn the CLI would run on its own choice: a session that lists no model refuses it by name [PC-ENG-004]", async () => {
-    const h = await harness({}, { gemini: { ...loadOnly, geminiNoModels: true } });
-    const task = await h.service.createTask(h.workspaceId, undefined, "gemini");
-    await assert.rejects(h.send(task.task.taskId, "one"), /model_selection_failed/u);
-    assert.deepEqual(h.world.adapters[0]!.prompts, [], "the prompt never reached the CLI");
-  });
-
-  it("stores defaults only from the engine's own list, with no effort and only Gemini's own modes [PC-ENG-004, PC-SET-002]", async () => {
-    const h = await harness({}, { gemini: loadOnly });
-    await assert.rejects(h.service.setEngineSettings("gemini", null, null, "acceptEdits"), /runtime_settings_change_unavailable/u);
-    await assert.rejects(h.service.setEngineSettings("gemini", null, null, "workspace-write"), /runtime_settings_change_unavailable/u);
-    await assert.rejects(h.service.setEngineSettings("gemini", "gemini-3.5-flash-lite", null, "default"), /runtime_settings_change_unavailable/u, "no list yet");
-    const task = await h.service.createTask(h.workspaceId, undefined, "gemini");
-    await h.send(task.task.taskId, "x");
-    await h.completed();
-    await h.idle();
-    await assert.rejects(h.service.setEngineSettings("gemini", "gemini-9", null, "default"), /runtime_settings_change_unavailable/u);
-    await assert.rejects(h.service.setEngineSettings("gemini", "auto", null, "default"), /runtime_settings_change_unavailable/u, "auto is never offered");
-    await assert.rejects(h.service.setEngineSettings("gemini", "gemini-3.5-flash-lite", "high", "default"), /runtime_settings_change_unavailable/u, "no thinking control");
-    const saved = await h.service.setEngineSettings("gemini", "gemini-3-flash-preview", null, "yolo");
-    assert.deepEqual(
-      [saved.runtimeSettings.engines?.gemini?.model, saved.runtimeSettings.engines?.gemini?.reasoningEffort, saved.runtimeSettings.engines?.gemini?.permissionMode],
-      ["gemini-3-flash-preview", null, "yolo"],
-    );
-    // The Codex defaults are another engine's.
-    assert.equal(saved.runtimeSettings.engines?.codex?.permissionMode, "workspace-write");
-    const second = await h.service.createTask(h.workspaceId, undefined, "gemini");
-    await h.send(second.task.taskId, "two");
-    await h.completed();
-    const adapter = h.world.adapters.at(-1)!;
-    assert.deepEqual(adapter.log.slice(0, 4), ["new", "mode=yolo", "config:model=gemini-3-flash-preview", "prompt:two"]);
-  });
-
-  it("fills the Gemini list from the session start, never with auto, keeps it out of the other lists and caches it [PC-MODEL-001, PC-ENG-004]", async () => {
-    const h = await harness({}, { gemini: loadOnly });
-    const task = await h.service.createTask(h.workspaceId, undefined, "gemini");
-    await h.send(task.task.taskId, "x");
-    await h.completed();
-    await h.idle();
-    const catalogs = (await h.service.bootstrap()).runtimeSettings.modelCatalogs!;
-    assert.deepEqual(catalogs.gemini.models.map((model) => model.id), ["gemini-3.1-pro-preview", "gemini-3-flash-preview", "gemini-3.5-flash-lite"]);
-    assert.ok(catalogs.gemini.models.every((model) => model.group === "gemini" && model.reasoningEfforts.length === 0));
-    assert.equal(catalogs.gemini.runtimeDefaultModelId, "gemini-3.5-flash-lite", "the cheapest, not the CLI's auto");
-    assert.equal(catalogs.claude.models.some((model) => model.id.startsWith("gemini")), false);
-    assert.equal(catalogs.codex.models.some((model) => model.id.startsWith("gemini")), false);
-    assert.equal(catalogs.grok.models.some((model) => model.id.startsWith("gemini")), false);
-    await h.restart();
-    const after = (await h.service.bootstrap()).runtimeSettings.modelCatalogs!;
-    assert.deepEqual(after.gemini.models.map((model) => model.id), ["gemini-3.1-pro-preview", "gemini-3-flash-preview", "gemini-3.5-flash-lite"]);
-    assert.equal((await h.service.openTask(task.task.taskId)).modelSelection.modelId, "gemini-3.5-flash-lite");
-  });
-
-  it("stores a task's own model, applies it between turns, refuses what the CLI did not list or an effort, and names each turn [PC-MODEL-001, PC-CONV-001]", async () => {
-    let store!: GuildPersistence;
-    const h = await harness({}, { gemini: loadOnly }, (path) => {
-      store = openGuildPersistence({ path });
-      return store;
-    });
-    const task = await h.service.createTask(h.workspaceId, undefined, "gemini");
-    const taskId = task.task.taskId;
-    await h.send(taskId, "one");
-    await h.completed();
-    await h.idle();
-    const adapter = h.world.adapters[0]!;
-    const saved = await h.service.setTaskRuntimeSettings({ taskId, model: "gemini-3-flash-preview", reasoningEffort: null, contextWindow: null });
-    assert.equal(saved.status, "applied");
-    assert.equal(saved.task.modelSelection.source, "task");
-    assert.equal(saved.task.modelSelection.modelId, "gemini-3-flash-preview");
-    assert.ok(adapter.log.includes("config:model=gemini-3-flash-preview"));
-    for (const request of [
-      { model: "gemini-9", reasoningEffort: null, contextWindow: null },
-      { model: "auto", reasoningEffort: null, contextWindow: null },
-      { model: "gemini-3-flash-preview", reasoningEffort: "high", contextWindow: null },
-      { model: "gemini-3-flash-preview", reasoningEffort: null, contextWindow: 100_000 },
-    ]) {
-      const refused = await h.service.setTaskRuntimeSettings({ taskId, ...request });
-      assert.equal(refused.status, "refused", JSON.stringify(request));
-    }
-    await h.send(taskId, "two");
-    await h.completed(2);
-    await h.idle();
-    const view = await h.service.openTask(taskId);
-    const runs = [...new Set(view.timeline.filter((item) => item.kind === "user").map((item) => item.runId!))];
-    const labels = new Map((view.runModels ?? []).map((entry) => [entry.runId, entry.label] as const));
-    assert.deepEqual(runs.map((runId) => labels.get(runId)), ["gemini-3.5-flash-lite", "gemini-3-flash-preview"]);
-    assert.equal(store.listRunModelLabels(taskId).length, 2);
-  });
-
-  it("names the key state instead of failing blind: an unusable key or an unconfirmed binding stops the start, not the task [PC-ENG-004]", async () => {
-    for (const reason of ["unconfirmed", "unusable"] as const) {
-      const h = await harness({}, { gemini: { ...loadOnly, keyUnavailable: reason } });
-      const task = await h.service.createTask(h.workspaceId, undefined, "gemini");
-      await assert.rejects(h.send(task.task.taskId, "hi"), /^Error: engine_key_required$/u, reason);
-      assert.equal(h.world.adapters.length, 0, "nothing was spawned");
-      const reduced = await h.service.openTask(task.task.taskId);
-      assert.equal(reduced.engineStatus?.loginRequired, true);
-      assert.equal(reduced.canSend, true, "the task stays usable");
-      const settings = await geminiSettings(h);
-      assert.equal(settings?.status, "not_logged_in");
-      assert.equal(settings?.apiKey?.state, "unconfirmed", "no binding is confirmed in this world");
-      assert.equal(toDesktopIpcFailure(new Error("engine_key_required")).message, "engine_key_required", "the code survives the IPC allowlist");
-    }
-    // The CLI itself saying the key is not accepted is the same named state, in the timeline and in the settings.
-    const rejecting = await harness({}, { gemini: { ...loadOnly, authRequiredOnNewSession: true } });
-    const rejected = await rejecting.service.createTask(rejecting.workspaceId, undefined, "gemini");
-    await assert.rejects(rejecting.send(rejected.task.taskId, "hi"), /^Error: engine_key_required$/u);
-    assert.equal(rejecting.world.adapters[0]!.authenticateCalls, 0);
-    const expiring = await harness({}, { gemini: { ...loadOnly, authRequiredOnPrompt: true } });
-    const third = await expiring.service.createTask(expiring.workspaceId, undefined, "gemini");
-    await expiring.send(third.task.taskId, "login-expired");
-    await eventually(async () => {
-      const view = (await expiring.service.bootstrap()).activeTask;
-      return view?.timeline.some((item) => item.kind === "error" && /no usable API key|没有可用的 API 密钥/u.test(item.text) && !/login|登录/u.test(item.text)) === true;
-    });
-  });
-
-  it("refuses a start whose env file would move the key, writes a note naming the file and the variable, and sends nothing [PC-ENG-004]", async () => {
-    const problem = { path: "/work/project/.env", variable: "GOOGLE_GEMINI_BASE_URL" };
-    const h = await harness({}, { gemini: { ...loadOnly, envFileProblem: problem } });
-    const task = await h.service.createTask(h.workspaceId, undefined, "gemini");
-    await assert.rejects(h.send(task.task.taskId, "hi"), /^Error: engine_env_file_unsafe$/u);
-    assert.equal(h.world.adapters.length, 0);
-    const view = await h.service.openTask(task.task.taskId);
-    const notice = view.timeline.find((item) => item.kind === "notice" && item.text.includes(problem.variable));
-    assert.ok(notice !== undefined, "the conversation says which file and variable");
-    assert.ok(notice.kind === "notice" && notice.text.includes(problem.path) && !/AIza|=/u.test(notice.text), "a name and a path, never a value");
-    assert.equal(toDesktopIpcFailure(new Error("engine_env_file_unsafe")).message, "engine_env_file_unsafe");
-  });
-
-  it("says in its note when a settings file or an oversized file stopped the start, and never shows a value [PC-ENG-004]", async () => {
-    for (const [problem, expected] of [
-      [{ path: "/work/project/.gemini/settings.json", variable: "security.auth.selectedType", source: "settings_file", reason: "forbidden" }, /(sets security\.auth\.selectedType.*Remove that setting)|(设置了 security\.auth\.selectedType.*删除这项设置)/u],
-      [{ path: "/work/project/.env", variable: "", source: "env_file", reason: "uncheckable" }, /(\.env is too large or too unusual for Guild to check)|(\.env 太大或格式异常，Guild 无法)/u],
-    ] as const) {
-      const h = await harness({}, { gemini: { ...loadOnly, envFileProblem: problem } });
-      const task = await h.service.createTask(h.workspaceId, undefined, "gemini");
-      await assert.rejects(h.send(task.task.taskId, "hi"), /^Error: engine_env_file_unsafe$/u);
-      assert.equal(h.world.adapters.length, 0);
-      const notice = (await h.service.openTask(task.task.taskId)).timeline.find((item) => item.kind === "notice" && item.text.includes(problem.path));
-      assert.ok(notice !== undefined && notice.kind === "notice" && expected.test(notice.text), notice?.kind === "notice" ? notice.text : "no note");
-    }
-  });
-
-  it("reports the install state from the probe: ready with the version, not found, integrity, unavailable [PC-ENG-004]", async () => {
-    let answer: () => Promise<{ version: string }> = async () => ({ version: "0.63.0" });
-    const path = await keyFile(`GEMINI_API_KEY=${KEY}\n`);
-    const h = await harness({ addonEngineProbes: { gemini: () => answer() }, defaultKeyFile: path, confirmEngineKey: async () => true });
-    // Found, but the key is not confirmed yet: the engine reads as having no usable key, not as ready.
-    await eventually(async () => (await geminiSettings(h))?.version === "0.63.0");
-    assert.equal((await geminiSettings(h))?.status, "not_logged_in");
-    await h.service.confirmEngineApiKey("gemini");
-    assert.equal((await geminiSettings(h))?.status, "ready");
-    assert.equal((await geminiSettings(h))?.version, "0.63.0");
-    for (const [thrown, status] of [
-      [new GeminiLocatorError("cli_missing"), "not_found"],
-      [new GeminiEngineIntegrityError("cli"), "integrity_changed"],
-      [new Error("boom"), "unavailable"],
-    ] as const) {
-      const failing = await harness({ addonEngineProbes: { gemini: async () => { throw thrown; } } });
-      await eventually(async () => (await geminiSettings(failing))?.status === status);
-    }
-    void answer;
-  });
-
-  it("shows a turn's tokens as used-only context, with no window to make a percentage of [PC-FALLBACK-001]", async () => {
-    const h = await harness({}, { gemini: { ...loadOnly, terminalTokens: 22090 } });
-    const task = await h.service.createTask(h.workspaceId, undefined, "gemini");
-    await h.send(task.task.taskId, "x");
-    await h.completed();
-    await eventually(async () => {
-      const view = (await h.service.bootstrap()).activeTask;
-      return view?.contextWindow.status === "used_only" && view.contextWindow.used === 22090;
-    });
-  });
-
-  it("asks no engine but Grok for official usage, with a Gemini task live [PC-FALLBACK-001]", async () => {
-    const h = await harness({}, { gemini: loadOnly });
-    const task = await h.service.createTask(h.workspaceId, undefined, "gemini");
-    await h.send(task.task.taskId, "x");
-    await h.completed();
-    await h.service.refreshUsage();
-    assert.equal(h.world.adapters[0]!.billingCalls, 0);
-    assert.equal(h.world.adapters[0]!.extensionCalls, 0);
-  });
-
-  describe("the API key binding [PC-ENG-004, PC-ROUTE-002]", () => {
-    it("names a file and a variable, binds them to the engine's host only through the native dialog, and shows no key [PC-ENG-004]", async () => {
-      const path = await keyFile(`OTHER=1\nGEMINI_API_KEY=${KEY}\n`);
-      const prompts: Array<{ message: string; detail: string }> = [];
-      let allow = false;
-      const h = await harness({
-        defaultKeyFile: path,
-        confirmEngineKey: async (prompt) => { prompts.push(prompt); return allow; },
-      });
-      const initial = (await geminiSettings(h))?.apiKey;
-      assert.deepEqual({ ...initial }, {
-        keyFile: null, keyVariable: "GEMINI_API_KEY", host: KEY_HOST, confirmed: false, defaultKeyFile: path, state: "unconfirmed",
-      });
-
-      // A cancelled dialog leaves the binding unconfirmed, and the dialog names the variable, the file and the host.
-      const cancelled = await h.service.confirmEngineApiKey("gemini");
-      assert.equal(cancelled.runtimeSettings.engines?.gemini?.apiKey?.confirmed, false);
-      assert.equal(prompts.length, 1);
-      assert.ok(prompts[0]!.message.includes("GEMINI_API_KEY") && prompts[0]!.message.includes(path) && prompts[0]!.message.includes(KEY_HOST));
-
-      allow = true;
-      const confirmed = await h.service.confirmEngineApiKey("gemini");
-      const key = confirmed.runtimeSettings.engines?.gemini?.apiKey;
-      assert.deepEqual([key?.confirmed, key?.state], [true, "usable"]);
-      assert.notEqual(confirmed.runtimeSettings.engines?.gemini?.status, "not_logged_in");
-      // Confirmed already: no second dialog.
-      await h.service.confirmEngineApiKey("gemini");
-      assert.equal(prompts.length, 2);
-
-      // Nothing the renderer can read carries the key, the host is the engine's own, and the file is never echoed back as a value.
-      const everything = JSON.stringify(await h.service.bootstrap());
-      assert.equal(everything.includes(KEY), false);
-      assert.equal(everything.includes("AIzaSy"), false);
-    });
-
-    it("voids the confirmation when the names change, and keeps it when they do not [PC-ENG-004]", async () => {
-      const path = await keyFile(`GEMINI_API_KEY=${KEY}\nMY_KEY=${KEY}2\n`);
-      const h = await harness({ defaultKeyFile: path, confirmEngineKey: async () => true });
-      await h.service.confirmEngineApiKey("gemini");
-      assert.equal((await geminiSettings(h))?.apiKey?.confirmed, true);
-      const same = await h.service.setEngineApiKey("gemini", null, "GEMINI_API_KEY");
-      assert.equal(same.runtimeSettings.engines?.gemini?.apiKey?.confirmed, true, "the same names change nothing");
-      const renamed = await h.service.setEngineApiKey("gemini", null, "MY_KEY");
-      assert.deepEqual(
-        [renamed.runtimeSettings.engines?.gemini?.apiKey?.keyVariable, renamed.runtimeSettings.engines?.gemini?.apiKey?.confirmed, renamed.runtimeSettings.engines?.gemini?.apiKey?.state],
-        ["MY_KEY", false, "unconfirmed"],
-      );
-      const moved = await h.service.confirmEngineApiKey("gemini");
-      assert.equal(moved.runtimeSettings.engines?.gemini?.apiKey?.state, "usable");
-      const elsewhere = await h.service.setEngineApiKey("gemini", path, "MY_KEY");
-      assert.deepEqual([elsewhere.runtimeSettings.engines?.gemini?.apiKey?.keyFile, elsewhere.runtimeSettings.engines?.gemini?.apiKey?.confirmed], [path, false]);
-    });
-
-    it("answers an edit made while the dialog is open with an unconfirmed binding: the answer was for the old names [PC-ENG-004]", async () => {
-      const path = await keyFile(`GEMINI_API_KEY=${KEY}\nOTHER_KEY=${KEY}\n`);
-      let h!: Harness;
-      let edited = false;
-      h = await harness({
-        defaultKeyFile: path,
-        confirmEngineKey: async () => {
-          // The renderer changes the variable while the native dialog is still up; then the user clicks Allow.
-          if (!edited) { edited = true; await h.service.setEngineApiKey("gemini", null, "OTHER_KEY"); }
-          return true;
-        },
-      });
-      const after = await h.service.confirmEngineApiKey("gemini");
-      assert.deepEqual(
-        [after.runtimeSettings.engines?.gemini?.apiKey?.keyVariable, after.runtimeSettings.engines?.gemini?.apiKey?.confirmed],
-        ["OTHER_KEY", false],
-      );
-    });
-
-    it("never confirms without a native dialog, and refuses names and engines that cannot be a binding [PC-ENG-004]", async () => {
-      const path = await keyFile(`GEMINI_API_KEY=${KEY}\n`);
-      const withoutDialog = await harness({ defaultKeyFile: path });
-      assert.equal((await withoutDialog.service.confirmEngineApiKey("gemini")).runtimeSettings.engines?.gemini?.apiKey?.confirmed, false);
-      for (const [engine, file, variable] of [
-        ["codex", null, "GEMINI_API_KEY"], ["claude", null, "GEMINI_API_KEY"], ["grok", null, "GEMINI_API_KEY"],
-        ["gemini", "relative.env", "GEMINI_API_KEY"], ["gemini", "/a/../b", "GEMINI_API_KEY"], ["gemini", null, "lower_case"], ["gemini", null, ""],
-        ["gemini", null, "AIzaSyD-this-is-a-key"],
-      ] as const) {
-        await assert.rejects(withoutDialog.service.setEngineApiKey(engine as never, file, variable), /^Error: engine_key_unavailable$/u, `${engine} ${String(file)} ${variable}`);
-      }
-      await assert.rejects(withoutDialog.service.confirmEngineApiKey("codex"), /^Error: engine_key_unavailable$/u);
-    });
-
-    it("follows the file: a confirmed binding whose variable disappears is unusable, and the status says no key [PC-ENG-004]", async () => {
-      const path = await keyFile(`GEMINI_API_KEY=${KEY}\n`);
-      const h = await harness({ defaultKeyFile: path, confirmEngineKey: async () => true });
-      await h.service.confirmEngineApiKey("gemini");
-      assert.equal((await geminiSettings(h))?.apiKey?.state, "usable");
-      await writeFile(path, "OTHER=1\n");
-      const looked = await h.service.setEngineApiKey("gemini", null, "GEMINI_API_KEY");
-      assert.equal(looked.runtimeSettings.engines?.gemini?.apiKey?.state, "unusable");
-      assert.equal(looked.runtimeSettings.engines?.gemini?.status, "not_logged_in");
-      await writeFile(path, `GEMINI_API_KEY=${KEY}\n`);
-      const fixed = await h.service.setEngineApiKey("gemini", null, "GEMINI_API_KEY");
-      assert.equal(fixed.runtimeSettings.engines?.gemini?.apiKey?.state, "usable");
-      assert.notEqual(fixed.runtimeSettings.engines?.gemini?.status, "not_logged_in");
-    });
-  });
-
-  it("serves the Gemini engine fields from the fixture service [PC-ENG-004]", async () => {
-    const fixture = createFixtureDesktopService();
-    const projection = await fixture.bootstrap();
-    assert.deepEqual(projection.runtimeSettings.modelCatalogs!.gemini.models.map((model) => model.group), ["gemini", "gemini", "gemini"]);
-    assert.equal(projection.runtimeSettings.engines?.gemini?.permissionMode, "default");
-    assert.equal(projection.runtimeSettings.engines?.gemini?.apiKey?.confirmed, false);
-    assert.equal(projection.generalSettings.dockIcon, "dark");
-    const confirmed = await fixture.confirmEngineApiKey("gemini");
-    assert.equal(confirmed.runtimeSettings.engines?.gemini?.apiKey?.confirmed, true);
-    const renamed = await fixture.setEngineApiKey("gemini", null, "OTHER_KEY");
-    assert.equal(renamed.runtimeSettings.engines?.gemini?.apiKey?.confirmed, false);
-    const task = await fixture.createTask(projection.workspaces[0]!.workspaceId, undefined, "gemini");
-    assert.equal(task.modelSelection.modelId, "gemini-3.5-flash-lite", "the cheapest, the engine's own pick");
-    const light = await fixture.setGeneralSettings(true, "ask", false, true, "light");
-    assert.equal(light.generalSettings.dockIcon, "light");
   });
 });
 
@@ -2338,19 +1885,6 @@ type EngineSpec = {
   resumeGate?: Promise<void>;
   /** Claude: the Default row describes no model (the real adapter does, but a version of it may not). */
   readonly vagueDefault?: boolean;
-  /** Gemini: the session lists no model at all (an odd CLI answer): a turn must not run on the CLI's own choice. */
-  readonly geminiNoModels?: boolean;
-  /**
-   * Gemini: `session/load` replays these prompts through the replay barrier, each with a thought, a tool call and an
-   * answer unlike the live turn (as the real CLI does), instead of establishing the session at once.
-   */
-  readonly geminiReplay?: readonly Readonly<{ user: string }>[];
-  /** Gemini: the runtime cannot be built because no usable key was found (nothing is spawned). */
-  readonly keyUnavailable?: "unconfirmed" | "unusable";
-  /** Gemini: the runtime cannot be built because an env file names a variable that moves the key. */
-  readonly envFileProblem?: { readonly path: string; readonly variable: string; readonly source?: "env_file" | "settings_file"; readonly reason?: "forbidden" | "uncheckable" };
-  /** The prompt result reports this many tokens (`contextTokensUsed`), as Gemini's quota does. */
-  readonly terminalTokens?: number;
   /**
    * Claude: what a routed process (one started with a modelPicker) lists as Claude's own models. It runs on an
    * API token, so the real list is a degraded one: fewer models and a Default row that only says "Opus".
@@ -2433,13 +1967,10 @@ function newWorld(): World {
 }
 
 function engineFactory(world: World, specs: Partial<Record<GuildEngine, EngineSpec>>): RuntimeFactory {
-  const counts: Record<GuildEngine, number> = { grok: 0, claude: 0, codex: 0, gemini: 0 };
+  const counts: Record<GuildEngine, number> = { grok: 0, claude: 0, codex: 0 };
   return async (input) => {
     world.inputs.push(input);
     await world.onSpawn?.(input);
-    const spec = specs[input.engine];
-    if (input.engine === "gemini" && spec?.keyUnavailable !== undefined) throw new GeminiKeyUnavailableError(spec.keyUnavailable);
-    if (input.engine === "gemini" && spec?.envFileProblem !== undefined) throw new GeminiEnvironmentError(spec.envFileProblem);
     counts[input.engine] += 1;
     world.log.push(`spawn:${input.engine}:${input.extraEnvironment?.["ANTHROPIC_BASE_URL"] === undefined ? "native" : "routed"}`);
     const adapter = new EngineFake(
@@ -2453,9 +1984,7 @@ function engineFactory(world: World, specs: Partial<Record<GuildEngine, EngineSp
     );
     world.adapters.push(adapter);
     return {
-      runtimeVersion: input.engine === "claude"
-        ? "Claude Code 2.1.291"
-        : input.engine === "codex" ? "Codex 0.160.1" : input.engine === "gemini" ? "Gemini CLI 0.63.0" : "Fake Grok 1.0",
+      runtimeVersion: input.engine === "claude" ? "Claude Code 2.1.291" : input.engine === "codex" ? "Codex 0.160.1" : "Fake Grok 1.0",
       adapter,
     };
   };
@@ -2659,52 +2188,20 @@ class EngineFake implements RuntimeAdapterPort {
     if (this.spec.loadSession !== true) throw new Error("load is not advertised");
     this.note("load");
     this.startCalls.push({ kind: "load", sessionId, options: startOptions });
-    // The replay barrier is not needed by most tests: the session is established like a resume.
-    const replay = this.engine === "gemini" ? this.spec.geminiReplay : undefined;
-    if (replay === undefined) return this.open("resume", sessionId, startOptions);
-    const identity = { adapterEpoch: this.adapterEpoch, sessionId };
-    const barrier = await this.sink.beginReplayBarrier({ identity });
-    try {
-      for (const [index, turn] of replay.entries()) {
-        const payloads = [
-          { type: "user_text_chunk" as const, sessionId, text: turn.user, received: received() },
-          { type: "agent_thought_chunk" as const, sessionId, text: `replayed thought ${index}`, received: received() },
-          {
-            type: "tool_call_create" as const,
-            sessionId,
-            toolCallId: `write_file__replayed_${index}`,
-            title: "WriteFile",
-            kind: "edit" as const,
-            status: "completed" as const,
-            received: received(),
-          },
-          { type: "agent_text_chunk" as const, sessionId, text: `replayed answer ${index}`, received: received() },
-        ];
-        for (const payload of payloads) {
-          await this.sink.commitUpdate({ identity, ingestMode: "replay", update: { type: "turn", payload } });
-        }
-      }
-      await this.sink.commitReplayBarrier({ identity, barrier, state: {} });
-    } catch (cause: unknown) {
-      await this.sink.abortReplayBarrier({ identity, barrier });
-      throw cause;
-    }
-    return this.open("resume", sessionId, startOptions, false);
+    // The replay barrier is not needed by these tests: the session is established like a resume.
+    return this.open("resume", sessionId, startOptions);
   }
 
   private async open(
     establishedBy: "new" | "resume",
     sessionId: string,
     startOptions: AcpV1SessionStartOptions | undefined,
-    establish = true,
   ): Promise<AcpV1AdapterSession> {
-    if (establish) {
-      await this.sink.commitSessionEstablished({
-        identity: { adapterEpoch: this.adapterEpoch, sessionId },
-        establishedBy,
-        state: {},
-      });
-    }
+    await this.sink.commitSessionEstablished({
+      identity: { adapterEpoch: this.adapterEpoch, sessionId },
+      establishedBy,
+      state: {},
+    });
     if (this.engine === "claude") {
       // The adapter lists whatever the session's modelPicker adds next to its own models.
       const picker = (startOptions?.claudeCodeOptions as
@@ -2735,9 +2232,6 @@ class EngineFake implements RuntimeAdapterPort {
       // Like the real adapter: a new and a resumed session both come back on the user's own Codex configuration
       // (Auto review, the first model, its configured effort). A resume does not restore what Guild applied.
       this.options = codexOptions();
-    } else if (this.engine === "gemini") {
-      // Like the real CLI: a new session and a loaded one both start on `auto` in the default mode.
-      this.options = this.spec.geminiNoModels === true ? geminiSession().options.filter((option) => option.id === "mode") : geminiSession().options;
     } else {
       this.options = Object.freeze([]);
     }
@@ -2745,11 +2239,8 @@ class EngineFake implements RuntimeAdapterPort {
       adapterEpoch: this.adapterEpoch,
       sessionId,
       establishedBy,
-      ...(this.engine === "claude" || this.engine === "codex" || this.engine === "gemini" ? { configOptions: this.options } : {}),
+      ...(this.engine === "claude" || this.engine === "codex" ? { configOptions: this.options } : {}),
       ...(this.engine === "codex" ? { modelCatalog: CODEX_START_CATALOG } : {}),
-      ...(this.engine === "gemini"
-        ? { modes: GEMINI_MODES, ...(this.spec.geminiNoModels === true ? {} : { modelCatalog: geminiSession().catalog }) }
-        : {}),
     });
     return this.session;
   }
@@ -2802,7 +2293,6 @@ class EngineFake implements RuntimeAdapterPort {
       stopReason: "end_turn",
       classification: "completed",
       received: received(),
-      ...(this.spec.terminalTokens === undefined ? {} : { contextTokensUsed: this.spec.terminalTokens }),
     });
     await this.sink.commitPromptTerminal({ identity, terminal });
     return terminal;
@@ -2974,30 +2464,6 @@ const CODEX_START_CATALOG = freezeModelCatalog("codex", {
     contextWindows: [],
   })),
 });
-
-/** What a Gemini session lists when it starts (docs/21 section 7), built by the real codec from the CLI's own wording. */
-const GEMINI_MODES = Object.freeze({
-  currentModeId: "default",
-  availableModes: Object.freeze([
-    Object.freeze({ id: "default", name: "Default", description: "Prompts for approval" }),
-    Object.freeze({ id: "autoEdit", name: "Auto Edit", description: "Auto-approves edit tools" }),
-    Object.freeze({ id: "yolo", name: "YOLO", description: "Auto-approves all tools" }),
-    Object.freeze({ id: "plan", name: "Plan", description: "Read-only mode" }),
-  ]),
-});
-
-function geminiSession(): { readonly options: readonly RuntimeConfigOption[]; readonly catalog: ModelCatalog } {
-  const options = deriveGeminiConfigOptions({
-    availableModels: [
-      { modelId: "auto", name: "Auto", description: "Let Gemini CLI decide the best model for the task" },
-      { modelId: "gemini-3.1-pro-preview", name: "gemini-3.1-pro-preview" },
-      { modelId: "gemini-3-flash-preview", name: "gemini-3-flash-preview" },
-      { modelId: "gemini-3.5-flash-lite", name: "gemini-3.5-flash-lite" },
-    ],
-    currentModelId: "auto",
-  }, GEMINI_MODES);
-  return { options, catalog: deriveGeminiModelCatalog(options)! };
-}
 
 /** The automatic recovery after an interruption has failed this many times, as its diagnostic record says. */
 async function recoveryFailures(h: Harness, count: number): Promise<void> {

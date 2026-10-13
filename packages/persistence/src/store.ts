@@ -6,7 +6,6 @@ import {
   GUILD_ADDON_ENGINES,
   GUILD_ENGINES,
   createRuntimeTurnEvent,
-  engineApiKeySpec,
   freezeModelCatalog,
   isConstructedRuntimeTurnEvent,
   isTerminalRunState,
@@ -27,8 +26,6 @@ import {
   parseGuildReasoningEffort,
   parseModelSourceDraft,
   parseModelSourceId,
-  parseModelSourceKeyFile,
-  parseModelSourceKeyVariable,
   parseModelSourceModels,
   type GuildDockIcon,
   type GuildNewTaskWorkspaceMode,
@@ -482,21 +479,6 @@ export type EngineDefaultsRecord = Readonly<{
   model: string | null;
   reasoningEffort: string | null;
   permissionMode: string;
-}>;
-
-/**
- * Where an add-on engine's API key is read from, and the host the user confirmed it for. It holds names and an address,
- * never a key. Any change of file or variable clears `confirmedHost` (PC-ENG-004).
- */
-export type EngineKeyBindingRecord = Readonly<{
-  engine: GuildAddonEngine;
-  /** Absolute path of the env file; `null` means the default key file. */
-  keyFile: string | null;
-  keyVariable: string;
-  /** The host the user confirmed, or `null` while unconfirmed. Written only by `confirmEngineKeyBinding`. */
-  confirmedHost: string | null;
-  revision: number;
-  updatedAtMs: number;
 }>;
 
 export type AppSettingsRecord = {
@@ -958,25 +940,6 @@ export interface GuildPersistence {
     readonly lastActiveTaskId?: TaskId | null;
     readonly lastWorkspaceId?: string | null;
   }): AppSettingsRecord;
-  /** The API key binding of an add-on engine that takes one; undefined until the user named it. */
-  loadEngineKeyBinding(engine: GuildAddonEngine): EngineKeyBindingRecord | undefined;
-  /**
-   * Names the file and variable the key is read from. A change voids the confirmation; saving the same names again
-   * changes nothing. Refused for an engine that takes no key.
-   */
-  saveEngineKeyBinding(input: {
-    readonly engine: GuildAddonEngine;
-    readonly keyFile: string | null;
-    readonly keyVariable: string;
-  }): EngineKeyBindingRecord;
-  /**
-   * Records that the user confirmed the key may be sent to the engine's own host. The main process calls it only
-   * after its native dialog; no IPC request reaches it.
-   */
-  confirmEngineKeyBinding(input: {
-    readonly engine: GuildAddonEngine;
-    readonly expectedRevision: number;
-  }): EngineKeyBindingRecord;
   loadTaskRuntimeSettings(taskId: TaskId): TaskRuntimeSettingsRecord | undefined;
   saveTaskRuntimeSettings(input: {
     readonly taskId: TaskId;
@@ -1576,19 +1539,6 @@ function parsedRuntimeSetting<T>(value: unknown, parse: (value: unknown) => T): 
 function parsedEngine(value: unknown): GuildEngine {
   try {
     return parseGuildEngine(value);
-  } catch (cause: unknown) {
-    throw persistenceError("domain_operation_rejected", cause);
-  }
-}
-
-/** An add-on engine that takes an API key; any other engine is refused. */
-function parsedKeyedEngine(value: unknown): GuildAddonEngine {
-  try {
-    const engine = parseGuildEngine(value);
-    if (!(GUILD_ADDON_ENGINES as readonly string[]).includes(engine) || engineApiKeySpec(engine) === undefined) {
-      throw new TypeError("invalid_engine");
-    }
-    return engine as GuildAddonEngine;
   } catch (cause: unknown) {
     throw persistenceError("domain_operation_rejected", cause);
   }
@@ -4349,78 +4299,6 @@ class SqliteGuildPersistence implements GuildPersistence {
           .run(engineChange.engine, written.model ?? "", written.reasoningEffort ?? "", written.permissionMode);
       }
       return this.#requiredAppSettings();
-    });
-  }
-
-  loadEngineKeyBinding(engineInput: GuildAddonEngine): EngineKeyBindingRecord | undefined {
-    this.#assertOpen();
-    const engine = parsedKeyedEngine(engineInput);
-    const row = this.#database.prepare("SELECT * FROM engine_key_bindings WHERE engine = ?").get(engine);
-    return row === undefined ? undefined : this.#decodeEngineKeyBindingRow(row);
-  }
-
-  saveEngineKeyBinding(input: {
-    readonly engine: GuildAddonEngine;
-    readonly keyFile: string | null;
-    readonly keyVariable: string;
-  }): EngineKeyBindingRecord {
-    this.#assertOpen();
-    const engine = parsedKeyedEngine(input.engine);
-    let keyFile: string | null;
-    let keyVariable: string;
-    try {
-      keyFile = input.keyFile === null ? null : parseModelSourceKeyFile(input.keyFile);
-      keyVariable = parseModelSourceKeyVariable(input.keyVariable);
-    } catch (cause: unknown) {
-      throw persistenceError("domain_operation_rejected", cause);
-    }
-    return this.#immediate(() => {
-      const existing = this.#selectEngineKeyBinding(engine);
-      const at = exactNow();
-      if (existing === undefined) {
-        this.#database
-          .prepare(`
-            INSERT INTO engine_key_bindings(engine, key_file, key_variable, confirmed_host, revision, updated_at_ms)
-            VALUES(?, ?, ?, NULL, 1, ?)
-          `)
-          .run(engine, keyFile, keyVariable, at);
-        return this.#requiredEngineKeyBinding(engine);
-      }
-      // The confirmation was for this file and variable; naming others voids it.
-      if (existing.keyFile === keyFile && existing.keyVariable === keyVariable) return existing;
-      const updated = this.#database
-        .prepare(`
-          UPDATE engine_key_bindings
-          SET key_file = ?, key_variable = ?, confirmed_host = NULL, revision = revision + 1, updated_at_ms = ?
-          WHERE engine = ? AND revision = ?
-        `)
-        .run(keyFile, keyVariable, Math.max(at, existing.updatedAtMs), engine, existing.revision);
-      if (changes(updated.changes) !== 1) throw persistenceError("persistence_cas_conflict");
-      return this.#requiredEngineKeyBinding(engine);
-    });
-  }
-
-  confirmEngineKeyBinding(input: {
-    readonly engine: GuildAddonEngine;
-    readonly expectedRevision: number;
-  }): EngineKeyBindingRecord {
-    this.#assertOpen();
-    const engine = parsedKeyedEngine(input.engine);
-    const expectedRevision = parsedRevision(input.expectedRevision);
-    const spec = engineApiKeySpec(engine)!;
-    return this.#immediate(() => {
-      const current = this.#requiredEngineKeyBinding(engine);
-      if (current.revision !== expectedRevision) throw persistenceError("persistence_cas_conflict");
-      if (current.confirmedHost === spec.host) return current;
-      const updated = this.#database
-        .prepare(`
-          UPDATE engine_key_bindings
-          SET confirmed_host = ?, revision = revision + 1, updated_at_ms = ?
-          WHERE engine = ? AND revision = ?
-        `)
-        .run(spec.host, Math.max(exactNow(), current.updatedAtMs), engine, expectedRevision);
-      if (changes(updated.changes) !== 1) throw persistenceError("persistence_cas_conflict");
-      return this.#requiredEngineKeyBinding(engine);
     });
   }
 
@@ -7741,36 +7619,6 @@ class SqliteGuildPersistence implements GuildPersistence {
       createdAtMs: exactInteger(row, "created_at_ms"),
       updatedAtMs: exactInteger(row, "updated_at_ms"),
     });
-  }
-
-  #selectEngineKeyBinding(engine: GuildAddonEngine): EngineKeyBindingRecord | undefined {
-    const row = this.#database.prepare("SELECT * FROM engine_key_bindings WHERE engine = ?").get(engine);
-    return row === undefined ? undefined : this.#decodeEngineKeyBindingRow(row);
-  }
-
-  #requiredEngineKeyBinding(engine: GuildAddonEngine): EngineKeyBindingRecord {
-    const binding = this.#selectEngineKeyBinding(engine);
-    if (binding === undefined) throw persistenceError("aggregate_not_found");
-    return binding;
-  }
-
-  #decodeEngineKeyBindingRow(row: SqlRow): EngineKeyBindingRecord {
-    try {
-      const engine = parsedKeyedEngine(parseGuildEngine(exactText(row, "engine")));
-      const keyFile = optionalText(row, "key_file");
-      const confirmedHost = optionalText(row, "confirmed_host");
-      return freeze({
-        engine,
-        keyFile: keyFile === undefined ? null : parseModelSourceKeyFile(keyFile),
-        keyVariable: parseModelSourceKeyVariable(exactText(row, "key_variable")),
-        // Only the engine's own host can have been confirmed; anything else in the row is not trusted.
-        confirmedHost: confirmedHost === undefined || confirmedHost !== engineApiKeySpec(engine)!.host ? null : confirmedHost,
-        revision: exactInteger(row, "revision"),
-        updatedAtMs: exactInteger(row, "updated_at_ms"),
-      });
-    } catch (cause: unknown) {
-      throw persistenceError("aggregate_integrity_failed", cause);
-    }
   }
 
   #selectModelSource(sourceId: string): ModelSourceRecord | undefined {

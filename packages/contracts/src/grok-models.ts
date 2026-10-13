@@ -11,7 +11,7 @@
  *  - pure selection helpers shared by main, persistence and the renderer.
  *
  * Guild 3.0 (PC-ENG-001, PC-MODEL-001): the same catalog shape now also describes the Claude
- * engine, and in 3.1 every add-on engine (Codex, Gemini). A catalog and each of its models carry an `engine` / `group` label, the model id grammar
+ * engine, and in 3.1 every add-on engine (Codex). A catalog and each of its models carry an `engine` / `group` label, the model id grammar
  * is chosen per engine (`parseGuildModelId`), and `freezeModelCatalog(engine, ...)` validates either.
  * The Grok-era names below keep their meaning and behavior for the Grok engine.
  */
@@ -175,19 +175,9 @@ export const EMPTY_CODEX_MODEL_CATALOG: ModelCatalog = Object.freeze({
   models: Object.freeze([]),
 });
 
-export const EMPTY_GEMINI_MODEL_CATALOG: ModelCatalog = Object.freeze({
-  engine: "gemini",
-  models: Object.freeze([]),
-});
-
 /** The empty catalog of `engine`: what a picker shows before any session of that engine reported a list. */
 export function emptyModelCatalogOf(engine: GuildEngine): ModelCatalog {
-  switch (engine) {
-    case "claude": return EMPTY_CLAUDE_MODEL_CATALOG;
-    case "codex": return EMPTY_CODEX_MODEL_CATALOG;
-    case "gemini": return EMPTY_GEMINI_MODEL_CATALOG;
-    case "grok": return EMPTY_GROK_MODEL_CATALOG;
-  }
+  return engine === "claude" ? EMPTY_CLAUDE_MODEL_CATALOG : engine === "codex" ? EMPTY_CODEX_MODEL_CATALOG : EMPTY_GROK_MODEL_CATALOG;
 }
 
 export function modelCatalogEngineOf(catalog: ModelCatalog): GuildEngine {

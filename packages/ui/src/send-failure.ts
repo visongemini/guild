@@ -14,9 +14,6 @@ export function classifyComposerSendFailure(cause: unknown): ComposerSendFailure
   if (text.includes("claude_start_timeout")) return "claude_start";
   // PC-ENG-003: the same for an add-on engine (Codex); the task says which engine it is.
   if (text.includes("engine_start_timeout")) return "engine_start";
-  // PC-ENG-004: a Gemini task with no usable API key is a runtime failure; the conversation's error entry says what is
-  // missing and points at Settings, so the composer adds nothing of its own.
-  if (text.includes("engine_key_required")) return "runtime";
   if (
     text.includes("invalid_draft") ||
     text.includes("invalid_message") ||

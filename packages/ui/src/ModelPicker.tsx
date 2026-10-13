@@ -46,8 +46,6 @@ export type ModelPickerProps = Readonly<{
   claudeState?: ClaudeStatusState;
   /** Codex's state, when the main process reports one (the ChatGPT group); the same rules as `claudeState`. */
   codexState?: ClaudeStatusState;
-  /** Gemini's state, when the main process reports one; `not_logged_in` means no usable API key (see `modelPickerView`). */
-  geminiState?: ClaudeStatusState;
   /** A switch between a Claude model and an Online / Local one is running for this task (D-062): the trigger says so. */
   switching?: boolean;
   /**
@@ -112,7 +110,6 @@ export function ModelPicker({
   engineFixed,
   claudeState,
   codexState,
-  geminiState,
   switching = false,
   modalOpen = false,
   onApply,
@@ -143,7 +140,6 @@ export function ModelPicker({
     ...(olderOpen === undefined ? {} : { olderExpanded: olderOpen }),
     ...(claudeState === undefined ? {} : { claudeState }),
     ...(codexState === undefined ? {} : { codexState }),
-    ...(geminiState === undefined ? {} : { geminiState }),
   });
   const locked = pickerIsLocked(view.disabledReason);
   const panelOpen = open && !locked;
@@ -321,13 +317,11 @@ export function ModelPicker({
           >
             {view.groups.map((group) => {
               const headingId = `${popoverId}-group-${group.group}`;
-              const hintId = `${headingId}-hint`;
-              return <div key={group.group} className="guild-model-group" role="group" aria-labelledby={headingId} aria-describedby={group.hint === undefined ? undefined : hintId}>
+              return <div key={group.group} className="guild-model-group" role="group" aria-labelledby={headingId}>
                 <div
                   id={headingId}
                   className={view.showGroupHeadings ? "guild-model-heading guild-model-group-heading" : "guild-sr-only"}
                 >{group.label}</div>
-                {group.hint !== undefined && <small id={hintId} className="guild-model-group-hint">{group.hint}</small>}
                 {group.models.map(renderRow)}
                 {group.older !== undefined && <>
                   <button

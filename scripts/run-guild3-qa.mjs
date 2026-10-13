@@ -22,17 +22,11 @@
  * a UI approval, I Codex (ChatGPT subscription; Guild 3.1): the account's models in the ChatGPT group, the cheapest
  * chosen, one tool turn behind a permission card approved in the UI, the per-turn model line, a Guild restart that
  * resumes the same session with the stored model and permission mode, the engine marker in the sidebar and the Codex
- * section of Settings > Engines, J Gemini (own API key, pay-as-you-go; Guild 3.1): a fresh task on the cheapest Flash
- * model of the session's list, one tool turn behind a permission card approved in the UI, the per-turn model line, a
- * Guild restart that continues the session through session/load, the child's environment (Guild's own home, the key as a
- * presence only, no OAuth / Google Cloud / base-URL value, the variables a .env could use fixed in the environment), the badge in the sidebar and the Gemini section of
- * Settings > Engines, K the Dock icon setting (Settings > General): light and back to dark, each persisted across a restart.
+ * section of Settings > Engines, K the Dock icon setting (Settings > General): light and back to dark, each persisted across a
+ * restart.
  * Environment: GUILD_QA_STAMP (reuse a run), GUILD_QA_ONLY=A,B (subset), GUILD_QA_KEEP_APP=1,
  * GUILD_QA_CODEX_ACP=<package directory of a codex-acp install> (handed to the unpackaged app as the dev-only
- * GUILD_DEV_CODEX_ACP; check I runs only when it is set; the production lookup is never changed),
- * GUILD_QA_GEMINI_CLI=<package directory of a @google/gemini-cli install> (handed to the unpackaged app as the dev-only
- * GUILD_DEV_GEMINI_CLI; check J runs only when it is set and the key file names GEMINI_API_KEY; the seed confirms the
- * key binding through the store, replacing the native dialog for QA only). Check J spends a few thousand tokens.
+ * GUILD_DEV_CODEX_ACP; check I runs only when it is set; the production lookup is never changed).
  *
  * Usage: node scripts/run-guild3-qa.mjs
  */
@@ -57,8 +51,7 @@ const workspaceDir = `/tmp/guild3-qa-ws-${stamp}`;
 const dataDir = `/tmp/guild3-qa-data-${stamp}`;
 const evidenceDir = `/tmp/guild3-qa-evidence-${stamp}`;
 const codexAcpRoot = process.env.GUILD_QA_CODEX_ACP;
-const geminiCliRoot = process.env.GUILD_QA_GEMINI_CLI;
-const only = new Set((process.env.GUILD_QA_ONLY ?? `A,B,C,D,E,F,G,H${codexAcpRoot === undefined ? "" : ",I"}${geminiCliRoot === undefined ? "" : ",J"},K`).split(",").map((value) => value.trim().toUpperCase()).filter(Boolean));
+const only = new Set((process.env.GUILD_QA_ONLY ?? `A,B,C,D,E,F,G,H${codexAcpRoot === undefined ? "" : ",I"},K`).split(",").map((value) => value.trim().toUpperCase()).filter(Boolean));
 const TERMINAL = new Set(["completed", "failed", "cancelled", "interrupted"]);
 
 mkdirSync(evidenceDir, { recursive: true });
@@ -132,12 +125,6 @@ function processEnvHas(pid, name) {
   return new RegExp(`(?:^|\\s)${name}=`, "u").test(text);
 }
 
-/** Whether the process environment gives a variable a non-empty value. Only a boolean leaves this function. */
-function processEnvHasValue(pid, name) {
-  const result = spawnSync("/bin/ps", ["-E", "-ww", "-o", "command=", "-p", String(pid)], { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 });
-  return new RegExp(`(?:^|\\s)${name}=\\S`, "u").test(result.stdout ?? "");
-}
-
 function processEnvValueIs(pid, name, value) {
   const result = spawnSync("/bin/ps", ["-E", "-ww", "-o", "command=", "-p", String(pid)], { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 });
   return (result.stdout ?? "").includes(` ${name}=${value}`);
@@ -188,7 +175,6 @@ async function launchApp() {
       GUILD_DEV_DATA_DIR: dataDir,
       GUILD_DEV_CLAUDE_CAPTURE_OFF: "1",
       ...(codexAcpRoot === undefined ? {} : { GUILD_DEV_CODEX_ACP: codexAcpRoot }),
-      ...(geminiCliRoot === undefined ? {} : { GUILD_DEV_GEMINI_CLI: geminiCliRoot }),
     },
   });
   closeSync(out);
@@ -638,49 +624,6 @@ function codexAdapterProcess() {
   return descendantsOf(app.pid).find((entry) => /codex-acp/u.test(entry.command) && !/app-server/u.test(entry.command));
 }
 
-/** Guild's own home for Gemini (HOME and GEMINI_CLI_HOME of the child), under the data dir. */
-const geminiHome = join(dataDir, "engines", "gemini-home");
-
-function geminiProcess() {
-  trackDescendants();
-  return descendantsOf(app.pid).find((entry) => /gemini\.js\b.*--acp/u.test(entry.command));
-}
-
-/** Whether the key file names the variable. Names only: no value is kept. */
-function keyFileNames(variable) {
-  if (!existsSync(keyFile)) return false;
-  return readFileSync(keyFile, "utf8").split("\n").some((line) => new RegExp(`^(?:export\\s+)?${variable}=.+`, "u").test(line.trim()));
-}
-
-/** The child's environment as booleans: Guild's home, the key as a presence, and none of the variables that would change the sign-in or the host. */
-function geminiEnvironment(pid) {
-  const underHome = (name) => [geminiHome, `/private${geminiHome}`].some((root) => processEnvValueStartsWith(pid, name, root));
-  return {
-    cliHomeIsGuilds: underHome("GEMINI_CLI_HOME"),
-    homeIsGuilds: underHome("HOME"),
-    keyPresent: processEnvHas(pid, "GEMINI_API_KEY"),
-    singleProcess: processEnvValueIs(pid, "GEMINI_CLI_NO_RELAUNCH", "1"),
-    envProxy: processEnvValueIs(pid, "NODE_USE_ENV_PROXY", "1"),
-    // Guild fixes these variables to an empty value (or a harmless default) so that no .env file can supply them: each one is
-    // present, and none of them carries a value that would change the sign-in or the host.
-    noOAuthSwitch: !processEnvHasValue(pid, "GOOGLE_GENAI_USE_GCA"),
-    noBaseUrl: !processEnvHasValue(pid, "GOOGLE_GEMINI_BASE_URL") && !processEnvHasValue(pid, "GOOGLE_VERTEX_BASE_URL"),
-    noVertex: !processEnvHasValue(pid, "GOOGLE_GENAI_USE_VERTEXAI") && !processEnvHasValue(pid, "GOOGLE_CLOUD_PROJECT"),
-    noGoogleKeyOrCredentials: !processEnvHasValue(pid, "GOOGLE_API_KEY") && !processEnvHasValue(pid, "GOOGLE_APPLICATION_CREDENTIALS"),
-    fixedAgainstEnvFiles: ["GOOGLE_GEMINI_BASE_URL", "GOOGLE_GENAI_USE_GCA", "GOOGLE_GENAI_USE_VERTEXAI", "GOOGLE_API_KEY", "GOOGLE_APPLICATION_CREDENTIALS", "CLOUD_SHELL"]
-      .every((name) => processEnvHas(pid, name)),
-    noBrowser: processEnvValueIs(pid, "NO_BROWSER", "true"),
-    codeAssistClosed: processEnvValueIs(pid, "CODE_ASSIST_ENDPOINT", "http://127.0.0.1:9"),
-    noOtherEngineKeys: !processEnvHas(pid, "ANTHROPIC_BASE_URL") && !processEnvHas(pid, "ANTHROPIC_AUTH_TOKEN") && !processEnvHas(pid, "OPENAI_API_KEY"),
-  };
-}
-
-/** The chat files the CLI wrote in Guild's home (what session/load reads). */
-function geminiChatFiles() {
-  const root = join(geminiHome, ".gemini", "tmp");
-  return existsSync(root) ? [...walk(root)].filter((path) => /[\\/]chats[\\/]/u.test(path) && path.endsWith(".jsonl")) : [];
-}
-
 const escapeRegExp = (text) => text.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
 
 function readLines(path) {
@@ -734,7 +677,7 @@ document.getElementById("press").addEventListener("click", () => {
 // ---------------------------------------------------------------------------------------------
 
 const results = [];
-const state = { claudeTaskId: undefined, grokTaskId: undefined, codexTaskId: undefined, geminiTaskId: undefined };
+const state = { claudeTaskId: undefined, grokTaskId: undefined, codexTaskId: undefined };
 
 async function runCheck(id, title, fn) {
   if (!only.has(id[0])) return;
@@ -1457,245 +1400,9 @@ async function checkI(record) {
   return details;
 }
 
-/**
- * J: Gemini with the owner's own API key, paid per use (docs/21 section 8, PC-ENG-004). Guild never shows or stores the
- * key: the seed confirms the binding of the default key file and GEMINI_API_KEY through the store (QA only), Guild reads
- * the key when it starts the child and hands it over as GEMINI_API_KEY alone. The CLI is found through the dev-only
- * GUILD_DEV_GEMINI_CLI hook (a scratch install); the pins apply to it as to any install. Everything printed is a name, a
- * count or a boolean, never a value.
- */
-async function checkJ(record) {
-  const details = { issues: [] };
-  record.details = details; // kept in the report when a step fails
-  const fileName = "gemini-qa.txt";
-
-  // 0. Guild found the CLI and a usable, confirmed key, and says so without showing it.
-  const opened = await until("gemini engine ready in Settings", async () => {
-    const gemini = (await call("bootstrap")).runtimeSettings.engines?.gemini;
-    return gemini?.status === "ready" ? gemini : undefined;
-  }, { timeout: 90_000, interval: 500 });
-  details.statusAtOpen = {
-    status: opened.status, version: opened.version ?? null, permissionMode: opened.permissionMode,
-    apiKey: { keyVariable: opened.apiKey?.keyVariable, host: opened.apiKey?.host, confirmed: opened.apiKey?.confirmed, state: opened.apiKey?.state, hasKeyField: Object.keys(opened.apiKey ?? {}).some((name) => /^(key|secret|token|value)$/iu.test(name)) },
-  };
-  if (opened.apiKey?.confirmed !== true || opened.apiKey?.state !== "usable" || opened.apiKey?.host !== "generativelanguage.googleapis.com" || details.statusAtOpen.apiKey.hasKeyField) {
-    throw new Error(`the key binding is wrong: ${JSON.stringify(details.statusAtOpen.apiKey)}`);
-  }
-  if (opened.permissionMode !== "default") throw new Error(`the default Gemini permission mode is ${opened.permissionMode}, expected default (asks first)`);
-
-  // 1. A fresh Gemini task; a Grok task next to it makes the sidebar show the engine markers.
-  const created = await call("createTask", { workspaceId, engine: "gemini" });
-  const taskId = created.task.taskId;
-  state.geminiTaskId = taskId;
-  details.taskId = taskId;
-  details.engineAtCreate = created.task.engine;
-  if (created.task.engine !== "gemini") throw new Error(`the task engine is ${created.task.engine}`);
-  await call("openTask", { taskId });
-  // A session without a turn lists the models (no prompt is sent, so nothing is billed).
-  await call("loadSlashCommands", { taskId }).catch((error) => details.issues.push(`slash commands: ${safeText(error.message, 120)}`));
-  const catalog = await until("gemini model list", async () => {
-    const models = (await call("bootstrap")).runtimeSettings.modelCatalogs?.gemini?.models ?? [];
-    return models.length > 0 ? models : undefined;
-  }, { timeout: 120_000, interval: 500 });
-  details.sessionModels = catalog.map((model) => ({ id: model.id, name: model.name, efforts: model.reasoningEfforts.length }));
-  if (catalog.some((model) => model.id === "auto" || /^auto$/iu.test(model.name))) throw new Error("the model list offers the CLI's own auto choice");
-  if (catalog.some((model) => model.reasoningEfforts.length > 0)) throw new Error("a Gemini model carries a reasoning effort row");
-  const cheapest = catalog.find((model) => /flash-lite/iu.test(model.id)) ?? catalog.find((model) => /flash/iu.test(model.id)) ?? catalog.at(-1);
-  details.chosenModel = { id: cheapest.id, name: cheapest.name };
-  if (!/flash/iu.test(cheapest.id)) throw new Error(`no Flash model is listed, so the cheapest one cannot be chosen: ${JSON.stringify(details.sessionModels)}`);
-
-  // 2. The Gemini group lists those models with its muted cost hint; the cheapest is chosen in the picker.
-  details.viewBeforePick = await call("openTask", { taskId }).then((view) => ({ engine: view.task.engine, canChange: view.modelSelection.canChange, modelId: view.modelSelection.modelId, source: view.modelSelection.source, runState: view.task.activeRunState ?? null, canSend: view.canSend }));
-  await until("model picker trigger", async () => {
-    const value = await cdp.evaluate(locate(".guild-model-picker-trigger"));
-    return value !== null && !value.disabled ? value : undefined;
-  }, { timeout: 60_000 });
-  if (!(await domExists(".guild-model-popover"))) await clickDom(".guild-model-picker-trigger");
-  await until("model popover", () => domExists(".guild-model-popover"), { timeout: 10_000 });
-  await sleep(300);
-  details.groupHints = await cdp.evaluate(`[...document.querySelectorAll(".guild-model-group")].map((group) => ({ group: (group.querySelector(".guild-model-heading")?.textContent || "").trim(), hint: (group.querySelector(".guild-model-group-hint")?.textContent || "").trim() }))`);
-  const picked = await pickModel("J", `^\\s*${escapeRegExp(cheapest.name)}`);
-  details.pickerGroups = picked.groups;
-  const geminiGroup = picked.groups.find((group) => /Gemini/u.test(group.group));
-  if (geminiGroup === undefined) throw new Error(`the picker has no Gemini group: ${JSON.stringify(picked.groups.map((group) => group.group))}`);
-  if (!/pay-as-you-go|按量/iu.test(geminiGroup.group)) throw new Error(`the Gemini group does not say it is pay-as-you-go: ${geminiGroup.group}`);
-  const geminiHint = details.groupHints.find((entry) => /Gemini/u.test(entry.group))?.hint ?? "";
-  if (!/Google AI Studio/u.test(geminiHint)) throw new Error(`the Gemini group has no cost hint: ${JSON.stringify(geminiHint)}`);
-  if (geminiGroup.rows.length < catalog.length || !geminiGroup.rows.includes(cheapest.name)) throw new Error(`the Gemini group does not list the session's models: ${JSON.stringify(geminiGroup)}`);
-  if (geminiGroup.rows.some((row) => /^auto\b/iu.test(row))) throw new Error("the Gemini group offers auto");
-  const selected = await waitSelection(taskId, `^${escapeRegExp(cheapest.id)}$`, { timeout: 60_000 });
-  details.selectionAfterPick = { modelId: selected.modelSelection.modelId, source: selected.modelSelection.source };
-  await shot("J", "gemini-model-chosen");
-
-  // 3. One turn that writes a file: the permission card is decided through the UI (the Default mode asks first).
-  const prompt = `Use your file-writing tool (write_file) to create a file named ${fileName} in the current directory containing exactly: ok. When it is written, reply with one short sentence and end your reply with GEMINI-QA-OK.`;
-  const sent = await call("sendMessage", { taskId, text: prompt });
-  if (sent.status !== "started") throw new Error(`send_not_started:${sent.status}`);
-  const seen = await until("pending permission card or end of run", async () => {
-    if (await domExists(".guild-permission")) return "card";
-    const view = await call("openTask", { taskId });
-    return TERMINAL.has(view.task.activeRunState ?? "") && view.timeline.some((item) => item.runId === sent.runId) ? "ended" : undefined;
-  }, { timeout: 300_000, interval: 300 });
-  if (seen === "ended") throw new Error("the run ended without a permission card (inconclusive)");
-  await sleep(500);
-  details.pendingCardTitle = safeText(await domText(".guild-permission-title"), 120);
-  details.cardButtons = (await domText(".guild-permission-actions")).split("\n").map((text) => text.trim()).filter(Boolean).slice(0, 8);
-  await shot("J", "card-pending");
-  await clickDom(".guild-permission-actions button.primary");
-  const done = await waitForRun("J", taskId, sent.runId, { timeout: 360_000, approve: true });
-  const reply = assistantTextOf(done.view, sent.runId);
-  const filePath = join(workspaceDir, fileName);
-  const fileText = existsSync(filePath) ? readFileSync(filePath, "utf8") : undefined;
-  details.fileText = fileText === undefined ? null : fileText.trim();
-  details.replyHasMarker = reply.includes("GEMINI-QA-OK");
-  details.toolCalls = done.view.timeline.filter((item) => item.kind === "tool" && item.runId === sent.runId).length;
-  details.afterApprovalUi = await settleUi("J");
-  if (fileText === undefined || fileText.trim() !== "ok") throw new Error(`${fileName} content ${JSON.stringify(fileText)}`);
-  if (details.afterApprovalUi.stalePermissionCards > 0) throw new Error("the permission card is still shown after it was approved and the run completed");
-  if (details.afterApprovalUi.countingChangesStuck) throw new Error("'Counting changes' never settled");
-  // The mode narration and replayed context frames of the CLI never reach the conversation.
-  const stray = done.view.timeline.filter((item) => (item.kind === "assistant" || item.kind === "user") && /\[MODE_UPDATE\]|<session_context>|\[Function Response:/u.test(item.text ?? ""));
-  details.strayInternalChunks = stray.length;
-  if (stray.length > 0) throw new Error("the conversation shows a frame the CLI invented");
-
-  // 4. The footer names the model of the turn, as the record and as the line under the turn.
-  const modelLine = await until("per-turn model line", async () => {
-    const text = await domText(".guild-turn-model");
-    return text.includes(cheapest.name) ? text : undefined;
-  }, { timeout: 20_000, interval: 300 });
-  details.turnModelLine = safeText(modelLine, 160);
-  details.runModelRecord = (done.view.runModels ?? []).find((entry) => entry.runId === sent.runId)?.label ?? null;
-  if (details.runModelRecord !== cheapest.name) throw new Error(`the run's model label is ${JSON.stringify(details.runModelRecord)}, expected ${cheapest.name}`);
-  await shot("J", "gemini-turn-done");
-
-  // 5. The child: node running the pinned bundle, Guild's own home, the key as a presence only, nothing that would sign in
-  // another way or send the key elsewhere.
-  const child = geminiProcess();
-  details.process = child === undefined ? null : { pid: child.pid, command: safeText(child.command.replace(/\s\/\S*\/gemini\.js/u, " <bundle>/gemini.js"), 160) };
-  if (child === undefined) throw new Error("no Gemini CLI process was found");
-  details.env = geminiEnvironment(child.pid);
-  details.argv = { acp: /\s--acp(\s|$)/u.test(child.command), skipTrust: /\s--skip-trust(\s|$)/u.test(child.command) };
-  const badEnv = Object.entries(details.env).filter(([, ok]) => ok !== true).map(([name]) => name);
-  if (badEnv.length > 0 || !details.argv.acp || !details.argv.skipTrust) throw new Error(`the Gemini process is wrong: env ${badEnv.join(", ") || "ok"}, argv ${JSON.stringify(details.argv)}`);
-  // Guild's settings file for the child, and no sign-in state of any other kind in Guild's home.
-  // The model is in the file only for a start that knew it: the first process of the task did not, and the model was
-  // applied to its session with session/set_model, so the file is checked for it again after the restart below.
-  const readSettingsFile = () => {
-    const settingsFile = join(geminiHome, ".gemini", "settings.json");
-    const written = existsSync(settingsFile) ? JSON.parse(readFileSync(settingsFile, "utf8")) : undefined;
-    return written === undefined ? null : {
-      selectedType: written.security?.auth?.selectedType ?? null,
-      usageStatistics: written.privacy?.usageStatisticsEnabled ?? null,
-      autoUpdate: written.general?.enableAutoUpdate ?? null,
-      autoUpdateNotification: written.general?.enableAutoUpdateNotification ?? null,
-      modelName: written.model?.name ?? null,
-    };
-  };
-  const settingsFileIsGuilds = (file) => file !== null && file.selectedType === "gemini-api-key" && file.usageStatistics === false &&
-    file.autoUpdate === false && file.autoUpdateNotification === false;
-  details.settingsFile = readSettingsFile();
-  details.oauthFileInHome = existsSync(join(geminiHome, ".gemini", "oauth_creds.json"));
-  if (!settingsFileIsGuilds(details.settingsFile) || (details.settingsFile.modelName !== null && details.settingsFile.modelName !== cheapest.id)) {
-    throw new Error(`Guild's Gemini settings file is wrong: ${JSON.stringify(details.settingsFile)}`);
-  }
-  if (details.oauthFileInHome) throw new Error("an OAuth credential file exists in Guild's Gemini home");
-  details.chatFilesAfterFirstTurn = geminiChatFiles().length;
-
-  // 6. The sidebar row carries the Gemini marker; the account card is Gemini's own; Settings shows the Gemini section.
-  const marker = await cdp.evaluate(`(() => { const e = document.querySelector(".guild-task-engine.gemini"); return e ? { text: (e.textContent || "").trim(), title: e.getAttribute("title") || "" } : null; })()`);
-  details.sidebarMarker = marker;
-  const sidebarEngines = new Set((await call("bootstrap")).workspaces.flatMap((workspace) => workspace.tasks.map((task) => task.engine ?? "grok")));
-  details.sidebarEngines = [...sidebarEngines].sort();
-  if (sidebarEngines.size > 1) {
-    if (marker === null) throw new Error("the sidebar shows no Gemini marker");
-    if (!/gemini/iu.test(marker.title) || !marker.text.startsWith("Ge")) throw new Error(`the marker is ${JSON.stringify(marker)}`);
-  } else {
-    details.issues.push("only Gemini tasks in the sidebar: no engine markers are shown, so none was checked (run the other checks too)");
-  }
-  await shot("J", "sidebar-gemini-marker");
-  if (!(await domExists(".guild-account-popover"))) await clickDom(".guild-profile");
-  await until("usage popover", () => domExists(".guild-account-popover"), { timeout: 10_000 });
-  await sleep(500);
-  details.accountCard = safeText(await domText(".guild-account-popover .guild-usage-card"), 300);
-  details.accountCardHasGrokLink = await domExists(".guild-usage-link");
-  await shot("J", "account-card");
-  await cdp.evaluate(`document.querySelector(".guild-account-popover")?.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }))`);
-  if (!/Gemini/u.test(details.accountCard) || details.accountCardHasGrokLink || /grok/iu.test(details.accountCard)) {
-    throw new Error(`the account card is not Gemini's: ${details.accountCard}`);
-  }
-  if (/\$\s?\d|cost|费用/iu.test(details.accountCard)) throw new Error(`the account card shows a cost: ${details.accountCard}`);
-  if (!/Google AI Studio/u.test(details.accountCard)) details.issues.push("the account card does not defer to Google AI Studio for billing");
-  await openSettings();
-  await clickDom("#guild-settings-tab-engines");
-  await sleep(500);
-  const sectionText = await domText("#guild-settings-panel-engines .guild-engine-gemini");
-  details.geminiSection = safeText(sectionText, 700);
-  details.geminiSectionModes = ["Default", "Auto-edit|Auto edit", "Plan", "Full access|YOLO"].map((pattern) => new RegExp(pattern, "u").test(sectionText));
-  details.geminiSectionHasEffortRow = /reasoning effort|推理强度/iu.test(sectionText);
-  details.geminiSectionKeyInput = await cdp.evaluate(`[...document.querySelectorAll("#guild-settings-panel-engines .guild-engine-gemini input")].map((input) => ({ type: input.type, name: input.name || "", placeholder: input.placeholder || "" })).filter((input) => /password|secret|key$/iu.test(input.type + input.name))`);
-  // The dialog scrolls: bring the Gemini section, then its key binding, into view for the screenshots.
-  for (const [selector, label] of [["#guild-settings-panel-engines .guild-engine-gemini", "settings-gemini-section"], ["#guild-settings-panel-engines .guild-engine-gemini .guild-engine-key", "settings-gemini-key-binding"]]) {
-    await cdp.evaluate(`document.querySelector(${JSON.stringify(selector)})?.scrollIntoView({ block: "start" })`);
-    await sleep(300);
-    await shot("J", label);
-  }
-  await cdp.evaluate(`document.querySelector(".guild-dialog-settings")?.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }))`);
-  await sleep(400);
-  if (!/Gemini/u.test(sectionText) || !/Ready|已就绪/u.test(sectionText) || !/GEMINI_API_KEY/u.test(sectionText) || !/generativelanguage\.googleapis\.com/u.test(sectionText) ||
-      !details.geminiSectionModes.every(Boolean) || details.geminiSectionHasEffortRow || details.geminiSectionKeyInput.length > 0) {
-    throw new Error(`the Gemini section of Settings is wrong: ${details.geminiSection}`);
-  }
-
-  // 7. Quit and reopen Guild: the same session continues through session/load; the stored model and mode are applied first.
-  record.details = details;
-  details.quit = await quitApp();
-  await launchApp();
-  const reopened = await call("openTask", { taskId });
-  details.engineAfterRestart = reopened.task.engine;
-  details.selectionAfterRestart = { modelId: reopened.modelSelection.modelId, source: reopened.modelSelection.source };
-  if (reopened.task.engine !== "gemini") throw new Error("the task engine changed across the restart");
-  if (reopened.modelSelection.modelId !== cheapest.id) throw new Error(`the model after the restart is ${reopened.modelSelection.modelId}`);
-  if ((reopened.runModels ?? []).find((entry) => entry.runId === sent.runId)?.label !== cheapest.name) throw new Error("the first turn lost its model line across the restart");
-  const follow = `Without using any tools: what exact text did ${fileName} contain? Reply with just that text. End with GEMINI-RESUME-OK.`;
-  let resumed;
-  try {
-    resumed = await sendAndWait("J", taskId, follow, { timeout: 360_000 });
-  } catch (error) {
-    details.issues.push(`first follow-up after restart failed: ${safeText(error.message, 160)}`);
-    await shot("J", "restore-first-attempt-failed");
-    await sleep(20_000);
-    resumed = await sendAndWait("J", taskId, follow, { timeout: 360_000 });
-  }
-  const resumedReply = assistantTextOf(resumed.view, resumed.runId);
-  details.resumedReplyMentionsOk = /\bok\b/iu.test(resumedReply);
-  details.noSessionRestoredNotice = !resumed.view.timeline.some((item) => item.kind === "notice" && item.noticeType === "session_restored");
-  details.sessionRecovery = resumed.view.sessionRecovery ?? null;
-  details.sessionModeAfterResume = resumed.view.sessionModes?.currentModeId ?? null;
-  details.secondRunModelRecord = (resumed.view.runModels ?? []).find((entry) => entry.runId === resumed.runId)?.label ?? null;
-  const runtimeEvents = readLines(join(dataDir, "diagnostics", "runtime.jsonl")).filter((entry) => entry.taskId === taskId);
-  details.loadCommittedEvents = runtimeEvents.filter((entry) => entry.event === "load_committed").length;
-  details.loadFailedEvents = runtimeEvents.filter((entry) => entry.event === "load_failed").length;
-  details.chatFilesAfterRestart = geminiChatFiles().length;
-  details.chatFilesHoldingBothTurns = geminiChatFiles().filter((path) => {
-    const text = readFileSync(path, "utf8");
-    return text.includes("GEMINI-QA-OK") || text.includes(fileName) ? text.includes("GEMINI-RESUME-OK") : false;
-  }).length;
-  const childAfter = geminiProcess();
-  details.envAfterRestart = childAfter === undefined ? null : geminiEnvironment(childAfter.pid);
-  details.settingsFileAfterRestart = readSettingsFile();
-  details.oauthFileAfterRestart = existsSync(join(geminiHome, ".gemini", "oauth_creds.json"));
-  await shot("J", "gemini-after-restart");
-  if (!details.resumedReplyMentionsOk) throw new Error("the resumed turn does not remember the file's content");
-  if (!details.noSessionRestoredNotice || details.sessionRecovery === "replacement_required") throw new Error("the session was replaced instead of loaded");
-  if (!settingsFileIsGuilds(details.settingsFileAfterRestart) || details.settingsFileAfterRestart.modelName !== cheapest.id || details.oauthFileAfterRestart) {
-    throw new Error(`Guild's Gemini settings file after the restart is wrong: ${JSON.stringify(details.settingsFileAfterRestart)}`);
-  }
-  if (details.loadCommittedEvents < 1) throw new Error("no session/load was committed after the restart");
-  if (details.sessionModeAfterResume !== null && details.sessionModeAfterResume !== "default") throw new Error(`the permission mode after the resume is ${details.sessionModeAfterResume}`);
-  if (details.secondRunModelRecord !== cheapest.name) throw new Error(`the resumed turn ran on ${JSON.stringify(details.secondRunModelRecord)}, expected ${cheapest.name}`);
-  if (childAfter === undefined || Object.values(details.envAfterRestart).some((ok) => ok !== true)) throw new Error(`the Gemini process environment after the restart is wrong: ${JSON.stringify(details.envAfterRestart)}`);
-  return details;
-}
+// ---------------------------------------------------------------------------------------------
+// Secret scan, cleanup, report
+// ---------------------------------------------------------------------------------------------
 
 /**
  * K: the Dock icon setting (Settings > General, PC-SET-002). Light is chosen, persists across a Guild restart and is
@@ -1785,10 +1492,6 @@ async function checkK() {
   return details;
 }
 
-// ---------------------------------------------------------------------------------------------
-// Secret scan, cleanup, report
-// ---------------------------------------------------------------------------------------------
-
 function* walk(root) {
   for (const name of readdirSync(root, { withFileTypes: true })) {
     const path = join(root, name.name);
@@ -1798,7 +1501,7 @@ function* walk(root) {
 }
 
 function keyValues() {
-  const wanted = new Set(["DEEPSEEK_API_KEY", "QWEN_LOCAL_API_KEY", "GEMINI_API_KEY"]);
+  const wanted = new Set(["DEEPSEEK_API_KEY", "QWEN_LOCAL_API_KEY"]);
   const values = [];
   for (const line of readFileSync(keyFile, "utf8").split("\n")) {
     const match = /^(?:export\s+)?([A-Z0-9_]+)=(.*)$/u.exec(line.trim());
@@ -1814,7 +1517,7 @@ function scanSecrets() {
     ...[...new Set(claudeTranscripts().map((path) => join(path, "..")))].map((path) => ({ name: "claude-transcripts", path })),
   ];
   const secretValues = keyValues();
-  const summary = { filesScanned: 0, bytesScanned: 0, keyValueHits: 0, boundarySkHits: 0, boundaryBearerHits: 0, boundaryGoogleKeyHits: 0, literalSkHits: 0, literalBearerHits: 0, literalSkFiles: [], boundaryFiles: [] };
+  const summary = { filesScanned: 0, bytesScanned: 0, keyValueHits: 0, boundarySkHits: 0, boundaryBearerHits: 0, literalSkHits: 0, literalBearerHits: 0, literalSkFiles: [], boundaryFiles: [] };
   for (const root of roots) {
     if (!existsSync(root.path)) continue;
     for (const path of walk(root.path)) {
@@ -1829,9 +1532,6 @@ function scanSecrets() {
       const literalBearer = occurrences(text, "Bearer ");
       const boundarySk = (text.match(/(?<![A-Za-z0-9])sk-[A-Za-z0-9_-]{8,}/gu) ?? []).length;
       const boundaryBearer = (text.match(/Bearer\s+[A-Za-z0-9._~+/=-]{8,}/gu) ?? []).length;
-      const boundaryGoogle = (text.match(/(?<![A-Za-z0-9])AIza[A-Za-z0-9_-]{30,}/gu) ?? []).length;
-      summary.boundaryGoogleKeyHits += boundaryGoogle;
-      if (boundaryGoogle > 0) summary.boundaryFiles.push(`${root.name}:${path.replace(root.path, "")}`);
       summary.literalSkHits += literalSk;
       summary.literalBearerHits += literalBearer;
       summary.boundarySkHits += boundarySk;
@@ -1854,14 +1554,6 @@ function cleanClaudeTranscripts() {
     removed.push(name);
   }
   return removed;
-}
-
-/** The sessions the Gemini check made live in Guild's own home under the QA data dir; the whole home goes. */
-function cleanGeminiHome() {
-  const files = geminiChatFiles().length;
-  if (!geminiHome.startsWith(`${dataDir}/`)) return { removedChatFiles: 0, skipped: "home is not under the QA data dir" };
-  rmSync(geminiHome, { recursive: true, force: true });
-  return { removedChatFiles: files };
 }
 
 function writeReport(extra) {
@@ -1924,9 +1616,6 @@ async function main() {
   await runCheck("H2", "Grok: permission card clears after a UI approval", () => checkH("H2", "grok", "dom-grok.txt"));
   if (codexAcpRoot === undefined) skip("I", "Codex", "GUILD_QA_CODEX_ACP is not set");
   else await runCheck("I", "Codex: ChatGPT group, cheapest model, tool turn behind a permission card, model line, restart and resume, sidebar marker, Settings", checkI);
-  if (geminiCliRoot === undefined) skip("J", "Gemini", "GUILD_QA_GEMINI_CLI is not set");
-  else if (!keyFileNames("GEMINI_API_KEY")) skip("J", "Gemini", "the key file names no GEMINI_API_KEY");
-  else await runCheck("J", "Gemini: pay-as-you-go group, cheapest Flash model, tool turn behind a permission card, model line, child environment, restart and session/load, sidebar marker, Settings", checkJ);
   await runCheck("K", "Dock icon setting: light and back to dark, saved, applied by the main process and kept across a restart", checkK);
 
   const quit = process.env.GUILD_QA_KEEP_APP === "1" ? { stage: "kept" } : await quitApp();
@@ -1934,14 +1623,12 @@ async function main() {
   const secrets = scanSecrets();
   const removedTranscripts = cleanClaudeTranscripts();
   const removedCodexRollouts = cleanCodexRollouts();
-  const removedGemini = cleanGeminiHome();
   const portClosed = !(await portOpen(debugPort));
-  const extra = { quit, secrets, removedTranscripts, removedCodexRollouts, removedGemini, portClosed, pageHits };
+  const extra = { quit, secrets, removedTranscripts, removedCodexRollouts, portClosed, pageHits };
   writeReport(extra);
   log("secret scan", JSON.stringify({ ...secrets, literalSkFiles: undefined, boundaryFiles: undefined }));
   log("removed claude transcripts", JSON.stringify(removedTranscripts));
   log("removed codex rollouts", JSON.stringify(removedCodexRollouts));
-  log("removed gemini home", JSON.stringify(removedGemini));
   const failed = results.filter((entry) => entry.status === "fail");
   log(`RESULT ${results.map((entry) => `${entry.id}:${entry.status}`).join(" ")}`);
   process.exitCode = failed.length === 0 && secrets.keyValueHits === 0 ? 0 : 1;

@@ -69,7 +69,6 @@ async function asSchema19(path: string, schemaVersion: 19 | 20 = 19) {
     database.exec(`
       PRAGMA foreign_keys = OFF;
       DROP TABLE IF EXISTS engine_defaults;
-      DROP TABLE IF EXISTS engine_key_bindings;
       ALTER TABLE app_settings DROP COLUMN dock_icon;
       DELETE FROM schema_migrations WHERE version = 21;
       ${schemaVersion === 19 ? "DROP TABLE IF EXISTS run_model_labels; DELETE FROM schema_migrations WHERE version = 20;" : ""}
@@ -108,9 +107,7 @@ test("a backup made by Guild 3.0.2 to 3.0.5 (schema 20) restores and migrates fo
     assert.equal(store.loadAppSettings().nickname, "Release 3.0.5");
     assert.equal(store.verifyIntegrity().schemaVersion, SCHEMA_VERSION);
     assert.equal(store.loadAppSettings().engineDefaults.codex.permissionMode, "workspace-write", "the add-on engine defaults appear with their defaults");
-    assert.equal(store.loadAppSettings().engineDefaults.gemini.permissionMode, "default");
     assert.equal(store.loadAppSettings().dockIcon, "dark", "the Dock icon appears on the bundle icon");
-    assert.equal(store.loadEngineKeyBinding("gemini"), undefined, "no key binding until the user names one");
   } finally { store.close(); }
   await finishLocalRestore(live);
 });

@@ -145,16 +145,6 @@ export interface DesktopApplicationService {
     reasoningEffort: string | null,
     permissionMode: string,
   ): Promise<DesktopBootstrapProjection>;
-  /**
-   * Names the file and variable an engine's API key is read from (PC-ENG-004). Any change voids the confirmation; no key
-   * and no host crosses this call.
-   */
-  setEngineApiKey(engine: GuildEngine, keyFile: string | null, keyVariable: string): Promise<DesktopBootstrapProjection>;
-  /**
-   * Shows the native confirmation that binds the key to the engine's own host. Nothing is confirmed unless the user
-   * allows it there; a cancelled dialog leaves the binding unconfirmed.
-   */
-  confirmEngineApiKey(engine: GuildEngine): Promise<DesktopBootstrapProjection>;
   setSidebarWidth(width: number): Promise<void>;
   chooseAvatar(): Promise<ChooseAvatarResponse>;
   saveProfile(nickname: string, avatar: SaveProfileAvatar): Promise<DesktopBootstrapProjection>;

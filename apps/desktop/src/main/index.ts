@@ -30,7 +30,6 @@ import {
   type ModelRouterHost,
 } from "./model-router-host.js";
 import { createModelSourcesService, type ModelSourcesService } from "./model-sources-service.js";
-import type { HostConfirmationPrompt } from "./model-source-messages.js";
 import { RouterDiagnosticLog } from "./router-diagnostic-log.js";
 import { createGuildWindow } from "./window-security.js";
 import {
@@ -141,25 +140,6 @@ app.whenReady().then(async () => {
       },
     });
     modelRouterHost = routerHost;
-    // The one native dialog that binds a key to a host: a model source's and an engine's use the same (PC-ROUTE-002,
-    // PC-ENG-004). Cancel is the default button; only "Allow" confirms, and nothing in the renderer can answer it.
-    const confirmHost = async (prompt: HostConfirmationPrompt): Promise<boolean> => {
-      const options = {
-        type: "warning" as const,
-        title: "Guild",
-        message: prompt.message,
-        detail: prompt.detail,
-        buttons: [prompt.cancelLabel, prompt.allowLabel],
-        defaultId: 0,
-        cancelId: 0,
-        noLink: true,
-      };
-      const owner = guildWindow;
-      const answer = owner !== undefined && !owner.isDestroyed()
-        ? await dialog.showMessageBox(owner, options)
-        : await dialog.showMessageBox(options);
-      return answer.response === 1;
-    };
     // The Dock icon the user chose (PC-SET-002): the dark one is the bundle's own PNG, the light one a packaged resource.
     const dockIcons = createDockIconApplier({
       platform: process.platform,
@@ -175,7 +155,23 @@ app.whenReady().then(async () => {
       store: persistence,
       defaultKeyFile,
       getLocale: currentLocale,
-      confirmHost,
+      confirmHost: async (prompt) => {
+        const options = {
+          type: "warning" as const,
+          title: "Guild",
+          message: prompt.message,
+          detail: prompt.detail,
+          buttons: [prompt.cancelLabel, prompt.allowLabel],
+          defaultId: 0,
+          cancelId: 0,
+          noLink: true,
+        };
+        const owner = guildWindow;
+        const answer = owner !== undefined && !owner.isDestroyed()
+          ? await dialog.showMessageBox(owner, options)
+          : await dialog.showMessageBox(options);
+        return answer.response === 1;
+      },
       onChanged: () => {
         void routerHost.refresh();
       },
@@ -196,9 +192,6 @@ app.whenReady().then(async () => {
         browserMcp: bridge.mcp,
         claudeCaptureOff: devHooks.claudeCaptureOff,
         ...(devHooks.codexAdapterRoot === undefined ? {} : { codexAdapterRoot: devHooks.codexAdapterRoot }),
-        ...(devHooks.geminiCliRoot === undefined ? {} : { geminiCliRoot: devHooks.geminiCliRoot }),
-        defaultKeyFile,
-        confirmEngineKey: confirmHost,
         applyDockIcon: (icon) => dockIcons.apply(icon),
         appVersion: app.getVersion(),
         databasePath: join(app.getPath("userData"), "guild.sqlite3"),

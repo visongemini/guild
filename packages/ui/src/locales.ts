@@ -1,4 +1,4 @@
-import type { AcpToolKind, EngineApiKeyProjection, GuildAddonEngine, GuildClaudePermissionMode, GuildDockIcon, GuildEngine, GuildGrokManagementAction, GuildGrokPermissionMode, GuildLocale, GuildModelSwitchRefusalReason, GuildTaskActivity, ModelGroup, ModelProbeOutcome, ModelSourceTestRefusal } from "@guild/contracts";
+import type { AcpToolKind, GuildAddonEngine, GuildClaudePermissionMode, GuildDockIcon, GuildEngine, GuildGrokManagementAction, GuildGrokPermissionMode, GuildLocale, GuildModelSwitchRefusalReason, GuildTaskActivity, ModelGroup, ModelProbeOutcome, ModelSourceTestRefusal } from "@guild/contracts";
 
 import { WORKSHOP_ZH, WORKSHOP_EN, type WorkshopMessages } from "./workshop-messages.js";
 import { createChangeMessages, type ChangeMessages } from "./change-messages.js";
@@ -176,8 +176,6 @@ export type GuildMessages = WorkshopMessages & ChangeMessages & {
   readonly modelPickerRefused: (reason: GuildModelSwitchRefusalReason) => string;
   // Guild 3.0 grouped picker (PC-MODEL-001)
   readonly modelGroupName: (group: ModelGroup) => string;
-  /** A muted line under a group's heading, for a group whose models are paid for per use (Gemini); undefined otherwise. */
-  readonly modelGroupHint: (group: ModelGroup) => string | undefined;
   readonly modelPickerGroupEmpty: (group: "online" | "local") => string;
   readonly modelPickerOpenModelSources: string;
   readonly modelPickerClaudeUnavailable: string;
@@ -231,15 +229,13 @@ export type GuildMessages = WorkshopMessages & ChangeMessages & {
   readonly claudeStatusNotLoggedIn: string;
   readonly claudeStatusUnavailable: string;
   readonly claudeStatusIntegrityChanged: string;
-  // Guild 3.1 add-on engines (Codex, Gemini): the wording that depends on the engine, looked up by engine (PC-ENG-003, PC-ENG-004, PC-SET-002)
+  // Guild 3.1 add-on engines (Codex): the wording that depends on the engine, looked up by engine (PC-ENG-003, PC-SET-002)
   readonly addonEngineName: (engine: GuildAddonEngine) => string;
   readonly modelPickerAddonUnavailable: (engine: GuildAddonEngine) => string;
   readonly modelPickerAddonUnavailableHelp: (engine: GuildAddonEngine) => string;
   readonly modelPickerAddonNotStarted: (engine: GuildAddonEngine) => string;
   /** The add-on group's one row while the engine lists no model yet: the task follows the engine's own default. */
   readonly modelPickerAddonDefault: (engine: GuildAddonEngine) => string;
-  /** What that row starts on, when the engine's default is Guild's own choice (Gemini); undefined otherwise. */
-  readonly modelPickerAddonDefaultHelp: (engine: GuildAddonEngine) => string | undefined;
   readonly settingsAddonHeading: (engine: GuildAddonEngine) => string;
   readonly enginesAddonIntro: (engine: GuildAddonEngine) => string;
   readonly addonDefaultModelOption: (engine: GuildAddonEngine) => string;
@@ -247,34 +243,20 @@ export type GuildMessages = WorkshopMessages & ChangeMessages & {
   readonly addonPermissionModeHelp: (engine: GuildAddonEngine, mode: string) => string;
   readonly addonSettingsHelp: (engine: GuildAddonEngine) => string;
   readonly addonSettingsFailed: (engine: GuildAddonEngine) => string;
-  /** The account label when the engine reported one, else the CLI's version for an engine that names it (Gemini). */
-  readonly addonStatusReady: (engine: GuildAddonEngine, account: string | undefined, version?: string) => string;
+  readonly addonStatusReady: (engine: GuildAddonEngine, account: string | undefined) => string;
   /** Said before the command that installs the engine, which Settings shows next to it. */
   readonly addonStatusNotFound: (engine: GuildAddonEngine) => string;
   readonly addonStatusNotLoggedIn: (engine: GuildAddonEngine) => string;
   readonly addonStatusUnavailable: (engine: GuildAddonEngine) => string;
   readonly addonStatusIntegrityChanged: (engine: GuildAddonEngine) => string;
   readonly addonInstallCommand: (engine: GuildAddonEngine) => string;
-  /** Undefined for an engine that signs in with an API key instead of a login (Gemini). */
-  readonly addonLoginCommand: (engine: GuildAddonEngine) => string | undefined;
+  readonly addonLoginCommand: (engine: GuildAddonEngine) => string;
   readonly usageAddonHeading: (engine: GuildAddonEngine) => string;
   readonly usageAddonAccountManaged: (engine: GuildAddonEngine) => string;
   readonly usageAddonQuota: (engine: GuildAddonEngine) => string;
   readonly addonStartTimeout: (engine: GuildAddonEngine) => string;
   /** What Stop does not do: a command the engine already started may keep running (docs/21 section 4.8). */
   readonly addonStopCaveat: (engine: GuildAddonEngine) => string;
-  // The API key binding of an engine paid for per use (Gemini; PC-ENG-004, docs/21 section 8.2). Names only, never a key.
-  readonly engineKeyHeading: string;
-  readonly engineKeyVariableHint: (defaultVariable: string) => string;
-  readonly engineKeyHostLabel: string;
-  readonly engineKeyConfirmationLabel: string;
-  readonly engineKeyConfirmed: (host: string) => string;
-  readonly engineKeyNotConfirmed: string;
-  readonly engineKeyStateLabel: string;
-  readonly engineKeyStateName: (state: EngineApiKeyProjection["state"]) => string;
-  readonly engineKeyConfirm: string;
-  readonly engineKeyConfirmHelp: (host: string) => string;
-  readonly engineKeyFailed: string;
   readonly grokToolsGrokOnly: string;
   readonly sourcesIntro: string;
   readonly sourcesLoading: string;
@@ -614,8 +596,6 @@ type AddonWording = Readonly<{
   pickerUnavailableHelp: string;
   pickerNotStarted: string;
   pickerDefault: string;
-  /** What the default row starts on, when Guild picks it (Gemini: the cheapest Flash model). */
-  pickerDefaultHelp?: string;
   intro: string;
   defaultModelOption: string;
   /** Permission mode id to its name and one-line help. */
@@ -624,32 +604,18 @@ type AddonWording = Readonly<{
   settingsFailed: string;
   /** What stands in for an account label the engine did not report. */
   managed: string;
-  /** Named with the version in the ready line, for an engine with no account label to show (Gemini). */
-  cli?: string;
   /** Said before the install command. */
   notFound: string;
-  /** The `not_logged_in` state: before the login command, or what is missing for an engine that takes an API key. */
-  notLoggedIn: string;
   integrityChanged: string;
   usageHeading: string;
-  /** The last line of the account card; absent means "Quota: <managed>". */
-  quota?: string;
 }>;
 
-/**
- * The commands Settings shows (and never runs): installing the engine's adapter, and logging in to the engine. An
- * engine that takes an API key (Gemini) has no login command: its key is bound in Settings instead.
- */
-const ADDON_COMMANDS: Readonly<Record<GuildAddonEngine, Readonly<{ install: string; login?: string }>>> = Object.freeze({
+/** The commands Settings shows (and never runs): installing the engine's adapter, and logging in to the engine. */
+const ADDON_COMMANDS: Readonly<Record<GuildAddonEngine, Readonly<{ install: string; login: string }>>> = Object.freeze({
   codex: Object.freeze({ install: "npm install -g @agentclientprotocol/codex-acp", login: "codex login" }),
-  gemini: Object.freeze({ install: "npm install -g @google/gemini-cli" }),
 });
 
 const mode = (name: string, help: string): readonly [string, string] => [name, help];
-
-/** "Gemini CLI 0.63.0" for an engine whose wording names its CLI, when the version is known. */
-const cliVersion = (wording: AddonWording, version: string | undefined): string | undefined =>
-  wording.cli === undefined || version === undefined ? undefined : `${wording.cli} ${version}`;
 
 const ZH_ADDON: Readonly<Record<GuildAddonEngine, AddonWording>> = Object.freeze({
   codex: Object.freeze({
@@ -670,34 +636,8 @@ const ZH_ADDON: Readonly<Record<GuildAddonEngine, AddonWording>> = Object.freeze
     settingsFailed: "Codex 设置没有保存，请重试。",
     managed: "由 Codex 管理",
     notFound: "没有找到 Codex 适配器。请在终端运行：",
-    notLoggedIn: "尚未登录。请在终端运行：",
     integrityChanged: "Codex 引擎文件被意外改动，Guild 已拒绝运行。若是你刚更新了引擎，请重启 Guild 以接受更新后的引擎文件；否则请重新安装 @agentclientprotocol/codex-acp。",
     usageHeading: "ChatGPT 订阅",
-  }),
-  gemini: Object.freeze({
-    name: "Gemini",
-    pickerUnavailable: "未找到 Gemini，或没有 API 密钥",
-    pickerUnavailableHelp: "请先安装 Gemini CLI（npm install -g @google/gemini-cli），再到「设置 › 引擎」选择并确认你的 API 密钥文件。",
-    pickerNotStarted: "Gemini 启动后才会显示可选的模型。",
-    pickerDefault: "Gemini（默认模型）",
-    pickerDefaultHelp: "从会话提供的最便宜的 Flash 模型开始。",
-    intro: "Gemini 通过这台 Mac 上已安装的 Gemini CLI 运行，使用你自己的 Gemini API 密钥，按 Google AI Studio 账户的用量付费，不走任何订阅。Guild 不显示也不保存这个密钥，只从你在下面指定的文件里读取，并且只发送到 generativelanguage.googleapis.com。",
-    defaultModelOption: "Gemini 默认：最便宜的 Flash（推荐）",
-    modes: Object.freeze({
-      default: mode("默认", "编辑文件和运行命令前都先询问你。"),
-      autoEdit: mode("自动编辑", "直接编辑文件，运行命令前先询问你。"),
-      plan: mode("规划", "只读，只做规划和回答，不编辑文件，也不运行命令。"),
-      yolo: mode("完全访问 (YOLO)", "不再询问，命令和文件修改会直接在此设备上运行；只在你信任的工作区使用。"),
-    }),
-    settingsHelp: "新的 Gemini 对话从这里的设置开始。没有选默认模型时，新任务从会话提供的最便宜的 Flash 模型开始。正在运行的一轮不会被改动。",
-    settingsFailed: "Gemini 设置没有保存，请重试。",
-    managed: "按量计费的 API 密钥",
-    cli: "Gemini CLI",
-    notFound: "没有找到 Gemini CLI，或者它的版本不受支持。请在终端运行：",
-    notLoggedIn: "没有可用的 API 密钥。请在下面选择并确认密钥文件。",
-    integrityChanged: "Gemini CLI 的文件被意外改动，Guild 已拒绝运行。若是你刚更新了它，请重启 Guild 以接受更新后的文件；否则请重新安装 @google/gemini-cli。",
-    usageHeading: "Gemini API（按量计费）",
-    quota: "令牌数为估算，计费以 Google AI Studio 为准",
   }),
 });
 
@@ -720,34 +660,8 @@ const EN_ADDON: Readonly<Record<GuildAddonEngine, AddonWording>> = Object.freeze
     settingsFailed: "The Codex settings were not saved. Try again.",
     managed: "managed by Codex",
     notFound: "The Codex adapter was not found. Run this in Terminal:",
-    notLoggedIn: "Not logged in. Run this in Terminal:",
     integrityChanged: "Codex engine files changed unexpectedly; restart Guild to accept updated engine files, or reinstall @agentclientprotocol/codex-acp.",
     usageHeading: "ChatGPT subscription",
-  }),
-  gemini: Object.freeze({
-    name: "Gemini",
-    pickerUnavailable: "Gemini not found or no API key",
-    pickerUnavailableHelp: "Install the Gemini CLI (npm install -g @google/gemini-cli), then choose and confirm your API key file in Settings > Engines.",
-    pickerNotStarted: "Model choices appear once Gemini has started.",
-    pickerDefault: "Gemini (default model)",
-    pickerDefaultHelp: "Starts on the cheapest Flash model the session offers.",
-    intro: "Gemini runs through the Gemini CLI installed on this Mac with your own Gemini API key, paid per use on your Google AI Studio account and never through a subscription. Guild never shows or stores the key: it reads it from the file you name below and sends it only to generativelanguage.googleapis.com.",
-    defaultModelOption: "Gemini default: cheapest Flash (recommended)",
-    modes: Object.freeze({
-      default: mode("Default", "Asks you before each file edit and each command."),
-      autoEdit: mode("Auto-edit", "Edits files without asking; asks you before each command."),
-      plan: mode("Plan", "Read-only: plans and answers without editing files or running commands."),
-      yolo: mode("Full access (YOLO)", "Asks nothing: commands and file changes run on this device directly; use it only in a workspace you trust."),
-    }),
-    settingsHelp: "New Gemini conversations start from these settings. With no default model, a new task starts on the cheapest Flash model the session offers. A turn that is already running is never changed.",
-    settingsFailed: "The Gemini settings were not saved. Try again.",
-    managed: "pay-as-you-go API key",
-    cli: "Gemini CLI",
-    notFound: "The Gemini CLI was not found, or its version is not supported. Run this in Terminal:",
-    notLoggedIn: "No usable API key. Choose and confirm the key file below.",
-    integrityChanged: "Gemini CLI files changed unexpectedly; restart Guild to accept updated files, or reinstall @google/gemini-cli.",
-    usageHeading: "Gemini API (pay-as-you-go)",
-    quota: "Token counts are approximate; billing is authoritative on Google AI Studio",
   }),
 });
 
@@ -950,8 +864,7 @@ const ZH_CN: GuildMessages = Object.freeze({
     unsupported_value: "Grok 目前没有为这个任务提供该选项，已保留你之前的选择。",
     unavailable: "Grok 暂时无法切换，已保留你之前的选择。",
   })[reason],
-  modelGroupName: (group) => ({ grok: "Grok", claude: "Claude（订阅）", codex: "ChatGPT（订阅）", gemini: "Gemini（API 按量）", online: "在线", local: "本地" })[group],
-  modelGroupHint: (group) => group === "gemini" ? "按 Google AI Studio 账户的用量计费" : undefined,
+  modelGroupName: (group) => ({ grok: "Grok", claude: "Claude（订阅）", codex: "ChatGPT（订阅）", online: "在线", local: "本地" })[group],
   modelPickerGroupEmpty: (group) => group === "online"
     ? "没有在线模型，请在「设置 › 模型源」中添加"
     : "没有本地模型，请在「设置 › 模型源」中添加",
@@ -963,13 +876,13 @@ const ZH_CN: GuildMessages = Object.freeze({
   modelPickerClaudeDefaultRow: (model) => model === undefined ? "默认" : `默认（${model}）`,
   modelPickerOlderModels: (count) => `更早的模型（${count}）`,
   modelPickerOlderState: (expanded) => expanded ? "，已展开" : "，已折叠",
-  modelPickerEngineNote: "第一条消息选的模型，决定这个对话用 Grok、Claude、ChatGPT 还是 Gemini，之后不能更换。",
+  modelPickerEngineNote: "第一条消息选的模型，决定这个对话用 Grok、Claude 还是 ChatGPT，之后不能更换。",
   modelPickerRestartTag: "需重启",
   modelPickerRestartHint: "切换后要重启 Claude Code，再接上这段对话",
   modelPickerSwitching: "切换中…",
   modelSwitchStatus: (model) => `正在切换到「${model}」，需要重启引擎，通常 30–90 秒。消息会在切换完成后发出。`,
-  taskEngineName: (engine) => ({ grok: "Grok", claude: "Claude", codex: "Codex", gemini: "Gemini" })[engine],
-  taskEngineMarkerTitle: (engine) => ({ grok: "Grok 对话", claude: "Claude Code 对话", codex: "Codex 对话", gemini: "Gemini 对话" })[engine],
+  taskEngineName: (engine) => ({ grok: "Grok", claude: "Claude", codex: "Codex" })[engine],
+  taskEngineMarkerTitle: (engine) => ({ grok: "Grok 对话", claude: "Claude Code 对话", codex: "Codex 对话" })[engine],
   onlineReminderTitle: "发给在线模型前确认一下",
   onlineReminderLead: (vendor) => `「${vendor}」是在线模型。切换后，这个任务的下面这些内容会发送给它的服务商：`,
   onlineReminderItemClaudeMd: "CLAUDE.md",
@@ -1014,7 +927,6 @@ const ZH_CN: GuildMessages = Object.freeze({
   modelPickerAddonUnavailableHelp: (engine) => ZH_ADDON[engine].pickerUnavailableHelp,
   modelPickerAddonNotStarted: (engine) => ZH_ADDON[engine].pickerNotStarted,
   modelPickerAddonDefault: (engine) => ZH_ADDON[engine].pickerDefault,
-  modelPickerAddonDefaultHelp: (engine) => ZH_ADDON[engine].pickerDefaultHelp,
   settingsAddonHeading: (engine) => ZH_ADDON[engine].name,
   enginesAddonIntro: (engine) => ZH_ADDON[engine].intro,
   addonDefaultModelOption: (engine) => ZH_ADDON[engine].defaultModelOption,
@@ -1022,34 +934,18 @@ const ZH_CN: GuildMessages = Object.freeze({
   addonPermissionModeHelp: (engine, mode) => ZH_ADDON[engine].modes[mode]?.[1] ?? "",
   addonSettingsHelp: (engine) => ZH_ADDON[engine].settingsHelp,
   addonSettingsFailed: (engine) => ZH_ADDON[engine].settingsFailed,
-  addonStatusReady: (engine, account, version) => `已就绪 · ${account ?? cliVersion(ZH_ADDON[engine], version) ?? ZH_ADDON[engine].managed}`,
+  addonStatusReady: (engine, account) => `已就绪 · ${account ?? ZH_ADDON[engine].managed}`,
   addonStatusNotFound: (engine) => ZH_ADDON[engine].notFound,
-  addonStatusNotLoggedIn: (engine) => ZH_ADDON[engine].notLoggedIn,
+  addonStatusNotLoggedIn: () => "尚未登录。请在终端运行：",
   addonStatusUnavailable: () => "暂时无法使用，稍后再试。",
   addonStatusIntegrityChanged: (engine) => ZH_ADDON[engine].integrityChanged,
   addonInstallCommand: (engine) => ADDON_COMMANDS[engine].install,
   addonLoginCommand: (engine) => ADDON_COMMANDS[engine].login,
   usageAddonHeading: (engine) => ZH_ADDON[engine].usageHeading,
   usageAddonAccountManaged: (engine) => ZH_ADDON[engine].managed,
-  usageAddonQuota: (engine) => ZH_ADDON[engine].quota ?? `额度：${ZH_ADDON[engine].managed}`,
+  usageAddonQuota: (engine) => `额度：${ZH_ADDON[engine].managed}`,
   addonStartTimeout: (engine) => `${ZH_ADDON[engine].name} 仍在启动（插件和连接器可能需要一些时间）。请稍后再试一次。`,
   addonStopCaveat: (engine) => `停止这一轮后，${ZH_ADDON[engine].name} 已经开始运行的命令可能还会继续，直到这个对话的进程关闭。`,
-  engineKeyHeading: "API 密钥",
-  engineKeyVariableHint: (variable) => `只填变量名，例如 ${variable}。Guild 从密钥文件读取它的值，不显示也不保存；不要把密钥本身粘贴到这里。`,
-  engineKeyHostLabel: "只发送到",
-  engineKeyConfirmationLabel: "确认状态",
-  engineKeyConfirmed: (host) => `已确认可以发送到 ${host}`,
-  engineKeyNotConfirmed: "尚未确认",
-  engineKeyStateLabel: "密钥",
-  engineKeyStateName: (state) => ({
-    usable: "已在这个文件里找到",
-    unusable: "这个文件里没有找到",
-    unchecked: "尚未查看",
-    unconfirmed: "确认之后才会读取",
-  })[state],
-  engineKeyConfirm: "确认…",
-  engineKeyConfirmHelp: (host) => `点「确认…」会先保存文件和变量名，再弹出系统窗口，由你决定是否允许把密钥发送到 ${host}。更改文件或变量名后需要重新确认。`,
-  engineKeyFailed: "密钥文件和变量名没有保存或确认，请重试。",
   grokToolsGrokOnly: "Grok 工具只用于 Grok 对话",
   sourcesIntro: "在线和本地模型会出现在 Claude 对话的模型选择里。Guild 只把请求发到你设置的地址；API 密钥留在你指定的文件里，Guild 不会显示、保存或记录它。",
   sourcesLoading: "正在读取模型源…",
@@ -1567,8 +1463,7 @@ const EN_US: GuildMessages = Object.freeze({
     unsupported_value: "Grok does not offer that option for this task right now. Your previous selection was kept.",
     unavailable: "Grok could not switch right now. Your previous selection was kept.",
   })[reason],
-  modelGroupName: (group) => ({ grok: "Grok", claude: "Claude", codex: "ChatGPT", gemini: "Gemini (API, pay-as-you-go)", online: "Online", local: "Local" })[group],
-  modelGroupHint: (group) => group === "gemini" ? "Billed per use on your Google AI Studio account" : undefined,
+  modelGroupName: (group) => ({ grok: "Grok", claude: "Claude", codex: "ChatGPT", online: "Online", local: "Local" })[group],
   modelPickerGroupEmpty: (group) => group === "online"
     ? "No online models — add one in Settings › Model sources"
     : "No local models — add one in Settings › Model sources",
@@ -1580,13 +1475,13 @@ const EN_US: GuildMessages = Object.freeze({
   modelPickerClaudeDefaultRow: (model) => model === undefined ? "Default" : `Default (${model})`,
   modelPickerOlderModels: (count) => `Older models (${count})`,
   modelPickerOlderState: (expanded) => expanded ? ", expanded" : ", collapsed",
-  modelPickerEngineNote: "The model you pick for the first message decides whether this conversation runs on Grok, Claude, ChatGPT or Gemini. It cannot change afterwards.",
+  modelPickerEngineNote: "The model you pick for the first message decides whether this conversation runs on Grok, Claude or ChatGPT. It cannot change afterwards.",
   modelPickerRestartTag: "Restarts",
   modelPickerRestartHint: "Switching restarts Claude Code, then reconnects this conversation",
   modelPickerSwitching: "Switching\u2026",
   modelSwitchStatus: (model) => `Switching to \u201c${model}\u201d. The engine needs a restart, usually 30\u201390 seconds. Your message will be sent once the switch is done.`,
-  taskEngineName: (engine) => ({ grok: "Grok", claude: "Claude", codex: "Codex", gemini: "Gemini" })[engine],
-  taskEngineMarkerTitle: (engine) => ({ grok: "Grok conversation", claude: "Claude Code conversation", codex: "Codex conversation", gemini: "Gemini conversation" })[engine],
+  taskEngineName: (engine) => ({ grok: "Grok", claude: "Claude", codex: "Codex" })[engine],
+  taskEngineMarkerTitle: (engine) => ({ grok: "Grok conversation", claude: "Claude Code conversation", codex: "Codex conversation" })[engine],
   onlineReminderTitle: "Confirm before sending to an online model",
   onlineReminderLead: (vendor) => `${vendor} is an online model. If you switch, these parts of this task are sent to its vendor:`,
   onlineReminderItemClaudeMd: "CLAUDE.md",
@@ -1631,7 +1526,6 @@ const EN_US: GuildMessages = Object.freeze({
   modelPickerAddonUnavailableHelp: (engine) => EN_ADDON[engine].pickerUnavailableHelp,
   modelPickerAddonNotStarted: (engine) => EN_ADDON[engine].pickerNotStarted,
   modelPickerAddonDefault: (engine) => EN_ADDON[engine].pickerDefault,
-  modelPickerAddonDefaultHelp: (engine) => EN_ADDON[engine].pickerDefaultHelp,
   settingsAddonHeading: (engine) => EN_ADDON[engine].name,
   enginesAddonIntro: (engine) => EN_ADDON[engine].intro,
   addonDefaultModelOption: (engine) => EN_ADDON[engine].defaultModelOption,
@@ -1639,34 +1533,18 @@ const EN_US: GuildMessages = Object.freeze({
   addonPermissionModeHelp: (engine, mode) => EN_ADDON[engine].modes[mode]?.[1] ?? "",
   addonSettingsHelp: (engine) => EN_ADDON[engine].settingsHelp,
   addonSettingsFailed: (engine) => EN_ADDON[engine].settingsFailed,
-  addonStatusReady: (engine, account, version) => `Ready \u00b7 ${account ?? cliVersion(EN_ADDON[engine], version) ?? EN_ADDON[engine].managed}`,
+  addonStatusReady: (engine, account) => `Ready \u00b7 ${account ?? EN_ADDON[engine].managed}`,
   addonStatusNotFound: (engine) => EN_ADDON[engine].notFound,
-  addonStatusNotLoggedIn: (engine) => EN_ADDON[engine].notLoggedIn,
+  addonStatusNotLoggedIn: () => "Not logged in. Run this in Terminal:",
   addonStatusUnavailable: () => "Not available right now. Try again in a moment.",
   addonStatusIntegrityChanged: (engine) => EN_ADDON[engine].integrityChanged,
   addonInstallCommand: (engine) => ADDON_COMMANDS[engine].install,
   addonLoginCommand: (engine) => ADDON_COMMANDS[engine].login,
   usageAddonHeading: (engine) => EN_ADDON[engine].usageHeading,
   usageAddonAccountManaged: (engine) => EN_ADDON[engine].managed,
-  usageAddonQuota: (engine) => EN_ADDON[engine].quota ?? `Quota: ${EN_ADDON[engine].managed}`,
+  usageAddonQuota: (engine) => `Quota: ${EN_ADDON[engine].managed}`,
   addonStartTimeout: (engine) => `${EN_ADDON[engine].name} is still starting (plugins and connectors can take a while). Try again in a moment.`,
   addonStopCaveat: (engine) => `After you stop a turn, a command ${EN_ADDON[engine].name} has already started may keep running until this conversation's process closes.`,
-  engineKeyHeading: "API key",
-  engineKeyVariableHint: (variable) => `Enter only the variable name, for example ${variable}. Guild reads its value from the key file and neither shows nor saves it; never paste the key itself here.`,
-  engineKeyHostLabel: "Sent only to",
-  engineKeyConfirmationLabel: "Confirmation",
-  engineKeyConfirmed: (host) => `Confirmed for ${host}`,
-  engineKeyNotConfirmed: "Not confirmed",
-  engineKeyStateLabel: "Key",
-  engineKeyStateName: (state) => ({
-    usable: "Found in that file",
-    unusable: "Not found in that file",
-    unchecked: "Not looked at yet",
-    unconfirmed: "Not read until you confirm",
-  })[state],
-  engineKeyConfirm: "Confirm\u2026",
-  engineKeyConfirmHelp: (host) => `Confirm saves the file and variable names, then asks you in a system dialog whether the key may be sent to ${host}. Changing the file or the variable needs a new confirmation.`,
-  engineKeyFailed: "The key file and variable were not saved or confirmed. Try again.",
   grokToolsGrokOnly: "Grok tools are for Grok conversations",
   sourcesIntro: "Online and Local models appear in the picker of Claude conversations. Guild only sends requests to the address you set. API keys stay in the file you name; Guild never shows, stores or logs them.",
   sourcesLoading: "Loading model sources…",
@@ -2190,10 +2068,6 @@ const ADDON_LOCALES: Readonly<Record<GuildAddonEngine, Readonly<Record<GuildLoca
   codex: Object.freeze({
     "zh-CN": Object.freeze({ ...ZH_CN, ...ADDON_ZH(ZH_CN, ZH_ADDON.codex.name) }),
     "en-US": Object.freeze({ ...EN_US, ...ADDON_EN(EN_US, EN_ADDON.codex.name) }),
-  }),
-  gemini: Object.freeze({
-    "zh-CN": Object.freeze({ ...ZH_CN, ...ADDON_ZH(ZH_CN, ZH_ADDON.gemini.name) }),
-    "en-US": Object.freeze({ ...EN_US, ...ADDON_EN(EN_US, EN_ADDON.gemini.name) }),
   }),
 });
 

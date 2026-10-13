@@ -924,8 +924,7 @@ describe("live desktop service", () => {
     services.push(service);
 
     const startup = { webSearchEnabled: true, planEnabled: true, subagentsEnabled: true, maxTurns: null };
-    const { engines: freshEngines, modelCatalogs: freshCatalogs, ...freshRest } = (await service.bootstrap()).runtimeSettings;
-    assert.deepEqual(freshRest, {
+    assert.deepEqual((await service.bootstrap()).runtimeSettings, {
       model: null,
       reasoningEffort: null,
       modelCatalog: { models: [] },
@@ -939,24 +938,16 @@ describe("live desktop service", () => {
         permissionMode: "default",
         availablePermissionModes: GUILD_CLAUDE_PERMISSION_MODES,
       },
+      engines: {
+        codex: {
+          model: null,
+          reasoningEffort: null,
+          permissionMode: "workspace-write",
+          availablePermissionModes: GUILD_CODEX_PERMISSION_MODES,
+        },
+      },
+      modelCatalogs: { grok: { models: [] }, claude: { engine: "claude", models: [] }, codex: { engine: "codex", models: [] } },
     }, "a new install follows the runtime default and has no model list yet");
-    assert.deepEqual(freshEngines?.codex, {
-      model: null,
-      reasoningEffort: null,
-      permissionMode: "workspace-write",
-      availablePermissionModes: GUILD_CODEX_PERMISSION_MODES,
-    });
-    // Gemini: its own modes, no model yet, no key bound (its status follows the key look, which runs off the critical path).
-    assert.deepEqual(
-      [freshEngines?.gemini?.model, freshEngines?.gemini?.reasoningEffort, freshEngines?.gemini?.permissionMode, freshEngines?.gemini?.apiKey?.state],
-      [null, null, "default", "unconfirmed"],
-    );
-    assert.deepEqual(freshCatalogs, {
-      grok: { models: [] },
-      claude: { engine: "claude", models: [] },
-      codex: { engine: "codex", models: [] },
-      gemini: { engine: "gemini", models: [] },
-    });
 
     // No list yet: any official-looking pair is accepted; the runtime validates it per session.
     const withWorkspace = await service.chooseWorkspace();

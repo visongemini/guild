@@ -50,7 +50,6 @@ import { migrateSchema } from "./schema.js";
  */
 const REMOVE_V21_SQL = `
   DROP TABLE IF EXISTS engine_defaults;
-  DROP TABLE IF EXISTS engine_key_bindings;
   ALTER TABLE app_settings DROP COLUMN dock_icon;
   DELETE FROM schema_migrations WHERE version = 21;
 `;
@@ -4631,7 +4630,7 @@ describe("Guild 3.0 dual engine, model sources and preferences (schema v19)", ()
         /task_engine_fixed_after_first_run/u,
       );
       assert.throws(
-        () => raw.prepare("UPDATE task_metadata SET engine = 'Gemini' WHERE task_id = ?").run(claudeTaskId),
+        () => raw.prepare("UPDATE task_metadata SET engine = 'Mistral' WHERE task_id = ?").run(claudeTaskId),
         /CHECK constraint failed/u,
       );
     });
@@ -5636,14 +5635,12 @@ describe("N-engine foundation (schema v21)", () => {
       assert.deepEqual({ ...raw.prepare("SELECT * FROM app_settings").get() }, { ...before.app, dock_icon: "dark" });
       assert.equal(raw.prepare("SELECT strict FROM pragma_table_list WHERE name = 'task_metadata'").get()?.["strict"], 1);
       assert.equal(raw.prepare("SELECT strict FROM pragma_table_list WHERE name = 'engine_defaults'").get()?.["strict"], 1);
-      assert.equal(raw.prepare("SELECT strict FROM pragma_table_list WHERE name = 'engine_key_bindings'").get()?.["strict"], 1);
 
-      // Schema: only the rebuilt tables, the two model triggers, guild_meta, app_settings (one column) and the
-      // new tables differ.
+      // Schema: only the rebuilt tables, the two model triggers, guild_meta, app_settings (one column) and the new table differ.
       const after = schemaObjects(raw);
       const changed = new Set(["task_metadata", "runtime_model_catalog", "guild_meta", "engine_defaults", "app_settings",
         "task_runtime_model_follows_engine_on_insert", "task_runtime_model_follows_engine_on_update"]);
-      assert.deepEqual([...after.keys()].filter((name) => !before.objects.has(name)).sort(), ["engine_defaults", "engine_key_bindings"]);
+      assert.deepEqual([...after.keys()].filter((name) => !before.objects.has(name)), ["engine_defaults"]);
       assert.deepEqual([...before.objects.keys()].filter((name) => !after.has(name)), []);
       for (const [name, sql] of before.objects) {
         if (changed.has(name)) continue;
@@ -5918,99 +5915,6 @@ describe("N-engine foundation (schema v21)", () => {
     });
   });
 
-  it("stores a Gemini task, its model ids and its camel-case permission mode, from a v20 database too [PC-ENG-004]", (t) => {
-    const geminiTaskId = must(parseTaskId("task-gemini"));
-    const path = temporaryDatabase(t);
-    withRaw(path, (raw) => {
-      migrateSchema(raw, 20);
-      raw.exec(`
-        INSERT INTO workspaces(workspace_id, canonical_path, display_name, disposition, revision, created_at_ms, updated_at_ms)
-        VALUES('workspace-1', '/tmp/guild-gemini-workspace', 'Workspace', 'active', 1, 10, 10);
-      `);
-    });
-    chmodSync(path, 0o600);
-    const store = openGuildPersistence({ path });
-    assert.equal(store.verifyIntegrity().schemaVersion, 21);
-    store.createConversationTask({ taskId: geminiTaskId, workspaceId, title: "Gemini task", owningWindowId: windowId, engine: "gemini" });
-    assert.equal(store.loadTaskEngine(geminiTaskId), "gemini");
-    assert.throws(() => store.markTaskRouted({ taskId: geminiTaskId }), failure("domain_operation_rejected"), "only a Claude task is routed");
-    for (const model of ["gemini-3.5-flash-lite", "gemini-3.1-pro-preview", "gemini-2.5-pro", "gemini-3.1-pro-preview-customtools"]) {
-      const saved = store.loadTaskRuntimeSettings(geminiTaskId);
-      store.saveTaskRuntimeSettings({
-        taskId: geminiTaskId, expectedRevision: saved?.revision ?? 0, modelId: model, reasoningEffort: null, contextWindow: null,
-      });
-      assert.equal(store.loadTaskRuntimeSettings(geminiTaskId)?.modelId, model);
-    }
-    for (const bad of ["gemini flash", "", "gemini/pro", "x".repeat(129)]) {
-      assert.throws(
-        () => store.saveTaskRuntimeSettings({ taskId: geminiTaskId, expectedRevision: 4, modelId: bad, reasoningEffort: null, contextWindow: null }),
-        (error) => error instanceof PersistenceError,
-        JSON.stringify(bad),
-      );
-    }
-    // The defaults of the engine start on the CLI's own default mode and accept all four of its modes.
-    const initial = store.loadAppSettings();
-    assert.deepEqual(initial.engineDefaults.gemini, { model: null, reasoningEffort: null, permissionMode: "default" });
-    let settings = initial;
-    for (const mode of ["autoEdit", "yolo", "plan", "default"]) {
-      settings = store.updateAppSettings({
-        expectedRevision: settings.revision,
-        engineDefaults: { engine: "gemini", model: "gemini-3.5-flash-lite", permissionMode: mode },
-      });
-      assert.deepEqual(settings.engineDefaults.gemini, { model: "gemini-3.5-flash-lite", reasoningEffort: null, permissionMode: mode });
-    }
-    for (const bad of ["acceptEdits", "read-only", "AutoEdit ", "yolo!", ""]) {
-      assert.throws(
-        () => store.updateAppSettings({ expectedRevision: settings.revision, engineDefaults: { engine: "gemini", permissionMode: bad } }),
-        failure("domain_operation_rejected"),
-        JSON.stringify(bad),
-      );
-    }
-    store.updateAppSettings({
-      expectedRevision: settings.revision, engineDefaults: { engine: "gemini", permissionMode: "autoEdit" },
-    });
-    // Codex is untouched by Gemini's defaults.
-    assert.equal(store.loadAppSettings().engineDefaults.codex.permissionMode, "workspace-write");
-    store.close();
-    const reopened = openGuildPersistence({ path });
-    assert.equal(reopened.loadAppSettings().engineDefaults.gemini.permissionMode, "autoEdit");
-    assert.equal(reopened.loadTaskRuntimeSettings(geminiTaskId)?.modelId, "gemini-3.1-pro-preview-customtools");
-    reopened.close();
-    // A raw writer cannot store a mode with a space, a quote or an empty name; upper-case letters are legal.
-    withRaw(path, (raw) => {
-      raw.prepare("UPDATE engine_defaults SET permission_mode = 'autoEdit' WHERE engine = 'gemini'").run();
-      for (const bad of ["Auto Edit", "auto'Edit", "", "-yolo", "1plan"]) {
-        assert.throws(
-          () => raw.prepare("UPDATE engine_defaults SET permission_mode = ? WHERE engine = 'gemini'").run(bad),
-          /CHECK constraint failed/u,
-          JSON.stringify(bad),
-        );
-      }
-    });
-  });
-
-  it("caches the Gemini model list as its own engine's row [PC-MODEL-001]", (t) => {
-    const path = temporaryDatabase(t);
-    const store = openGuildPersistence({ path });
-    const catalog = {
-      engine: "gemini",
-      runtimeDefaultModelId: "gemini-3.5-flash-lite",
-      models: [
-        { id: "gemini-3.5-flash-lite", name: "gemini-3.5-flash-lite", group: "gemini", reasoningEfforts: [], contextWindows: [] },
-        { id: "gemini-3.1-pro-preview", name: "gemini-3.1-pro-preview", group: "gemini", reasoningEfforts: [], contextWindows: [] },
-      ],
-    };
-    store.saveModelCatalogCache({ engine: "gemini", catalog: catalog as never, runtimeVersion: "Gemini CLI 0.63.0" });
-    assert.deepEqual(store.loadModelCatalogCache("gemini")?.catalog.models.map((model) => model.id), ["gemini-3.5-flash-lite", "gemini-3.1-pro-preview"]);
-    assert.equal(store.loadModelCatalogCache("codex"), undefined);
-    assert.throws(
-      () => store.saveModelCatalogCache({ engine: "codex", catalog: catalog as never }),
-      failure("domain_operation_rejected"),
-      "a Gemini list is not stored as the Codex one",
-    );
-    store.close();
-  });
-
   it("holds the Dock icon in the settings row under compare-and-set, default dark [PC-SET-002]", (t) => {
     const path = temporaryDatabase(t);
     const store = openGuildPersistence({ path });
@@ -6044,67 +5948,4 @@ describe("N-engine foundation (schema v21)", () => {
     });
   });
 
-  it("keeps the names of an engine's key file and variable and the host the user confirmed, never a key [PC-ENG-004]", (t) => {
-    const path = temporaryDatabase(t);
-    const store = openGuildPersistence({ path });
-    assert.equal(store.loadEngineKeyBinding("gemini"), undefined);
-    const first = store.saveEngineKeyBinding({ engine: "gemini", keyFile: null, keyVariable: "GEMINI_API_KEY" });
-    assert.deepEqual(
-      { keyFile: first.keyFile, keyVariable: first.keyVariable, confirmedHost: first.confirmedHost, revision: first.revision },
-      { keyFile: null, keyVariable: "GEMINI_API_KEY", confirmedHost: null, revision: 1 },
-    );
-    // The same names change nothing.
-    assert.equal(store.saveEngineKeyBinding({ engine: "gemini", keyFile: null, keyVariable: "GEMINI_API_KEY" }).revision, 1);
-
-    // Confirming binds the engine's own host; a stale revision cannot confirm a newer edit.
-    assert.throws(() => store.confirmEngineKeyBinding({ engine: "gemini", expectedRevision: 2 }), failure("persistence_cas_conflict"));
-    const confirmed = store.confirmEngineKeyBinding({ engine: "gemini", expectedRevision: 1 });
-    assert.equal(confirmed.confirmedHost, "generativelanguage.googleapis.com");
-    assert.equal(confirmed.revision, 2);
-    assert.equal(store.confirmEngineKeyBinding({ engine: "gemini", expectedRevision: 2 }).revision, 2, "already confirmed: no new revision");
-    assert.equal(store.saveEngineKeyBinding({ engine: "gemini", keyFile: null, keyVariable: "GEMINI_API_KEY" }).confirmedHost, confirmed.confirmedHost);
-
-    // Naming another variable or file voids the confirmation.
-    const otherVariable = store.saveEngineKeyBinding({ engine: "gemini", keyFile: null, keyVariable: "MY_GEMINI_KEY" });
-    assert.deepEqual([otherVariable.confirmedHost, otherVariable.revision], [null, 3]);
-    const reconfirmed = store.confirmEngineKeyBinding({ engine: "gemini", expectedRevision: 3 });
-    const otherFile = store.saveEngineKeyBinding({ engine: "gemini", keyFile: "/Users/me/keys.env", keyVariable: "MY_GEMINI_KEY" });
-    assert.equal(reconfirmed.confirmedHost, "generativelanguage.googleapis.com");
-    assert.deepEqual([otherFile.keyFile, otherFile.confirmedHost, otherFile.revision], ["/Users/me/keys.env", null, 5]);
-
-    // Only an engine with a key field has a binding, and the names must be names.
-    for (const engine of ["codex", "claude", "grok", "mistral"]) {
-      assert.throws(() => store.saveEngineKeyBinding({ engine: engine as never, keyFile: null, keyVariable: "GEMINI_API_KEY" }), failure("domain_operation_rejected"), engine);
-      assert.throws(() => store.loadEngineKeyBinding(engine as never), failure("domain_operation_rejected"), engine);
-      assert.throws(() => store.confirmEngineKeyBinding({ engine: engine as never, expectedRevision: 1 }), failure("domain_operation_rejected"), engine);
-    }
-    for (const keyVariable of ["", "gemini_api_key", "A B", "1KEY", "A".repeat(65), "KEY;rm", "sk-live-abcdef123456"]) {
-      assert.throws(() => store.saveEngineKeyBinding({ engine: "gemini", keyFile: null, keyVariable }), failure("domain_operation_rejected"), keyVariable);
-    }
-    for (const keyFile of ["", "relative/keys.env", "../keys.env", "/a/../b", `/${"a".repeat(4096)}`, "/tmp/\nkeys", "/tmp/sk-abcdefghijk"]) {
-      assert.throws(() => store.saveEngineKeyBinding({ engine: "gemini", keyFile, keyVariable: "GEMINI_API_KEY" }), failure("domain_operation_rejected"), keyFile);
-    }
-    assert.throws(() => store.confirmEngineKeyBinding({ engine: "gemini", expectedRevision: 0 }), failure("domain_operation_rejected"));
-    store.close();
-
-    const reopened = openGuildPersistence({ path });
-    const stored = reopened.loadEngineKeyBinding("gemini");
-    assert.deepEqual([stored?.keyFile, stored?.keyVariable, stored?.confirmedHost], ["/Users/me/keys.env", "MY_GEMINI_KEY", null]);
-    reopened.close();
-    withRaw(path, (raw) => {
-      // The table has no column that could hold a key, and a raw writer cannot make the shape wrong.
-      assert.deepEqual(
-        raw.prepare("SELECT name FROM pragma_table_info('engine_key_bindings') ORDER BY cid").all().map((row) => row["name"]),
-        ["engine", "key_file", "key_variable", "confirmed_host", "revision", "updated_at_ms"],
-      );
-      assert.throws(() => raw.prepare("UPDATE engine_key_bindings SET key_variable = 'lower'").run(), /CHECK constraint failed/u);
-      assert.throws(() => raw.prepare("UPDATE engine_key_bindings SET revision = 0").run(), /CHECK constraint failed/u);
-      assert.throws(() => raw.prepare("INSERT INTO engine_key_bindings(engine, key_file, key_variable, confirmed_host, revision, updated_at_ms) VALUES('Gemini', NULL, 'K', NULL, 1, 1)").run(), /CHECK constraint failed/u);
-      // A host written behind the store's back is not trusted: only the engine's own host counts as confirmed.
-      raw.prepare("UPDATE engine_key_bindings SET confirmed_host = 'evil.example' WHERE engine = 'gemini'").run();
-    });
-    const tampered = openGuildPersistence({ path });
-    assert.equal(tampered.loadEngineKeyBinding("gemini")?.confirmedHost, null);
-    tampered.close();
-  });
 });

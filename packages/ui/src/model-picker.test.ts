@@ -3,7 +3,6 @@ import test from "node:test";
 import {
   EMPTY_CLAUDE_MODEL_CATALOG,
   EMPTY_CODEX_MODEL_CATALOG,
-  EMPTY_GEMINI_MODEL_CATALOG,
   defaultReasoningEffortOf,
   freezeGrokModelCatalog,
   freezeModelCatalog,
@@ -15,14 +14,10 @@ import {
   type TaskViewProjection,
 } from "@guild/contracts";
 import { messagesFor } from "./locales.js";
-import { CLAUDE_CATALOG, GEMINI_CATALOG, REAL_CATALOG } from "./model-catalog.fixture.js";
+import { CLAUDE_CATALOG, REAL_CATALOG } from "./model-catalog.fixture.js";
 import {
   CLEAR_MODEL_OVERRIDE,
-  addonEngineOfGroup,
   catalogModelById,
-  catalogOfEngine,
-  engineOffersEffort,
-  engineTakesApiKey,
   formatContextTokens,
   formatContextWindows,
   globalDefaultView,
@@ -358,14 +353,13 @@ const CATALOGS = Object.freeze({ grok: REAL_CATALOG, claude: CLAUDE_CATALOG });
 const groupView = (view: ReturnType<typeof modelPickerView>, group: string) =>
   view.groups.find((entry) => entry.group === group)!;
 
-test("a task with a Run lists only its engine's groups, a task without one lists all six in order", () => {
+test("a task with a Run lists only its engine's groups, a task without one lists all five in order", () => {
   assert.deepEqual(visibleModelGroups("grok", true), ["grok"]);
   assert.deepEqual(visibleModelGroups("claude", true), ["claude", "online", "local"]);
   assert.deepEqual(visibleModelGroups("codex", true), ["codex"]);
-  assert.deepEqual(visibleModelGroups("gemini", true), ["gemini"]);
-  for (const engine of ["grok", "claude", "codex", "gemini"] as const) {
-    assert.deepEqual(visibleModelGroups(engine, false), ["grok", "claude", "codex", "gemini", "online", "local"], engine);
-  }
+  assert.deepEqual(visibleModelGroups("grok", false), ["grok", "claude", "codex", "online", "local"]);
+  assert.deepEqual(visibleModelGroups("claude", false), ["grok", "claude", "codex", "online", "local"]);
+  assert.deepEqual(visibleModelGroups("codex", false), ["grok", "claude", "codex", "online", "local"]);
   const fixed = modelPickerView({
     messages: EN, catalogs: CATALOGS, selection: selection("opus", "high"), taskEngine: "claude", engineFixed: true,
   });
@@ -375,7 +369,7 @@ test("a task with a Run lists only its engine's groups, a task without one lists
   const fresh = modelPickerView({
     messages: EN, catalogs: CATALOGS, selection: selection("grok-4.7", "high", "runtime"), taskEngine: "grok", engineFixed: false,
   });
-  assert.deepEqual(fresh.groups.map((entry) => entry.label), ["Grok", "Claude", "ChatGPT", "Gemini (API, pay-as-you-go)", "Online", "Local"]);
+  assert.deepEqual(fresh.groups.map((entry) => entry.label), ["Grok", "Claude", "ChatGPT", "Online", "Local"]);
   assert.equal(fresh.engineNote, EN.modelPickerEngineNote);
   // A Grok task that already ran keeps the old single, heading-less list.
   const grokFixed = modelPickerView({ messages: EN, catalogs: CATALOGS, selection: selection("grok-4.7", "high"), taskEngine: "grok", engineFixed: true });
@@ -383,11 +377,11 @@ test("a task with a Run lists only its engine's groups, a task without one lists
   assert.equal(grokFixed.groups.length, 1);
 });
 
-test("group headings are localized: Grok, Claude (subscription), ChatGPT (subscription), Gemini (API, pay-as-you-go), Online, Local", () => {
+test("group headings are localized: Grok, Claude (subscription), ChatGPT (subscription), Online, Local", () => {
   const zh = modelPickerView({
     messages: ZH, catalogs: CATALOGS, selection: selection("grok-4.7", "high", "runtime"), taskEngine: "grok", engineFixed: false,
   });
-  assert.deepEqual(zh.groups.map((entry) => entry.label), ["Grok", "Claude\uff08\u8ba2\u9605\uff09", "ChatGPT\uff08\u8ba2\u9605\uff09", "Gemini\uff08API \u6309\u91cf\uff09", "\u5728\u7ebf", "\u672c\u5730"]);
+  assert.deepEqual(zh.groups.map((entry) => entry.label), ["Grok", "Claude\uff08\u8ba2\u9605\uff09", "ChatGPT\uff08\u8ba2\u9605\uff09", "\u5728\u7ebf", "\u672c\u5730"]);
 });
 
 test("rows go to the group their catalog entry names and only the task's own engine marks a selection", () => {
@@ -577,15 +571,13 @@ test("the catalogs come from modelCatalogs, falling back to the single Grok cata
   assert.equal(legacy.grok, REAL_CATALOG);
   assert.equal(legacy.claude, EMPTY_CLAUDE_MODEL_CATALOG);
   assert.equal(legacy.codex, EMPTY_CODEX_MODEL_CATALOG);
-  assert.equal(legacy.gemini, EMPTY_GEMINI_MODEL_CATALOG);
   const both = modelCatalogsOf({
     modelCatalog: { models: [] },
-    modelCatalogs: { grok: REAL_CATALOG, claude: CLAUDE_CATALOG, codex: EMPTY_CODEX_MODEL_CATALOG, gemini: GEMINI_CATALOG },
+    modelCatalogs: { grok: REAL_CATALOG, claude: CLAUDE_CATALOG, codex: EMPTY_CODEX_MODEL_CATALOG },
   });
   assert.equal(both.grok, REAL_CATALOG);
   assert.equal(both.claude, CLAUDE_CATALOG);
   assert.equal(both.codex, EMPTY_CODEX_MODEL_CATALOG);
-  assert.equal(both.gemini, GEMINI_CATALOG);
 });
 
 test("a cancelled switch needs no notice", () => {
@@ -705,119 +697,4 @@ test("an absent Codex catalog reads as an empty one, so a pre-3.1 caller still w
   });
   assert.equal(groupView(view, "codex").models[0]!.name, "Codex (default model)");
   assert.equal(modelCatalogsOf({ modelCatalog: REAL_CATALOG }).codex, EMPTY_CODEX_MODEL_CATALOG);
-});
-
-// ---- Guild 3.1 part 2: the Gemini group (PC-ENG-004, PC-MODEL-001)
-
-test("the Gemini group comes after ChatGPT, says it is pay-as-you-go and carries the billing line under its heading", () => {
-  const catalogs = { grok: REAL_CATALOG, claude: CLAUDE_CATALOG, codex: EMPTY_CODEX_MODEL_CATALOG, gemini: GEMINI_CATALOG };
-  const fresh = { catalogs, selection: selection("grok-4.7", "high", "runtime"), taskEngine: "grok" as const, engineFixed: false };
-  const en = modelPickerView({ messages: EN, ...fresh });
-  assert.deepEqual(en.groups.map((entry) => entry.group), ["grok", "claude", "codex", "gemini", "online", "local"]);
-  assert.equal(groupView(en, "gemini").label, "Gemini (API, pay-as-you-go)");
-  assert.equal(groupView(en, "gemini").hint, "Billed per use on your Google AI Studio account");
-  const zh = modelPickerView({ messages: ZH, ...fresh });
-  assert.equal(groupView(zh, "gemini").label, "Gemini\uff08API \u6309\u91cf\uff09");
-  assert.equal(groupView(zh, "gemini").hint, "\u6309 Google AI Studio \u8d26\u6237\u7684\u7528\u91cf\u8ba1\u8d39");
-  // Only the group paid for per use has the line.
-  assert.deepEqual(en.groups.filter((entry) => entry.hint !== undefined).map((entry) => entry.group), ["gemini"]);
-  // A Gemini task that already ran lists only its own group, which keeps its line though its heading is hidden.
-  const fixed = modelPickerView({ messages: EN, catalogs, selection: selection("gemini-3.8-flash", null), taskEngine: "gemini", engineFixed: true, geminiState: "ready" });
-  assert.deepEqual(fixed.groups.map((entry) => entry.group), ["gemini"]);
-  assert.equal(fixed.showGroupHeadings, false);
-  assert.equal(groupView(fixed, "gemini").hint, EN.modelGroupHint("gemini"));
-  assert.equal(fixed.engineNote, undefined);
-  // Every other task that already ran never sees the Gemini group.
-  for (const taskEngine of ["grok", "claude", "codex"] as const) {
-    assert.equal(modelPickerView({ messages: EN, catalogs, selection: selection(null, null, "runtime"), taskEngine, engineFixed: true })
-      .groups.some((entry) => entry.group === "gemini"), false, taskEngine);
-  }
-});
-
-test("Gemini rows are the session's own models with their own words, and never have an effort", () => {
-  const catalogs = { grok: REAL_CATALOG, claude: CLAUDE_CATALOG, gemini: GEMINI_CATALOG };
-  // Even a stored effort (from an older default) is ignored: Gemini has no effort setting over ACP.
-  const view = modelPickerView({
-    messages: EN, catalogs, selection: selection("gemini-3.8-flash", "high"), taskEngine: "gemini", engineFixed: true, geminiState: "ready",
-  });
-  const gemini = groupView(view, "gemini");
-  assert.deepEqual(gemini.models.map((row) => [row.id, row.engine, row.group]), GEMINI_CATALOG.models.map((model) => [model.id, "gemini", "gemini"]));
-  assert.equal(gemini.models.find((row) => row.id === "gemini-3.5-flash-lite")!.description, "Fastest and cheapest");
-  assert.equal(gemini.models.some((row) => row.runtimeDefault === true), false, "no default row once the session listed its models");
-  assert.equal(gemini.empty, undefined);
-  assert.deepEqual(view.models.filter((row) => row.selected).map((row) => row.id), ["gemini-3.8-flash"]);
-  assert.equal(view.triggerText, "Gemini 3.8 Flash");
-  assert.equal(view.effortLabel, undefined);
-  assert.equal(view.selectedEffortId, null);
-  assert.deepEqual(view.efforts, []);
-  assert.equal(view.showEfforts, false);
-  // Nor does a Gemini catalog that somehow lists efforts bring the control back.
-  const withEfforts = freezeModelCatalog("gemini", {
-    models: [{ id: "gemini-3.8-flash", name: "Gemini 3.8 Flash", group: "gemini", contextWindows: [], reasoningEfforts: [{ id: "high", label: "High", isDefault: true }] }],
-  });
-  const odd = modelPickerView({
-    messages: EN, catalogs: { ...catalogs, gemini: withEfforts }, selection: selection("gemini-3.8-flash", null), taskEngine: "gemini", engineFixed: true,
-  });
-  assert.equal(odd.showEfforts, false);
-  assert.deepEqual(odd.efforts, []);
-  assert.equal(odd.triggerText, "Gemini 3.8 Flash");
-  // Choosing a Gemini row never carries an effort, and moves an unstarted task to Gemini.
-  const row = odd.models.find((candidate) => candidate.id === "gemini-3.8-flash")!;
-  assert.deepEqual(selectionForRow({ ...catalogs, gemini: withEfforts }, row, "high", "grok"), {
-    model: "gemini-3.8-flash", reasoningEffort: null, group: "gemini", engine: "gemini",
-  });
-  const flashLite = view.models.find((candidate) => candidate.id === "gemini-3.5-flash-lite")!;
-  const sameEngine = selectionForRow(catalogs, flashLite, "high", "gemini");
-  assert.equal("engine" in sameEngine, false);
-  assert.equal(sameEngine.reasoningEffort, null);
-});
-
-test("before a Gemini session reported models, its one default row exists only while the CLI is installed and has a usable key", () => {
-  const catalogs = { grok: REAL_CATALOG, claude: CLAUDE_CATALOG, gemini: EMPTY_GEMINI_MODEL_CATALOG };
-  const fresh = { messages: EN, catalogs, selection: selection("grok-4.7", "high", "runtime"), taskEngine: "grok" as const, engineFixed: false };
-  for (const geminiState of [undefined, "ready"] as const) {
-    const view = modelPickerView({ ...fresh, ...(geminiState === undefined ? {} : { geminiState }) });
-    const gemini = groupView(view, "gemini");
-    assert.deepEqual(
-      gemini.models.map((row) => [row.id, row.name, row.description, row.group, row.engine, row.runtimeDefault, row.selected]),
-      [["", "Gemini (default model)", "Starts on the cheapest Flash model the session offers.", "gemini", "gemini", true, false]],
-      String(geminiState),
-    );
-    assert.equal(gemini.empty?.kind, "not_started");
-    assert.equal(gemini.empty?.text, "Model choices appear once Gemini has started.");
-  }
-  // No usable key (not_logged_in for Gemini), no CLI, changed files or an unavailable CLI: no row, only the way out.
-  for (const geminiState of ["not_logged_in", "not_found", "unavailable", "integrity_changed"] as const) {
-    const gemini = groupView(modelPickerView({ ...fresh, geminiState }), "gemini");
-    assert.equal(gemini.models.length, 0, geminiState);
-    assert.equal(gemini.empty?.kind, "claude_unavailable", geminiState);
-  }
-  for (const geminiState of ["not_logged_in", "not_found"] as const) {
-    const empty = groupView(modelPickerView({ ...fresh, geminiState }), "gemini").empty;
-    assert.equal(empty?.text, "Gemini not found or no API key");
-    assert.equal(empty?.help, "Install the Gemini CLI (npm install -g @google/gemini-cli), then choose and confirm your API key file in Settings > Engines.");
-  }
-  assert.equal(groupView(modelPickerView({ ...fresh, geminiState: "unavailable" }), "gemini").empty?.text, EN.addonStatusUnavailable("gemini"));
-  assert.match(groupView(modelPickerView({ ...fresh, geminiState: "integrity_changed" }), "gemini").empty?.text ?? "", /Gemini CLI files changed/u);
-  // Codex keeps its own rule: a missing login still offers its row (the login can follow the first start).
-  assert.equal(groupView(modelPickerView({ ...fresh, codexState: "not_logged_in" }), "codex").models.length, 1);
-  // The row selected while a Gemini task follows its default; picking it clears the override and moves the task.
-  const following = modelPickerView({ ...fresh, taskEngine: "gemini", engineFixed: true, selection: selection(null, null, "runtime") });
-  const defaultRow = following.models.find((row) => row.group === "gemini")!;
-  assert.equal(defaultRow.selected, true);
-  assert.equal(following.triggerText, "Gemini (default model)");
-  assert.equal(following.showEfforts, false);
-  assert.deepEqual(selectionForRow(catalogs, defaultRow, null, "grok"), { model: null, reasoningEffort: null, group: "gemini", engine: "gemini" });
-  // The owner-facing Chinese name.
-  assert.equal(groupView(modelPickerView({ ...fresh, messages: ZH }), "gemini").models[0]!.name, "Gemini\uff08\u9ed8\u8ba4\u6a21\u578b\uff09");
-});
-
-test("the add-on engine table: Gemini owns its group, takes an API key and has no effort setting; Codex logs in and has efforts", () => {
-  assert.equal(addonEngineOfGroup("gemini"), "gemini");
-  assert.equal(addonEngineOfGroup("codex"), "codex");
-  for (const group of ["grok", "claude", "online", "local"] as const) assert.equal(addonEngineOfGroup(group), undefined, group);
-  assert.deepEqual((["grok", "claude", "codex", "gemini"] as const).map(engineOffersEffort), [true, true, true, false]);
-  assert.deepEqual((["grok", "claude", "codex", "gemini"] as const).map(engineTakesApiKey), [false, false, false, true]);
-  assert.equal(catalogOfEngine({ grok: REAL_CATALOG, claude: CLAUDE_CATALOG }, "gemini"), EMPTY_GEMINI_MODEL_CATALOG);
-  assert.equal(catalogOfEngine({ grok: REAL_CATALOG, claude: CLAUDE_CATALOG, gemini: GEMINI_CATALOG }, "gemini"), GEMINI_CATALOG);
 });

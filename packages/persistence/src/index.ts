@@ -5,7 +5,6 @@ export {
   type AdapterEpochRecord,
   type AppSettingsRecord,
   type EngineDefaultsRecord,
-  type EngineKeyBindingRecord,
   type CanonicalTaskRestore,
   type ConversationEntryCreationResult,
   type ConversationEntryKind,

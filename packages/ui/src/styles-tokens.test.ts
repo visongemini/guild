@@ -117,7 +117,7 @@ for (const [theme, block] of [["light", light], ["dark", dark]] as const) {
     }
     const onAccent = contrast(solid("--guild-on-accent"), solid("--guild-accent"));
     assert.ok(onAccent >= 4.5, `${theme}: text on the accent fill is ${onAccent.toFixed(2)}:1`);
-    for (const dot of ["--guild-accent", "--guild-wait", "--guild-error", "--guild-fresh", "--guild-gemini"]) {
+    for (const dot of ["--guild-accent", "--guild-wait", "--guild-error", "--guild-fresh"]) {
       const ratio = contrast(solid(dot), panel);
       assert.ok(ratio >= 3, `${theme}: ${dot} marker on the sidebar is ${ratio.toFixed(2)}:1`);
     }

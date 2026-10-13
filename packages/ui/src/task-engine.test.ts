@@ -18,7 +18,6 @@ test("a task without an engine is a Grok task", () => {
   assert.equal(taskEngineOf(task()), "grok");
   assert.equal(taskEngineOf(task({ engine: "claude" })), "claude");
   assert.equal(taskEngineOf(task({ engine: "codex" })), "codex");
-  assert.equal(taskEngineOf(task({ engine: "gemini" })), "gemini");
 });
 
 test("the engine is open for a fresh task and fixed by anything a Run leaves behind", () => {
@@ -46,9 +45,6 @@ test("markers appear only while both engines are in use", () => {
   assert.equal(hasMixedEngines([workspace("codex", "codex")]), false);
   assert.equal(hasMixedEngines([workspace("claude", "codex")]), true);
   assert.equal(hasMixedEngines([workspace(undefined), workspace("codex")]), true);
-  // Gemini is one more engine like the others.
-  assert.equal(hasMixedEngines([workspace("gemini", "gemini")]), false);
-  assert.equal(hasMixedEngines([workspace("gemini"), workspace("codex")]), true);
 });
 
 test("each engine has its own marker letter, and Claude and Codex do not share one (PC-ENG-003)", () => {
@@ -57,12 +53,4 @@ test("each engine has its own marker letter, and Claude and Codex do not share o
     ["G", "C", "X"],
   );
   assert.equal(new Set((["grok", "claude", "codex"] as const).map((engine) => engineMarkerLetter(engine))).size, 3);
-});
-
-test("Gemini's marker is the letter pair Ge, distinct from Grok's G and every other engine's letter (PC-ENG-004)", () => {
-  const engines = ["grok", "claude", "codex", "gemini"] as const;
-  assert.deepEqual(engines.map((engine) => engineMarkerLetter(engine)), ["G", "C", "X", "Ge"]);
-  assert.equal(new Set(engines.map((engine) => engineMarkerLetter(engine))).size, engines.length);
-  // Two letters at most, so the marker keeps its fixed box.
-  assert.equal(engines.every((engine) => engineMarkerLetter(engine).length <= 2), true);
 });

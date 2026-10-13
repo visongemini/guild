@@ -10,10 +10,8 @@ import {
   GUILD_PROMPT_ATTACHMENT_MAX_BYTES,
   EMPTY_CLAUDE_MODEL_CATALOG,
   EMPTY_CODEX_MODEL_CATALOG,
-  EMPTY_GEMINI_MODEL_CATALOG,
   EMPTY_GROK_MODEL_CATALOG,
   emptyModelCatalogOf,
-  engineApiKeySpec,
   GUILD_ADDON_DEFAULT_PERMISSION_MODE,
   GUILD_ADDON_ENGINES,
   GUILD_ADDON_PERMISSION_MODES,
@@ -39,8 +37,6 @@ import {
   parseGuildNickname,
   parseGuildDockIcon,
   parseGuildNewTaskWorkspaceMode,
-  parseModelSourceKeyFile,
-  parseModelSourceKeyVariable,
   parseContinuousFooter,
   defaultReasoningEffortOf,
   CLAUDE_DEFAULT_MODEL_ID,
@@ -67,7 +63,6 @@ import {
   type AcpToolStatus,
   type AddonEngineSettingsProjection,
   type DesktopBootstrapProjection,
-  type EngineApiKeyProjection,
   type EngineStatusProjection,
   type GrokModelCatalog,
   type GuildAddonEngine,
@@ -166,7 +161,6 @@ import {
   GrokProcessHost,
   deriveClaudeModelCatalog,
   deriveCodexModelCatalog,
-  deriveGeminiModelCatalog,
   engineProfileFor,
   type AcpV1AdapterInterruptionReason,
   type AcpV1AdapterInterruptionDiagnostic,
@@ -199,12 +193,6 @@ import {
 } from "./addon-engines.js";
 import { CodexEngineIntegrityError, CodexLocatorError, locateCodexEngine } from "./codex-locator.js";
 import { createCodexRuntime } from "./codex-runtime.js";
-import { effectiveEngineKeyBinding, readEngineApiKey } from "./engine-api-key.js";
-import { engineKeyConfirmationPrompt } from "./engine-key-messages.js";
-import { GeminiEnvironmentError } from "./gemini-env-guard.js";
-import { GeminiEngineIntegrityError, GeminiLocatorError, probeGeminiCli } from "./gemini-locator.js";
-import { GeminiKeyUnavailableError, createGeminiRuntime } from "./gemini-runtime.js";
-import type { HostConfirmationPrompt } from "./model-source-messages.js";
 import type { BrowserMcpPort, ModelRouterHostPort, RoutedModelInfo } from "./engine-ports.js";
 import {
   GuildAvatarError,
@@ -229,9 +217,7 @@ import {
   CLAUDE_DEFAULT_MUST_BE_NATIVE,
   CLAUDE_LOGIN_REQUIRED,
   CLAUDE_START_TIMEOUT,
-  ENGINE_ENV_FILE_UNSAFE,
   ENGINE_INTEGRITY_CHANGED,
-  ENGINE_KEY_REQUIRED,
   ENGINE_LOGIN_REQUIRED,
   ENGINE_START_TIMEOUT,
   MODEL_ROUTER_UNAVAILABLE,
@@ -399,11 +385,6 @@ export type RuntimeFactory = (input: {
    * `ANTHROPIC_AUTH_TOKEN` is a throwaway secret: never log either.
    */
   readonly extraEnvironment?: Readonly<Record<string, string>>;
-  /**
-   * Gemini only: the model the task will run on, so the CLI's settings name it and a process never starts on the CLI's
-   * own `auto` choice (docs/21 8.3). Absent while the list of models is not known.
-   */
-  readonly model?: string;
 }) => Promise<{
   readonly adapter: RuntimeAdapterPort;
   readonly runtimeVersion?: string;
@@ -452,14 +433,7 @@ export type LiveDesktopServiceOptions = {
   readonly addonEngineProbes?: Readonly<Partial<Record<GuildAddonEngine, () => Promise<Readonly<{ version: string }>>>>>;
   /** Dev-only (`GUILD_DEV_CODEX_ACP`, see dev-hooks.ts): a `codex-acp` package directory the Codex locator tries first. */
   readonly codexAdapterRoot?: string;
-  /** Dev-only (`GUILD_DEV_GEMINI_CLI`, see dev-hooks.ts): a `@google/gemini-cli` package directory the Gemini locator tries first. */
-  readonly geminiCliRoot?: string;
-  /** Absolute path of the key file used by an engine binding that names none (docs/21 8.2); shown in the confirmation. */
-  readonly defaultKeyFile?: string;
-  /** Shows the native dialog that binds an engine's API key to its host and resolves true only for "Allow". Absent: nothing can be confirmed. */
-  readonly confirmEngineKey?: (prompt: HostConfirmationPrompt) => Promise<boolean>;
-  /** Applies the Dock icon the user chose (PC-SET-002); called at startup and whenever the setting changes. */
-  /** Sets the Dock icon; false when nothing was set (not macOS, a missing or empty file). */
+  /** Applies the Dock icon the user chose (PC-SET-002); called at startup and whenever the setting changes. Returns false when nothing was set (not macOS, a missing or empty file). */
   readonly applyDockIcon?: (icon: GuildDockIcon) => boolean | void;
   /** Online / Local models behind the loopback router (docs/20 3.3, 3.4). Absent: Claude tasks stay native. */
   readonly modelRouterHost?: ModelRouterHostPort;
@@ -696,18 +670,8 @@ export function createLiveDesktopService(
   const conversationPageDepths = new Map<TaskId, number>();
   const scheduledQueuedTasks = new Map<TaskId, Promise<void>>();
   const scheduledContinuousTasks = new Map<TaskId, Promise<void>>();
-  const geminiHomeDirectory = join(dirname(options.databasePath), "engines", "gemini-home");
   const runtimeFactory = options.runtimeFactory ??
-    ((input: Parameters<RuntimeFactory>[0]) => createProductionRuntime(input, {
-      codexAdapterRoot: options.codexAdapterRoot,
-      geminiCliRoot: options.geminiCliRoot,
-      geminiHomeDirectory,
-      readApiKey: (engine) => readEngineApiKey({
-        engine,
-        binding: store.loadEngineKeyBinding(engine),
-        defaultKeyFile: options.defaultKeyFile ?? "",
-      }),
-    }));
+    ((input: Parameters<RuntimeFactory>[0]) => createProductionRuntime(input, { codexAdapterRoot: options.codexAdapterRoot }));
   const mediaRoot = options.mediaRoot ?? `${options.databasePath}.media`;
   const diagnosticsRoot = options.diagnosticsRoot ?? join(dirname(options.databasePath), "diagnostics");
   const diagnosticLog = new RuntimeDiagnosticLog(diagnosticsRoot);
@@ -757,14 +721,8 @@ export function createLiveDesktopService(
               ...(options.codexAdapterRoot === undefined ? {} : { extraAdapterRoots: [options.codexAdapterRoot] }),
             })).core.version,
           }),
-          gemini: () => probeGeminiCli({
-            ...(options.geminiCliRoot === undefined ? {} : { extraPackageRoots: [options.geminiCliRoot] }),
-          }),
         }
       : {});
-  type EngineKeyCheck = { state: EngineApiKeyProjection["state"]; atMs: number; operation: Promise<void> | undefined };
-  const engineKeyChecks = new Map<GuildAddonEngine, EngineKeyCheck>();
-  const defaultEngineKeyFile = options.defaultKeyFile ?? "";
   const modelRouterHost = options.modelRouterHost;
   const browserMcp = options.browserMcp;
   let usageSnapshot: AcpV1OfficialBillingSnapshot | undefined;
@@ -930,10 +888,7 @@ export function createLiveDesktopService(
 
   /** Looks for every add-on engine's installation off the critical path; a change reaches the next projection. */
   function refreshAddonInstalls(): void {
-    for (const engine of GUILD_ADDON_ENGINES) {
-      refreshAddonInstall(engine);
-      void refreshEngineKey(engine);
-    }
+    for (const engine of GUILD_ADDON_ENGINES) refreshAddonInstall(engine);
   }
 
   /** The Dock icon is the main process's to set; a failure there never reaches the settings. */
@@ -945,72 +900,6 @@ export function createLiveDesktopService(
     } catch {
       logRuntime({ category: "runtime", event: "dock_icon_failed" });
     }
-  }
-
-  // --- An add-on engine's API key (Gemini; PC-ENG-004). The state is what the last look found; the key itself is
-  // read again at every launch and is never held here. (The variables are declared with the add-on state, above.)
-
-  function engineKeyCheck(engine: GuildAddonEngine): EngineKeyCheck {
-    let check = engineKeyChecks.get(engine);
-    if (check === undefined) {
-      check = { state: "unchecked", atMs: 0, operation: undefined };
-      engineKeyChecks.set(engine, check);
-    }
-    return check;
-  }
-
-  /**
-   * Looks at the confirmed binding's file and variable (at most every probe interval unless forced) and records only
-   * whether a usable key is there. A binding that changed while the file was being read is looked at again.
-   */
-  function refreshEngineKey(engine: GuildAddonEngine, force = false): Promise<void> {
-    if (engineApiKeySpec(engine) === undefined || closed || closing) return Promise.resolve();
-    const check = engineKeyCheck(engine);
-    if (check.operation !== undefined) return check.operation;
-    if (!force && Date.now() - check.atMs < ADDON_PROBE_INTERVAL_MS) return Promise.resolve();
-    check.atMs = Date.now();
-    check.operation = (async () => {
-      for (let attempt = 0; attempt < 3; attempt += 1) {
-        const binding = store.loadEngineKeyBinding(engine);
-        const reading = await readEngineApiKey({ engine, binding, defaultKeyFile: defaultEngineKeyFile });
-        if (store.loadEngineKeyBinding(engine)?.revision !== binding?.revision) continue;
-        noteEngineKeyState(
-          engine,
-          reading.status === "ready" ? "usable" : reading.status === "unconfirmed" ? "unconfirmed" : "unusable",
-        );
-        return;
-      }
-    })().catch(() => undefined).finally(() => { check.operation = undefined; });
-    return check.operation;
-  }
-
-  /** A key that cannot be used reads as "no login" for the engine, so its status and picker row say so. */
-  function noteEngineKeyState(engine: GuildAddonEngine, state: EngineApiKeyProjection["state"]): void {
-    if (closed || closing) return;
-    const check = engineKeyCheck(engine);
-    const engineState = addonState(engine);
-    const auth = state === "usable"
-      ? (engineState.auth?.kind === "none" ? undefined : engineState.auth)
-      : Object.freeze({ kind: "none" });
-    if (check.state === state && engineState.auth === auth) return;
-    check.state = state;
-    engineState.auth = auth;
-    schedulePhasePublish();
-  }
-
-  function engineApiKeyProjection(engine: GuildAddonEngine): EngineApiKeyProjection | undefined {
-    const spec = engineApiKeySpec(engine);
-    if (spec === undefined) return undefined;
-    const stored = store.loadEngineKeyBinding(engine);
-    const confirmed = stored?.confirmedHost === spec.host;
-    return Object.freeze({
-      keyFile: stored?.keyFile ?? null,
-      keyVariable: stored?.keyVariable ?? spec.defaultVariable,
-      host: spec.host,
-      confirmed,
-      defaultKeyFile: defaultEngineKeyFile,
-      state: confirmed ? engineKeyCheck(engine).state : "unconfirmed",
-    });
   }
 
   function refreshAddonInstall(engine: GuildAddonEngine): void {
@@ -1027,11 +916,9 @@ export function createLiveDesktopService(
         next = Object.freeze({
           // Changed pinned files are not a missing install: the picker withholds the default row and Settings
           // shows the integrity text (PC-ENG-003).
-          status: cause instanceof CodexEngineIntegrityError || cause instanceof GeminiEngineIntegrityError
+          status: cause instanceof CodexEngineIntegrityError
             ? "integrity_changed" as const
-            : cause instanceof CodexLocatorError || cause instanceof GeminiLocatorError
-              ? "not_found" as const
-              : "unavailable" as const,
+            : cause instanceof CodexLocatorError ? "not_found" as const : "unavailable" as const,
         });
       }
       // A refusal to run changed files stays until a session of the engine opens again; a probe that only finds
@@ -1047,14 +934,12 @@ export function createLiveDesktopService(
     settings: ReturnType<GuildPersistence["loadAppSettings"]>,
   ): AddonEngineSettingsProjection {
     const defaults = settings.engineDefaults[engine];
-    const apiKey = engineApiKeyProjection(engine);
     return Object.freeze({
       ...addonEngineReport(addonState(engine)),
       model: defaults.model,
       reasoningEffort: defaults.reasoningEffort,
       permissionMode: defaults.permissionMode,
       availablePermissionModes: GUILD_ADDON_PERMISSION_MODES[engine],
-      ...(apiKey === undefined ? {} : { apiKey }),
     });
   }
 
@@ -1266,9 +1151,6 @@ export function createLiveDesktopService(
       syncClaudePermissionModes(controller, options);
     } else if (controller.engine === "codex") {
       noteAddonCatalog("codex", startCatalog ?? deriveCodexModelCatalog(options), startCatalog !== undefined);
-      syncClaudePermissionModes(controller, options);
-    } else if (controller.engine === "gemini") {
-      noteAddonCatalog("gemini", startCatalog ?? deriveGeminiModelCatalog(options), startCatalog !== undefined);
       syncClaudePermissionModes(controller, options);
     }
   }
@@ -1532,14 +1414,9 @@ export function createLiveDesktopService(
     // id that Claude does not offer; the runtime default is applied then, also when nothing is pinned (D-062).
     const strayRoutedModel = controller.engine === "claude" && !controller.routedProcess &&
       selection.modelId !== null && sessionModelUnoffered(controller.sessionConfigOptions);
-    // A Gemini session starts on the CLI's own `auto` (and returns to it after a load), which can route to the Pro
-    // model: it is never left there, whatever is pinned (docs/21 8.5).
-    const geminiOnAuto = controller.engine === "gemini" && selection.modelId !== null &&
-      sessionModelUnoffered(controller.sessionConfigOptions);
     // Nothing pinned anywhere: the runtime default (or the session's own earlier choice) stays.
-    if ((selection.source === "runtime" && !strayRoutedModel && !geminiOnAuto) || adapter.state !== "ready") {
+    if ((selection.source === "runtime" && !strayRoutedModel) || adapter.state !== "ready") {
       controller.selectionRefused = false;
-      assertGeminiNotOnAuto(taskId, controller, session);
       return "skipped";
     }
     const strict = isAdapterEngine(controller.engine);
@@ -1592,7 +1469,6 @@ export function createLiveDesktopService(
       if (requestFailed || modelMissing) throw refuseSelection(outcome.reason);
     }
     controller.selectionRefused = outcome.status === "refused";
-    assertGeminiNotOnAuto(taskId, controller, session);
     if (outcome.status !== "unchanged") {
       logRuntime({
         category: "runtime",
@@ -1603,20 +1479,6 @@ export function createLiveDesktopService(
       });
     }
     return outcome.status;
-  }
-
-  /**
-   * A Gemini turn never runs on a model the session's own list does not offer: the CLI's `auto` can route to the Pro
-   * model, which is dearer than the Flash model the task selected. When the session is still on one after the selection
-   * was applied (nothing listed, a refusal), the turn is not sent.
-   */
-  function assertGeminiNotOnAuto(taskId: TaskId, controller: RuntimeController, session: AcpV1AdapterSession): void {
-    if (controller.engine !== "gemini") return;
-    const modelOption = selectionOptionsOf(controller.sessionConfigOptions).model;
-    if (modelOption !== undefined && modelOption.type === "select" && modelOption.unlisted !== true) return;
-    controller.selectionRefused = true;
-    logRuntime({ category: "runtime", event: "model_switch_refused", taskId, sessionId: session.sessionId, reason: "session_on_auto" });
-    throw new Error(MODEL_SELECTION_FAILED);
   }
 
   /**
@@ -1699,52 +1561,6 @@ export function createLiveDesktopService(
           ...(reasoningEffort === undefined ? {} : { reasoningEffort }),
           ...(mcpServers.length === 0 ? {} : { mcpServers }),
         });
-  }
-
-  /**
-   * Tells the user, in the task, which env or settings file stopped a Gemini start and which variable or setting in it did
-   * (never a value; docs/21 8.1). A failure to write the note must not hide the refusal.
-   */
-  function writeEnvFileNotice(
-    taskId: TaskId,
-    problem: Readonly<{ path: string; variable: string; source?: "env_file" | "settings_file"; reason?: "forbidden" | "uncheckable" }>,
-  ): void {
-    try {
-      const locale = store.loadAppSettings().locale;
-      const zh = locale === "zh-CN";
-      const text = problem.reason === "uncheckable"
-        ? zh
-          ? `Gemini 没有启动：${problem.path} 太大或格式异常，Guild 无法在 Gemini 读取它之前检查其中的内容。请缩小或移除该文件，或把它移出这个项目，然后重新发送。`
-          : `Gemini was not started: ${problem.path} is too large or too unusual for Guild to check before Gemini reads it. Shrink or remove the file, or move it out of this project, then send again.`
-        : problem.source === "settings_file"
-          ? zh
-            ? `Gemini 没有启动：${problem.path} 设置了 ${problem.variable}，它会改变登录方式或把对话发往别处。请从该文件删除这项设置，或把它移出这个项目，然后重新发送。`
-            : `Gemini was not started: ${problem.path} sets ${problem.variable}, which could change the sign-in method or send the conversation elsewhere. Remove that setting from the file, or move the file out of this project, then send again.`
-          : zh
-            ? `Gemini 没有启动：${problem.path} 设置了 ${problem.variable}，它会把 API 密钥发往别处或改变登录方式。请从该文件删除这一行，或把它移出这个项目，然后重新发送。`
-            : `Gemini was not started: ${problem.path} sets ${problem.variable}, which could send the API key elsewhere or change the sign-in method. Remove that line from the file, or move the file out of this project, then send again.`;
-      store.createConversationEntry({
-        taskId,
-        entryId: unique("gemini-env-file"),
-        kind: "notice",
-        text,
-        metadata: { failureCategory: "gemini_env_file_unsafe" },
-        status: "complete",
-      });
-    } catch {
-      logRuntime({ category: "runtime", event: "gemini_env_file_notice_failed", taskId });
-    }
-  }
-
-  /**
-   * The model a Gemini process is told to start on (its settings name it): the task's selection when the engine's last
-   * list contains it. Nothing is guessed while the list is unknown; the first session then starts on the CLI's own
-   * choice and is brought to the selection before its first prompt.
-   */
-  function geminiStartModel(taskId: TaskId, controller: RuntimeController): string | undefined {
-    if (controller.engine !== "gemini") return undefined;
-    const modelId = desiredSelection(taskId).selection.modelId;
-    return modelId !== null && addonState("gemini").catalog.models.some((model) => model.id === modelId) ? modelId : undefined;
   }
 
   /** The loopback browser server (docs/20 3.5); an engine that did not advertise HTTP MCP is never given it. */
@@ -3620,7 +3436,6 @@ export function createLiveDesktopService(
           grok: modelCatalog,
           claude: claudeCatalogProjection(),
           codex: addonState("codex").catalog,
-          gemini: addonState("gemini").catalog,
         }),
       }),
       generalSettings: Object.freeze({
@@ -5083,7 +4898,6 @@ export function createLiveDesktopService(
           startup: selectedRuntimeSettings.startup,
         }),
         ...(spawnEnvironment === undefined ? {} : { extraEnvironment: spawnEnvironment }),
-        ...(geminiStartModel(taskId, controller) === undefined ? {} : { model: geminiStartModel(taskId, controller)! }),
       });
       logRuntime({ category: "runtime", event: "factory_ready", taskId, adapterEpoch });
       if (runtimeGeneration !== startGeneration) {
@@ -5240,8 +5054,8 @@ export function createLiveDesktopService(
       applySessionOptions(
         controller,
         session.configOptions ?? Object.freeze([]),
-        // The list of models (and, for Codex, the efforts of every model) that an add-on session reports when it starts.
-        controller.engine === "codex" || controller.engine === "gemini" ? session.modelCatalog : undefined,
+        // The list of efforts of every model that a Codex session reports when it starts.
+        controller.engine === "codex" ? session.modelCatalog : undefined,
       );
       if (session.contextWindowSize !== undefined) {
         store.saveContextWindowSize({
@@ -5380,28 +5194,14 @@ export function createLiveDesktopService(
         adapterEpoch,
         reason: `${startStage}:${detail}`.slice(0, 320),
       });
-      // Gemini: no usable key was found before anything was spawned, or the CLI itself says there is none.
-      if (controller.engine === "gemini" && cause instanceof GeminiKeyUnavailableError) {
-        noteEngineKeyState("gemini", cause.reason === "unconfirmed" ? "unconfirmed" : "unusable");
-        throw new Error(ENGINE_KEY_REQUIRED);
-      }
-      if (controller.engine === "gemini" && cause instanceof GeminiEnvironmentError) {
-        logRuntime({ category: "runtime", event: "gemini_env_file_unsafe", taskId, adapterEpoch });
-        writeEnvFileNotice(taskId, cause.problem);
-        throw new Error(ENGINE_ENV_FILE_UNSAFE);
-      }
       if (isAuthRequired(controller, cause)) {
         noteLoginRequired(controller.engine);
-        throw new Error(
-          controller.engine === "gemini"
-            ? ENGINE_KEY_REQUIRED
-            : isAddonEngine(controller.engine) ? ENGINE_LOGIN_REQUIRED : CLAUDE_LOGIN_REQUIRED,
-        );
+        throw new Error(isAddonEngine(controller.engine) ? ENGINE_LOGIN_REQUIRED : CLAUDE_LOGIN_REQUIRED);
       }
       if (controller.engine === "claude" && cause instanceof ClaudeLocatorError) {
         noteClaudeInstall(Object.freeze({ status: "not_found" as const }));
       }
-      if (isAddonEngine(controller.engine) && (cause instanceof CodexLocatorError || cause instanceof GeminiLocatorError)) {
+      if (isAddonEngine(controller.engine) && cause instanceof CodexLocatorError) {
         noteAddonInstall(controller.engine, Object.freeze({ status: "not_found" as const }));
       }
       if (controller.engine === "claude" && created?.refusedForIntegrity?.() === true) {
@@ -5576,18 +5376,12 @@ export function createLiveDesktopService(
     }
   }
 
-  /**
-   * The loaded session must replay the task's own history. `anchorsOnly` (Gemini, docs/21 8.6) compares the user
-   * prompts alone: the CLI's replay is not faithful to the live turns (tool titles, paths, statuses and the end of the
-   * final text differ), so the rest of a turn can neither prove nor disprove anything.
-   */
   function reconcileReplayHistory(
     taskId: TaskId,
     loadedSessionId: string,
     updates: readonly AcpV1DecodedUpdate[],
-    anchorsOnly = false,
   ): void {
-    const replayTurns = replayTurnsFromUpdates(updates, anchorsOnly);
+    const replayTurns = replayTurnsFromUpdates(updates);
     const localTurns = localReplayTurns(taskId, loadedSessionId);
     let reachableReplayIndexes = new Set<number>([0]);
     for (const local of localTurns) {
@@ -5596,7 +5390,7 @@ export function createLiveDesktopService(
       for (const replayIndex of reachableReplayIndexes) {
         if (!required) next.add(replayIndex);
         const replay = replayTurns[replayIndex];
-        if (replay !== undefined && replayTurnMatches(local, replay, !required, anchorsOnly)) {
+        if (replay !== undefined && replayTurnMatches(local, replay, !required)) {
           next.add(replayIndex + 1);
         }
       }
@@ -6486,7 +6280,7 @@ export function createLiveDesktopService(
           staging.sessionId !== event.identity.sessionId ||
           staging.adapterEpoch !== event.identity.adapterEpoch
         ) throw new Error("replay_barrier_mismatch");
-        reconcileReplayHistory(taskId, staging.sessionId, staging.updates, controller.engine === "gemini");
+        reconcileReplayHistory(taskId, staging.sessionId, staging.updates);
         const epoch = store.loadCurrentAdapterEpoch(taskId);
         if (
           epoch === undefined ||
@@ -7704,7 +7498,6 @@ export function createLiveDesktopService(
   }
   // The bundle icon already is the dark one, so a launch on the default changes nothing at all.
   if (store.loadAppSettings().dockIcon !== "dark") applyDockIcon(store.loadAppSettings().dockIcon);
-  void refreshEngineKey("gemini", true);
   discardStoredPristineTasks();
   void sweepPristineWorktreeTasks();
   const diagnosticsHydration = hydrateRuntimeIncidents().catch(() => undefined);
@@ -8712,7 +8505,6 @@ export function createLiveDesktopService(
             if (
               offered === undefined ||
               (request.contextWindow ?? null) !== null ||
-              (addon === "gemini" && request.reasoningEffort !== null) ||
               (request.reasoningEffort !== null &&
                 offered.reasoningEfforts.length > 0 &&
                 !modelSupportsReasoningEffort(offered, request.reasoningEffort))
@@ -8951,8 +8743,6 @@ export function createLiveDesktopService(
       try {
         exactMode = parseGuildAddonPermissionMode(engine, permissionMode);
         if (model === null && reasoningEffort !== null) throw new TypeError("effort_without_model");
-        // Gemini has no thinking control over ACP: an effort is never stored for it.
-        if (engine === "gemini" && reasoningEffort !== null) throw new TypeError("gemini_has_no_effort");
         if (model !== null) parseGuildModelId(engine, model);
         if (reasoningEffort !== null) parseGuildReasoningEffort(engine, reasoningEffort);
       } catch {
@@ -9058,66 +8848,6 @@ export function createLiveDesktopService(
       await publish();
       return buildBootstrap();
     }),
-    setEngineApiKey: async (engine, keyFile, keyVariable) => enqueueCommand(async () => {
-      assertOpen();
-      if (!isAddonEngine(engine) || engineApiKeySpec(engine) === undefined) throw new Error("engine_key_unavailable");
-      try {
-        // The renderer names a file and a variable; whatever it says, a change voids the confirmation in the store.
-        store.saveEngineKeyBinding({
-          engine,
-          keyFile: keyFile === null ? null : parseModelSourceKeyFile(keyFile),
-          keyVariable: parseModelSourceKeyVariable(keyVariable),
-        });
-      } catch {
-        throw new Error("engine_key_unavailable");
-      }
-      await refreshEngineKey(engine, true);
-      await publish();
-      return buildBootstrap();
-    }),
-    confirmEngineApiKey: async (engine) => {
-      assertOpen();
-      const spec = isAddonEngine(engine) ? engineApiKeySpec(engine) : undefined;
-      if (!isAddonEngine(engine) || spec === undefined) throw new Error("engine_key_unavailable");
-      // The dialog is shown outside the command queue: it is modal and must not hold up anything else. What it says
-      // is built from the binding as it is now; an edit made while it is open voids the answer (revision compare).
-      const prepared = await enqueueCommand(async () => {
-        assertOpen();
-        const binding = store.loadEngineKeyBinding(engine) ??
-          store.saveEngineKeyBinding({ engine, keyFile: null, keyVariable: spec.defaultVariable });
-        if (binding.confirmedHost === spec.host) return undefined;
-        const effective = effectiveEngineKeyBinding(engine, binding, defaultEngineKeyFile)!;
-        return Object.freeze({
-          revision: binding.revision,
-          prompt: engineKeyConfirmationPrompt({
-            locale: store.loadAppSettings().locale,
-            engineName: engineName(engine),
-            host: spec.host,
-            keyVariable: effective.keyVariable,
-            keyFile: effective.keyFile,
-          }),
-        });
-      });
-      if (prepared !== undefined) {
-        // Without a native dialog nothing can be confirmed: the binding is never confirmed on the renderer's word.
-        const allowed = options.confirmEngineKey === undefined ? false : await options.confirmEngineKey(prepared.prompt);
-        if (allowed) {
-          await enqueueCommand(async () => {
-            assertOpen();
-            try {
-              store.confirmEngineKeyBinding({ engine, expectedRevision: prepared.revision });
-            } catch {
-              // The binding changed while the dialog was open: the answer was for the old names and does not apply.
-            }
-          });
-        }
-      }
-      await enqueueCommand(async () => {
-        await refreshEngineKey(engine, true);
-        await publish();
-      });
-      return buildBootstrap();
-    },
     openUserData: async () => {
       assertOpen();
       if (options.openUserData === undefined) return;
@@ -9352,7 +9082,6 @@ function emptyReplayTurn(): ReplayTurnSnapshot {
 
 function replayTurnsFromUpdates(
   updates: readonly AcpV1DecodedUpdate[],
-  anchorsOnly = false,
 ): readonly ReplayTurnSnapshot[] {
   const turns: ReplayTurnSnapshot[] = [];
   let current: ReplayTurnSnapshot | undefined;
@@ -9364,23 +9093,6 @@ function replayTurnsFromUpdates(
     if (update.type === "ignored_extension" || update.type === "session_context") continue;
     if (update.type === "unsupported_content") {
       throw new Error("session_load_replay_unsupported_content");
-    }
-    if (anchorsOnly) {
-      // Gemini replays each user prompt as one whole chunk (its internal context and function-response chunks are
-      // dropped by the codec), so every user chunk opens a turn and nothing else is looked at, except for the events
-      // a replay must never carry.
-      if (update.type === "media_content") continue;
-      const replayed = update.payload;
-      if (replayed.type === "permission_request" || replayed.type === "prompt_terminal") {
-        throw new Error("session_load_replay_side_effect_event");
-      }
-      if (replayed.type === "user_text_chunk" && update.interjection !== true) {
-        const anchor = emptyReplayTurn();
-        anchor.user = replayed.text;
-        anchor.hasUserChunk = true;
-        turns.push(anchor);
-      }
-      continue;
     }
     if (update.type === "media_content") {
       const turn = requireCurrent();
@@ -9474,10 +9186,8 @@ function replayTurnMatches(
   local: LocalReplayTurn,
   replay: ReplayTurnSnapshot,
   _allowUncertainTail: boolean,
-  anchorsOnly = false,
 ): boolean {
   if (!replayUserMatches(local, replay.user)) return false;
-  if (anchorsOnly) return true;
   if (local.assistant !== replay.assistant || local.thought !== replay.thought) return false;
   if ((local.plan === undefined) !== (replay.plan === undefined)) return false;
   if (
@@ -9697,12 +9407,7 @@ function transportInterruptionMessage(
 
 /** The engine's name as the user knows it, for the notices Guild writes into a task. */
 function engineName(engine: GuildEngine): string {
-  switch (engine) {
-    case "claude": return "Claude";
-    case "codex": return "Codex";
-    case "gemini": return "Gemini";
-    case "grok": return "Grok";
-  }
+  return engine === "claude" ? "Claude" : engine === "codex" ? "Codex" : "Grok";
 }
 
 /** Engines whose process is a user-installed ACP adapter that Guild never authenticates for: every engine but Grok. */
@@ -9728,23 +9433,17 @@ function loginRequiredMessage(locale: GuildLocale, engine: GuildEngine): string 
   return isAddonEngine(engine) ? addonLoginRequiredMessage(locale, engine) : claudeLoginRequiredMessage(locale);
 }
 
-/** The `failureCategory` of the error entry a missing login (for Gemini: a missing API key) leaves in the conversation. */
+/** The `failureCategory` of the error entry a missing login leaves in the conversation. */
 function loginRequiredCategory(engine: GuildEngine): string {
-  return engine === "gemini" ? "gemini_key_required" : isAddonEngine(engine) ? `${engine}_login_required` : "claude_login_required";
+  return isAddonEngine(engine) ? `${engine}_login_required` : "claude_login_required";
 }
 
-/** The login command of each add-on engine that signs in with an account; Guild shows it and never runs it. */
-const ADDON_LOGIN_COMMAND: Readonly<Partial<Record<GuildAddonEngine, string>>> = Object.freeze({ codex: "codex login" });
+/** The login command of each add-on engine; Guild shows it and never runs it. */
+const ADDON_LOGIN_COMMAND: Readonly<Record<GuildAddonEngine, string>> = Object.freeze({ codex: "codex login" });
 
 function addonLoginRequiredMessage(locale: GuildLocale, engine: GuildAddonEngine): string {
   const name = engineName(engine);
   const command = ADDON_LOGIN_COMMAND[engine];
-  if (command === undefined) {
-    // An engine paid for per use with an API key: there is no login, and the fix is in Settings (PC-ENG-004).
-    return locale === "zh-CN"
-      ? `${name} 没有可用的 API 密钥。请在 设置 > 引擎 > ${name} 中选择存放密钥的文件和变量并确认，然后重试。`
-      : `${name} has no usable API key. Choose the file and variable that hold it in Settings > Engines > ${name} and confirm it, then retry.`;
-  }
   return locale === "zh-CN"
     ? `${name} 尚未登录。请先在终端运行 \`${command}\` 并完成登录，然后重试。`
     : `${name} is not logged in. Run \`${command}\` in Terminal and log in, then retry.`;
@@ -9752,33 +9451,8 @@ function addonLoginRequiredMessage(locale: GuildLocale, engine: GuildAddonEngine
 
 async function createProductionRuntime(
   input: Parameters<RuntimeFactory>[0],
-  options: Readonly<{
-    codexAdapterRoot?: string | undefined;
-    geminiCliRoot?: string | undefined;
-    geminiHomeDirectory?: string | undefined;
-    readApiKey?: ((engine: GuildAddonEngine) => ReturnType<typeof readEngineApiKey>) | undefined;
-  }> = {},
+  options: Readonly<{ codexAdapterRoot?: string | undefined }> = {},
 ) {
-  if (input.engine === "gemini") {
-    if (options.geminiHomeDirectory === undefined || options.readApiKey === undefined) {
-      throw new Error("gemini_runtime_unavailable");
-    }
-    const readApiKey = options.readApiKey;
-    return createGeminiRuntime(
-      {
-        adapterEpoch: input.adapterEpoch,
-        sink: input.sink,
-        stagingRoot: input.stagingRoot,
-        workingDirectory: input.workingDirectory,
-        model: input.model,
-      },
-      {
-        homeDirectory: options.geminiHomeDirectory,
-        readApiKey: () => readApiKey("gemini"),
-        locatorOptions: options.geminiCliRoot === undefined ? {} : { extraPackageRoots: [options.geminiCliRoot] },
-      },
-    );
-  }
   if (input.engine === "codex") {
     return createCodexRuntime(
       {

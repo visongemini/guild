@@ -11,7 +11,6 @@ import { AdapterPinError, type AdapterPinFailureCode } from "./adapter-pin.js";
 import {
   CLAUDE_ENVIRONMENT_POLICY_VERSION,
   CODEX_ENVIRONMENT_POLICY_VERSION,
-  GEMINI_ENVIRONMENT_POLICY_VERSION,
   GROK_ENGINE_PROFILE,
   GROK_ENVIRONMENT_POLICY,
   GROK_ENVIRONMENT_POLICY_VERSION,
@@ -92,8 +91,7 @@ export type ProcessStartReceipt = {
   readonly environmentPolicyVersion:
     | typeof PROCESS_ENVIRONMENT_POLICY_VERSION
     | typeof CLAUDE_ENVIRONMENT_POLICY_VERSION
-    | typeof CODEX_ENVIRONMENT_POLICY_VERSION
-    | typeof GEMINI_ENVIRONMENT_POLICY_VERSION;
+    | typeof CODEX_ENVIRONMENT_POLICY_VERSION;
 };
 
 export type ProcessWriteReceipt = {

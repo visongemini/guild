@@ -7,10 +7,7 @@ import {
   GUILD_CLAUDE_PERMISSION_MODES,
   GUILD_CODEX_PERMISSION_MODES,
   GUILD_ENGINES,
-  GUILD_ENGINE_API_KEY,
-  GUILD_GEMINI_PERMISSION_MODES,
   GUILD_MODEL_GROUPS,
-  engineApiKeySpec,
   engineOfModelGroup,
   isAddonEngine,
   isClaudeModelId,
@@ -28,21 +25,19 @@ import {
   parseGuildReasoningEffort,
 } from "./grok-models.js";
 
-test("an engine is grok, claude, codex or gemini and nothing else (PC-ENG-001, PC-ENG-003, PC-ENG-004)", () => {
-  assert.deepEqual([...GUILD_ENGINES], ["grok", "claude", "codex", "gemini"]);
+test("an engine is grok, claude or codex and nothing else (PC-ENG-001, PC-ENG-003)", () => {
+  assert.deepEqual([...GUILD_ENGINES], ["grok", "claude", "codex"]);
   assert.equal(parseGuildEngine("grok"), "grok");
   assert.equal(parseGuildEngine("claude"), "claude");
   assert.equal(parseGuildEngine("codex"), "codex");
-  assert.equal(parseGuildEngine("gemini"), "gemini");
-  for (const bad of ["", "Grok", "CLAUDE", "Codex", "Gemini", "openai", "google", " claude", 1, null, undefined, {}, ["grok"]]) {
+  for (const bad of ["", "Grok", "CLAUDE", "Codex", "mistral", "openai", " claude", 1, null, undefined, {}, ["grok"]]) {
     assert.throws(() => parseGuildEngine(bad), /invalid_engine/u, String(bad));
   }
 });
 
 test("add-on engines are the engines that are neither Grok nor Claude, and each carries its own modes (PC-ENG-003)", () => {
-  assert.deepEqual([...GUILD_ADDON_ENGINES], ["codex", "gemini"]);
+  assert.deepEqual([...GUILD_ADDON_ENGINES], ["codex"]);
   assert.equal(isAddonEngine("codex"), true);
-  assert.equal(isAddonEngine("gemini"), true);
   assert.equal(isAddonEngine("grok"), false);
   assert.equal(isAddonEngine("claude"), false);
   for (const engine of GUILD_ADDON_ENGINES) {
@@ -53,8 +48,8 @@ test("add-on engines are the engines that are neither Grok nor Claude, and each 
   }
 });
 
-test("model groups are grok, claude, codex, gemini, online and local, and each engine owns its own (PC-MODEL-001)", () => {
-  assert.deepEqual([...GUILD_MODEL_GROUPS], ["grok", "claude", "codex", "gemini", "online", "local"]);
+test("model groups are grok, claude, codex, online and local, and each engine owns its own (PC-MODEL-001)", () => {
+  assert.deepEqual([...GUILD_MODEL_GROUPS], ["grok", "claude", "codex", "online", "local"]);
   for (const group of GUILD_MODEL_GROUPS) assert.equal(parseModelGroup(group), group);
   for (const bad of ["", "Grok", "remote", "cloud", "chatgpt", 0, null, undefined]) {
     assert.throws(() => parseModelGroup(bad), /invalid_model_group/u, String(bad));
@@ -62,7 +57,6 @@ test("model groups are grok, claude, codex, gemini, online and local, and each e
   assert.deepEqual([...modelGroupsOfEngine("grok")], ["grok"]);
   assert.deepEqual([...modelGroupsOfEngine("claude")], ["claude", "online", "local"]);
   assert.deepEqual([...modelGroupsOfEngine("codex")], ["codex"]);
-  assert.deepEqual([...modelGroupsOfEngine("gemini")], ["gemini"]);
   // Every group belongs to exactly one engine, and that engine lists it.
   for (const group of GUILD_MODEL_GROUPS) {
     assert.ok(modelGroupsOfEngine(engineOfModelGroup(group)).includes(group), group);
@@ -70,7 +64,6 @@ test("model groups are grok, claude, codex, gemini, online and local, and each e
   assert.equal(engineOfModelGroup("online"), "claude");
   assert.equal(engineOfModelGroup("local"), "claude");
   assert.equal(engineOfModelGroup("codex"), "codex");
-  assert.equal(engineOfModelGroup("gemini"), "gemini");
 });
 
 test("Codex model ids follow the shared adapter grammar and name the engine in the error (PC-ENG-003)", () => {
@@ -148,31 +141,4 @@ test("Claude permission modes are the five the adapter offers", () => {
   for (const bad of ["dontAsk", "Default", "", "ask", null, 1]) {
     assert.throws(() => parseGuildClaudePermissionMode(bad), /invalid_claude_permission_mode/u, String(bad));
   }
-});
-
-test("Gemini permission modes are the four the CLI offers by its own camel-case ids, and the default asks first (PC-ENG-004)", () => {
-  assert.deepEqual([...GUILD_GEMINI_PERMISSION_MODES], ["default", "autoEdit", "yolo", "plan"]);
-  assert.equal(GUILD_ADDON_DEFAULT_PERMISSION_MODE.gemini, "default");
-  for (const mode of GUILD_GEMINI_PERMISSION_MODES) assert.equal(parseGuildAddonPermissionMode("gemini", mode), mode);
-  for (const bad of ["acceptEdits", "auto-edit", "autoedit", "YOLO", "read-only", "agent", "", null, 1]) {
-    assert.throws(() => parseGuildAddonPermissionMode("gemini", bad), /invalid_gemini_permission_mode/u, String(bad));
-  }
-});
-
-test("Gemini model ids use the shared adapter grammar, efforts are not a Gemini notion but keep the shared grammar (PC-ENG-004)", () => {
-  for (const good of ["gemini-3.5-flash-lite", "gemini-3.1-pro-preview", "gemini-3-flash-preview", "gemini-2.5-pro", "gemini-3.1-pro-preview-customtools", "auto"]) {
-    assert.equal(parseGuildModelId("gemini", good), good);
-    assert.equal(isModelIdOfEngine("gemini", good), true, good);
-  }
-  for (const bad of ["", "gemini 3", "gemini/pro", "-x", "x".repeat(129), 3, null, undefined]) {
-    assert.throws(() => parseGuildModelId("gemini", bad), /invalid_gemini_model/u, String(bad));
-  }
-  assert.throws(() => parseGuildReasoningEffort("gemini", "High"), /invalid_gemini_reasoning_effort/u);
-});
-
-test("only Gemini takes an API key, bound to one fixed host, and the default variable is the CLI's own (PC-ENG-004)", () => {
-  assert.deepEqual(Object.keys(GUILD_ENGINE_API_KEY), ["gemini"]);
-  assert.deepEqual(engineApiKeySpec("gemini"), { host: "generativelanguage.googleapis.com", defaultVariable: "GEMINI_API_KEY" });
-  for (const engine of ["grok", "claude", "codex"] as const) assert.equal(engineApiKeySpec(engine), undefined, engine);
-  assert.ok(Object.isFrozen(GUILD_ENGINE_API_KEY) && Object.isFrozen(GUILD_ENGINE_API_KEY.gemini));
 });

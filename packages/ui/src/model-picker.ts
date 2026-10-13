@@ -1,7 +1,6 @@
 import type {
   GrokModelCatalog,
   GrokModelDescriptor,
-  GuildAddonEngine,
   GuildEngine,
   GuildModelSwitchRefusalReason,
   ModelCatalog,
@@ -13,7 +12,6 @@ import type {
 import {
   EMPTY_CLAUDE_MODEL_CATALOG,
   EMPTY_CODEX_MODEL_CATALOG,
-  EMPTY_GEMINI_MODEL_CATALOG,
   EMPTY_GROK_MODEL_CATALOG,
   defaultReasoningEffortOf,
   grokModelById,
@@ -30,33 +28,8 @@ import {
 import type { GuildMessages } from "./locales.js";
 import { switchRestartsEngine } from "./model-switch.js";
 
-/**
- * The add-on engines (docs/21): each owns the picker group of its own name, its status and its default row. Codex
- * signs in with a login it reports on its first start; Gemini takes an API key, so without a usable one it cannot
- * start at all, and it has no effort setting over ACP (docs/21 section 8.4). The record keeps the renderer's list
- * complete: a further add-on engine in the contract does not compile until it has an entry here.
- */
-const ADDON_ENGINE_TRAITS: Readonly<Record<GuildAddonEngine, Readonly<{ apiKey: boolean; effort: boolean }>>> = Object.freeze({
-  codex: Object.freeze({ apiKey: false, effort: true }),
-  gemini: Object.freeze({ apiKey: true, effort: false }),
-});
-
-/** The add-on engine whose picker group `group` is, or undefined for the Grok, Claude, Online and Local groups. */
-export function addonEngineOfGroup(group: ModelGroup | GuildEngine): GuildAddonEngine | undefined {
-  return Object.hasOwn(ADDON_ENGINE_TRAITS, group) ? group as GuildAddonEngine : undefined;
-}
-
-/** False for an engine with no effort setting (Gemini): no effort control anywhere, and a stored effort is ignored. */
-export function engineOffersEffort(engine: GuildEngine): boolean {
-  const addon = addonEngineOfGroup(engine);
-  return addon === undefined || ADDON_ENGINE_TRAITS[addon].effort;
-}
-
-/** True for an add-on engine that is paid for with an API key the user binds in Settings (Gemini), not a login. */
-export function engineTakesApiKey(engine: GuildEngine): boolean {
-  const addon = addonEngineOfGroup(engine);
-  return addon !== undefined && ADDON_ENGINE_TRAITS[addon].apiKey;
-}
+/** The name of the first (and so far only) add-on engine: its picker group, status and default row. */
+const CODEX_ENGINE = "codex" as const;
 
 /*
  * Pure view-model for the composer model picker and the Settings default-model control.
@@ -259,8 +232,6 @@ export type OlderModelsView = Readonly<{
 export type ModelGroupView = Readonly<{
   group: ModelGroup;
   label: string;
-  /** A muted line under the heading (Gemini: billed per use); shown whether or not the heading is. */
-  hint?: string;
   models: readonly ModelRowView[];
   older?: OlderModelsView;
   /** Present exactly when the group lists no model of the catalog (the Claude group may still hold its default row). */
@@ -273,18 +244,11 @@ export type ModelPickerCatalogs = Readonly<{
   claude: ModelCatalog;
   /** Absent reads as an empty ChatGPT (Codex) list. */
   codex?: ModelCatalog;
-  /** Absent reads as an empty Gemini list. */
-  gemini?: ModelCatalog;
 }>;
 
 /** The catalog of `engine` in `catalogs`; an engine the caller did not supply a list for has none. */
 export function catalogOfEngine(catalogs: ModelPickerCatalogs, engine: GuildEngine): ModelCatalog {
-  switch (engine) {
-    case "claude": return catalogs.claude;
-    case "codex": return catalogs.codex ?? EMPTY_CODEX_MODEL_CATALOG;
-    case "gemini": return catalogs.gemini ?? EMPTY_GEMINI_MODEL_CATALOG;
-    case "grok": return catalogs.grok;
-  }
+  return engine === "claude" ? catalogs.claude : engine === CODEX_ENGINE ? catalogs.codex ?? EMPTY_CODEX_MODEL_CATALOG : catalogs.grok;
 }
 
 /** `modelCatalogs` from the engines, falling back to the single Grok `modelCatalog` while an older main process supplies only that. */
@@ -295,7 +259,6 @@ export function modelCatalogsOf(
     grok: runtimeSettings.modelCatalogs?.grok ?? runtimeSettings.modelCatalog,
     claude: runtimeSettings.modelCatalogs?.claude ?? EMPTY_CLAUDE_MODEL_CATALOG,
     codex: runtimeSettings.modelCatalogs?.codex ?? EMPTY_CODEX_MODEL_CATALOG,
-    gemini: runtimeSettings.modelCatalogs?.gemini ?? EMPTY_GEMINI_MODEL_CATALOG,
   });
 }
 
@@ -303,17 +266,16 @@ const GROUPS_OF_ENGINE: Readonly<Record<GuildEngine, readonly ModelGroup[]>> = O
   grok: Object.freeze(["grok"] as const),
   claude: Object.freeze(["claude", "online", "local"] as const),
   codex: Object.freeze(["codex"] as const),
-  gemini: Object.freeze(["gemini"] as const),
 });
-const ALL_GROUPS: readonly ModelGroup[] = Object.freeze(["grok", "claude", "codex", "gemini", "online", "local"] as const);
+const ALL_GROUPS: readonly ModelGroup[] = Object.freeze(["grok", "claude", "codex", "online", "local"] as const);
 
-/** Groups an open picker lists, in display order: the task's own engine once it has a Run, otherwise all six. */
+/** Groups an open picker lists, in display order: the task's own engine once it has a Run, otherwise all five. */
 export function visibleModelGroups(engine: GuildEngine, engineFixed: boolean): readonly ModelGroup[] {
   return engineFixed ? GROUPS_OF_ENGINE[engine] : ALL_GROUPS;
 }
 
 export function engineOfGroup(group: ModelGroup): GuildEngine {
-  return group === "grok" ? "grok" : addonEngineOfGroup(group) ?? "claude";
+  return group === "grok" ? "grok" : group === CODEX_ENGINE ? CODEX_ENGINE : "claude";
 }
 
 export type ModelPickerView = Readonly<{
@@ -357,17 +319,13 @@ export function effortDisplayLabel(
   return messages.reasoningEffortName(effortId, officialLabel);
 }
 
-/** Nothing said about an add-on engine's state means nothing says it cannot run. */
-function addonAvailable(state: ClaudeStatusState | undefined): boolean {
-  return state === undefined || state === "ready";
-}
-
 function groupEmptyView(
   messages: GuildMessages,
   group: ModelGroup,
   claudeAvailable: boolean,
   claudeState: ClaudeStatusState | undefined,
-  addonStates: Readonly<Record<GuildAddonEngine, ClaudeStatusState | undefined>>,
+  codexAvailable = true,
+  codexState?: ClaudeStatusState,
 ): ModelGroupEmptyView {
   if (group === "online" || group === "local") {
     return Object.freeze({
@@ -376,23 +334,21 @@ function groupEmptyView(
       action: "open_model_sources",
     });
   }
-  const addon = addonEngineOfGroup(group);
-  if (addon !== undefined) {
-    const addonState = addonStates[addon];
-    if (addonAvailable(addonState)) {
-      return Object.freeze({ kind: "not_started", text: messages.modelPickerAddonNotStarted(addon) });
+  if (group === CODEX_ENGINE) {
+    if (codexAvailable) {
+      return Object.freeze({ kind: "not_started", text: messages.modelPickerAddonNotStarted(CODEX_ENGINE) });
     }
-    return addonState === "unavailable" || addonState === "integrity_changed"
+    return codexState === "unavailable" || codexState === "integrity_changed"
       ? Object.freeze({
           kind: "claude_unavailable",
-          text: addonState === "unavailable"
-            ? messages.addonStatusUnavailable(addon)
-            : messages.addonStatusIntegrityChanged(addon),
+          text: codexState === "unavailable"
+            ? messages.addonStatusUnavailable(CODEX_ENGINE)
+            : messages.addonStatusIntegrityChanged(CODEX_ENGINE),
         })
       : Object.freeze({
           kind: "claude_unavailable",
-          text: messages.modelPickerAddonUnavailable(addon),
-          help: messages.modelPickerAddonUnavailableHelp(addon),
+          text: messages.modelPickerAddonUnavailable(CODEX_ENGINE),
+          help: messages.modelPickerAddonUnavailableHelp(CODEX_ENGINE),
         });
   }
   if (group === "claude" && !claudeAvailable) {
@@ -433,11 +389,6 @@ export function modelPickerView(input: {
   readonly claudeState?: ClaudeStatusState;
   /** Codex's state, when the main process reports one; the same rules as `claudeState` for the ChatGPT group. */
   readonly codexState?: ClaudeStatusState;
-  /**
-   * Gemini's state, when the main process reports one. `not_logged_in` means no usable API key: unlike Codex, whose
-   * login can follow the first start, a Gemini task cannot start without one, so its default row is not offered then.
-   */
-  readonly geminiState?: ClaudeStatusState;
   /** A cross-mode switch (Claude model to Online / Local or back) of this task is running (D-062). */
   readonly switching?: boolean;
   /**
@@ -451,18 +402,15 @@ export function modelPickerView(input: {
     grok: input.catalog ?? EMPTY_GROK_MODEL_CATALOG,
     claude: EMPTY_CLAUDE_MODEL_CATALOG,
     codex: EMPTY_CODEX_MODEL_CATALOG,
-    gemini: EMPTY_GEMINI_MODEL_CATALOG,
   });
   const taskEngine = input.taskEngine ?? "grok";
-  const taskAddon = addonEngineOfGroup(taskEngine);
   const engineFixed = input.engineFixed ?? true;
   const claudeAvailable = input.claudeState === undefined
     ? catalogs.claude.models.length > 0
     : input.claudeState === "ready";
-  const addonStates: Readonly<Record<GuildAddonEngine, ClaudeStatusState | undefined>> = Object.freeze({
-    codex: input.codexState,
-    gemini: input.geminiState,
-  });
+  const codexCatalog = catalogs.codex ?? EMPTY_CODEX_MODEL_CATALOG;
+  // Nothing said about Codex's state means nothing says it cannot run: its default row is offered with the start hint.
+  const codexAvailable = input.codexState === undefined || input.codexState === "ready";
   const catalog = catalogOfEngine(catalogs, taskEngine);
   const model = catalogModelById(catalog, selection?.modelId);
   const modelId = selection?.modelId ?? null;
@@ -475,10 +423,9 @@ export function modelPickerView(input: {
     modelId ??
     (taskEngine === "claude"
       ? messages.modelPickerClaudeDefault
-      : taskAddon !== undefined ? messages.modelPickerAddonDefault(taskAddon) : messages.modelDefaultName);
-  // An effort the task has not pinned is the model's own default, which is what the engine will use. An engine with
-  // no effort setting (Gemini) has none, whatever is stored.
-  const effortId = selection === undefined || !engineOffersEffort(taskEngine)
+      : taskEngine === CODEX_ENGINE ? messages.modelPickerAddonDefault(CODEX_ENGINE) : messages.modelDefaultName);
+  // An effort the task has not pinned is the model's own default, which is what the engine will use.
+  const effortId = selection === undefined
     ? null
     : selection.reasoningEffort ?? (model === undefined ? null : modelDefaultEffort(model));
   const officialEffort = model?.reasoningEfforts.find((effort) => effort.id === effortId);
@@ -522,8 +469,8 @@ export function modelPickerView(input: {
     // by its family. Online, Local and Grok rows keep the table of known ids and the runtime's text.
     const isDefaultRow = group === "claude" && candidate.id === CLAUDE_DEFAULT_ROW_ID;
     const standsFor = isDefaultRow ? modelNameFromDescription(candidate.description) : undefined;
-    // An add-on row is described by what its engine says about it: there is no table of its models to translate from.
-    const description = addonEngineOfGroup(group) !== undefined
+    // A Codex row is described by what Codex says about it: there is no table of its models to translate from.
+    const description = group === CODEX_ENGINE
       ? candidate.description
       : group !== "claude"
       ? messages.modelDescription(candidate.id, candidate.description)
@@ -566,32 +513,23 @@ export function modelPickerView(input: {
     runtimeDefault: true,
     ...(crossesMode("claude") ? { restarts: true as const } : {}),
   });
-  // The same for an add-on engine: its group offers "Codex (default model)" / "Gemini (default model)" until a session
-  // reported its models. A login can still follow (Codex reports it on its first start), but an engine that takes an
-  // API key (Gemini) is offered only while it is installed and has a usable key: not_logged_in means it has none.
-  const addonDefaultOffered = (addon: GuildAddonEngine): boolean => {
-    const addonState = addonStates[addon];
-    return (addonAvailable(addonState) || (addonState === "not_logged_in" && !engineTakesApiKey(addon))) &&
-      !catalogOfEngine(catalogs, addon).models.some((candidate) => modelGroupOf(candidate) === addon);
-  };
-  const addonDefaultRow = (addon: GuildAddonEngine): Omit<ModelRowView, "tabStop"> => {
-    const help = messages.modelPickerAddonDefaultHelp(addon);
-    return {
-      id: "",
-      name: messages.modelPickerAddonDefault(addon),
-      ...(help === undefined ? {} : { description: help }),
-      selected: taskEngine === addon && selection !== undefined && selection.source !== "task",
-      group: addon,
-      engine: addon,
-      runtimeDefault: true,
-    };
-  };
+  // The same for Codex: its group offers "Codex (default model)" until a session reported its models.
+  const codexDefaultOffered =
+    (input.codexState === undefined || input.codexState === "ready" || input.codexState === "not_logged_in") &&
+    !codexCatalog.models.some((candidate) => modelGroupOf(candidate) === CODEX_ENGINE);
+  const codexDefaultRow = (): Omit<ModelRowView, "tabStop"> => ({
+    id: "",
+    name: messages.modelPickerAddonDefault(CODEX_ENGINE),
+    selected: taskEngine === CODEX_ENGINE && selection !== undefined && selection.source !== "task",
+    group: CODEX_ENGINE,
+    engine: CODEX_ENGINE,
+    runtimeDefault: true,
+  });
   const rawGroups = visible.map((group) => {
     const catalogRows = rowsOfGroup(group);
-    const addon = addonEngineOfGroup(group);
     const allGroupRows = group === "claude" && claudeDefaultOffered
       ? [claudeDefaultRow(), ...catalogRows]
-      : addon !== undefined && addonDefaultOffered(addon) ? [addonDefaultRow(addon), ...catalogRows] : catalogRows;
+      : group === CODEX_ENGINE && codexDefaultOffered ? [codexDefaultRow(), ...catalogRows] : catalogRows;
     // Claude's list: the Default row and the newest of each family up front, the rest behind "Older models (N)".
     const { shown, older } = group === "claude"
       ? splitOlderClaudeModels(allGroupRows, (row) => row.id === CLAUDE_DEFAULT_ROW_ID || row.runtimeDefault === true)
@@ -615,11 +553,9 @@ export function modelPickerView(input: {
     const withStop = (row: Omit<ModelRowView, "tabStop">): ModelRowView => Object.freeze({ ...row, tabStop: flatIndex++ === tabStopIndex });
     const models = entry.rows.map(withStop);
     const olderModels = entry.expanded ? entry.older.map(withStop) : [];
-    const hint = messages.modelGroupHint(entry.group);
     return Object.freeze({
       group: entry.group,
       label: messages.modelGroupName(entry.group),
-      ...(hint === undefined ? {} : { hint }),
       models: Object.freeze(models),
       ...(entry.older.length === 0
         ? {}
@@ -633,12 +569,12 @@ export function modelPickerView(input: {
             }),
           }),
       ...(entry.catalogRows === 0
-        ? { empty: groupEmptyView(messages, entry.group, claudeAvailable, input.claudeState, addonStates) }
+        ? { empty: groupEmptyView(messages, entry.group, claudeAvailable, input.claudeState, codexAvailable, input.codexState) }
         : {}),
     });
   });
   const models = groups.flatMap((entry) => [...entry.models, ...(entry.older?.models ?? [])]);
-  const offeredEfforts = engineOffersEffort(taskEngine) ? model?.reasoningEfforts ?? [] : [];
+  const offeredEfforts = model?.reasoningEfforts ?? [];
   const efforts = (taskEngine !== "grok" ? effortsDescending(offeredEfforts) : offeredEfforts).map((candidate, index): EffortChoiceView => {
     const selected = candidate.id === effortId;
     return Object.freeze({
@@ -650,8 +586,7 @@ export function modelPickerView(input: {
       tabStop: modelOffersEffort(model, effortId) ? selected : index === 0,
     });
   });
-  // Online and Local models without efforts hide the control, and an engine without an effort setting never shows it.
-  const showEfforts = engineOffersEffort(taskEngine) && !(
+  const showEfforts = !(
     (selectedGroup === "online" || selectedGroup === "local") && efforts.length === 0
   );
   return Object.freeze({
@@ -694,8 +629,6 @@ export function selectionForRow(
     : selectionAfterModelChange(catalogOfEngine(catalogs, row.engine), row.id, currentEffort);
   return Object.freeze({
     ...change,
-    // An engine without an effort setting (Gemini) never gets one, whatever its list or the previous model said.
-    ...(engineOffersEffort(row.engine) ? {} : { reasoningEffort: null }),
     group: row.group,
     ...(row.engine === taskEngine ? {} : { engine: row.engine }),
   });

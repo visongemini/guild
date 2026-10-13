@@ -3,7 +3,6 @@ import test from "node:test";
 import {
   EMPTY_CLAUDE_MODEL_CATALOG,
   EMPTY_CODEX_MODEL_CATALOG,
-  EMPTY_GEMINI_MODEL_CATALOG,
   EMPTY_GROK_MODEL_CATALOG,
   emptyModelCatalogOf,
   defaultReasoningEffortOf,
@@ -282,41 +281,6 @@ test("a Codex catalog uses the shared adapter grammar and only the codex group (
   // A Claude catalog does not take the codex group, and a Grok catalog does not take codex ids.
   assert.throws(() => freezeModelCatalog("claude", { models: [{ id: "opus", name: "n", group: "codex", reasoningEfforts: [], contextWindows: [] }] }), /claude_model_catalog_invalid_group/u);
   assert.throws(() => freezeModelCatalog("grok", codexRaw), /grok_model_catalog_/u);
-});
-
-const geminiRaw = {
-  engine: "gemini",
-  runtimeDefaultModelId: "gemini-3.5-flash-lite",
-  models: [
-    { id: "gemini-3.5-flash-lite", name: "gemini-3.5-flash-lite", group: "gemini", reasoningEfforts: [], contextWindows: [] },
-    { id: "gemini-3.1-pro-preview", name: "gemini-3.1-pro-preview", group: "gemini", description: "Pro", reasoningEfforts: [], contextWindows: [] },
-  ],
-};
-
-test("a Gemini catalog uses the shared adapter grammar, only the gemini group and no efforts (PC-ENG-004, PC-MODEL-001)", () => {
-  const catalog = freezeModelCatalog("gemini", geminiRaw);
-  assert.equal(catalog.engine, "gemini");
-  assert.equal(modelCatalogEngineOf(catalog), "gemini");
-  assert.deepEqual(catalog.models.map((model) => [model.id, modelGroupOf(model)]), [
-    ["gemini-3.5-flash-lite", "gemini"],
-    ["gemini-3.1-pro-preview", "gemini"],
-  ]);
-  assert.equal(runtimeDefaultModelOf(catalog)?.id, "gemini-3.5-flash-lite");
-  assert.equal(defaultReasoningEffortOf(grokModelById(catalog, "gemini-3.5-flash-lite")), undefined);
-  assert.deepEqual(freezeModelCatalog("gemini", JSON.parse(JSON.stringify(catalog))), catalog, "round trips through the JSON cache");
-  assert.equal(freezeModelCatalog("gemini", { models: [{ id: "gemini-2.5-pro", name: "n", reasoningEfforts: [], contextWindows: [] }] }).models[0]!.group, "gemini");
-  assert.deepEqual(freezeModelCatalog("gemini", { models: [] }), EMPTY_GEMINI_MODEL_CATALOG);
-  assert.equal(emptyModelCatalogOf("gemini"), EMPTY_GEMINI_MODEL_CATALOG);
-  for (const [label, pattern, value] of [
-    ["the codex group", /gemini_model_catalog_invalid_group/u, { models: [{ id: "gemini-2.5-pro", name: "n", group: "codex", reasoningEfforts: [], contextWindows: [] }] }],
-    ["a space in an id", /gemini_model_catalog_invalid_model/u, { models: [{ id: "gemini 2", name: "n", reasoningEfforts: [], contextWindows: [] }] }],
-    ["a codex engine label", /gemini_model_catalog_engine_mismatch/u, { ...geminiRaw, engine: "codex" }],
-    ["a default not in the list", /gemini_model_catalog_unknown_default_model/u, { ...geminiRaw, runtimeDefaultModelId: "auto" }],
-  ] as Array<[string, RegExp, unknown]>) {
-    assert.throws(() => freezeModelCatalog("gemini", value), pattern, label);
-  }
-  assert.throws(() => freezeModelCatalog("codex", geminiRaw), /codex_model_catalog_engine_mismatch/u);
-  assert.throws(() => freezeModelCatalog("grok", geminiRaw), /grok_model_catalog_/u);
 });
 
 test("a Claude catalog may hold native models plus the models of every source, a Grok catalog stays at 32", () => {
