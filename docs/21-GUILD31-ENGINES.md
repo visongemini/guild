@@ -104,7 +104,9 @@ Claude-only machinery (router, native and routed processes, `modelPicker`, OpenV
   In a packaged app the core, the `vendor/<triple>` folder it starts its helpers from (`codex-path`, `codex-resources`),
   every folder above them and the whole adapter package must be private to the user (owned by the user or root, writable by
   neither group nor others, no `admin` exemption), at locate time and again right before each spawn (D-070,
-  `docs/20` section 3.2); otherwise Codex shows `install_not_private` with the path.
+  `docs/20` section 3.2); otherwise Codex shows `install_not_private` with the path. These checks trust the user and root and
+  read owner and mode bits only: write access that the user or root gave another account by an ACL is treated as trusting that
+  account with the user's files (D-071).
 - Environment: the Claude allowlist (PATH, LANG, LC_*, TMPDIR, proxy and SSL variables, `USER`, `LOGNAME`;
   `NO_PROXY=127.0.0.1,localhost` always), no inherited `CODEX_*` or `OPENAI_*` variable, so `CODEX_HOME` is never
   redirected and no API key can reach the adapter. Guild-owned values: `CODEX_PATH`, `OPENVIKING_AUTO_RECALL=false`,

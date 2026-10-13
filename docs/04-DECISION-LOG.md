@@ -1389,8 +1389,30 @@ Consequences
   - Settings > Engines (and the picker's empty group) shows `install_not_private` with the path and says that only the user may be able to
     change it; the send fails with the code `engine_install_not_private`, which carries no path. The status clears when the install is
     private again (the probe re-checks, and a session that starts clears it).
-  - Not covered, stated plainly: access control lists are not read (owner and mode bits only, as before); the check cannot make the
+  - Not covered, stated plainly: access control lists are not read (owner and mode bits only, as before; D-071 records why); the check cannot make the
     check-to-exec window zero (it makes sure nobody but the user and root could have written during it); a dependency that a package
     resolves from a folder outside the package (a hoisted `node_modules`) is judged only through the package's links and the Codex core's
     own folder, not as a whole.
+- Requirements: PC-ENG-002, PC-ENG-003, PC-SEC-001.
+
+## D-071 — Guild 3.1: what the file checks defend against: Guild trusts the user and root, and reads owner and mode bits only
+
+- Date: 2026-10-13
+- Status: accepted
+- Context: the review of D-070 asked whether the ownership checks of the locators, the private-install rule and the staging root
+  should also read access control lists (ACLs), since an ACL entry can let another account write a file whose mode bits say otherwise.
+- Decision
+  - Guild trusts the user and root. The checks (trusted locations in D-068, the private-install rule and the staging root in D-070)
+    defend against **other accounts that can write through ownership or mode bits without the user having done anything for it**:
+    notably every administrator account through the shared `admin` group on a Homebrew prefix (`drwxrwxr-x user admin`), a folder or
+    file writable by group or others, and a file or folder owned by another account.
+  - Write access that the user or root granted to another account by an ACL is treated like trusting that account with the user's
+    files: an account that can write there could equally edit the user's shell profile, a LaunchAgent or the engine's own
+    configuration. Guild does not defend against that and does not read ACLs. It reads **owner and mode bits only**. This is a limit of
+    the design, not an oversight.
+  - ACL parsing is not implemented: it would need a native call or a subprocess on every locate and every spawn, and it would not change
+    the trust boundary, because an ACL grant is a deliberate act of the user or root. macOS itself puts an ACL on the home folder
+    (`group:everyone deny delete`); that entry takes rights away and is not what the checks look for.
+  - Not defended either: root, the user, and anything that already runs as the user.
+  - Recorded in `docs/20` section 3.2, `docs/21` section 4.1 and `SECURITY.md`.
 - Requirements: PC-ENG-002, PC-ENG-003, PC-SEC-001.

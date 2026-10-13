@@ -115,6 +115,11 @@ created and never changes. Process topology stays one engine process per task (D
   can change ...", the picker's group says the same, and a send fails with `engine_install_not_private` (no path in the
   error). A development run skips the rule. On a Mac where Homebrew owns the prefix (`drwxrwxr-x user admin`) the engines
   must be installed under the user's home (`~/.local`, `~/.npm-global`).
+- Threat model of these checks (D-071): Guild trusts the user and root. The checks defend against other accounts that can
+  write a file or one of its folders through ownership or mode bits without the user having done anything for it, notably
+  every administrator through the shared `admin` group of a Homebrew prefix. Write access that the user or root granted to
+  another account by an ACL is treated like trusting that account with the user's files (it could equally edit the user's
+  shell profile or a LaunchAgent), so Guild reads owner and mode bits only and does not parse ACLs. That is a stated limit.
 - Env (allowlist + Guild-owned values): PATH, HOME, USER, LOGNAME (claude looks up its Keychain login by account name; without USER it reports "not logged in" [WP-A smoke]), LANG/LC_*, TMPDIR, proxy vars, SSL vars,
   `NO_PROXY=127.0.0.1,localhost` (always), `CLAUDE_CODE_EXECUTABLE=<pinned claude>`. Strip every
   inherited `ANTHROPIC_*` and `CLAUDE_CODE_*` variable first. Do NOT inject the Grok OpenViking
