@@ -331,12 +331,14 @@ Dock choice of section 9. The `gemini` engine value and Gemini model ids already
 
 The owner approved new artwork, hand drawn as vector by Claude on 2026-10-13: the square "G" in a dark (the owner's "I") and a light
 (the owner's "H") variant. `apps/desktop/build/icon.icns` and `icon.png` are the dark variant (the default); the sources are
-`icon-dark.svg` and `icon-light.svg` next to them, and `icon-light.png` (1024 px) ships as the packaged resource
-`Contents/Resources/icon-light.png`. Settings > General > "Dock icon" (Dark / Light, default Dark, with small previews) persists
-in `app_settings.dock_icon`. The main process applies it at startup and immediately on change with
-`app.dock.setIcon(<resource path>)` for Light and restores the bundle icon (`app.dock.setIcon(null)` is not supported, so it
-sets the dark PNG) for Dark. The packaged-app verification checks that the packaged `icon.icns` equals `build/icon.icns` and
-that the light PNG is present and byte-equal to its source.
+`icon-dark.svg` and `icon-light.svg` next to them. Both 1024 px PNGs ship as packaged resources, `Contents/Resources/icon.png` (dark)
+and `Contents/Resources/icon-light.png` (light), because Electron's `nativeImage` cannot read the bundle's `icon.icns` (it loads
+as an empty image) and `app.dock.setIcon(null)` is not supported, so neither choice can fall back to the bundle icon. Settings >
+General > "Dock icon" (Dark / Light, default Dark, with small previews) persists in `app_settings.dock_icon`. The main process
+applies it with `app.dock.setIcon(<PNG>)` at startup (only when it is not Dark, which the bundle icon already is) and immediately
+on change; a missing or empty file leaves the icon as it was and logs one fixed word, never a path. The packaged-app verification
+checks that the packaged `icon.icns` equals `build/icon.icns` and that both PNGs are present, 1024 px square and byte-equal to their
+sources. Previews in the Settings row are 128 px renders of the same artwork (`packages/ui/src/assets/dock-icon-*.png`).
 
 ## 10. Acceptance (installed app)
 1. A fresh Gemini task: the "Gemini (API, pay-as-you-go)" group lists the session's models without `auto`, the cheapest Flash(-Lite)

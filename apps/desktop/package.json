@@ -47,6 +47,14 @@
         "filter": [
           "**/*"
         ]
+      },
+      {
+        "from": "build/icon.png",
+        "to": "icon.png"
+      },
+      {
+        "from": "build/icon-light.png",
+        "to": "icon-light.png"
       }
     ],
     "electronFuses": {

@@ -18,6 +18,11 @@ const legacyBrowserServer = join(
 );
 const sourceIcon = join(projectRoot, "build", "icon.icns");
 const packagedIcon = join(appPath, "Contents", "Resources", "icon.icns");
+const sourceIconPng = join(projectRoot, "build", "icon.png");
+const sourceLightIcon = join(projectRoot, "build", "icon-light.png");
+const packagedIconPng = join(appPath, "Contents", "Resources", "icon.png");
+const packagedLightIcon = join(appPath, "Contents", "Resources", "icon-light.png");
+const pngSignature = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 const infoPlist = join(appPath, "Contents", "Info.plist");
 const legalRoot = join(appPath, "Contents", "Resources", "legal");
 const dmgPath = join(projectRoot, "dist", `Guild-${packageJson.version}-arm64.dmg`);
@@ -41,6 +46,12 @@ function assert(condition, message) {
   if (!condition) throw new Error(message);
 }
 
+function assertSquarePng(bytes, size, label) {
+  assert(bytes.length >= 24 && bytes.subarray(0, 8).equals(pngSignature), `${label} is not a PNG`);
+  assert(bytes.toString("latin1", 12, 16) === "IHDR", `${label} lacks an IHDR header`);
+  assert(bytes.readUInt32BE(16) === size && bytes.readUInt32BE(20) === size, `${label} is not ${size}x${size}`);
+}
+
 assert(existsSync(appPath), "packaged app missing");
 assert(existsSync(dmgPath), "DMG missing");
 assert(packageJson.build?.mac?.timestamp === "none", "local signing must not require an online timestamp authority");
@@ -54,6 +65,24 @@ assert(plistValue("NSHumanReadableCopyright") === "Copyright © 2026 BDV", "copy
 assert(existsSync(sourceIcon), "source application icon missing");
 assert(existsSync(packagedIcon), "packaged application icon missing");
 assert(readFileSync(sourceIcon).equals(readFileSync(packagedIcon)), "packaged icon differs from explicit source ICNS");
+
+// The Dock icon choice (Settings > General) loads 1024 px PNG resources: nativeImage cannot read the
+// bundle ICNS, so the dark icon ships as a PNG next to it, with the light one.
+for (const name of ["icon-dark.svg", "icon-light.svg"]) {
+  assert(existsSync(join(projectRoot, "build", name)), `icon source artwork missing: ${name}`);
+}
+assert(existsSync(sourceIconPng), "source application icon PNG missing");
+assert(existsSync(sourceLightIcon), "source light Dock icon missing");
+for (const [source, packaged, label] of [
+  [sourceIconPng, packagedIconPng, "dark Dock icon"],
+  [sourceLightIcon, packagedLightIcon, "light Dock icon"],
+]) {
+  assert(existsSync(packaged), `packaged ${label} missing`);
+  const packagedBytes = readFileSync(packaged);
+  assertSquarePng(readFileSync(source), 1024, `source ${label}`);
+  assertSquarePng(packagedBytes, 1024, `packaged ${label}`);
+  assert(packagedBytes.equals(readFileSync(source)), `packaged ${label} differs from source PNG`);
+}
 
 for (const [name, minimumBytes] of [
   ["NOTICE", 100],

@@ -1298,5 +1298,6 @@ Consequences
   - Usage is what the prompt result reports (`_meta.quota` tokens); it is labelled as approximate and Google AI Studio is the
     billing authority. Guild shows no cost for Gemini.
 - Icon: the new artwork (hand-drawn vector, dark and light) replaces the application icon; the dark variant is the bundle icon
-  and the default, the light one ships as a resource for a runtime Dock icon chosen in Settings > General.
+  and the default. Both variants also ship as 1024 px PNG resources, because the runtime Dock icon chosen in Settings > General
+  is set from a PNG (`nativeImage` cannot read the bundle `icon.icns` and the Dock icon cannot be unset).
 - Requirements: PC-ENG-001, PC-ENG-004, PC-MODEL-001, PC-SET-002, PC-PROV-002.
