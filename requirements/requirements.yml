@@ -1,6 +1,6 @@
 schema_version: 1
 document_id: GUILD2-REQUIREMENTS
-product_version: 3.0.3
+product_version: 3.0.4
 baseline_ui: Guild 1.1.13
 status: implementation
 
