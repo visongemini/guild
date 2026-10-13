@@ -6,6 +6,8 @@ import { describe, it } from "node:test";
 import {
   CLAUDE_START_TIMEOUT,
   ENGINE_INTEGRITY_CHANGED,
+  ENGINE_LOGIN_REQUIRED,
+  ENGINE_START_TIMEOUT,
   MESSAGE_TOO_LONG,
   WORKSPACE_FOLDER_MISSING,
   SESSION_RECOVERY_CONTEXT_REQUIRED,
@@ -41,6 +43,11 @@ describe("workspace folder presence", () => {
     assert.equal(toDesktopIpcFailure(new Error(ENGINE_INTEGRITY_CHANGED)).message, ENGINE_INTEGRITY_CHANGED);
     assert.equal(CLAUDE_START_TIMEOUT, "claude_start_timeout");
     assert.equal(toDesktopIpcFailure(new Error(CLAUDE_START_TIMEOUT)).message, CLAUDE_START_TIMEOUT);
+    // The add-on engines' codes name no engine: the task says which engine it is.
+    assert.equal(ENGINE_LOGIN_REQUIRED, "engine_login_required");
+    assert.equal(ENGINE_START_TIMEOUT, "engine_start_timeout");
+    assert.equal(toDesktopIpcFailure(new Error(ENGINE_LOGIN_REQUIRED)).message, ENGINE_LOGIN_REQUIRED);
+    assert.equal(toDesktopIpcFailure(new Error(ENGINE_START_TIMEOUT)).message, ENGINE_START_TIMEOUT);
     assert.equal(toDesktopIpcFailure(new Error("runtime_start_process_start:preflight")).message, "guild_operation_failed");
     assert.equal(toDesktopIpcFailure("unknown").message, "guild_operation_failed");
   });

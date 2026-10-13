@@ -9,7 +9,12 @@ import {
   GUILD_PROMPT_ATTACHMENT_LIMIT,
   GUILD_PROMPT_ATTACHMENT_MAX_BYTES,
   EMPTY_CLAUDE_MODEL_CATALOG,
+  EMPTY_CODEX_MODEL_CATALOG,
   EMPTY_GROK_MODEL_CATALOG,
+  emptyModelCatalogOf,
+  GUILD_ADDON_DEFAULT_PERMISSION_MODE,
+  GUILD_ADDON_ENGINES,
+  GUILD_ADDON_PERMISSION_MODES,
   GUILD_CLAUDE_IDENTIFIER_LIMITS,
   GUILD_CLAUDE_PERMISSION_MODES,
   GUILD_GROK_PERMISSION_MODES,
@@ -36,15 +41,18 @@ import {
   CLAUDE_DEFAULT_MODEL_ID,
   freezeModelCatalog,
   grokModelById,
+  isAddonEngine,
   isClaudeModelId,
   isOfficialGrokModelId,
   modelCatalogEngineOf,
   modelGroupOf,
   modelNameFromDescription,
   modelSupportsReasoningEffort,
+  parseGuildAddonPermissionMode,
   parseGuildClaudePermissionMode,
   parseGuildClaudeReasoningEffort,
   parseGuildModelId,
+  parseGuildReasoningEffort,
   resolveEffectiveSelection,
   runtimeDefaultModelOf,
   selectionOptionsOf,
@@ -52,10 +60,11 @@ import {
   type AdapterEpoch,
   type AcpToolKind,
   type AcpToolStatus,
+  type AddonEngineSettingsProjection,
   type DesktopBootstrapProjection,
   type EngineStatusProjection,
   type GrokModelCatalog,
-  type GuildClaudePermissionMode,
+  type GuildAddonEngine,
   type GuildEngine,
   type GuildLocale,
   type GuildGrokModel,
@@ -149,6 +158,7 @@ import {
   AcpV1AdapterError,
   GrokProcessHost,
   deriveClaudeModelCatalog,
+  deriveCodexModelCatalog,
   engineProfileFor,
   type AcpV1AdapterInterruptionReason,
   type AcpV1AdapterInterruptionDiagnostic,
@@ -171,6 +181,16 @@ import {
 import type { DesktopApplicationService } from "./application-service.js";
 import { ClaudeEngineIntegrityError, ClaudeLocatorError, locateClaudeEngine } from "./claude-locator.js";
 import { createClaudeRuntime } from "./claude-runtime.js";
+import {
+  addonEngineReport,
+  createAddonEngineState,
+  mergeAddonCatalog,
+  type AddonAuth,
+  type AddonEngineState,
+  type AddonInstall,
+} from "./addon-engines.js";
+import { CodexEngineIntegrityError, CodexLocatorError, locateCodexEngine } from "./codex-locator.js";
+import { createCodexRuntime } from "./codex-runtime.js";
 import type { BrowserMcpPort, ModelRouterHostPort, RoutedModelInfo } from "./engine-ports.js";
 import {
   GuildAvatarError,
@@ -196,6 +216,8 @@ import {
   CLAUDE_LOGIN_REQUIRED,
   CLAUDE_START_TIMEOUT,
   ENGINE_INTEGRITY_CHANGED,
+  ENGINE_LOGIN_REQUIRED,
+  ENGINE_START_TIMEOUT,
   MODEL_ROUTER_UNAVAILABLE,
   MODEL_SELECTION_FAILED,
   SESSION_RECOVERY_CONTEXT_REQUIRED,
@@ -267,6 +289,8 @@ const REWIND_FILE_LIST_LIMIT = 500;
 const REWIND_REQUEST_TIMEOUT_MS = 10_000;
 /** The Claude installation is looked at again at most this often (the locator itself is cached). */
 const CLAUDE_PROBE_INTERVAL_MS = 30_000;
+/** An add-on engine's installation is looked at again at most this often. */
+const ADDON_PROBE_INTERVAL_MS = 30_000;
 
 export type WorkspaceChooser = () => Promise<string | undefined>;
 
@@ -329,10 +353,10 @@ export type RuntimeAdapterPort = {
     text: string,
     options?: { readonly timeoutMs?: number },
   ): Promise<AcpV1SteerResult>;
-  /** Claude applies the permission mode as a config option after the session opens. */
+  /** The adapter engines apply the permission mode as a config option after the session opens. */
   setPermissionMode(
     session: AcpV1AdapterSession,
-    mode: GuildClaudePermissionMode,
+    mode: string,
   ): Promise<readonly RuntimeConfigOption[]>;
   /** Local stdio round trip; `false` means the process no longer answers. Never closes the adapter. */
   probeLiveness(timeoutMs: number): Promise<boolean>;
@@ -399,6 +423,14 @@ export type LiveDesktopServiceOptions = {
    * when a `runtimeFactory` is injected (the status is then learned from the sessions it starts).
    */
   readonly claudeEngineProbe?: () => Promise<Readonly<{ version: string }>>;
+  /**
+   * Looks for an add-on engine's installation (node, adapter, core) and returns the engine's version; a
+   * `CodexLocatorError` means something is missing. Defaults to the real locator, and to nothing when a
+   * `runtimeFactory` is injected (the status is then learned from the sessions it starts).
+   */
+  readonly addonEngineProbes?: Readonly<Partial<Record<GuildAddonEngine, () => Promise<Readonly<{ version: string }>>>>>;
+  /** Dev-only (`GUILD_DEV_CODEX_ACP`, see dev-hooks.ts): a `codex-acp` package directory the Codex locator tries first. */
+  readonly codexAdapterRoot?: string;
   /** Online / Local models behind the loopback router (docs/20 3.3, 3.4). Absent: Claude tasks stay native. */
   readonly modelRouterHost?: ModelRouterHostPort;
   /** Loopback browser MCP server handed to engines that advertise HTTP MCP (docs/20 3.5). */
@@ -634,7 +666,8 @@ export function createLiveDesktopService(
   const conversationPageDepths = new Map<TaskId, number>();
   const scheduledQueuedTasks = new Map<TaskId, Promise<void>>();
   const scheduledContinuousTasks = new Map<TaskId, Promise<void>>();
-  const runtimeFactory = options.runtimeFactory ?? createProductionRuntime;
+  const runtimeFactory = options.runtimeFactory ??
+    ((input: Parameters<RuntimeFactory>[0]) => createProductionRuntime(input, { codexAdapterRoot: options.codexAdapterRoot }));
   const mediaRoot = options.mediaRoot ?? `${options.databasePath}.media`;
   const diagnosticsRoot = options.diagnosticsRoot ?? join(dirname(options.databasePath), "diagnostics");
   const diagnosticLog = new RuntimeDiagnosticLog(diagnosticsRoot);
@@ -671,6 +704,21 @@ export function createLiveDesktopService(
   const claudeProbe = options.claudeEngineProbe ?? (options.runtimeFactory === undefined
     ? async () => ({ version: (await locateClaudeEngine()).claude.version })
     : undefined);
+  // Add-on engines (Codex first): the same per-engine state as the Claude variables above, keyed by engine.
+  const addonStates = new Map<GuildAddonEngine, AddonEngineState>(GUILD_ADDON_ENGINES.map((engine) => [
+    engine,
+    createAddonEngineState(engine, store.loadModelCatalogCache(engine)?.catalog ?? emptyModelCatalogOf(engine)),
+  ]));
+  const addonProbes: Readonly<Partial<Record<GuildAddonEngine, () => Promise<Readonly<{ version: string }>>>>> =
+    options.addonEngineProbes ?? (options.runtimeFactory === undefined
+      ? {
+          codex: async () => ({
+            version: (await locateCodexEngine({
+              ...(options.codexAdapterRoot === undefined ? {} : { extraAdapterRoots: [options.codexAdapterRoot] }),
+            })).core.version,
+          }),
+        }
+      : {});
   const modelRouterHost = options.modelRouterHost;
   const browserMcp = options.browserMcp;
   let usageSnapshot: AcpV1OfficialBillingSnapshot | undefined;
@@ -730,6 +778,7 @@ export function createLiveDesktopService(
   }
 
   refreshClaudeInstall();
+  refreshAddonInstalls();
   // Sources added, confirmed, edited, disabled or deleted change what the Claude picker offers.
   const unsubscribeRouterChanges = modelRouterHost?.onChange(() => schedulePublish());
 
@@ -829,6 +878,63 @@ export function createLiveDesktopService(
     })().finally(() => { claudeProbeOperation = undefined; });
   }
 
+  function addonState(engine: GuildAddonEngine): AddonEngineState {
+    return addonStates.get(engine)!;
+  }
+
+  /** Looks for every add-on engine's installation off the critical path; a change reaches the next projection. */
+  function refreshAddonInstalls(): void {
+    for (const engine of GUILD_ADDON_ENGINES) refreshAddonInstall(engine);
+  }
+
+  function refreshAddonInstall(engine: GuildAddonEngine): void {
+    const state = addonState(engine);
+    const probe = addonProbes[engine];
+    if (probe === undefined || closed || closing || state.probeOperation !== undefined) return;
+    if (Date.now() - state.probeAtMs < ADDON_PROBE_INTERVAL_MS) return;
+    state.probeAtMs = Date.now();
+    state.probeOperation = (async () => {
+      let next: AddonInstall;
+      try {
+        next = Object.freeze({ status: "ready" as const, version: (await probe()).version });
+      } catch (cause: unknown) {
+        next = Object.freeze({
+          // Changed pinned files are not a missing install: the picker withholds the default row and Settings
+          // shows the integrity text (PC-ENG-003).
+          status: cause instanceof CodexEngineIntegrityError
+            ? "integrity_changed" as const
+            : cause instanceof CodexLocatorError ? "not_found" as const : "unavailable" as const,
+        });
+      }
+      // A refusal to run changed files stays until a session of the engine opens again; a probe that only finds
+      // the pieces present must not hide it.
+      if (state.install?.status === "integrity_changed") return;
+      noteAddonInstall(engine, next);
+    })().finally(() => { state.probeOperation = undefined; });
+  }
+
+  /** `status`, `accountLabel` and `version` plus the stored defaults of `runtimeSettings.engines[engine]` (docs/21 4.2). */
+  function addonSettingsProjection(
+    engine: GuildAddonEngine,
+    settings: ReturnType<GuildPersistence["loadAppSettings"]>,
+  ): AddonEngineSettingsProjection {
+    const defaults = settings.engineDefaults[engine];
+    return Object.freeze({
+      ...addonEngineReport(addonState(engine)),
+      model: defaults.model,
+      reasoningEffort: defaults.reasoningEffort,
+      permissionMode: defaults.permissionMode,
+      availablePermissionModes: GUILD_ADDON_PERMISSION_MODES[engine],
+    });
+  }
+
+  function noteAddonInstall(engine: GuildAddonEngine, next: AddonInstall): void {
+    const state = addonState(engine);
+    if (closed || closing || (state.install?.status === next.status && state.install.version === next.version)) return;
+    state.install = next;
+    schedulePhasePublish();
+  }
+
   function noteClaudeInstall(next: NonNullable<typeof claudeInstall>): void {
     if (closed || closing || (claudeInstall?.status === next.status && claudeInstall.version === next.version)) return;
     claudeInstall = next;
@@ -864,6 +970,27 @@ export function createLiveDesktopService(
       store.saveModelCatalogCache({
         catalog,
         ...(runtimeVersion === undefined ? {} : { runtimeVersion: runtimeVersion.slice(0, 128) }),
+      });
+    } catch {
+      // The cache only lets the picker show choices before a runtime starts.
+    }
+    schedulePhasePublish();
+  }
+
+  /**
+   * An add-on engine's own models as its sessions reported them (group of the engine). A session lists every
+   * model's efforts when it starts; later updates carry the selected model's only (`mergeAddonCatalog`).
+   */
+  function noteAddonCatalog(engine: GuildAddonEngine, derived: ModelCatalog | undefined, atStart: boolean): void {
+    const state = addonState(engine);
+    const next = mergeAddonCatalog(engine, state.catalog, derived, atStart);
+    if (next === undefined || JSON.stringify(next) === JSON.stringify(state.catalog)) return;
+    state.catalog = next;
+    try {
+      store.saveModelCatalogCache({
+        engine,
+        catalog: next,
+        ...(state.runtimeVersion === undefined ? {} : { runtimeVersion: state.runtimeVersion.slice(0, 128) }),
       });
     } catch {
       // The cache only lets the picker show choices before a runtime starts.
@@ -990,23 +1117,31 @@ export function createLiveDesktopService(
   }
 
   function catalogOfEngine(engine: GuildEngine): ModelCatalog {
-    return engine === "claude" ? claudeCatalogProjection() : modelCatalog;
+    return engine === "claude" ? claudeCatalogProjection() : isAddonEngine(engine) ? addonState(engine).catalog : modelCatalog;
   }
 
   /**
    * The one place a session's config options are stored, so a Claude model list is never missed. Only a native
    * process may set the native Claude catalog, the same rule as the account label (D-062, D-064).
    */
-  function applySessionOptions(controller: RuntimeController, options: readonly RuntimeConfigOption[]): void {
+  function applySessionOptions(
+    controller: RuntimeController,
+    options: readonly RuntimeConfigOption[],
+    /** The catalog a session reported when it started: it lists the efforts of every model. */
+    startCatalog?: ModelCatalog,
+  ): void {
     controller.sessionConfigOptions = options;
     if (controller.engine === "claude") {
       if (!controller.routedProcess) noteClaudeNativeCatalog(deriveClaudeModelCatalog(options), controller.pickerModelIds);
+      syncClaudePermissionModes(controller, options);
+    } else if (controller.engine === "codex") {
+      noteAddonCatalog("codex", startCatalog ?? deriveCodexModelCatalog(options), startCatalog !== undefined);
       syncClaudePermissionModes(controller, options);
     }
   }
 
   /**
-   * The permission mode of a Claude session is its `mode` config option; the session's mode list
+   * The permission mode of an adapter session (Claude, Codex) is its `mode` config option; the session's mode list
    * (`activeTask.sessionModes`) follows it, also when the adapter reported no list of its own.
    */
   function syncClaudePermissionModes(controller: RuntimeController, options: readonly RuntimeConfigOption[]): void {
@@ -1036,12 +1171,28 @@ export function createLiveDesktopService(
     contextWindow: number | null;
   }> {
     const override = readOncePerBuild(`rts:${taskId}`, () => store.loadTaskRuntimeSettings(taskId));
-    if (readOncePerBuild(`engine:${taskId}`, () => engineOfTask(taskId)) === "claude") {
+    const taskEngine = readOncePerBuild(`engine:${taskId}`, () => engineOfTask(taskId));
+    if (taskEngine === "claude") {
       return Object.freeze({
         selection: resolveClaudeSelection(
           override === undefined ? undefined : { modelId: override.modelId, reasoningEffort: override.reasoningEffort },
           { modelId: settings.claudeModel, reasoningEffort: settings.claudeEffort },
         ),
+        contextWindow: null,
+      });
+    }
+    if (isAddonEngine(taskEngine)) {
+      // The same order as the Grok resolution, over the engine's own list: task override, the engine default of the
+      // settings, then the engine's own pick (the model its session started on, a catalog fact).
+      const defaults = settings.engineDefaults[taskEngine];
+      return Object.freeze({
+        selection: resolveEffectiveSelection({
+          ...(override === undefined
+            ? {}
+            : { task: { modelId: override.modelId, reasoningEffort: override.reasoningEffort } }),
+          global: { modelId: defaults.model, reasoningEffort: defaults.reasoningEffort },
+          catalog: addonState(taskEngine).catalog,
+        }),
         contextWindow: null,
       });
     }
@@ -1094,6 +1245,15 @@ export function createLiveDesktopService(
     if (offered.models.some((model) => model.id === modelId)) return true;
     if (nativeClaudeModels().length === 0 && NATIVE_CLAUDE_ALIASES.has(modelId)) return true;
     return offered.models.length === 0;
+  }
+
+  /**
+   * Whether a task or the settings of an add-on engine may store this model: one its own sessions listed. Before
+   * any session reported a list there is nothing to choose from; the picker's "default model" row then clears the
+   * choice instead.
+   */
+  function addonModelStorable(engine: GuildAddonEngine, modelId: string): boolean {
+    return addonState(engine).catalog.models.some((model) => model.id === modelId);
   }
 
   /**
@@ -1224,8 +1384,8 @@ export function createLiveDesktopService(
   /**
    * Brings a live idle session to the stored selection. Grok: refusals and unknown options never abort
    * a start or a prompt; the session keeps its previous selection and the projection reports it.
-   * Claude (docs/20 3.3): a turn never runs on a model other than the selected one, so a model the
-   * session does not offer, or a `set_config_option` that fails, throws `model_selection_failed`.
+   * Claude and Codex (docs/20 3.3, docs/21 4.3): a turn never runs on a model other than the selected one, so a
+   * model the session does not offer, or a `set_config_option` that fails, throws `model_selection_failed`.
    * The session is left as it is and the projection shows what it really runs.
    */
   async function reconcileRuntimeSelection(
@@ -1244,7 +1404,7 @@ export function createLiveDesktopService(
       controller.selectionRefused = false;
       return "skipped";
     }
-    const strict = controller.engine === "claude";
+    const strict = isAdapterEngine(controller.engine);
     // A request the runtime refused or could not take is a failed application; a value the session
     // never offered is judged from its option list below.
     let requestFailed = false;
@@ -1307,18 +1467,22 @@ export function createLiveDesktopService(
   }
 
   /**
-   * Claude takes its permission mode as a config option (docs/20 3.2), from the Claude settings. A
-   * mode the session does not offer is skipped; a refused or failed change throws, because a resumed
-   * session keeps the mode it last had and must never run looser than the setting says.
+   * The adapter engines take their permission mode as a config option (docs/20 3.2), from the engine's settings
+   * (Claude: its own; Codex: `engineDefaults.codex`). A mode the session does not offer is skipped; a refused or
+   * failed change throws, because a resumed session keeps the mode it last had (Codex even forgets it: a resumed
+   * session comes back in Auto review) and must never run looser than the setting says.
    */
-  async function reconcileClaudePermissionMode(
+  async function reconcileAdapterPermissionMode(
     taskId: TaskId,
     controller: RuntimeController,
     adapter: RuntimeAdapterPort,
     session: AcpV1AdapterSession,
   ): Promise<void> {
-    if (controller.engine !== "claude" || adapter.state !== "ready") return;
-    const desired = store.loadAppSettings().claudePermissionMode;
+    if (!isAdapterEngine(controller.engine) || adapter.state !== "ready") return;
+    const settings = store.loadAppSettings();
+    const desired = isAddonEngine(controller.engine)
+      ? settings.engineDefaults[controller.engine].permissionMode
+      : settings.claudePermissionMode;
     const modeOption = controller.sessionConfigOptions.find((option) => option.category === "mode");
     const current = modeOption?.type === "select"
       ? modeOption.currentValue
@@ -1334,7 +1498,7 @@ export function createLiveDesktopService(
 
   /**
    * What a new or resumed session is started with. Grok: the effort, only when the model a new session
-   * starts on offers it. Both engines: the browser MCP server when the agent advertised HTTP MCP.
+   * starts on offers it. Every engine: the browser MCP server when the agent advertised HTTP MCP.
    * Claude: the `modelPicker` that adds a routed task's Online / Local models to the model list.
    */
   async function sessionStartOptionsFor(
@@ -1365,6 +1529,10 @@ export function createLiveDesktopService(
                   }),
                 }),
           });
+    }
+    // Codex takes no start options but the browser server: its effort and model are config options set afterwards.
+    if (isAddonEngine(controller.engine)) {
+      return mcpServers.length === 0 ? undefined : Object.freeze({ mcpServers });
     }
     const { selection } = desiredSelection(taskId);
     const startModel = grokModelById(modelCatalog, modelCatalog.runtimeDefaultModelId);
@@ -1547,26 +1715,27 @@ export function createLiveDesktopService(
     return store.loadSessionBinding(taskId);
   }
 
-  function isClaudeAuthRequired(controller: RuntimeController, cause: unknown): boolean {
-    return controller.engine === "claude" &&
+  function isAuthRequired(controller: RuntimeController, cause: unknown): boolean {
+    return isAdapterEngine(controller.engine) &&
       cause instanceof AcpV1AdapterError &&
       cause.code === "auth_required";
   }
 
   /**
-   * A Claude start that got no answer in time, or lost its process before one: the session may well
+   * An adapter-engine start that got no answer in time, or lost its process before one: the session may well
    * exist, so nothing is declared lost and the next send resumes it (docs/20 3.2). Transport loss
    * counts only while a session is being resumed or loaded; during initialize or session/new it is
    * a process that cannot start, which is a plain failure.
    */
-  function isClaudeStartInterruption(controller: RuntimeController, startStage: string, cause: unknown): boolean {
-    if (controller.engine !== "claude" || !(cause instanceof AcpV1AdapterError)) return false;
+  function isStartInterruption(controller: RuntimeController, startStage: string, cause: unknown): boolean {
+    if (!isAdapterEngine(controller.engine) || !(cause instanceof AcpV1AdapterError)) return false;
     if (cause.code === "request_timeout") return true;
     return cause.code === "transport_lost" && (startStage === "session_resume" || startStage === "session_load");
   }
 
-  function noteClaudeLoginRequired(): void {
-    claudeAuth = Object.freeze({ kind: "none" });
+  function noteLoginRequired(engine: GuildEngine): void {
+    if (isAddonEngine(engine)) addonState(engine).auth = Object.freeze({ kind: "none" });
+    else claudeAuth = Object.freeze({ kind: "none" });
     schedulePhasePublish();
   }
 
@@ -1577,6 +1746,17 @@ export function createLiveDesktopService(
    * process last reported (D-062).
    */
   function observeEngineSignal(taskId: TaskId, signal: EngineSignal): void {
+    if (signal.type === "auth_status" && signal.engine !== "claude") {
+      // An add-on engine has no routed mode: what it says about its account is its account.
+      const engine = signal.engine;
+      if (!isAddonEngine(engine)) return;
+      const state = addonState(engine);
+      const label = signal.status.label ?? signal.status.plan;
+      if (state.auth?.kind === signal.status.kind && state.auth.label === label) return;
+      state.auth = Object.freeze({ kind: signal.status.kind, ...(label === undefined ? {} : { label }) });
+      schedulePhasePublish();
+      return;
+    }
     if (signal.type === "auth_status") {
       if (controllers.get(taskId)?.routedProcess === true) return;
       const label = signal.status.label ?? signal.status.plan;
@@ -2648,12 +2828,14 @@ export function createLiveDesktopService(
   ): Promise<SteerRequestOutcome> {
     const timeoutMs = options.steerRequestTimeoutMs ?? DEFAULT_STEER_REQUEST_TIMEOUT_MS;
     try {
-      if (send.adapter.engine === "claude") {
+      if (isAdapterEngine(send.adapter.engine)) {
         // `_session/steering`: the agent tells us whether the text went into the running turn.
         const result = await send.adapter.steer(send.session, text, { timeoutMs });
         if (result.status === "unsupported") return "unsupported";
         if (result.outcome === "injected") return "accepted";
-        // `startedNewTurn` cannot happen for a request that asked for `promptRequired`.
+        // Claude never starts a turn for a request that asked for `promptRequired`; the Codex adapter ignores that
+        // request and does, so it reports `startedNewTurn` after cancelling that turn: the text goes out as an
+        // ordinary message below, exactly once.
         return result.outcome === "promptRequired" ? "not_running" : "failed";
       }
       const outcome = await send.adapter.sendExtensionRequest(
@@ -3231,7 +3413,15 @@ export function createLiveDesktopService(
           permissionMode: settings.claudePermissionMode,
           availablePermissionModes: GUILD_CLAUDE_PERMISSION_MODES,
         }),
-        modelCatalogs: Object.freeze({ grok: modelCatalog, claude: claudeCatalogProjection() }),
+        engines: Object.freeze(Object.fromEntries(GUILD_ADDON_ENGINES.map((engine) => [
+          engine,
+          addonSettingsProjection(engine, settings),
+        ]))) as Readonly<Partial<Record<GuildAddonEngine, AddonEngineSettingsProjection>>>,
+        modelCatalogs: Object.freeze({
+          grok: modelCatalog,
+          claude: claudeCatalogProjection(),
+          codex: addonState("codex").catalog,
+        }),
       }),
       generalSettings: Object.freeze({
         restoreLastTask: settings.restoreLastTask,
@@ -3432,10 +3622,18 @@ export function createLiveDesktopService(
     });
   }
 
-  /** Claude's login summary (docs/20 3.8). A Grok task has none. */
+  /** The login summary of an adapter engine (docs/20 3.8, docs/21 4.7). A Grok task has none. */
   function engineStatusProjection(
     metadata: ReturnType<GuildPersistence["loadTaskMetadata"]>,
   ): EngineStatusProjection | undefined {
+    if (isAddonEngine(metadata.engine)) {
+      const report = addonEngineReport(addonState(metadata.engine));
+      const status: EngineStatusProjection = Object.freeze({
+        ...(report.accountLabel === undefined ? {} : { accountLabel: report.accountLabel }),
+        ...(report.status === "not_logged_in" ? { loginRequired: true as const } : {}),
+      });
+      return Object.keys(status).length === 0 ? undefined : status;
+    }
     if (metadata.engine !== "claude") return undefined;
     const loginRequired = claudeAuth?.kind === "none";
     const status: EngineStatusProjection = Object.freeze({
@@ -4088,8 +4286,8 @@ export function createLiveDesktopService(
         metadata.disposition !== "active" ||
         store.loadWorkspace(metadata.workspaceId).disposition !== "active" ||
         store.loadSessionBinding(taskId).state !== "restore_pending" ||
-        // A Claude session without a prompt cannot be resumed, so there is nothing to warm up.
-        (metadata.engine === "claude" && store.listTaskRuns(taskId).length === 0)
+        // An adapter session without a prompt cannot be resumed, so there is nothing to warm up.
+        (isAdapterEngine(metadata.engine) && store.listTaskRuns(taskId).length === 0)
       ) return;
     } catch {
       return;
@@ -4614,9 +4812,9 @@ export function createLiveDesktopService(
     clearCancelTimer(controller);
     clearPromptSilenceTimer(controller);
     let binding = store.loadSessionBinding(taskId);
-    // A Claude session that never had a prompt has no transcript to resume (the adapter answers
-    // "resource not found"), and nothing in it to lose: it is replaced without asking.
-    const silentReplacement = controller.engine === "claude" &&
+    // A Claude or Codex session that never had a prompt has no transcript to resume (the adapter answers
+    // "resource not found" / "no rollout found"), and nothing in it to lose: it is replaced without asking.
+    const silentReplacement = isAdapterEngine(controller.engine) &&
       (binding.state === "restore_pending" || binding.state === "replacement_pending") &&
       store.listTaskRuns(taskId).length === 0;
     if (silentReplacement && binding.state === "restore_pending") {
@@ -4692,9 +4890,12 @@ export function createLiveDesktopService(
       controller.adapter = created.adapter;
       controller.routedProcess = routed !== undefined;
       if (closed || closing) throw new Error("desktop_service_closed");
-      // The version label is Grok's; Claude keeps its own for the model list cache.
+      // The version label is Grok's; Claude and each add-on engine keep their own for the model list cache.
       if (controller.engine === "grok") runtimeVersion = created.runtimeVersion ?? runtimeVersion;
-      else claudeRuntimeVersion = created.runtimeVersion ?? claudeRuntimeVersion;
+      else if (isAddonEngine(controller.engine)) {
+        const state = addonState(controller.engine);
+        state.runtimeVersion = created.runtimeVersion ?? state.runtimeVersion;
+      } else claudeRuntimeVersion = created.runtimeVersion ?? claudeRuntimeVersion;
       startStage = "initialize";
       const initialized = await created.adapter.start();
       logRuntime({ category: "runtime", event: "initialized", taskId, adapterEpoch });
@@ -4771,8 +4972,9 @@ export function createLiveDesktopService(
               sessionStartOptions,
             );
           } catch (cause: unknown) {
-            if (controller.engine === "claude") {
-              // Only the agent's own "no such session" (ACP -32002) says the session is gone. A login
+            if (isAdapterEngine(controller.engine)) {
+              // Only the agent's own "no such session" (ACP -32002; Codex: an internal error that names the missing
+              // rollout, which the adapter port maps to the same code) says the session is gone. A login
               // that lapsed, a slow start, a lost process or any other failure keeps the retained
               // session: the binding stays restore_pending and the next send resumes it again.
               if (!(cause instanceof AcpV1AdapterError && cause.code === "session_not_found")) throw cause;
@@ -4782,10 +4984,10 @@ export function createLiveDesktopService(
             restoreCause = cause;
           }
         }
-        // Claude's session/load answers a missing session the same way and, started after a timed-out
+        // An adapter's session/load answers a missing session the same way and, started after a timed-out
         // resume, would only wait a second window: it is the fallback of an agent without resume.
-        const claudeResumes = controller.engine === "claude" && initialized.agentCapabilities.resumeSession;
-        if (session === undefined && initialized.agentCapabilities.loadSession && !claudeResumes) {
+        const adapterResumes = isAdapterEngine(controller.engine) && initialized.agentCapabilities.resumeSession;
+        if (session === undefined && initialized.agentCapabilities.loadSession && !adapterResumes) {
           startStage = "session_load";
           try {
             // The same start options as the resume: a routed task's modelPicker and the browser server.
@@ -4833,7 +5035,12 @@ export function createLiveDesktopService(
       if (session === undefined) throw new Error("runtime_session_unavailable");
       controller.contextWindowSize = session.contextWindowSize;
       controller.sessionModes = session.modes ?? null;
-      applySessionOptions(controller, session.configOptions ?? Object.freeze([]));
+      applySessionOptions(
+        controller,
+        session.configOptions ?? Object.freeze([]),
+        // The list of efforts of every model that a Codex session reports when it starts.
+        controller.engine === "codex" ? session.modelCatalog : undefined,
+      );
       if (session.contextWindowSize !== undefined) {
         store.saveContextWindowSize({
           taskId,
@@ -4842,9 +5049,10 @@ export function createLiveDesktopService(
         });
       }
       noteModelCatalog(session.modelCatalog);
-      // Claude: the permission mode first, then the model and effort (docs/20 3.2).
+      // Claude and Codex: the permission mode first, then the model and effort (docs/20 3.2, docs/21 4.3). A resumed
+      // Codex session forgets all three, so they are applied before any prompt.
       startStage = "session_permission_mode";
-      await reconcileClaudePermissionMode(taskId, controller, created.adapter, session);
+      await reconcileAdapterPermissionMode(taskId, controller, created.adapter, session);
       startStage = "session_selection";
       const selectionStatus = await reconcileRuntimeSelection(taskId, controller, created.adapter, session);
       if (runtimeGeneration !== startGeneration) {
@@ -4881,6 +5089,9 @@ export function createLiveDesktopService(
       if (controller.engine === "claude") {
         const version = /\d+\.\d+\.\d+/u.exec(created.runtimeVersion ?? "")?.[0];
         noteClaudeInstall(Object.freeze({ status: "ready" as const, ...(version === undefined ? {} : { version }) }));
+      } else if (isAddonEngine(controller.engine)) {
+        const version = /\d+\.\d+\.\d+/u.exec(created.runtimeVersion ?? "")?.[0];
+        noteAddonInstall(controller.engine, Object.freeze({ status: "ready" as const, ...(version === undefined ? {} : { version }) }));
       }
       logRuntime({
         category: "session",
@@ -4920,9 +5131,9 @@ export function createLiveDesktopService(
         bindingChanged = true;
       } else if (
         startStage === "session_resume" &&
-        // Claude settles a missing session inline; any failure that reaches here keeps the binding.
-        controller.engine !== "claude" &&
-        !isClaudeAuthRequired(controller, cause) &&
+        // An adapter engine settles a missing session inline; any failure that reaches here keeps the binding.
+        !isAdapterEngine(controller.engine) &&
+        !isAuthRequired(controller, cause) &&
         failedBinding.state === "restore_pending" &&
         failedBinding.restoreAttemptId === attemptId &&
         failedBinding.sessionId !== undefined &&
@@ -4940,11 +5151,11 @@ export function createLiveDesktopService(
         }));
         bindingChanged = true;
       }
-      // A Claude task with no prompt has no session worth a question (see silentReplacement): a
+      // A Claude or Codex task with no prompt has no session worth a question (see silentReplacement): a
       // failed creation, for example a missing login, leaves it ready for the next try.
       if (
         bindingChanged &&
-        controller.engine === "claude" &&
+        isAdapterEngine(controller.engine) &&
         store.loadSessionBinding(taskId).state === "broken" &&
         store.listTaskRuns(taskId).length === 0
       ) {
@@ -4967,20 +5178,33 @@ export function createLiveDesktopService(
         adapterEpoch,
         reason: `${startStage}:${detail}`.slice(0, 320),
       });
-      if (isClaudeAuthRequired(controller, cause)) {
-        noteClaudeLoginRequired();
-        throw new Error(CLAUDE_LOGIN_REQUIRED);
+      if (isAuthRequired(controller, cause)) {
+        noteLoginRequired(controller.engine);
+        throw new Error(isAddonEngine(controller.engine) ? ENGINE_LOGIN_REQUIRED : CLAUDE_LOGIN_REQUIRED);
       }
       if (controller.engine === "claude" && cause instanceof ClaudeLocatorError) {
         noteClaudeInstall(Object.freeze({ status: "not_found" as const }));
+      }
+      if (isAddonEngine(controller.engine) && cause instanceof CodexLocatorError) {
+        noteAddonInstall(controller.engine, Object.freeze({ status: "not_found" as const }));
       }
       if (controller.engine === "claude" && created?.refusedForIntegrity?.() === true) {
         noteClaudeInstall(Object.freeze({ status: "integrity_changed" as const }));
         throw new Error(ENGINE_INTEGRITY_CHANGED);
       }
-      if (isClaudeStartInterruption(controller, startStage, cause)) {
-        logRuntime({ category: "runtime", event: "claude_start_timeout", taskId, adapterEpoch, reason: startStage });
-        throw new Error(CLAUDE_START_TIMEOUT);
+      if (isAddonEngine(controller.engine) && created?.refusedForIntegrity?.() === true) {
+        noteAddonInstall(controller.engine, Object.freeze({ status: "integrity_changed" as const }));
+        throw new Error(ENGINE_INTEGRITY_CHANGED);
+      }
+      if (isStartInterruption(controller, startStage, cause)) {
+        logRuntime({
+          category: "runtime",
+          event: controller.engine === "claude" ? "claude_start_timeout" : "engine_start_timeout",
+          taskId,
+          adapterEpoch,
+          reason: startStage,
+        });
+        throw new Error(controller.engine === "claude" ? CLAUDE_START_TIMEOUT : ENGINE_START_TIMEOUT);
       }
       if (cause instanceof Error && (cause.message === MODEL_ROUTER_UNAVAILABLE || cause.message === MODEL_SELECTION_FAILED)) {
         throw cause;
@@ -6691,11 +6915,11 @@ export function createLiveDesktopService(
       // selection that could not be applied ends the turn here, before the prompt is sent.
       assertProcessModeMatchesModel(taskId, controller, session);
       await reconcileRuntimeSelection(taskId, controller, adapter, session).catch((cause: unknown) => {
-        if (controller.engine === "claude" && errorMessageIncludes(cause, MODEL_SELECTION_FAILED)) throw cause;
+        if (isAdapterEngine(controller.engine) && errorMessageIncludes(cause, MODEL_SELECTION_FAILED)) throw cause;
         logRuntime({ category: "runtime", event: "model_switch_failed", taskId });
       });
-      // A Claude session never runs a turn looser than the setting says; a refusal ends the turn here.
-      await reconcileClaudePermissionMode(taskId, controller, adapter, session);
+      // A Claude or Codex session never runs a turn looser than the setting says; a refusal ends the turn here.
+      await reconcileAdapterPermissionMode(taskId, controller, adapter, session);
       // Which model answers is known now: the selection has been applied and nothing has been sent yet.
       recordRunModel(taskId, controller, runId);
       notePhase(controller, { type: "prompt_sent" });
@@ -6711,9 +6935,9 @@ export function createLiveDesktopService(
         );
       }
       let runTerminalized = false;
-      const loginRequired = isClaudeAuthRequired(controller, cause);
-      if (loginRequired) noteClaudeLoginRequired();
-      const selectionFailed = controller.engine === "claude" && errorMessageIncludes(cause, MODEL_SELECTION_FAILED);
+      const loginRequired = isAuthRequired(controller, cause);
+      if (loginRequired) noteLoginRequired(controller.engine);
+      const selectionFailed = isAdapterEngine(controller.engine) && errorMessageIncludes(cause, MODEL_SELECTION_FAILED);
       if (controller.activeRunId === runId) {
         const run = safeLoadRun(taskId, runId);
         if (run?.state === "starting") {
@@ -6736,9 +6960,9 @@ export function createLiveDesktopService(
                   ? `指令已经写入 ${engineName(controller.engine)}，但 Guild 未能确认本地接收记录。为避免重复修改，不会自动重发；请先查看原任务状态。`
                   : `The instruction was written to ${engineName(controller.engine)}, but Guild could not confirm its local acceptance record. It will not resend automatically; check the original task state first.`)
               : loginRequired
-                ? claudeLoginRequiredMessage(store.loadAppSettings().locale)
+                ? loginRequiredMessage(store.loadAppSettings().locale, controller.engine)
                 : selectionFailed
-                  ? modelSelectionFailedMessage(store.loadAppSettings().locale)
+                  ? modelSelectionFailedMessage(store.loadAppSettings().locale, controller.engine)
                   : (store.loadAppSettings().locale === "zh-CN"
                     ? `${engineName(controller.engine)} 运行时未能开始这次任务。你可以重新发送这条消息。`
                     : `The ${engineName(controller.engine)} runtime could not start this task. You can send the message again.`),
@@ -6746,7 +6970,7 @@ export function createLiveDesktopService(
               ? { failureCategory: "prompt_delivery_unconfirmed" }
               : {
                   failureCategory: loginRequired
-                    ? "claude_login_required"
+                    ? loginRequiredCategory(controller.engine)
                     : selectionFailed ? MODEL_SELECTION_FAILED : "prompt_launch_failed",
                 },
             status: "failed",
@@ -6772,8 +6996,8 @@ export function createLiveDesktopService(
             runId,
             entryId: unique("prompt-protocol-error"),
             kind: "error",
-            text: loginRequired ? claudeLoginRequiredMessage(locale) : promptFailureMessage(locale, controller.engine),
-            metadata: { failureCategory: loginRequired ? "claude_login_required" : "runtime_prompt_rejected" },
+            text: loginRequired ? loginRequiredMessage(locale, controller.engine) : promptFailureMessage(locale, controller.engine),
+            metadata: { failureCategory: loginRequired ? loginRequiredCategory(controller.engine) : "runtime_prompt_rejected" },
             status: "failed",
           });
           controller.activeRunId = undefined;
@@ -7264,6 +7488,7 @@ export function createLiveDesktopService(
     bootstrap: async () => {
       await diagnosticsHydration;
       refreshClaudeInstall();
+      refreshAddonInstalls();
       // PC-CONV-002: renderer reload loses its cache; restore its requested history once.
       // Normal publish() calls keep sending only the bounded live tail.
       const projection = buildBootstrap(true);
@@ -7467,8 +7692,8 @@ export function createLiveDesktopService(
         entryId: unique("branch-notice"),
         kind: "notice",
         text: store.loadAppSettings().locale === "zh-CN"
-          ? `已从“${source.title}”复制本地对话快照。此分支会启动新的${source.engine === "claude" ? " Claude " : "官方 Grok "}会话，不会冒充上游会话克隆。`
-          : `Copied a local transcript snapshot from “${source.title}”. This branch starts a new ${source.engine === "claude" ? "Claude" : "official Grok"} session; it is not an upstream session clone.`,
+          ? `已从“${source.title}”复制本地对话快照。此分支会启动新的${source.engine === "grok" ? "官方 Grok " : ` ${engineName(source.engine)} `}会话，不会冒充上游会话克隆。`
+          : `Copied a local transcript snapshot from “${source.title}”. This branch starts a new ${source.engine === "grok" ? "official Grok" : engineName(source.engine)} session; it is not an upstream session clone.`,
         status: "complete",
       });
       activeTaskId = branchTaskId;
@@ -7588,8 +7813,8 @@ export function createLiveDesktopService(
           // Model and effort have their own validated channel (D-011: only official models, between turns).
           option.category === "model" ||
           option.category === "thought_level" ||
-          // The Claude permission mode follows the Claude settings (reconcileClaudePermissionMode).
-          (controller.engine === "claude" && option.category === "mode") ||
+          // The permission mode of an adapter engine follows its settings (reconcileAdapterPermissionMode).
+          (isAdapterEngine(controller.engine) && option.category === "mode") ||
           (option.type === "boolean" && typeof value !== "boolean") ||
           (option.type === "select" && typeof value !== "string")
         ) {
@@ -8253,7 +8478,23 @@ export function createLiveDesktopService(
           return Object.freeze({ status: "refused" as const, reason, task: view() });
         };
         const claude = metadata.engine === "claude";
-        if (claude) {
+        const addon = isAddonEngine(metadata.engine) ? metadata.engine : undefined;
+        if (addon !== undefined) {
+          if (request.model !== null) {
+            // The engine's own list is the choice: a model its sessions did not report cannot be stored, and neither
+            // can an effort that model does not offer (Codex lists every model's efforts when a session starts).
+            const offered = addonState(addon).catalog.models.find((candidate) => candidate.id === request.model);
+            if (
+              offered === undefined ||
+              (request.contextWindow ?? null) !== null ||
+              (request.reasoningEffort !== null &&
+                offered.reasoningEfforts.length > 0 &&
+                !modelSupportsReasoningEffort(offered, request.reasoningEffort))
+            ) {
+              return refuse("unsupported_value");
+            }
+          }
+        } else if (claude) {
           if (request.model !== null) {
             // The effort of a model the session has not switched to is only known after the switch,
             // so only its form is checked here; the engine has the last word when it is applied.
@@ -8466,13 +8707,48 @@ export function createLiveDesktopService(
         current.claudeEffort === reasoningEffort &&
         current.claudePermissionMode === exactMode
       ) return buildBootstrap();
-      // Applied to each session between turns (reconcileRuntimeSelection, reconcileClaudePermissionMode),
+      // Applied to each session between turns (reconcileRuntimeSelection, reconcileAdapterPermissionMode),
       // so changing a default never closes a process or loses a conversation's context.
       store.updateAppSettings({
         expectedRevision: current.revision,
         claudeModel: model,
         claudeEffort: reasoningEffort,
         claudePermissionMode: exactMode,
+      });
+      await publish();
+      return buildBootstrap();
+    }),
+    setEngineSettings: async (engine, model, reasoningEffort, permissionMode) => enqueueCommand(async () => {
+      assertOpen();
+      if (!isAddonEngine(engine)) throw new Error("runtime_settings_change_unavailable");
+      let exactMode: string;
+      try {
+        exactMode = parseGuildAddonPermissionMode(engine, permissionMode);
+        if (model === null && reasoningEffort !== null) throw new TypeError("effort_without_model");
+        if (model !== null) parseGuildModelId(engine, model);
+        if (reasoningEffort !== null) parseGuildReasoningEffort(engine, reasoningEffort);
+      } catch {
+        throw new Error("runtime_settings_change_unavailable");
+      }
+      // The stored default must be a model the engine's own sessions listed, with an effort that model offers.
+      if (model !== null) {
+        const offered = addonState(engine).catalog.models.find((candidate) => candidate.id === model);
+        if (
+          offered === undefined ||
+          (reasoningEffort !== null && offered.reasoningEfforts.length > 0 && !modelSupportsReasoningEffort(offered, reasoningEffort))
+        ) {
+          throw new Error("runtime_settings_change_unavailable");
+        }
+      }
+      const current = store.loadAppSettings();
+      const stored = current.engineDefaults[engine];
+      if (stored.model === model && stored.reasoningEffort === reasoningEffort && stored.permissionMode === exactMode) {
+        return buildBootstrap();
+      }
+      // Applied to each session between turns, so changing a default never closes a process or loses context.
+      store.updateAppSettings({
+        expectedRevision: current.revision,
+        engineDefaults: { engine, model, reasoningEffort, permissionMode: exactMode },
       });
       await publish();
       return buildBootstrap();
@@ -9109,14 +9385,20 @@ function transportInterruptionMessage(
 
 /** The engine's name as the user knows it, for the notices Guild writes into a task. */
 function engineName(engine: GuildEngine): string {
-  return engine === "claude" ? "Claude" : "Grok";
+  return engine === "claude" ? "Claude" : engine === "codex" ? "Codex" : "Grok";
+}
+
+/** Engines whose process is a user-installed ACP adapter that Guild never authenticates for: every engine but Grok. */
+function isAdapterEngine(engine: GuildEngine): boolean {
+  return engine !== "grok";
 }
 
 /** The turn was not sent because the session could not be brought to the selected model (docs/20 3.3). */
-function modelSelectionFailedMessage(locale: GuildLocale): string {
+function modelSelectionFailedMessage(locale: GuildLocale, engine: GuildEngine = "claude"): string {
+  const name = engineName(engine);
   return locale === "zh-CN"
-    ? "Claude 未能切换到这个任务选择的模型，所以这条消息没有发送。请重新选择模型，或换一个模型后再发送。"
-    : "Claude could not switch to the model selected for this task, so the message was not sent. Choose the model again, or pick another one, then send it again.";
+    ? `${name} 未能切换到这个任务选择的模型，所以这条消息没有发送。请重新选择模型，或换一个模型后再发送。`
+    : `${name} could not switch to the model selected for this task, so the message was not sent. Choose the model again, or pick another one, then send it again.`;
 }
 
 function claudeLoginRequiredMessage(locale: GuildLocale): string {
@@ -9125,7 +9407,43 @@ function claudeLoginRequiredMessage(locale: GuildLocale): string {
     : "Claude Code is not logged in. Run `claude` in Terminal once and log in, then retry.";
 }
 
-async function createProductionRuntime(input: Parameters<RuntimeFactory>[0]) {
+function loginRequiredMessage(locale: GuildLocale, engine: GuildEngine): string {
+  return isAddonEngine(engine) ? addonLoginRequiredMessage(locale, engine) : claudeLoginRequiredMessage(locale);
+}
+
+/** The `failureCategory` of the error entry a missing login leaves in the conversation. */
+function loginRequiredCategory(engine: GuildEngine): string {
+  return isAddonEngine(engine) ? `${engine}_login_required` : "claude_login_required";
+}
+
+/** The login command of each add-on engine; Guild shows it and never runs it. */
+const ADDON_LOGIN_COMMAND: Readonly<Record<GuildAddonEngine, string>> = Object.freeze({ codex: "codex login" });
+
+function addonLoginRequiredMessage(locale: GuildLocale, engine: GuildAddonEngine): string {
+  const name = engineName(engine);
+  const command = ADDON_LOGIN_COMMAND[engine];
+  return locale === "zh-CN"
+    ? `${name} 尚未登录。请先在终端运行 \`${command}\` 并完成登录，然后重试。`
+    : `${name} is not logged in. Run \`${command}\` in Terminal and log in, then retry.`;
+}
+
+async function createProductionRuntime(
+  input: Parameters<RuntimeFactory>[0],
+  options: Readonly<{ codexAdapterRoot?: string | undefined }> = {},
+) {
+  if (input.engine === "codex") {
+    return createCodexRuntime(
+      {
+        adapterEpoch: input.adapterEpoch,
+        sink: input.sink,
+        stagingRoot: input.stagingRoot,
+        workingDirectory: input.workingDirectory,
+      },
+      {
+        locatorOptions: options.codexAdapterRoot === undefined ? {} : { extraAdapterRoots: [options.codexAdapterRoot] },
+      },
+    );
+  }
   if (input.engine === "claude") {
     return createClaudeRuntime({
       adapterEpoch: input.adapterEpoch,

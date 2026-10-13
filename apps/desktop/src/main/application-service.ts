@@ -137,6 +137,13 @@ export interface DesktopApplicationService {
     reasoningEffort: string | null,
     permissionMode: GuildClaudePermissionMode,
   ): Promise<DesktopBootstrapProjection>;
+  /** Defaults a new task of an add-on engine starts from (PC-SET-002); applied to sessions between turns. */
+  setEngineSettings(
+    engine: GuildEngine,
+    model: string | null,
+    reasoningEffort: string | null,
+    permissionMode: string,
+  ): Promise<DesktopBootstrapProjection>;
   setSidebarWidth(width: number): Promise<void>;
   chooseAvatar(): Promise<ChooseAvatarResponse>;
   saveProfile(nickname: string, avatar: SaveProfileAvatar): Promise<DesktopBootstrapProjection>;

@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   CLAUDE_CAPTURE_OFF_ENVIRONMENT,
   DEV_CLAUDE_CAPTURE_OFF_VARIABLE,
+  DEV_CODEX_ACP_VARIABLE,
   DEV_DATA_DIR_VARIABLE,
   resolveDevHooks,
 } from "./dev-hooks.js";
@@ -48,8 +49,9 @@ test("index.ts reads the hooks through resolveDevHooks with app.isPackaged and n
   assert.match(source, /resolveDevHooks\(\{ isPackaged: app\.isPackaged, env: process\.env \}\)/u);
   assert.match(source, /devHooks\.userDataDir \?\? join\(app\.getPath\("appData"\), "Guild-v2"\)/u);
   assert.match(source, /claudeCaptureOff: devHooks\.claudeCaptureOff/u);
+  assert.match(source, /codexAdapterRoot: devHooks\.codexAdapterRoot/u);
   // The variable names are not read directly in the main entry: the only gate is resolveDevHooks.
-  assert.doesNotMatch(source, /GUILD_DEV_DATA_DIR|GUILD_DEV_CLAUDE_CAPTURE_OFF/u);
+  assert.doesNotMatch(source, /GUILD_DEV_DATA_DIR|GUILD_DEV_CLAUDE_CAPTURE_OFF|GUILD_DEV_CODEX_ACP/u);
 });
 
 test("the capture variable reaches Claude spawns only through the live service option and the routed marker [PC-OV-001]", async () => {
@@ -59,4 +61,30 @@ test("the capture variable reaches Claude spawns only through the live service o
   assert.doesNotMatch(live, /process\.env\["GUILD_DEV/u);
   const hooks = await readFile(new URL("../../src/main/dev-hooks.ts", import.meta.url), "utf8");
   assert.match(hooks, /if \(input\.isPackaged\) return/u);
+});
+
+test("an unpackaged app takes a scratch Codex adapter directory; a packaged app ignores it [PC-ENG-003]", () => {
+  assert.equal(DEV_CODEX_ACP_VARIABLE, "GUILD_DEV_CODEX_ACP");
+  const hooks = resolveDevHooks({ isPackaged: false, env: { [DEV_CODEX_ACP_VARIABLE]: "/tmp/guild31-qa/codex-acp/node_modules/@agentclientprotocol/codex-acp" } });
+  assert.equal(hooks.codexAdapterRoot, "/tmp/guild31-qa/codex-acp/node_modules/@agentclientprotocol/codex-acp");
+  assert.equal(resolveDevHooks({ isPackaged: false, env: {} }).codexAdapterRoot, undefined);
+  assert.equal(resolveDevHooks({ isPackaged: false, env: { [DEV_CODEX_ACP_VARIABLE]: "" } }).codexAdapterRoot, undefined);
+  // Packaged: not read at all, so even a malformed value cannot change the production lookup or fail the launch.
+  assert.equal(resolveDevHooks({ isPackaged: true, env: { [DEV_CODEX_ACP_VARIABLE]: "/tmp/x/codex-acp" } }).codexAdapterRoot, undefined);
+  assert.doesNotThrow(() => resolveDevHooks({ isPackaged: true, env: { [DEV_CODEX_ACP_VARIABLE]: "relative" } }));
+  for (const bad of ["relative/dir", "/tmp/a/../b", "/tmp//double", "/tmp/with\0nul", "~/codex"]) {
+    assert.throws(
+      () => resolveDevHooks({ isPackaged: false, env: { [DEV_CODEX_ACP_VARIABLE]: bad } }),
+      /dev_codex_acp_invalid/u,
+      bad,
+    );
+  }
+});
+
+test("the Codex hook only adds a search root: the locator still pins what it finds [PC-ENG-003]", async () => {
+  const live = await readFile(new URL("../../src/main/live-service.ts", import.meta.url), "utf8");
+  assert.match(live, /extraAdapterRoots: \[options\.codexAdapterRoot\]/u);
+  assert.doesNotMatch(live, /process\.env\["GUILD_DEV/u);
+  const locator = await readFile(new URL("../../src/main/codex-locator.ts", import.meta.url), "utf8");
+  assert.match(locator, /await pinCodexAdapter\(root\)/u);
 });

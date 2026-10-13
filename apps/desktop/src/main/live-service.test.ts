@@ -20,6 +20,7 @@ import type {
 } from "@guild/contracts";
 import {
   GUILD_CLAUDE_PERMISSION_MODES,
+  GUILD_CODEX_PERMISSION_MODES,
   GUILD_GROK_PERMISSION_MODES,
   freezeGrokModelCatalog,
   parseAdapterEpoch,
@@ -937,7 +938,15 @@ describe("live desktop service", () => {
         permissionMode: "default",
         availablePermissionModes: GUILD_CLAUDE_PERMISSION_MODES,
       },
-      modelCatalogs: { grok: { models: [] }, claude: { engine: "claude", models: [] } },
+      engines: {
+        codex: {
+          model: null,
+          reasoningEffort: null,
+          permissionMode: "workspace-write",
+          availablePermissionModes: GUILD_CODEX_PERMISSION_MODES,
+        },
+      },
+      modelCatalogs: { grok: { models: [] }, claude: { engine: "claude", models: [] }, codex: { engine: "codex", models: [] } },
     }, "a new install follows the runtime default and has no model list yet");
 
     // No list yet: any official-looking pair is accepted; the runtime validates it per session.

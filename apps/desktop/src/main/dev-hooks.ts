@@ -2,12 +2,17 @@ import { isAbsolute, normalize } from "node:path";
 
 /**
  * Dev-only QA hooks (PC-ENG-001). They exist so a live acceptance run can use an isolated data
- * directory and keep its turns out of the owner's OpenViking memory store. A packaged app ignores
- * both variables completely: `isPackaged` is the first thing `resolveDevHooks` looks at, and
+ * directory, keep its turns out of the owner's OpenViking memory store and reach a scratch install of the Codex
+ * adapter. A packaged app ignores all of them completely: `isPackaged` is the first thing `resolveDevHooks` looks at, and
  * index.ts must call it with `app.isPackaged`.
  */
 export const DEV_DATA_DIR_VARIABLE = "GUILD_DEV_DATA_DIR";
 export const DEV_CLAUDE_CAPTURE_OFF_VARIABLE = "GUILD_DEV_CLAUDE_CAPTURE_OFF";
+/**
+ * Absolute path of a `codex-acp` package directory to try before the usual install places, so a live QA run can use a
+ * scratch install of the adapter. The pin and the locator's checks apply to it as to any other install.
+ */
+export const DEV_CODEX_ACP_VARIABLE = "GUILD_DEV_CODEX_ACP";
 
 /**
  * Added to every Claude engine spawn when the capture hook is on, and to the native spawns of a task that has used a
@@ -21,6 +26,8 @@ export type DevHooks = Readonly<{
   /** Absolute path that replaces Electron's `userData`; absent means the normal location. */
   userDataDir?: string;
   claudeCaptureOff: boolean;
+  /** A `codex-acp` package directory tried first by the Codex locator; absent in a packaged app. */
+  codexAdapterRoot?: string;
 }>;
 
 export function resolveDevHooks(input: {
@@ -34,8 +41,15 @@ export function resolveDevHooks(input: {
       throw new Error("dev_data_dir_invalid");
     }
   }
+  const codexRoot = input.env[DEV_CODEX_ACP_VARIABLE];
+  if (codexRoot !== undefined && codexRoot !== "") {
+    if (!isAbsolute(codexRoot) || normalize(codexRoot) !== codexRoot || codexRoot.includes("\0")) {
+      throw new Error("dev_codex_acp_invalid");
+    }
+  }
   return Object.freeze({
     ...(dataDir === undefined || dataDir === "" ? {} : { userDataDir: dataDir }),
     claudeCaptureOff: input.env[DEV_CLAUDE_CAPTURE_OFF_VARIABLE] === "1",
+    ...(codexRoot === undefined || codexRoot === "" ? {} : { codexAdapterRoot: codexRoot }),
   });
 }

@@ -58,36 +58,57 @@ test("tampered files, legacy manifests, symlinks, unknown paths, and broken SQLi
     } else await assert.rejects(validateBackup(source));
   }
 });
-/** Rewrites a sealed backup's database as the previous release (schema 19) made it, then reseals its manifest at that version. */
-async function asSchema19(path: string) {
+/**
+ * Rewrites a sealed backup's database as an earlier release made it (schema 19 by default, 3.0.0 and 3.0.1; schema 20
+ * is 3.0.2 to 3.0.5), then reseals its manifest at that version. The 3.1 tables go; the rest of the 3.1 shape
+ * (the engine columns' CHECK) stays, which the restore path does not mind: it only moves the schema number forward.
+ */
+async function asSchema19(path: string, schemaVersion: 19 | 20 = 19) {
   const database = new DatabaseSync(join(path, "guild.sqlite3"));
   try {
     database.exec(`
       PRAGMA foreign_keys = OFF;
-      DROP TABLE IF EXISTS run_model_labels;
-      DELETE FROM schema_migrations WHERE version = 20;
-      CREATE TABLE guild_meta_v19 (
+      DROP TABLE IF EXISTS engine_defaults;
+      DELETE FROM schema_migrations WHERE version = 21;
+      ${schemaVersion === 19 ? "DROP TABLE IF EXISTS run_model_labels; DELETE FROM schema_migrations WHERE version = 20;" : ""}
+      CREATE TABLE guild_meta_old (
         singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
-        schema_version INTEGER NOT NULL CHECK(schema_version = 19),
+        schema_version INTEGER NOT NULL CHECK(schema_version = ${schemaVersion}),
         clean_shutdown INTEGER NOT NULL CHECK(clean_shutdown IN (0, 1)),
         last_integrity_at_ms INTEGER CHECK(last_integrity_at_ms IS NULL OR last_integrity_at_ms >= 0)
       ) STRICT;
-      INSERT INTO guild_meta_v19(singleton, schema_version, clean_shutdown, last_integrity_at_ms)
-      SELECT singleton, 19, clean_shutdown, last_integrity_at_ms FROM guild_meta;
+      INSERT INTO guild_meta_old(singleton, schema_version, clean_shutdown, last_integrity_at_ms)
+      SELECT singleton, ${schemaVersion}, clean_shutdown, last_integrity_at_ms FROM guild_meta;
       DROP TABLE guild_meta;
-      ALTER TABLE guild_meta_v19 RENAME TO guild_meta;
-      PRAGMA user_version = 19;
+      ALTER TABLE guild_meta_old RENAME TO guild_meta;
+      PRAGMA user_version = ${schemaVersion};
     `);
   } finally { database.close(); }
   await rm(join(path, "manifest.json"));
-  await sealBackup(path, "3.0.1-test");
+  await sealBackup(path, schemaVersion === 19 ? "3.0.1-test" : "3.0.5-test");
   const manifest = JSON.parse(await readFile(join(path, "manifest.json"), "utf8"));
-  await writeFile(join(path, "manifest.json"), JSON.stringify({ ...manifest, schemaVersion: 19 }), { mode: 0o600 });
+  await writeFile(join(path, "manifest.json"), JSON.stringify({ ...manifest, schemaVersion }), { mode: 0o600 });
 }
 async function withManifestSchema(path: string, schemaVersion: number) {
   const manifest = JSON.parse(await readFile(join(path, "manifest.json"), "utf8"));
   await writeFile(join(path, "manifest.json"), JSON.stringify({ ...manifest, schemaVersion }), { mode: 0o600 });
 }
+test("a backup made by Guild 3.0.2 to 3.0.5 (schema 20) restores and migrates forward to this release [PC-DATA-001, PC-ENG-001]", async (t) => {
+  const base = await root(t), source = join(base, "backup"), live = join(base, "live");
+  await snapshot(source, "Release 3.0.5"); await snapshot(live, "Current");
+  await asSchema19(source, 20);
+  assert.equal((await validateBackup(source)).schemaVersion, 20);
+  const staged = await stageBackup(source, live);
+  await applyStagedBackup(staged, live);
+  assert.equal(await recoverLocalRestore(live), true);
+  const store = openGuildPersistence({ path: join(live, "guild.sqlite3") });
+  try {
+    assert.equal(store.loadAppSettings().nickname, "Release 3.0.5");
+    assert.equal(store.verifyIntegrity().schemaVersion, SCHEMA_VERSION);
+    assert.equal(store.loadAppSettings().engineDefaults.codex.permissionMode, "workspace-write", "the add-on engine defaults appear with their defaults");
+  } finally { store.close(); }
+  await finishLocalRestore(live);
+});
 test("a backup made by the previous release (schema 19) restores and migrates forward, a newer or older-than-3.0 one is refused", async (t) => {
   const base = await root(t), source = join(base, "backup"), live = join(base, "live");
   await snapshot(source, "Old release"); await snapshot(live, "Current");

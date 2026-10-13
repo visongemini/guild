@@ -168,6 +168,8 @@ export function registerDesktopIpc(
     service.setTaskEngine(request.taskId, request.engine));
   handle(DESKTOP_IPC_CHANNELS.setClaudeSettings, async (request) =>
     service.setClaudeSettings(request.model, request.reasoningEffort, request.permissionMode));
+  handle(DESKTOP_IPC_CHANNELS.setEngineSettings, async (request) =>
+    service.setEngineSettings(request.engine, request.model, request.reasoningEffort, request.permissionMode));
 
   const modelSources = extras.modelSources;
   if (modelSources !== undefined) {

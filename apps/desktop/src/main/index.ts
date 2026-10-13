@@ -174,6 +174,7 @@ app.whenReady().then(async () => {
         modelRouterHost: routerHost,
         browserMcp: bridge.mcp,
         claudeCaptureOff: devHooks.claudeCaptureOff,
+        ...(devHooks.codexAdapterRoot === undefined ? {} : { codexAdapterRoot: devHooks.codexAdapterRoot }),
         appVersion: app.getVersion(),
         databasePath: join(app.getPath("userData"), "guild.sqlite3"),
         initialLocale: app.getLocale().toLowerCase().startsWith("zh") ? "zh-CN" : "en-US",

@@ -20,6 +20,16 @@ export const ENGINE_INTEGRITY_CHANGED = "engine_integrity_changed";
  * the next send resumes it. The wording is `claudeStartTimeout`.
  */
 export const CLAUDE_START_TIMEOUT = "claude_start_timeout";
+/**
+ * PC-ENG-003: an add-on engine (Codex) reported that nobody is logged in; Guild never logs in for it. The wording is
+ * the engine's own (`engineStatusNotLoggedIn`), naming the command that logs in.
+ */
+export const ENGINE_LOGIN_REQUIRED = "engine_login_required";
+/**
+ * PC-ENG-003: an add-on engine did not answer within its start window. Nothing was lost: the task keeps its
+ * session id and the next send resumes it (`engineStartTimeout`).
+ */
+export const ENGINE_START_TIMEOUT = "engine_start_timeout";
 /** PC-ENG-001: the task has a Run or switched to a router model, so its engine can no longer change. */
 export const TASK_ENGINE_LOCKED = "task_engine_locked";
 /** Docs/20 3.3: a routed task needs the model router, which is not available. */
@@ -62,6 +72,8 @@ export function toDesktopIpcFailure(cause: unknown): Error {
     message === MESSAGE_TOO_LONG ||
     message === CLAUDE_LOGIN_REQUIRED ||
     message === CLAUDE_START_TIMEOUT ||
+    message === ENGINE_LOGIN_REQUIRED ||
+    message === ENGINE_START_TIMEOUT ||
     message === TASK_ENGINE_LOCKED ||
     message === MODEL_ROUTER_UNAVAILABLE ||
     message === MODEL_SELECTION_FAILED ||

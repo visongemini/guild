@@ -334,7 +334,7 @@ export async function locateClaudeEngine(
   return Object.freeze({ node: node.value, adapter: adapter.value, claude: claude.value });
 }
 
-type LocatorContext = Readonly<{
+export type LocatorContext = Readonly<{
   environment: NodeJS.ProcessEnv;
   homeDirectory: string;
   fallbackDirectories: readonly string[];
@@ -342,7 +342,7 @@ type LocatorContext = Readonly<{
   probeEnvironment: Readonly<Record<string, string>>;
 }>;
 
-function resolveContext(options: ClaudeLocatorOptions): LocatorContext {
+export function resolveContext(options: ClaudeLocatorOptions): LocatorContext {
   const environment = options.environment ?? process.env;
   const homeDirectory = options.homeDirectory ?? homedir();
   return Object.freeze({
@@ -359,7 +359,7 @@ function resolveContext(options: ClaudeLocatorOptions): LocatorContext {
 }
 
 /** Real paths of every `name` found on the search path for `kind`, in order, without duplicates. */
-async function findCandidates(
+export async function findCandidates(
   kind: ClaudeSearchKind,
   name: string,
   context: LocatorContext,
@@ -377,7 +377,7 @@ async function findCandidates(
 }
 
 /** `<root>/dist/index.js` -> `<root>`; anything else is not an adapter entry script. */
-function adapterPackageRoot(entryPath: string): string | undefined {
+export function adapterPackageRoot(entryPath: string): string | undefined {
   if (basename(entryPath) !== "index.js") return undefined;
   const dist = dirname(entryPath);
   if (basename(dist) !== "dist") return undefined;

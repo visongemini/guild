@@ -12,7 +12,7 @@ import type {
   TaskViewProjection,
   WorkspaceId,
 } from "@guild/contracts";
-import { sessionSelectionOf } from "@guild/contracts";
+import { freezeModelCatalog, sessionSelectionOf } from "@guild/contracts";
 import {
   AcpV1AdapterError,
   AcpV1ConfigOptionRefusedError,
@@ -29,6 +29,7 @@ import {
   type XaiExtensionOutcome,
 } from "@guild/runtime-grok";
 import { ClaudeEngineIntegrityError, ClaudeLocatorError } from "./claude-locator.js";
+import { CodexEngineIntegrityError, CodexLocatorError } from "./codex-locator.js";
 import type { GitCheckpointPort } from "./git-checkpoints.js";
 import { toDesktopIpcFailure } from "./workspace-folder.js";
 import type { BrowserMcpPort, ModelRouterHostPort, RoutedModelInfo } from "./engine-ports.js";
@@ -1812,7 +1813,7 @@ describe("dual engine orchestration [PC-ENG-001, PC-MODEL-001]", () => {
   it("serves the engine fields from the fixture service", async () => {
     const fixture = createFixtureDesktopService();
     const projection = await fixture.bootstrap();
-    assert.deepEqual(Object.keys(projection.runtimeSettings.modelCatalogs ?? {}).sort(), ["claude", "grok"]);
+    assert.deepEqual(Object.keys(projection.runtimeSettings.modelCatalogs ?? {}).sort(), ["claude", "codex", "grok"]);
     assert.deepEqual(
       projection.runtimeSettings.modelCatalogs!.claude.models.map((model) => model.group),
       ["claude", "claude", "claude", "claude", "online", "local"],
@@ -1830,6 +1831,21 @@ describe("dual engine orchestration [PC-ENG-001, PC-MODEL-001]", () => {
     assert.equal(settings.runtimeSettings.claude?.model, "opus");
     await fixture.sendMessage(created.task.taskId, "hi");
     await assert.rejects(fixture.setTaskEngine(created.task.taskId, "claude"), /task_engine_locked/u);
+
+    // The Codex engine (PC-ENG-003): its own list, account label, defaults and permission modes.
+    assert.deepEqual(projection.runtimeSettings.modelCatalogs!.codex.models.map((model) => model.group), ["codex", "codex"]);
+    assert.equal(projection.runtimeSettings.engines?.codex?.permissionMode, "workspace-write");
+    assert.equal(projection.runtimeSettings.engines?.codex?.status, "ready");
+    const codexTask = await fixture.createTask(workspaceId, undefined, "codex");
+    assert.equal(codexTask.task.engine, "codex");
+    assert.equal(codexTask.engineStatus?.accountLabel, "ChatGPT Plus");
+    assert.equal(codexTask.modelSelection.modelId, "gpt-6.1-sol", "the engine's own pick");
+    const codexSettings = await fixture.setEngineSettings("codex", "gpt-5.6-luna", "low", "read-only");
+    assert.deepEqual(
+      [codexSettings.runtimeSettings.engines?.codex?.model, codexSettings.runtimeSettings.engines?.codex?.permissionMode],
+      ["gpt-5.6-luna", "read-only"],
+    );
+    assert.equal((await fixture.openTask(codexTask.task.taskId)).modelSelection.modelId, "gpt-5.6-luna");
   });
 });
 
@@ -1949,7 +1965,7 @@ function newWorld(): World {
 }
 
 function engineFactory(world: World, specs: Partial<Record<GuildEngine, EngineSpec>>): RuntimeFactory {
-  const counts: Record<GuildEngine, number> = { grok: 0, claude: 0 };
+  const counts: Record<GuildEngine, number> = { grok: 0, claude: 0, codex: 0 };
   return async (input) => {
     world.inputs.push(input);
     await world.onSpawn?.(input);
@@ -1966,7 +1982,7 @@ function engineFactory(world: World, specs: Partial<Record<GuildEngine, EngineSp
     );
     world.adapters.push(adapter);
     return {
-      runtimeVersion: input.engine === "claude" ? "Claude Code 2.1.291" : "Fake Grok 1.0",
+      runtimeVersion: input.engine === "claude" ? "Claude Code 2.1.291" : input.engine === "codex" ? "Codex 0.160.1" : "Fake Grok 1.0",
       adapter,
     };
   };
@@ -2072,7 +2088,7 @@ class EngineFake implements RuntimeAdapterPort {
         prompt: Object.freeze({ image: false, audio: false, embeddedContext: false }),
       }),
       authMethods: Object.freeze(this.spec.advertiseAuthMethod === true
-        ? [{ id: "claude-login", name: "Log in with Claude", type: "terminal" as const }] as never
+        ? [{ id: `${this.engine}-login`, name: `Log in with ${this.engine}`, type: "terminal" as const }] as never
         : []),
       ...(this.spec.mcpHttp === true ? { mcpCapabilities: { http: true, sse: false } } : {}),
       ...(this.engine === "claude" ? { steering: { supported: this.spec.steering ?? true } } : {}),
@@ -2081,7 +2097,7 @@ class EngineFake implements RuntimeAdapterPort {
 
   async authenticate(): Promise<void> {
     this.authenticateCalls += 1;
-    if (this.engine === "claude") throw new AcpV1AdapterError("unsupported_for_engine");
+    if (this.engine !== "grok") throw new AcpV1AdapterError("unsupported_for_engine");
   }
 
   async officialBilling(): Promise<AcpV1OfficialBillingSnapshot> {
@@ -2099,7 +2115,7 @@ class EngineFake implements RuntimeAdapterPort {
 
   async steer(_session: AcpV1AdapterSession, text: string): Promise<AcpV1SteerResult> {
     this.steers.push(text);
-    if (this.engine !== "claude" || !this.features.steer) {
+    if (this.engine === "grok" || !this.features.steer) {
       return Object.freeze({ status: "unsupported" as const, reason: "engine" as const });
     }
     return this.spec.steerResult ?? Object.freeze({ status: "ok" as const, outcome: "injected" as const });
@@ -2128,12 +2144,13 @@ class EngineFake implements RuntimeAdapterPort {
       const { unlisted: _unlisted, ...rest } = option as RuntimeConfigOption & { unlisted?: true };
       return Object.freeze({ ...rest, currentValue: value }) as RuntimeConfigOption;
     }));
+    if (this.engine === "codex") this.options = codexOptions(this.options);
     await this.world.onConfigOption?.(this.label, configId, value);
     return this.options;
   }
 
   async setPermissionMode(_session: AcpV1AdapterSession, mode: string): Promise<readonly RuntimeConfigOption[]> {
-    if (this.engine !== "claude") throw new AcpV1AdapterError("unsupported_for_engine");
+    if (this.engine === "grok") throw new AcpV1AdapterError("unsupported_for_engine");
     if (this.spec.refuseMode === true) throw new AcpV1ConfigOptionRefusedError("invalid_value", -32602);
     this.note(`mode=${mode}`);
     this.options = Object.freeze(this.options.map((option) =>
@@ -2209,6 +2226,10 @@ class EngineFake implements RuntimeAdapterPort {
             }) as RuntimeConfigOption
           : option));
       }
+    } else if (this.engine === "codex") {
+      // Like the real adapter: a new and a resumed session both come back on the user's own Codex configuration
+      // (Auto review, the first model, its configured effort). A resume does not restore what Guild applied.
+      this.options = codexOptions();
     } else {
       this.options = Object.freeze([]);
     }
@@ -2216,7 +2237,8 @@ class EngineFake implements RuntimeAdapterPort {
       adapterEpoch: this.adapterEpoch,
       sessionId,
       establishedBy,
-      ...(this.engine === "claude" ? { configOptions: this.options } : {}),
+      ...(this.engine === "claude" || this.engine === "codex" ? { configOptions: this.options } : {}),
+      ...(this.engine === "codex" ? { modelCatalog: CODEX_START_CATALOG } : {}),
     });
     return this.session;
   }
@@ -2321,7 +2343,7 @@ class EngineFake implements RuntimeAdapterPort {
   }
 
   emitAuthStatus(status: { readonly kind: string; readonly label?: string; readonly plan?: string }): void {
-    this.sink.observeEngineSignal?.({ type: "auth_status", engine: "claude", status });
+    this.sink.observeEngineSignal?.({ type: "auth_status", engine: this.engine === "codex" ? "codex" : "claude", status });
   }
 
   async emitContextUsage(used: number, size: number): Promise<void> {
@@ -2385,6 +2407,61 @@ function claudeOptions(
     },
   ]) as readonly RuntimeConfigOption[];
 }
+
+/** What a Codex session lists when it starts: the user's own configuration, as the real adapter reports it. */
+const CODEX_MODELS = [
+  { id: "gpt-6.1-sol", name: "6.1 Sol", description: "Latest workhorse model for coding and everyday work.", efforts: ["low", "medium", "high", "ultra"] },
+  { id: "gpt-6-luna", name: "6 Luna", description: "Fast and affordable model for easier tasks.", efforts: ["low", "medium"] },
+] as const;
+
+function codexOptions(
+  previous: readonly RuntimeConfigOption[] = [],
+  current: { readonly mode?: string; readonly model?: string; readonly effort?: string } = {},
+): readonly RuntimeConfigOption[] {
+  const value = (id: string, fallback: string): string => {
+    const option = previous.find((candidate) => candidate.id === id);
+    return option?.type === "select" ? option.currentValue : fallback;
+  };
+  const flat = (values: ReadonlyArray<{ value: string; name: string; description?: string }>) => ({ form: "flat" as const, options: values });
+  // Like the real adapter, the effort option lists the efforts of the selected model only.
+  const model = current.model ?? value("model", "gpt-6.1-sol");
+  const offeredEfforts: readonly string[] = (CODEX_MODELS.find((candidate) => candidate.id === model) ?? CODEX_MODELS[0]).efforts;
+  const wantedEffort = current.effort ?? value("reasoning_effort", "high");
+  return Object.freeze([
+    {
+      id: "mode", name: "Mode", category: "mode", type: "select", currentValue: current.mode ?? value("mode", "agent"),
+      choices: flat([
+        { value: "read-only", name: "Read-only" },
+        { value: "workspace-write", name: "Workspace access" },
+        { value: "agent", name: "Auto review" },
+        { value: "agent-full-access", name: "Full access" },
+      ]),
+    },
+    {
+      id: "model", name: "Model", category: "model", type: "select", currentValue: model,
+      choices: flat(CODEX_MODELS.map((model) => ({ value: model.id, name: model.name, description: model.description }))),
+    },
+    {
+      id: "reasoning_effort", name: "Reasoning effort", category: "thought_level", type: "select",
+      currentValue: offeredEfforts.includes(wantedEffort) ? wantedEffort : offeredEfforts.includes("medium") ? "medium" : offeredEfforts[0]!,
+      choices: flat(offeredEfforts.map((effort) => ({ value: effort, name: effort }))),
+    },
+  ]) as readonly RuntimeConfigOption[];
+}
+
+/** The efforts of every model, listed once when a Codex session starts (the adapter's legacy `models` list). */
+const CODEX_START_CATALOG = freezeModelCatalog("codex", {
+  engine: "codex",
+  runtimeDefaultModelId: "gpt-6.1-sol",
+  models: CODEX_MODELS.map((model) => ({
+    id: model.id,
+    name: model.name,
+    description: model.description,
+    group: "codex",
+    reasoningEfforts: model.efforts.map((id) => ({ id, label: id, isDefault: id === "high" })),
+    contextWindows: [],
+  })),
+});
 
 /** The automatic recovery after an interruption has failed this many times, as its diagnostic record says. */
 async function recoveryFailures(h: Harness, count: number): Promise<void> {
@@ -2513,5 +2590,546 @@ describe("which model answered each turn [PC-CONV-001, PC-MODEL-001]", () => {
     await h.send(taskId, "second");
     await h.completed(2);
     assert.deepEqual(await labels(h, taskId), [["turn 1", undefined], ["turn 2", "haiku"]]);
+  });
+});
+
+describe("Codex engine orchestration [PC-ENG-003]", () => {
+  const codexSettings = async (h: Harness) => (await h.service.bootstrap()).runtimeSettings.engines?.codex;
+  const sessionLog = (h: Harness, index = 0) => h.world.adapters[index]!.log;
+
+  it("creates Codex tasks, fixes the engine at the first turn and keeps it across a restart [PC-ENG-003]", async () => {
+    const h = await harness();
+    const task = await h.service.createTask(h.workspaceId, undefined, "codex");
+    assert.equal(task.task.engine, "codex");
+    // Before the first turn the picker's choice is still the engine.
+    assert.equal((await h.service.setTaskEngine(task.task.taskId, "grok")).task.engine, "grok");
+    assert.equal((await h.service.setTaskEngine(task.task.taskId, "codex")).task.engine, "codex");
+
+    await h.send(task.task.taskId, "hello");
+    await h.completed();
+    const sidebar = (await h.service.bootstrap()).workspaces[0]!.tasks;
+    assert.equal(sidebar.find((entry) => entry.taskId === task.task.taskId)?.engine, "codex");
+    await assert.rejects(h.service.setTaskEngine(task.task.taskId, "claude"), /task_engine_locked/u);
+    await assert.rejects(h.service.setTaskEngine(task.task.taskId, "grok"), /task_engine_locked/u);
+
+    await h.restart();
+    assert.equal((await h.service.openTask(task.task.taskId)).task.engine, "codex");
+    // The restarted turn resumes the same session on a fresh Codex process.
+    await h.send(task.task.taskId, "again");
+    await h.completed(2);
+    assert.deepEqual(h.world.adapters[0]!.startCalls.map((call) => call.kind), ["resume"]);
+    assert.equal(h.world.inputs[0]!.engine, "codex");
+  });
+
+  it("starts the Codex process without per-spawn environment, router or authentication [PC-ENG-003, PC-OV-001]", async () => {
+    const router = new FakeRouterHost([DEEPSEEK]);
+    const h = await harness({ modelRouterHost: router, claudeCaptureOff: true }, { codex: { advertiseAuthMethod: true } });
+    const task = await h.service.createTask(h.workspaceId, undefined, "codex");
+    await h.send(task.task.taskId, "x");
+    await h.completed();
+    // The OpenViking switches of the Codex plugin come from the engine profile's fixed environment, not from here.
+    assert.equal(h.world.inputs[0]!.extraEnvironment, undefined);
+    assert.equal(h.world.adapters[0]!.authenticateCalls, 0, "Guild never authenticates for Codex");
+    assert.equal(router.calls, 0, "no model router for Codex");
+    assert.equal(h.world.adapters[0]!.extensionCalls, 0, "no _x.ai request is ever sent to Codex");
+    assert.equal(h.world.adapters[0]!.billingCalls, 0);
+  });
+
+  it("applies the permission mode, then model and effort, before the first prompt, and again after a resume [PC-ENG-003]", async () => {
+    const h = await harness();
+    // Nothing is known about Codex's models until a session reported them, so only the mode can be chosen first.
+    await assert.rejects(h.service.setEngineSettings("codex", "gpt-6-luna", "low", "read-only"), /runtime_settings_change_unavailable/u);
+    await h.service.setEngineSettings("codex", null, null, "read-only");
+    const first = await h.service.createTask(h.workspaceId, undefined, "codex");
+    await h.send(first.task.taskId, "one");
+    await h.completed();
+    await h.idle();
+    assert.deepEqual(sessionLog(h).slice(0, 3), ["new", "mode=read-only", "prompt:one"], "no model is pinned: Codex keeps its own pick");
+
+    // The first session listed the models, so a model and one of its efforts can be chosen.
+    const saved = await h.service.setEngineSettings("codex", "gpt-6-luna", "low", "workspace-write");
+    assert.deepEqual(
+      [saved.runtimeSettings.engines?.codex?.model, saved.runtimeSettings.engines?.codex?.reasoningEffort, saved.runtimeSettings.engines?.codex?.permissionMode],
+      ["gpt-6-luna", "low", "workspace-write"],
+    );
+    const second = await h.service.createTask(h.workspaceId, undefined, "codex");
+    await h.send(second.task.taskId, "two");
+    await h.completed();
+    await h.idle();
+    const adapter = h.world.adapters.at(-1)!;
+    assert.deepEqual(adapter.log.slice(0, 5), ["new", "mode=workspace-write", "config:model=gpt-6-luna", "config:effort=low".replace("effort", "reasoning_effort"), "prompt:two"],
+      "permission mode first, then model and effort, then the turn");
+
+    // A resumed Codex session comes back on Codex's own configuration; Guild applies all three before the turn.
+    await adapter.emitTransportInterrupted();
+    await eventually(() => h.world.adapters.length >= 3 && h.world.adapters.at(-1)!.session !== undefined);
+    await h.send(second.task.taskId, "three");
+    await h.completed(2);
+    const resumed = h.world.adapters.at(-1)!;
+    assert.equal(resumed.startCalls[0]!.kind, "resume");
+    const afterResume = resumed.log.slice(resumed.log.indexOf("resume"));
+    assert.deepEqual(afterResume.slice(0, 4), ["resume", "mode=workspace-write", "config:model=gpt-6-luna", "config:reasoning_effort=low"]);
+    assert.equal(afterResume.at(-1), "prompt:three");
+    assert.equal((await h.service.bootstrap()).activeTask?.sessionModes?.currentModeId, "workspace-write");
+  });
+
+  it("starts a new session in the Guild default mode, never looser, and stops the start when the mode is refused [PC-ENG-003]", async () => {
+    const h = await harness();
+    assert.equal((await codexSettings(h))?.permissionMode, "workspace-write", "Guild's default");
+    const task = await h.service.createTask(h.workspaceId, undefined, "codex");
+    await h.send(task.task.taskId, "x");
+    await h.completed();
+    // The fake session starts in Auto review; the default is stricter, so it is applied.
+    assert.deepEqual(sessionLog(h).slice(0, 2), ["new", "mode=workspace-write"]);
+
+    const refusing = await harness({}, { codex: { refuseMode: true } });
+    const other = await refusing.service.createTask(refusing.workspaceId, undefined, "codex");
+    await assert.rejects(refusing.send(other.task.taskId, "x"), /runtime_start_session_permission_mode/u);
+    assert.equal(refusing.world.adapters[0]!.state, "closed", "the half-started process is closed");
+    assert.deepEqual(refusing.world.adapters[0]!.prompts, []);
+  });
+
+  it("stores defaults only from the engine's own list and only Codex's own permission modes [PC-ENG-003, PC-SET-002]", async () => {
+    const h = await harness();
+    const before = await codexSettings(h);
+    assert.deepEqual(before?.availablePermissionModes, ["read-only", "workspace-write", "agent", "agent-full-access"]);
+    assert.equal(before?.model, null);
+    assert.equal(before?.status, undefined, "nothing is known about the install yet");
+
+    await assert.rejects(h.service.setEngineSettings("codex", null, null, "bypassPermissions"), /runtime_settings_change_unavailable/u);
+    await assert.rejects(h.service.setEngineSettings("codex", null, "high", "workspace-write"), /runtime_settings_change_unavailable/u);
+    await assert.rejects(h.service.setEngineSettings("claude" as never, null, null, "default"), /runtime_settings_change_unavailable/u);
+    await assert.rejects(h.service.setEngineSettings("codex", "bad model!", null, "workspace-write"), /runtime_settings_change_unavailable/u);
+
+    const task = await h.service.createTask(h.workspaceId, undefined, "codex");
+    await h.send(task.task.taskId, "x");
+    await h.completed();
+    await h.idle();
+    const ready = await codexSettings(h);
+    assert.equal(ready?.status, "ready");
+    assert.equal(ready?.version, "0.160.1");
+    // A model its session did not list, or an effort that model does not offer, cannot be stored.
+    await assert.rejects(h.service.setEngineSettings("codex", "gpt-9", null, "workspace-write"), /runtime_settings_change_unavailable/u);
+    await assert.rejects(h.service.setEngineSettings("codex", "gpt-6-luna", "ultra", "workspace-write"), /runtime_settings_change_unavailable/u);
+    const ok = await h.service.setEngineSettings("codex", "gpt-6.1-sol", "ultra", "agent");
+    assert.equal(ok.runtimeSettings.engines?.codex?.reasoningEffort, "ultra");
+    // The Claude and Grok defaults are untouched.
+    assert.equal(ok.runtimeSettings.claude?.permissionMode, "default");
+    // The same values again change nothing.
+    assert.equal((await h.service.setEngineSettings("codex", "gpt-6.1-sol", "ultra", "agent")).runtimeSettings.engines?.codex?.permissionMode, "agent");
+  });
+
+  it("fills the Codex list from the session start with every model's efforts, keeps it out of the other lists and caches it [PC-MODEL-001, PC-ENG-003]", async () => {
+    const h = await harness();
+    const empty = (await h.service.bootstrap()).runtimeSettings.modelCatalogs!;
+    assert.deepEqual(empty.codex.models, []);
+    const task = await h.service.createTask(h.workspaceId, undefined, "codex");
+    await h.send(task.task.taskId, "x");
+    await h.completed();
+    await h.idle();
+    const catalogs = (await h.service.bootstrap()).runtimeSettings.modelCatalogs!;
+    assert.deepEqual(catalogs.codex.models.map((model) => model.id), ["gpt-6.1-sol", "gpt-6-luna"]);
+    assert.deepEqual(catalogs.codex.models.map((model) => model.group), ["codex", "codex"]);
+    assert.deepEqual(catalogs.codex.models[0]!.reasoningEfforts.map((effort) => effort.id), ["low", "medium", "high", "ultra"]);
+    assert.deepEqual(catalogs.codex.models[1]!.reasoningEfforts.map((effort) => effort.id), ["low", "medium"]);
+    assert.equal(catalogs.codex.runtimeDefaultModelId, "gpt-6.1-sol");
+    // Codex's models never reach the Claude or Grok lists, and the reverse.
+    assert.equal(catalogs.claude.models.some((model) => model.id.startsWith("gpt-")), false);
+    assert.equal(catalogs.grok.models.some((model) => model.id.startsWith("gpt-")), false);
+
+    // The list is cached for the next launch, so the picker has choices before a process runs.
+    await h.restart();
+    const after = (await h.service.bootstrap()).runtimeSettings.modelCatalogs!;
+    assert.deepEqual(after.codex.models.map((model) => model.id), ["gpt-6.1-sol", "gpt-6-luna"]);
+    const opened = await h.service.openTask(task.task.taskId);
+    assert.equal(opened.modelSelection.modelId, "gpt-6.1-sol");
+    assert.equal(opened.modelSelection.source, "runtime");
+  });
+
+  it("stores a task's own model and effort, applies them between turns, and refuses what Codex did not list [PC-MODEL-001]", async () => {
+    const h = await harness();
+    const task = await h.service.createTask(h.workspaceId, undefined, "codex");
+    const taskId = task.task.taskId;
+    await h.send(taskId, "one");
+    await h.completed();
+    await h.idle();
+    const adapter = h.world.adapters[0]!;
+
+    const saved = await h.service.setTaskRuntimeSettings({ taskId, model: "gpt-6-luna", reasoningEffort: "low", contextWindow: null });
+    assert.equal(saved.status, "applied");
+    assert.equal(saved.task.modelSelection.source, "task");
+    assert.deepEqual([saved.task.modelSelection.modelId, saved.task.modelSelection.reasoningEffort], ["gpt-6-luna", "low"]);
+    assert.ok(adapter.log.includes("config:model=gpt-6-luna"));
+
+    // Not listed, an effort the model does not offer, a context window: refused, nothing stored.
+    for (const request of [
+      { model: "gpt-9", reasoningEffort: null, contextWindow: null },
+      { model: "gpt-6-luna", reasoningEffort: "ultra", contextWindow: null },
+      { model: "gpt-6-luna", reasoningEffort: null, contextWindow: 100_000 },
+    ]) {
+      const refused = await h.service.setTaskRuntimeSettings({ taskId, ...request });
+      assert.equal(refused.status, "refused");
+      assert.equal(refused.status === "refused" ? refused.reason : "", "unsupported_value");
+    }
+    assert.equal((await h.service.openTask(taskId)).modelSelection.modelId, "gpt-6-luna");
+
+    // Clearing the override pins nothing: the live session keeps the model it runs and says so (the same rule as
+    // Grok's), and a session that starts afterwards runs on Codex's own pick.
+    const cleared = await h.service.setTaskRuntimeSettings({ taskId, model: null, reasoningEffort: null, contextWindow: null });
+    assert.equal(cleared.status, "applied");
+    assert.equal(cleared.task.modelSelection.source, "runtime");
+    assert.equal(cleared.task.modelSelection.modelId, "gpt-6-luna", "what the session really runs");
+    await h.restart();
+    const resumed = await h.service.openTask(taskId);
+    assert.equal(resumed.modelSelection.source, "runtime");
+    assert.equal(resumed.modelSelection.modelId, "gpt-6.1-sol");
+    await h.send(taskId, "two");
+    await h.completed(2);
+    const adapterAfter = h.world.adapters[0]!;
+    assert.equal(adapterAfter.log.some((entry) => entry.startsWith("config:model=")), false, "nothing is pinned, so nothing is applied");
+  });
+
+  it("refuses the turn by name when the session cannot take the selected model, and keeps the session [PC-MODEL-001]", async () => {
+    const h = await harness({}, { codex: { refuseModel: "gpt-6-luna" } });
+    const task = await h.service.createTask(h.workspaceId, undefined, "codex");
+    const taskId = task.task.taskId;
+    await h.send(taskId, "one");
+    await h.completed();
+    await h.idle();
+    assert.equal((await h.service.setTaskRuntimeSettings({ taskId, model: "gpt-6-luna", reasoningEffort: null, contextWindow: null })).status, "refused");
+    assert.equal((await h.service.openTask(taskId)).modelSelection.source, "runtime", "nothing was stored");
+  });
+
+  it("names each Codex turn by the model it started on and keeps the label across a restart [PC-CONV-001]", async () => {
+    let store!: GuildPersistence;
+    const h = await harness({}, {}, (path) => {
+      store = openGuildPersistence({ path });
+      return store;
+    });
+    const task = await h.service.createTask(h.workspaceId, undefined, "codex");
+    const taskId = task.task.taskId;
+    const labelsAtPrompt: number[] = [];
+    h.world.onPrompt = () => { labelsAtPrompt.push(store.listRunModelLabels(taskId).length); };
+    await h.send(taskId, "first");
+    await h.completed();
+    await h.idle();
+    assert.equal((await h.service.setTaskRuntimeSettings({ taskId, model: "gpt-6-luna", reasoningEffort: null, contextWindow: null })).status, "applied");
+    await h.send(taskId, "second");
+    await h.completed(2);
+    await h.idle();
+    const read = async () => {
+      const view = await h.service.openTask(taskId);
+      const runs = [...new Set(view.timeline.filter((item) => item.kind === "user").map((item) => item.runId!))];
+      const byRun = new Map((view.runModels ?? []).map((entry) => [entry.runId, entry.label] as const));
+      return runs.map((runId) => byRun.get(runId));
+    };
+    assert.deepEqual(await read(), ["6.1 Sol", "6 Luna"]);
+    assert.deepEqual(labelsAtPrompt, [1, 2], "each turn's label existed when its prompt went out");
+    await h.restart();
+    assert.deepEqual(await read(), ["6.1 Sol", "6 Luna"]);
+  });
+
+  it("names the login state instead of failing blind, never authenticates and keeps the task usable [PC-ENG-003]", async () => {
+    const h = await harness({}, { codex: { advertiseAuthMethod: true, authRequiredOnNewSession: true } });
+    const task = await h.service.createTask(h.workspaceId, undefined, "codex");
+    await assert.rejects(h.send(task.task.taskId, "hi"), /^Error: engine_login_required$/u);
+    assert.equal(h.world.adapters[0]!.authenticateCalls, 0);
+    const reduced = await h.service.openTask(task.task.taskId);
+    assert.equal(reduced.engineStatus?.loginRequired, true);
+    assert.equal(reduced.canSend, true);
+    assert.equal((await codexSettings(h))?.status, "not_logged_in");
+    assert.equal(toDesktopIpcFailure(new Error("engine_login_required")).message, "engine_login_required", "the code survives the IPC allowlist");
+
+    // The engine's own account notice clears it, and a later "none" brings it back.
+    const loggedIn = await harness();
+    const second = await loggedIn.service.createTask(loggedIn.workspaceId, undefined, "codex");
+    await loggedIn.send(second.task.taskId, "x");
+    await loggedIn.completed();
+    const adapter = loggedIn.world.adapters[0]!;
+    adapter.emitAuthStatus({ kind: "none" });
+    await eventually(async () => (await loggedIn.service.bootstrap()).activeTask?.engineStatus?.loginRequired === true);
+    adapter.emitAuthStatus({ kind: "account", label: "ChatGPT Plus" });
+    await eventually(async () => (await loggedIn.service.bootstrap()).activeTask?.engineStatus?.accountLabel === "ChatGPT Plus");
+    assert.equal((await codexSettings(loggedIn))?.accountLabel, "ChatGPT Plus");
+    // An API key or any other kind has no plan: no label at all, the interface says Codex manages it.
+    adapter.emitAuthStatus({ kind: "api_key", label: "sk-...secret" });
+    await eventually(async () => (await loggedIn.service.bootstrap()).activeTask?.engineStatus?.accountLabel === undefined);
+    assert.equal((await codexSettings(loggedIn))?.accountLabel, undefined);
+
+    // A login that expires mid-session surfaces as the same named state in the timeline, with Codex's login command.
+    const expiring = await harness({}, { codex: { authRequiredOnPrompt: true } });
+    const third = await expiring.service.createTask(expiring.workspaceId, undefined, "codex");
+    await expiring.send(third.task.taskId, "login-expired");
+    await eventually(async () => {
+      const view = (await expiring.service.bootstrap()).activeTask;
+      return view?.timeline.some((item) => item.kind === "error" && item.text.includes("`codex login`")) === true;
+    });
+    assert.equal((await expiring.service.bootstrap()).activeTask?.engineStatus?.loginRequired, true);
+  });
+
+  it("keeps the Codex session when a lapsed login or a lost process makes the resume fail, and resumes it on the next send [PC-ENG-003]", async () => {
+    const spec: EngineSpec = {};
+    lapsedResumes.set(spec, 1);
+    const h = await harness({}, { codex: spec });
+    const task = await h.service.createTask(h.workspaceId, undefined, "codex");
+    await h.send(task.task.taskId, "first");
+    await h.completed();
+    await h.world.adapters[0]!.emitTransportInterrupted();
+    await eventually(async () => (await h.service.bootstrap()).activeTask?.engineStatus?.loginRequired === true);
+    const lapsed = (await h.service.bootstrap()).activeTask!;
+    assert.equal(lapsed.sessionRecovery, "available", "the session is not declared lost");
+    await h.send(task.task.taskId, "second");
+    await h.completed(2);
+    const resumes = h.world.adapters.flatMap((adapter) => adapter.startCalls).filter((call) => call.kind === "resume");
+    assert.equal(new Set(resumes.map((call) => call.sessionId)).size, 1, "the same session each time");
+    assert.equal((await h.service.bootstrap()).activeTask!.timeline.some((item) => item.kind === "notice"), false);
+
+    // Only the adapter's own 'no such session' declares it lost; a timeout or a lost process does not.
+    const timed: EngineSpec = {};
+    resumeFailureCodes.set(timed, ["request_timeout"]);
+    const t = await harness({}, { codex: timed });
+    const second = await t.service.createTask(t.workspaceId, undefined, "codex");
+    await t.send(second.task.taskId, "first");
+    await t.completed();
+    await t.world.adapters[0]!.emitTransportInterrupted();
+    await recoveryFailures(t, 1);
+    assert.equal((await t.service.bootstrap()).activeTask!.sessionRecovery, "available");
+    await t.send(second.task.taskId, "again");
+    await t.completed(2);
+    assert.equal(t.world.adapters.at(-1)!.prompts.at(-1), "again");
+  });
+
+  it("declares a Codex session lost only when the adapter answers that it has no such rollout [PC-ENG-003]", async () => {
+    const spec: EngineSpec = {};
+    resumeFailureCodes.set(spec, ["session_not_found"]);
+    const h = await harness({}, { codex: spec });
+    const task = await h.service.createTask(h.workspaceId, undefined, "codex");
+    const taskId = task.task.taskId;
+    await h.send(taskId, "first");
+    await h.completed();
+    await h.world.adapters[0]!.emitTransportInterrupted();
+    await eventually(async () => (await h.service.bootstrap()).activeTask?.sessionRecovery === "replacement_required");
+    assert.deepEqual(h.world.adapters.flatMap((adapter) => adapter.startCalls).map((call) => call.kind), ["new", "resume"]);
+    await assert.rejects(h.send(taskId, "second"), /session_replacement_requires_user_authorization/u);
+
+    // Any other failure of the resume is not an answer about the session: it stays and is retried.
+    const other: EngineSpec = {};
+    resumeFailureCodes.set(other, ["operation_failed", "operation_failed"]);
+    const o = await harness({}, { codex: other });
+    const kept = await o.service.createTask(o.workspaceId, undefined, "codex");
+    await o.send(kept.task.taskId, "first");
+    await o.completed();
+    await o.service.createTask(o.workspaceId, undefined, "codex");
+    await o.world.adapters[0]!.emitTransportInterrupted();
+    await recoveryFailures(o, 1);
+    const failed = await o.send(kept.task.taskId, "second").then(() => undefined, (cause: unknown) => cause);
+    assert.match(String(failed), /runtime_start_session_resume/u);
+    assert.equal((await o.service.openTask(kept.task.taskId)).sessionRecovery, "available");
+    await o.send(kept.task.taskId, "third");
+    await o.completed(2);
+    assert.equal(o.world.adapters.at(-1)!.prompts.at(-1), "third");
+  });
+
+  it("reports the install state from the probe and the session: ready with the version, not found, integrity, unavailable [PC-ENG-003]", async () => {
+    const ready = await harness({ addonEngineProbes: { codex: async () => ({ version: "0.160.1" }) } });
+    const readySettings = await eventuallyValue(async () => {
+      const codex = await codexSettings(ready);
+      return codex?.status === "ready" ? codex : undefined;
+    });
+    assert.equal(readySettings.version, "0.160.1");
+    assert.equal(readySettings.accountLabel, undefined, "no login seen yet");
+
+    const missing = await harness({ addonEngineProbes: { codex: async () => { throw new CodexLocatorError("adapter_missing"); } } });
+    await eventually(async () => (await codexSettings(missing))?.status === "not_found");
+    const broken = await harness({ addonEngineProbes: { codex: async () => { throw new Error("EACCES"); } } });
+    await eventually(async () => (await codexSettings(broken))?.status === "unavailable");
+    for (const component of ["node", "adapter", "core"] as const) {
+      const changed = await harness({ addonEngineProbes: { codex: async () => { throw new CodexEngineIntegrityError(component); } } });
+      await eventually(async () => (await codexSettings(changed))?.status === "integrity_changed");
+    }
+
+    // Without a probe the status is learned from the engine: a missing piece at start, a session that runs.
+    const failing = await harness({
+      runtimeFactory: async (input) => {
+        if (input.engine === "codex") throw new CodexLocatorError("adapter_missing");
+        throw new Error("unexpected");
+      },
+    });
+    assert.equal((await codexSettings(failing))?.status, undefined, "nothing known yet");
+    const failingTask = await failing.service.createTask(failing.workspaceId, undefined, "codex");
+    await assert.rejects(failing.send(failingTask.task.taskId, "x"), /runtime_start_runtime_factory/u);
+    assert.equal((await codexSettings(failing))?.status, "not_found");
+  });
+
+  it("refuses a Codex start whose pinned files changed, names the reduced state and the IPC code, then recovers [PC-ENG-003]", async () => {
+    const world = newWorld();
+    const base = engineFactory(world, {});
+    let refuse = true;
+    const h = await harness({
+      runtimeFactory: async (input) => {
+        const created = await base(input);
+        if (input.engine !== "codex" || !refuse) return created;
+        (created.adapter as EngineFake).start = async () => { throw new AcpV1AdapterError("operation_failed"); };
+        return { ...created, refusedForIntegrity: () => true };
+      },
+    });
+    const task = await h.service.createTask(h.workspaceId, undefined, "codex");
+    const refused = await h.send(task.task.taskId, "x").then(() => undefined, (cause: unknown) => cause);
+    assert.match(String(refused), /^Error: engine_integrity_changed$/u);
+    assert.equal(toDesktopIpcFailure(refused).message, "engine_integrity_changed");
+    assert.equal((await codexSettings(h))?.status, "integrity_changed");
+    assert.equal(world.adapters[0]!.prompts.length, 0, "nothing was run");
+    // Claude's state is its own.
+    assert.equal((await h.service.bootstrap()).runtimeSettings.claude?.status, undefined);
+
+    refuse = false;
+    await h.send(task.task.taskId, "again");
+    await h.completed();
+    assert.equal((await codexSettings(h))?.status, "ready");
+  });
+
+  it("names a Codex start that got no answer at initialize, and keeps the session [PC-ENG-003]", async () => {
+    const h = await harness({}, { codex: { initializeFailure: "request_timeout" } });
+    const task = await h.service.createTask(h.workspaceId, undefined, "codex");
+    await assert.rejects(h.send(task.task.taskId, "x"), /^Error: engine_start_timeout$/u);
+    assert.equal(toDesktopIpcFailure(new Error("engine_start_timeout")).message, "engine_start_timeout");
+  });
+
+  it("hands the browser MCP server only when Codex advertised HTTP MCP, on a new session and on a resume [PC-BROWSER-002]", async () => {
+    const withMcp = await harness({ browserMcp: new FakeBrowserMcp() }, { codex: { mcpHttp: true } });
+    const task = await withMcp.service.createTask(withMcp.workspaceId, undefined, "codex");
+    await withMcp.send(task.task.taskId, "x");
+    await withMcp.completed();
+    const server = { type: "http", name: "guild-browser", url: BROWSER_URL, headers: [] };
+    assert.deepEqual(withMcp.world.adapters[0]!.startCalls[0]!.options, { mcpServers: [server] }, "nothing but the browser server");
+    await withMcp.world.adapters[0]!.emitTransportInterrupted();
+    await eventually(() => withMcp.world.adapters.length === 2 && withMcp.world.adapters[1]!.session !== undefined);
+    assert.equal(withMcp.world.adapters[1]!.startCalls[0]!.kind, "resume");
+    assert.deepEqual(withMcp.world.adapters[1]!.startCalls[0]!.options?.mcpServers, [server]);
+
+    const without = await harness({ browserMcp: new FakeBrowserMcp() }, { codex: { mcpHttp: false } });
+    const plain = await without.service.createTask(without.workspaceId, undefined, "codex");
+    await without.send(plain.task.taskId, "z");
+    await without.completed();
+    assert.equal(without.world.adapters[0]!.startCalls[0]!.options, undefined);
+  });
+
+  it("maps Steer to the Codex steering request, and sends what it did not inject as an ordinary message [docs/21 4.5]", async () => {
+    const injected = await harness();
+    const task = await injected.service.createTask(injected.workspaceId, undefined, "codex");
+    await injected.send(task.task.taskId, "hold");
+    await runningTurn(injected);
+    assert.deepEqual((await injected.service.bootstrap()).activeTask?.steer, { available: true });
+    const steered = await injected.service.steerMessage(task.task.taskId, "also this");
+    assert.equal(steered.status, "steered");
+    assert.deepEqual(injected.world.adapters[0]!.steers, ["also this"]);
+    assert.equal(injected.world.adapters[0]!.extensionCalls, 0);
+    injected.world.adapters[0]!.release();
+    await injected.completed();
+
+    // The adapter started a new turn instead (the turn had ended): the text goes out once, as an ordinary message.
+    const missed = await harness({}, { codex: { steerResult: { status: "ok", outcome: "promptRequired" } } });
+    const missedTask = await missed.service.createTask(missed.workspaceId, undefined, "codex");
+    await missed.send(missedTask.task.taskId, "hold");
+    await runningTurn(missed);
+    const fallback = await missed.service.steerMessage(missedTask.task.taskId, "late idea");
+    assert.equal(fallback.status, "queued");
+    assert.equal(fallback.status === "queued" ? fallback.reason : "", "turn_not_running");
+    missed.world.adapters[0]!.release();
+    await eventually(() => missed.world.adapters[0]!.prompts.includes("late idea"));
+    assert.equal(missed.world.adapters[0]!.prompts.filter((text) => text === "late idea").length, 1, "exactly once");
+
+    const unsupported = await harness({}, { codex: { steerResult: { status: "unsupported", reason: "not_found" } } });
+    const unsupportedTask = await unsupported.service.createTask(unsupported.workspaceId, undefined, "codex");
+    await unsupported.send(unsupportedTask.task.taskId, "hold");
+    await runningTurn(unsupported);
+    const refused = await unsupported.service.steerMessage(unsupportedTask.task.taskId, "nope");
+    assert.equal(refused.status, "queued");
+    const explanation = (await unsupported.service.openTask(unsupportedTask.task.taskId)).timeline.find((item) => item.kind === "notice");
+    assert.ok(explanation?.kind === "notice" && explanation.text.includes("Codex") && !explanation.text.includes("Grok"),
+      "the fallback notice names the engine the task runs on");
+  });
+
+  it("offers no conversation rewind to Codex and sends it no _x.ai request [docs/21 4.5]", async () => {
+    const h = await harness();
+    const task = await h.service.createTask(h.workspaceId, undefined, "codex");
+    await h.send(task.task.taskId, "x");
+    await h.completed();
+    const view = await h.service.openTask(task.task.taskId);
+    const runId = view.timeline.find((item) => item.runId !== undefined)!.runId!;
+    assert.deepEqual(await h.service.previewRewind(task.task.taskId, runId), { status: "refused", reason: "conversation_rewind_unsupported" });
+    assert.deepEqual(
+      await h.service.executeRewind({ taskId: task.task.taskId, runId, scope: "conversation_and_files" }),
+      { status: "refused", reason: "conversation_rewind_unsupported" },
+    );
+    assert.equal(h.world.adapters[0]!.extensionCalls, 0);
+  });
+
+  it("forks a Codex task into a Codex task and keeps the Grok version label out of Codex sessions [PC-ENG-003]", async () => {
+    const h = await harness();
+    const grok = await h.service.createTask(h.workspaceId);
+    await h.send(grok.task.taskId, "g");
+    await h.completed();
+    const grokVersion = (await h.service.bootstrap()).runtimeVersion;
+    const task = await h.service.createTask(h.workspaceId, undefined, "codex");
+    await h.send(task.task.taskId, "x");
+    await h.completed();
+    assert.equal((await h.service.bootstrap()).runtimeVersion, grokVersion, "Codex's version is not the Grok label");
+    const branch = await h.service.forkTask(task.task.taskId);
+    assert.equal(branch.task.engine, "codex");
+  });
+
+  it("shows Codex's permission mode as the session mode and keeps the generic option channel closed to it [PC-SET-002]", async () => {
+    const h = await harness();
+    await h.service.setEngineSettings("codex", null, null, "read-only");
+    const task = await h.service.createTask(h.workspaceId, undefined, "codex");
+    await h.send(task.task.taskId, "x");
+    await h.completed();
+    await h.idle();
+    const view = (await h.service.bootstrap()).activeTask!;
+    assert.equal(view.sessionModes?.currentModeId, "read-only");
+    assert.deepEqual(view.sessionModes?.availableModes.map((mode) => mode.id), ["read-only", "workspace-write", "agent", "agent-full-access"]);
+    // A later default reaches the idle session at its next turn.
+    await h.service.setEngineSettings("codex", null, null, "agent");
+    await h.send(task.task.taskId, "y");
+    await h.completed(2);
+    assert.equal((await h.service.bootstrap()).activeTask?.sessionModes?.currentModeId, "agent");
+    await assert.rejects(h.service.setSessionConfigOption(task.task.taskId, "mode", "agent-full-access"));
+  });
+
+  it("shows the plan label from an account login only, and context use like Claude's card [PC-FALLBACK-001]", async () => {
+    const h = await harness();
+    const task = await h.service.createTask(h.workspaceId, undefined, "codex");
+    await h.send(task.task.taskId, "x");
+    await h.completed();
+    const adapter = h.world.adapters[0]!;
+    assert.equal((await h.service.openTask(task.task.taskId)).engineStatus, undefined, "nothing reported yet");
+    adapter.emitAuthStatus({ kind: "account", label: "ChatGPT Pro", plan: "pro" });
+    await adapter.emitContextUsage(31_000, 400_000);
+    const view = await eventuallyValue(async () => {
+      const current = (await h.service.bootstrap()).activeTask;
+      return current?.engineStatus?.accountLabel === "ChatGPT Pro" ? current : undefined;
+    });
+    assert.deepEqual(view.engineStatus, { accountLabel: "ChatGPT Pro" });
+    assert.deepEqual(view.contextWindow, { status: "available", used: 31_000, size: 400_000 });
+    // The label is the engine's alone: a Claude task shows nothing of it, a Grok task has no status at all.
+    const claude = await h.service.createTask(h.workspaceId, undefined, "claude");
+    assert.equal(claude.engineStatus, undefined);
+    assert.equal((await h.service.createTask(h.workspaceId, undefined, "grok")).engineStatus, undefined);
+  });
+
+  it("asks no engine but Grok for official usage, with a Codex task live [PC-FALLBACK-001]", async () => {
+    const fetched: string[] = [];
+    const usageFetcher = async (): Promise<AcpV1OfficialBillingSnapshot> => {
+      fetched.push("dedicated");
+      return { creditUsagePercent: 12 };
+    };
+    const h = await harness({ usageFetcher });
+    const task = await h.service.createTask(h.workspaceId, undefined, "codex");
+    await h.send(task.task.taskId, "x");
+    await h.completed();
+    await h.service.refreshUsage();
+    assert.deepEqual(fetched, ["dedicated"], "nothing to borrow: the dedicated Grok probe answers");
+    assert.equal(h.world.adapters[0]!.billingCalls, 0);
   });
 });

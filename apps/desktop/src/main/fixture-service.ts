@@ -1,4 +1,6 @@
 import {
+  GUILD_ADDON_DEFAULT_PERMISSION_MODE,
+  GUILD_ADDON_PERMISSION_MODES,
   GUILD_API_VERSION,
   GUILD_CLAUDE_PERMISSION_MODES,
   GUILD_GROK_PERMISSION_MODES,
@@ -131,6 +133,36 @@ const FIXTURE_CLAUDE_CATALOG = freezeModelCatalog("claude", {
   ],
 });
 
+/** What the Codex picker offers: models and their efforts as a Codex session reports them when it starts. */
+const FIXTURE_CODEX_CATALOG = freezeModelCatalog("codex", {
+  engine: "codex",
+  runtimeDefaultModelId: "gpt-6.1-sol",
+  models: [
+    {
+      id: "gpt-6.1-sol", name: "6.1 Sol", description: "Latest workhorse model for coding and everyday work.", group: "codex",
+      reasoningEfforts: [
+        { id: "low", label: "Low", isDefault: false },
+        { id: "medium", label: "Medium", isDefault: false },
+        { id: "high", label: "High", isDefault: true },
+        { id: "xhigh", label: "Xhigh", isDefault: false },
+        { id: "max", label: "Max", isDefault: false },
+        { id: "ultra", label: "Ultra", isDefault: false },
+      ],
+      contextWindows: [],
+    },
+    {
+      id: "gpt-5.6-luna", name: "5.6 Luna", description: "Older fast and efficient model.", group: "codex",
+      reasoningEfforts: [
+        { id: "low", label: "Low", isDefault: false },
+        { id: "medium", label: "Medium", isDefault: false },
+        { id: "high", label: "High", isDefault: true },
+        { id: "max", label: "Max", isDefault: false },
+      ],
+      contextWindows: [],
+    },
+  ],
+});
+
 export function createFixtureDesktopService(): DesktopApplicationService {
   const listeners = new Set<(projection: DesktopBootstrapProjection) => void>();
   let locale: GuildLocale = "zh-CN";
@@ -142,6 +174,8 @@ export function createFixtureDesktopService(): DesktopApplicationService {
   let claudeModel: string | null = null;
   let claudeEffort: string | null = null;
   let claudePermissionMode: GuildClaudePermissionMode = "default";
+  let codexDefaults: Readonly<{ model: string | null; reasoningEffort: string | null; permissionMode: string }> =
+    Object.freeze({ model: null, reasoningEffort: null, permissionMode: GUILD_ADDON_DEFAULT_PERMISSION_MODE.codex });
   const taskEngines = new Map<string, GuildEngine>();
   let startup: GuildGrokStartupSettings = GUILD_DEFAULT_GROK_STARTUP_SETTINGS;
   let sidebarWidth = 280;
@@ -182,15 +216,19 @@ export function createFixtureDesktopService(): DesktopApplicationService {
   /** What the task will use for its next turn: its own override, then the global default, then the runtime's. */
   function withModelSelection(task: Omit<TaskViewProjection, "modelSelection">): TaskViewProjection {
     const override = taskOverrides.get(task.task.taskId);
-    const claude = taskEngines.get(task.task.taskId) === "claude";
+    const taskEngine = taskEngines.get(task.task.taskId);
+    const claude = taskEngine === "claude";
+    const codex = taskEngine === "codex";
     const resolved = resolveEffectiveSelection({
       ...(override === undefined
         ? {}
         : { task: { modelId: override.model, reasoningEffort: override.reasoningEffort } }),
       global: claude
         ? { modelId: claudeModel, reasoningEffort: claudeEffort }
-        : { modelId: grokModel, reasoningEffort },
-      catalog: claude ? FIXTURE_CLAUDE_CATALOG : FIXTURE_MODEL_CATALOG,
+        : codex
+          ? { modelId: codexDefaults.model, reasoningEffort: codexDefaults.reasoningEffort }
+          : { modelId: grokModel, reasoningEffort },
+      catalog: claude ? FIXTURE_CLAUDE_CATALOG : codex ? FIXTURE_CODEX_CATALOG : FIXTURE_MODEL_CATALOG,
     });
     const state = task.task.activeRunState;
     const turnLive = state !== undefined &&
@@ -232,7 +270,16 @@ export function createFixtureDesktopService(): DesktopApplicationService {
           permissionMode: claudePermissionMode,
           availablePermissionModes: GUILD_CLAUDE_PERMISSION_MODES,
         }),
-        modelCatalogs: Object.freeze({ grok: FIXTURE_MODEL_CATALOG, claude: FIXTURE_CLAUDE_CATALOG }),
+        engines: Object.freeze({
+          codex: Object.freeze({
+            status: "ready" as const,
+            accountLabel: "ChatGPT Plus",
+            version: "0.160.1",
+            ...codexDefaults,
+            availablePermissionModes: GUILD_ADDON_PERMISSION_MODES.codex,
+          }),
+        }),
+        modelCatalogs: Object.freeze({ grok: FIXTURE_MODEL_CATALOG, claude: FIXTURE_CLAUDE_CATALOG, codex: FIXTURE_CODEX_CATALOG }),
       }),
       generalSettings: Object.freeze({
         restoreLastTask,
@@ -361,7 +408,9 @@ export function createFixtureDesktopService(): DesktopApplicationService {
         }),
         ...(engine === "claude"
           ? { engineStatus: Object.freeze({ accountLabel: "Claude Max" }) }
-          : {}),
+          : engine === "codex"
+            ? { engineStatus: Object.freeze({ accountLabel: "ChatGPT Plus" }) }
+            : {}),
         timeline: Object.freeze([]),
         hasEarlierTimeline: false,
         queuedTurns: Object.freeze([]),
@@ -545,7 +594,11 @@ export function createFixtureDesktopService(): DesktopApplicationService {
       activeTask = withModelSelection({
         ...rest,
         task: Object.freeze({ ...activeTask.task, engine }),
-        ...(engine === "claude" ? { engineStatus: Object.freeze({ accountLabel: "Claude Max" }) } : {}),
+        ...(engine === "claude"
+          ? { engineStatus: Object.freeze({ accountLabel: "Claude Max" }) }
+          : engine === "codex"
+            ? { engineStatus: Object.freeze({ accountLabel: "ChatGPT Plus" }) }
+            : {}),
       });
       publish();
       return currentTask();
@@ -554,6 +607,12 @@ export function createFixtureDesktopService(): DesktopApplicationService {
       claudeModel = nextModel;
       claudeEffort = nextEffort;
       claudePermissionMode = nextPermissionMode;
+      activeTask = withModelSelection(activeTask);
+      publish();
+      return projection;
+    },
+    setEngineSettings: async (_engine, nextModel, nextEffort, nextPermissionMode) => {
+      codexDefaults = Object.freeze({ model: nextModel, reasoningEffort: nextEffort, permissionMode: nextPermissionMode });
       activeTask = withModelSelection(activeTask);
       publish();
       return projection;
