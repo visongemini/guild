@@ -15,6 +15,7 @@ import {
   type RuntimePermissionRequestPayload,
   type RuntimePromptTerminalPayload,
   type RuntimeConfigOption,
+  type RuntimeConfigSelectChoices,
   type RuntimeReceiveTimestamp,
   type XaiSignalEnvelope,
 } from "@guild/contracts";
@@ -40,6 +41,7 @@ import {
   encodeResumeSessionParams,
   encodeSetSessionConfigOptionParams,
   encodeSetSessionModelParams,
+  encodeSetSessionModeParams,
   encodeSelectedPermissionResult,
   encodePromptParams,
   AcpV1CodecError,
@@ -63,6 +65,11 @@ import {
   type EngineSignal,
 } from "./claude-dialect.js";
 import { isCodexSessionNotFound } from "./codex-dialect.js";
+import {
+  GEMINI_MODE_OPTION_ID,
+  GEMINI_MODEL_OPTION_ID,
+  isGeminiSessionNotFound,
+} from "./gemini-dialect.js";
 import {
   GROK_ENGINE_PROFILE,
   isAdapterDialect,
@@ -134,6 +141,16 @@ export const CLAUDE_ACP_ADAPTER_DEFAULT_TIMEOUTS = Object.freeze({
  * the same retryable "still starting" as for Claude, never a lost session.
  */
 export const CODEX_ACP_ADAPTER_DEFAULT_TIMEOUTS = Object.freeze({
+  ...ACP_V1_ADAPTER_DEFAULT_TIMEOUTS,
+  initializeMs: 180_000,
+  sessionMs: 180_000,
+});
+
+/**
+ * The Gemini CLI starts its tools, extensions and the user's MCP servers with the session; the same generous bound
+ * as Codex covers a start that is merely slow, and a timeout is the same retryable "still starting" (docs/21 8.1).
+ */
+export const GEMINI_ACP_ADAPTER_DEFAULT_TIMEOUTS = Object.freeze({
   ...ACP_V1_ADAPTER_DEFAULT_TIMEOUTS,
   initializeMs: 180_000,
   sessionMs: 180_000,
@@ -480,6 +497,11 @@ type SessionTransport = {
   phase: SessionPhase;
   sinkTail: Promise<void>;
   updateTail: Promise<void>;
+  /**
+   * Gemini only: the session's model and mode options as the CLI last confirmed them. The CLI has no config options,
+   * so the adapter keeps the current values itself and returns them from `setConfigOption`.
+   */
+  geminiOptions: readonly RuntimeConfigOption[] | undefined;
 };
 
 type PermissionPreparationOutcome =
@@ -566,7 +588,9 @@ export class AcpV1Adapter {
       ? CLAUDE_ACP_ADAPTER_DEFAULT_TIMEOUTS
       : this.profile.dialect === "codex"
         ? CODEX_ACP_ADAPTER_DEFAULT_TIMEOUTS
-        : ACP_V1_ADAPTER_DEFAULT_TIMEOUTS;
+        : this.profile.dialect === "gemini"
+          ? GEMINI_ACP_ADAPTER_DEFAULT_TIMEOUTS
+          : ACP_V1_ADAPTER_DEFAULT_TIMEOUTS;
     this.timeouts = Object.freeze({
       authenticateMs: positiveSafeInteger(
         options.timeouts?.authenticateMs ?? defaults.authenticateMs,
@@ -752,6 +776,9 @@ export class AcpV1Adapter {
     if (transport.activePrompt !== undefined) {
       throw new AcpV1AdapterError("overlapping_prompt");
     }
+    if (this.profile.dialect === "gemini") {
+      return this.setGeminiOption(transport, session, configId, value);
+    }
     try {
       const options = await this.request(
         ACP_V1_METHODS.sessionSetConfigOption,
@@ -774,6 +801,65 @@ export class AcpV1Adapter {
       }
       throw this.normalizeOperationFailure(cause);
     }
+  }
+
+  /**
+   * The Gemini CLI has no config options: the model is `session/set_model` and the mode `session/set_mode`. The two
+   * options Guild shows for it (`deriveGeminiConfigOptions`) are applied through those requests, a value the session
+   * did not list is refused before any wire call, and the options with the new current value are returned, so the
+   * callers that work on config options need no Gemini branch. A refusal by the CLI leaves the previous value.
+   */
+  private async setGeminiOption(
+    transport: SessionTransport,
+    session: AcpV1AdapterSession,
+    configId: string,
+    value: string | boolean,
+  ): Promise<readonly RuntimeConfigOption[]> {
+    const options = transport.geminiOptions ?? session.configOptions ?? [];
+    const option = options.find((candidate) => candidate.id === configId);
+    const method = configId === GEMINI_MODEL_OPTION_ID
+      ? ACP_V1_METHODS.sessionSetModel
+      : configId === GEMINI_MODE_OPTION_ID
+        ? ACP_V1_METHODS.sessionSetMode
+        : undefined;
+    if (
+      method === undefined ||
+      option === undefined ||
+      option.type !== "select" ||
+      typeof value !== "string" ||
+      !flatChoiceValues(option.choices).includes(value)
+    ) {
+      throw new AcpV1ConfigOptionRefusedError("invalid_value", -32602);
+    }
+    try {
+      await this.request(
+        method,
+        configId === GEMINI_MODEL_OPTION_ID
+          ? encodeSetSessionModelParams(transport.identity.sessionId, value)
+          : encodeSetSessionModeParams(transport.identity.sessionId, value),
+        this.timeouts.sessionMs,
+        (response) => this.decodeProtocol(() => decodeSessionSelectorResult(response)),
+      );
+    } catch (cause: unknown) {
+      if (cause instanceof JsonRpcRemoteError) {
+        throw new AcpV1ConfigOptionRefusedError(classifyConfigRefusal(cause), cause.response.code);
+      }
+      throw this.normalizeOperationFailure(cause);
+    }
+    transport.geminiOptions = Object.freeze(options.map((candidate): RuntimeConfigOption => {
+      if (candidate.id !== configId || candidate.type !== "select") return candidate;
+      // The value is now one of the choices, so the `unlisted` marker of a session that started on `auto` goes.
+      return Object.freeze({
+        id: candidate.id,
+        name: candidate.name,
+        ...(candidate.description === undefined ? {} : { description: candidate.description }),
+        ...(candidate.category === undefined ? {} : { category: candidate.category }),
+        type: "select" as const,
+        currentValue: value,
+        choices: candidate.choices,
+      });
+    }));
+    return transport.geminiOptions;
   }
 
   /**
@@ -899,8 +985,8 @@ export class AcpV1Adapter {
     }
     let exactMode: string;
     try {
-      exactMode = this.profile.dialect === "codex"
-        ? parseGuildAddonPermissionMode("codex", mode)
+      exactMode = this.profile.dialect === "codex" || this.profile.dialect === "gemini"
+        ? parseGuildAddonPermissionMode(this.profile.dialect, mode)
         : parseGuildClaudePermissionMode(mode);
     } catch {
       throw new AcpV1AdapterError("invalid_adapter_options");
@@ -1143,6 +1229,7 @@ export class AcpV1Adapter {
         response,
         transport.identity.sessionId,
         this.receiveTimestamp(),
+        this.profile.dialect,
       ));
       active.responseProven = true;
       this.abandonPendingPermissionPreparations(active);
@@ -1320,6 +1407,7 @@ export class AcpV1Adapter {
       phase,
       sinkTail: Promise.resolve(),
       updateTail: Promise.resolve(),
+      geminiOptions: undefined,
     };
     this.sessions.set(identity.sessionId, transport);
     this.sessionProvenance.set(publicSession, transport);
@@ -1879,7 +1967,8 @@ export class AcpV1Adapter {
       );
       const preparation = await transaction.prepared.promise;
       if (preparation.type === "abandoned") {
-        return PERMISSION_NO_RESPONSE;
+        // The Gemini CLI resolves a cancelled prompt only after the request it is waiting on is answered (docs/21 7).
+        return this.profile.dialect === "gemini" ? this.answerAbandonedPermission(key) : PERMISSION_NO_RESPONSE;
       }
       const prepared = preparation.response;
       this.assertSamePrompt(session, active);
@@ -2192,8 +2281,8 @@ export class AcpV1Adapter {
 
   /** True when the notification names a bound session that has no prompt of Guild's in flight. */
   /** The engine of an adapter dialect (Claude, Codex); undefined for Grok. */
-  private adapterEngine(): "claude" | "codex" | undefined {
-    return this.profile.dialect === "claude" || this.profile.dialect === "codex" ? this.profile.dialect : undefined;
+  private adapterEngine(): "claude" | "codex" | "gemini" | undefined {
+    return isAdapterDialect(this.profile.dialect) ? this.profile.dialect as "claude" | "codex" | "gemini" : undefined;
   }
 
   private claudeSessionIsIdle(params: JsonRpcParams | undefined): boolean {
@@ -2205,6 +2294,17 @@ export class AcpV1Adapter {
 
   private agentTurnsEnabled(): boolean {
     return this.profile.features.agentInitiatedTurns && this.sink.commitAgentTurnStarted !== undefined;
+  }
+
+  /**
+   * Answers a permission request whose turn was cancelled before the user decided with the ACP `cancelled` outcome.
+   * The transaction is dropped first so the written response is recognised as an answer to a request Guild no longer
+   * tracks, the same bookkeeping as `cancelUnboundPermission`.
+   */
+  private answerAbandonedPermission(key: string): JsonRpcHandlerReply {
+    this.pendingPermissionFlushes.delete(key);
+    this.unboundPermissionResponses.add(key);
+    return { type: "result", result: jsonValue(encodeCancelledPermissionResult()) };
   }
 
   /** Answers a permission callback that belongs to no Guild prompt with a cancellation. */
@@ -2449,11 +2549,25 @@ export class AcpV1Adapter {
       ) {
         return new AcpV1AdapterError("session_not_found");
       }
+      // So does the Gemini CLI (`session/load` is its only way back into a session).
+      if (
+        this.profile.dialect === "gemini" &&
+        cause instanceof JsonRpcRemoteError &&
+        isGeminiSessionNotFound(cause.response)
+      ) {
+        return new AcpV1AdapterError("session_not_found");
+      }
     }
     if (this.currentState === "faulted") return new AcpV1AdapterError("transport_lost");
     if (this.currentState === "closed") return new AcpV1AdapterError("adapter_closed");
     return new AcpV1AdapterError("operation_failed");
   }
+}
+
+function flatChoiceValues(choices: RuntimeConfigSelectChoices): readonly string[] {
+  return choices.form === "flat"
+    ? choices.options.map((choice) => choice.value)
+    : choices.groups.flatMap((group) => group.options.map((choice) => choice.value));
 }
 
 function adapterSession(

@@ -31,7 +31,7 @@ export type ClaudeAuthStatus = Readonly<{
 }>;
 
 /** The engines whose adapters send these signals (every engine but Grok). */
-export type AdapterEngineName = "claude" | "codex";
+export type AdapterEngineName = "claude" | "codex" | "gemini";
 
 /** Display-only engine signals that are not `_x.ai/*` signals. Never persisted, never awaited. */
 export type EngineSignal =

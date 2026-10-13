@@ -1,6 +1,16 @@
 import { isAbsolute, normalize } from "node:path";
 import { isAdapterDialect, type AcpDialect } from "./engine-profile.js";
 import {
+  GEMINI_AUTO_MODEL_ID,
+  GEMINI_MODE_OPTION_ID,
+  GEMINI_MODEL_OPTION_ID,
+  canonicalGeminiCurrentModelId,
+  canonicalGeminiModelId,
+  cheapestGeminiModelId,
+  decodeGeminiQuota,
+  isGeminiInternalChunk,
+} from "./gemini-dialect.js";
+import {
   ACP_PERMISSION_OPTION_KINDS,
   ACP_PROMPT_STOP_REASONS,
   ACP_TOOL_KINDS,
@@ -377,6 +387,17 @@ export function encodeSetSessionModelParams(
     sessionId: identifier(sessionId, "$.sessionId"),
     modelId: identifier(modelId, "$.modelId"),
     ...(Object.keys(fields).length === 0 ? {} : { _meta: fields }),
+  });
+}
+
+/** `session/set_mode` of the Gemini CLI, whose modes are session state and not a config option. */
+export function encodeSetSessionModeParams(
+  sessionId: string,
+  modeId: string,
+): Readonly<Record<string, unknown>> {
+  return deepFreeze({
+    sessionId: identifier(sessionId, "$.sessionId"),
+    modeId: identifier(modeId, "$.modeId"),
   });
 }
 
@@ -867,6 +888,126 @@ export function deriveCodexModelCatalog(
   }
 }
 
+const GEMINI_MODEL_OPTION_NAME = "Model";
+const GEMINI_MODE_OPTION_NAME = "Mode";
+
+/**
+ * The two select options Guild shows for a Gemini session, built from the `models` and `modes` of `session/new` and
+ * `session/load`: `model` (category `model`) lists every model but `auto`, which can route to the Pro model on its
+ * own and is never offered; a session that sits on it reports an `unlisted` current value, which Guild answers by
+ * selecting a listed model before the first prompt. `mode` (category `mode`) lists the CLI's modes. Advisory display
+ * data: anything unexpected yields fewer options and never throws.
+ */
+export function deriveGeminiConfigOptions(
+  models: unknown,
+  modes: AcpV1SessionState["modes"] | undefined,
+): readonly RuntimeConfigOption[] {
+  const options: RuntimeConfigOption[] = [];
+  const modelOption = geminiModelOption(models);
+  if (modelOption !== undefined) options.push(modelOption);
+  if (modes !== undefined && modes !== null) {
+    options.push({
+      id: GEMINI_MODE_OPTION_ID,
+      name: GEMINI_MODE_OPTION_NAME,
+      category: "mode",
+      type: "select",
+      currentValue: modes.currentModeId,
+      choices: {
+        form: "flat",
+        options: modes.availableModes.map((mode) => ({
+          value: mode.id,
+          name: mode.name,
+          ...(mode.description === undefined || mode.description === null ? {} : { description: mode.description }),
+        })),
+      },
+    });
+  }
+  return deepFreeze(options);
+}
+
+function geminiModelOption(models: unknown): RuntimeConfigOption | undefined {
+  try {
+    const state = record(models, "$.models");
+    const available = array(state["availableModels"], "$.models.availableModels", ACP_V1_CODEC_LIMITS.maxContentCollectionItems);
+    const limits = GUILD_GROK_IDENTIFIER_LIMITS;
+    const choices: RuntimeConfigSelectChoice[] = [];
+    const seen = new Set<string>();
+    for (const entry of available) {
+      if (choices.length >= GUILD_CLAUDE_IDENTIFIER_LIMITS.maxModels) break;
+      const item = entry !== null && typeof entry === "object" && !Array.isArray(entry)
+        ? entry as Record<string, unknown>
+        : undefined;
+      const rawId = item?.["modelId"];
+      if (typeof rawId !== "string" || rawId === GEMINI_AUTO_MODEL_ID) continue;
+      const name = catalogText(item?.["name"], limits.maxNameLength);
+      const modelId = canonicalGeminiModelId(rawId, name);
+      if (!isClaudeModelId(modelId) || seen.has(modelId)) continue;
+      seen.add(modelId);
+      const description = catalogText(item?.["description"], limits.maxDescriptionLength);
+      choices.push({
+        value: modelId,
+        name: name ?? modelId,
+        ...(description === undefined ? {} : { description }),
+      });
+    }
+    if (choices.length === 0) return undefined;
+    const reported = state["currentModelId"];
+    const current = typeof reported === "string" && reported.length > 0 &&
+      reported.length <= GUILD_CLAUDE_IDENTIFIER_LIMITS.modelIdLength
+      ? canonicalGeminiCurrentModelId(reported, seen)
+      : GEMINI_AUTO_MODEL_ID;
+    return {
+      id: GEMINI_MODEL_OPTION_ID,
+      name: GEMINI_MODEL_OPTION_NAME,
+      category: "model",
+      type: "select",
+      currentValue: current,
+      choices: { form: "flat", options: choices },
+      ...(seen.has(current) ? {} : { unlisted: true as const }),
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The Gemini model catalog, from the `model` option built above: every listed model in the `gemini` group, no
+ * efforts (the CLI exposes no thinking control over ACP) and no window sizes. The engine's runtime default is the
+ * cheapest model the session lists (`cheapestGeminiModelId`), never the session's own current model, which starts as
+ * `auto`. Returns `undefined` when there is no usable model option.
+ */
+export function deriveGeminiModelCatalog(options: readonly RuntimeConfigOption[]): ModelCatalog | undefined {
+  const modelOption = options.find((option) => option.type === "select" && option.category === "model");
+  if (modelOption === undefined || modelOption.type !== "select") return undefined;
+  const limits = GUILD_GROK_IDENTIFIER_LIMITS;
+  const catalogModels: ModelDescriptor[] = [];
+  for (const choice of flatChoices(modelOption.choices)) {
+    if (catalogModels.length >= GUILD_CLAUDE_IDENTIFIER_LIMITS.maxModels) break;
+    if (!isClaudeModelId(choice.value)) continue;
+    const description = catalogText(choice.description, limits.maxDescriptionLength);
+    catalogModels.push({
+      id: choice.value,
+      name: catalogText(choice.name, limits.maxNameLength) ?? choice.value,
+      ...(description === undefined ? {} : { description }),
+      group: "gemini",
+      reasoningEfforts: [],
+      contextWindows: [],
+    });
+  }
+  if (catalogModels.length === 0) return undefined;
+  const cheapest = cheapestGeminiModelId(catalogModels.map((model) => model.id));
+  try {
+    return freezeModelCatalog("gemini", {
+      engine: "gemini",
+      models: catalogModels,
+      ...(cheapest === undefined ? {} : { runtimeDefaultModelId: cheapest }),
+    });
+  } catch {
+    // The catalog is advisory display data: a list the contracts refuse must not fault the session.
+    return undefined;
+  }
+}
+
 function isClaudeReasoningEffort(value: string): boolean {
   try {
     parseGuildClaudeReasoningEffort(value);
@@ -921,11 +1062,15 @@ export function decodePromptResult(
   input: unknown,
   sessionId: string,
   received: RuntimeReceiveTimestamp,
+  dialect: AcpDialect = "grok",
 ): Exclude<RuntimePayload, { readonly type: "session_context" }> & { readonly type: "prompt_terminal" } {
   boundedJson(input);
   const rec = record(input, "$", ["stopReason"]);
   const stopReason = enumeration(rec["stopReason"], ACP_PROMPT_STOP_REASONS, "$.stopReason");
-  const contextTokensUsed = parsePromptContextTokens(rec["_meta"]);
+  // The Gemini CLI reports tokens as `_meta.quota` (input + output, summed over the turn's requests), nothing else.
+  const contextTokensUsed = dialect === "gemini"
+    ? geminiTokensUsed(rec["_meta"])
+    : parsePromptContextTokens(rec["_meta"]);
   return freezeRuntimePayload({
     type: "prompt_terminal",
     sessionId: identifier(sessionId, "$sessionId"),
@@ -934,6 +1079,13 @@ export function decodePromptResult(
     classification: classifyStopReason(stopReason),
     ...(contextTokensUsed === undefined ? {} : { contextTokensUsed }),
   }) as Exclude<RuntimePayload, { readonly type: "session_context" }> & { readonly type: "prompt_terminal" };
+}
+
+function geminiTokensUsed(metaValue: unknown): number | undefined {
+  const quota = decodeGeminiQuota(metaValue);
+  if (quota === undefined) return undefined;
+  const total = quota.inputTokens + quota.outputTokens;
+  return Number.isSafeInteger(total) ? total : undefined;
 }
 
 function parsePromptContextTokens(metaValue: unknown): number | undefined {
@@ -965,6 +1117,9 @@ export function decodeSessionUpdate(
   const sessionId = matchingSessionId(rec["sessionId"], expectedSessionId, "$.sessionId");
   const update = record(rec["update"], "$.update", ["sessionUpdate"]);
   const discriminator = boundedText(update["sessionUpdate"], "$.update.sessionUpdate", false);
+  if (dialect === "gemini" && isGeminiInternalFrame(discriminator, update)) {
+    return deepFreeze({ type: "ignored_extension", sessionId, discriminator });
+  }
 
   switch (discriminator) {
     case "user_message_chunk":
@@ -1010,6 +1165,15 @@ export function decodeSessionUpdate(
     default:
       return deepFreeze({ type: "ignored_extension", sessionId, discriminator });
   }
+}
+
+/** A chat frame the Gemini CLI invents (`[MODE_UPDATE]`, the replayed `<session_context>` and `[Function Response:`). */
+function isGeminiInternalFrame(discriminator: string, update: Record<string, unknown>): boolean {
+  if (discriminator !== "agent_message_chunk" && discriminator !== "user_message_chunk") return false;
+  const content = update["content"];
+  if (content === null || typeof content !== "object" || Array.isArray(content)) return false;
+  const text = (content as { readonly type?: unknown; readonly text?: unknown });
+  return text.type === "text" && typeof text.text === "string" && isGeminiInternalChunk(discriminator, text.text);
 }
 
 export function decodePermissionRequest(
@@ -1181,6 +1345,17 @@ function parseSessionStateRecord(
     }
     if (dialect === "codex" && configOptions !== null) {
       const modelCatalog = deriveCodexModelCatalog(configOptions, rec["models"]);
+      if (modelCatalog !== undefined) result["modelCatalog"] = modelCatalog;
+    }
+  }
+  if (dialect === "gemini") {
+    // The CLI has no config options: its models and modes are presented as the same two select options the other
+    // adapters have, so the rest of Guild is unchanged (docs/21 8.4).
+    const modes = result["modes"] as AcpV1SessionState["modes"];
+    const configOptions = deriveGeminiConfigOptions(rec["models"], modes);
+    if (configOptions.length > 0) {
+      result["configOptions"] = configOptions;
+      const modelCatalog = deriveGeminiModelCatalog(configOptions);
       if (modelCatalog !== undefined) result["modelCatalog"] = modelCatalog;
     }
   }

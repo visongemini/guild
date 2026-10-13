@@ -5,6 +5,7 @@ export * from "./adapter-pin.js";
 export * from "./claude-dialect.js";
 export * from "./codex-core-pin.js";
 export * from "./codex-dialect.js";
+export * from "./gemini-dialect.js";
 export {
   CLAUDE_ENGINE_PROFILE,
   CLAUDE_ENVIRONMENT_POLICY,
@@ -13,13 +14,19 @@ export {
   CODEX_ENGINE_PROFILE,
   CODEX_ENVIRONMENT_POLICY,
   CODEX_ENVIRONMENT_POLICY_VERSION,
+  GEMINI_API_KEY_VARIABLE,
+  GEMINI_ENGINE_PROFILE,
+  GEMINI_ENVIRONMENT_POLICY,
+  GEMINI_ENVIRONMENT_POLICY_VERSION,
   GROK_ENGINE_PROFILE,
   GROK_ENVIRONMENT_POLICY,
   GROK_ENVIRONMENT_POLICY_VERSION,
+  assertGeminiEnvironment,
   assertPerSpawnEnvironment,
   buildEngineEnvironment,
   engineProfileFor,
   isAdapterDialect,
+  isPlausibleGeminiApiKey,
 } from "./engine-profile.js";
 export type {
   AcpDialect,
@@ -32,6 +39,7 @@ export type {
   EnginePinStrategy,
   EngineProfile,
   EnvironmentPolicy,
+  GeminiLaunch,
   GrokLaunch,
 } from "./engine-profile.js";
 export * from "./grok-acp-profile.js";
