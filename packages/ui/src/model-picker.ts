@@ -11,6 +11,7 @@ import type {
 } from "@guild/contracts";
 import {
   EMPTY_CLAUDE_MODEL_CATALOG,
+  EMPTY_CODEX_MODEL_CATALOG,
   EMPTY_GROK_MODEL_CATALOG,
   defaultReasoningEffortOf,
   grokModelById,
@@ -26,6 +27,9 @@ import {
 } from "./claude-model-families.js";
 import type { GuildMessages } from "./locales.js";
 import { switchRestartsEngine } from "./model-switch.js";
+
+/** The name of the first (and so far only) add-on engine: its picker group, status and default row. */
+const CODEX_ENGINE = "codex" as const;
 
 /*
  * Pure view-model for the composer model picker and the Settings default-model control.
@@ -68,12 +72,13 @@ export const modelOffersEffort = modelSupportsReasoningEffort;
  * high, high, medium and low. An id this table does not know keeps the adapter's order after the known ones.
  */
 const EFFORT_DESCENDING_RANK: Readonly<Record<string, number>> = Object.freeze({
-  default: 0, max: 1, xhigh: 2, high: 3, medium: 4, low: 5,
+  default: 0, ultra: 0.5, max: 1, xhigh: 2, high: 3, medium: 4, low: 5,
 });
 
 /**
- * The Claude adapter lists its efforts weakest first and Grok lists its strongest first. Both pickers read from
- * the strongest down, so a Claude list is turned around here (the default row stays on top); the sort is stable.
+ * The Claude and Codex adapters list their efforts weakest first and Grok lists its strongest first. Every picker
+ * reads from the strongest down, so an adapter's list is turned around here (the default row stays on top); the
+ * sort is stable. Codex adds `ultra` above `max`.
  */
 export function effortsDescending<T extends Readonly<{ id: string }>>(efforts: readonly T[]): readonly T[] {
   const rank = (effort: T) => EFFORT_DESCENDING_RANK[effort.id] ?? Object.keys(EFFORT_DESCENDING_RANK).length;
@@ -233,11 +238,18 @@ export type ModelGroupView = Readonly<{
   empty?: ModelGroupEmptyView;
 }>;
 
-/** The two catalogs the picker draws from; the Claude one also carries the Online and Local models. */
+/** The catalogs the picker draws from, one per engine; the Claude one also carries the Online and Local models. */
 export type ModelPickerCatalogs = Readonly<{
   grok: GrokModelCatalog;
   claude: ModelCatalog;
+  /** Absent reads as an empty ChatGPT (Codex) list. */
+  codex?: ModelCatalog;
 }>;
+
+/** The catalog of `engine` in `catalogs`; an engine the caller did not supply a list for has none. */
+export function catalogOfEngine(catalogs: ModelPickerCatalogs, engine: GuildEngine): ModelCatalog {
+  return engine === "claude" ? catalogs.claude : engine === CODEX_ENGINE ? catalogs.codex ?? EMPTY_CODEX_MODEL_CATALOG : catalogs.grok;
+}
 
 /** `modelCatalogs` from the engines, falling back to the single Grok `modelCatalog` while an older main process supplies only that. */
 export function modelCatalogsOf(
@@ -246,22 +258,24 @@ export function modelCatalogsOf(
   return Object.freeze({
     grok: runtimeSettings.modelCatalogs?.grok ?? runtimeSettings.modelCatalog,
     claude: runtimeSettings.modelCatalogs?.claude ?? EMPTY_CLAUDE_MODEL_CATALOG,
+    codex: runtimeSettings.modelCatalogs?.codex ?? EMPTY_CODEX_MODEL_CATALOG,
   });
 }
 
 const GROUPS_OF_ENGINE: Readonly<Record<GuildEngine, readonly ModelGroup[]>> = Object.freeze({
   grok: Object.freeze(["grok"] as const),
   claude: Object.freeze(["claude", "online", "local"] as const),
+  codex: Object.freeze(["codex"] as const),
 });
-const ALL_GROUPS: readonly ModelGroup[] = Object.freeze(["grok", "claude", "online", "local"] as const);
+const ALL_GROUPS: readonly ModelGroup[] = Object.freeze(["grok", "claude", "codex", "online", "local"] as const);
 
-/** Groups an open picker lists, in display order: the task's own engine once it has a Run, otherwise all four. */
+/** Groups an open picker lists, in display order: the task's own engine once it has a Run, otherwise all five. */
 export function visibleModelGroups(engine: GuildEngine, engineFixed: boolean): readonly ModelGroup[] {
   return engineFixed ? GROUPS_OF_ENGINE[engine] : ALL_GROUPS;
 }
 
 export function engineOfGroup(group: ModelGroup): GuildEngine {
-  return group === "grok" ? "grok" : "claude";
+  return group === "grok" ? "grok" : group === CODEX_ENGINE ? CODEX_ENGINE : "claude";
 }
 
 export type ModelPickerView = Readonly<{
@@ -310,6 +324,8 @@ function groupEmptyView(
   group: ModelGroup,
   claudeAvailable: boolean,
   claudeState: ClaudeStatusState | undefined,
+  codexAvailable = true,
+  codexState?: ClaudeStatusState,
 ): ModelGroupEmptyView {
   if (group === "online" || group === "local") {
     return Object.freeze({
@@ -317,6 +333,23 @@ function groupEmptyView(
       text: messages.modelPickerGroupEmpty(group),
       action: "open_model_sources",
     });
+  }
+  if (group === CODEX_ENGINE) {
+    if (codexAvailable) {
+      return Object.freeze({ kind: "not_started", text: messages.modelPickerAddonNotStarted(CODEX_ENGINE) });
+    }
+    return codexState === "unavailable" || codexState === "integrity_changed"
+      ? Object.freeze({
+          kind: "claude_unavailable",
+          text: codexState === "unavailable"
+            ? messages.addonStatusUnavailable(CODEX_ENGINE)
+            : messages.addonStatusIntegrityChanged(CODEX_ENGINE),
+        })
+      : Object.freeze({
+          kind: "claude_unavailable",
+          text: messages.modelPickerAddonUnavailable(CODEX_ENGINE),
+          help: messages.modelPickerAddonUnavailableHelp(CODEX_ENGINE),
+        });
   }
   if (group === "claude" && !claudeAvailable) {
     // "Not found or not logged in" is only true when nothing says otherwise; a Claude Code that is
@@ -354,6 +387,8 @@ export function modelPickerView(input: {
    * unavailable exactly while the Claude catalog is empty.
    */
   readonly claudeState?: ClaudeStatusState;
+  /** Codex's state, when the main process reports one; the same rules as `claudeState` for the ChatGPT group. */
+  readonly codexState?: ClaudeStatusState;
   /** A cross-mode switch (Claude model to Online / Local or back) of this task is running (D-062). */
   readonly switching?: boolean;
   /**
@@ -366,13 +401,17 @@ export function modelPickerView(input: {
   const catalogs: ModelPickerCatalogs = input.catalogs ?? Object.freeze({
     grok: input.catalog ?? EMPTY_GROK_MODEL_CATALOG,
     claude: EMPTY_CLAUDE_MODEL_CATALOG,
+    codex: EMPTY_CODEX_MODEL_CATALOG,
   });
   const taskEngine = input.taskEngine ?? "grok";
   const engineFixed = input.engineFixed ?? true;
   const claudeAvailable = input.claudeState === undefined
     ? catalogs.claude.models.length > 0
     : input.claudeState === "ready";
-  const catalog = catalogs[taskEngine];
+  const codexCatalog = catalogs.codex ?? EMPTY_CODEX_MODEL_CATALOG;
+  // Nothing said about Codex's state means nothing says it cannot run: its default row is offered with the start hint.
+  const codexAvailable = input.codexState === undefined || input.codexState === "ready";
+  const catalog = catalogOfEngine(catalogs, taskEngine);
   const model = catalogModelById(catalog, selection?.modelId);
   const modelId = selection?.modelId ?? null;
   // A Claude task that follows Claude's own default (nothing reported yet, nothing pinned) says so with the
@@ -382,7 +421,9 @@ export function modelPickerView(input: {
     modelGroupOf(model) === "claude";
   const modelName = (defaultRowModel ? modelNameFromDescription(model.description) ?? messages.modelDefaultName : model?.name) ??
     modelId ??
-    (taskEngine === "claude" ? messages.modelPickerClaudeDefault : messages.modelDefaultName);
+    (taskEngine === "claude"
+      ? messages.modelPickerClaudeDefault
+      : taskEngine === CODEX_ENGINE ? messages.modelPickerAddonDefault(CODEX_ENGINE) : messages.modelDefaultName);
   // An effort the task has not pinned is the model's own default, which is what the engine will use.
   const effortId = selection === undefined
     ? null
@@ -428,7 +469,10 @@ export function modelPickerView(input: {
     // by its family. Online, Local and Grok rows keep the table of known ids and the runtime's text.
     const isDefaultRow = group === "claude" && candidate.id === CLAUDE_DEFAULT_ROW_ID;
     const standsFor = isDefaultRow ? modelNameFromDescription(candidate.description) : undefined;
-    const description = group !== "claude"
+    // A Codex row is described by what Codex says about it: there is no table of its models to translate from.
+    const description = group === CODEX_ENGINE
+      ? candidate.description
+      : group !== "claude"
       ? messages.modelDescription(candidate.id, candidate.description)
       : standsFor !== undefined
         ? undefined
@@ -449,7 +493,7 @@ export function modelPickerView(input: {
     };
   };
   const rowsOfGroup = (group: ModelGroup): Omit<ModelRowView, "tabStop">[] =>
-    (group === "grok" ? catalogs.grok : catalogs.claude).models
+    catalogOfEngine(catalogs, engineOfGroup(group)).models
       .filter((candidate) => modelGroupOf(candidate) === group)
       .map((candidate) => rowOf(candidate, group));
   // Claude Code lists its models only once a session has started. Until then (and whenever it lists none) the Claude
@@ -469,9 +513,23 @@ export function modelPickerView(input: {
     runtimeDefault: true,
     ...(crossesMode("claude") ? { restarts: true as const } : {}),
   });
+  // The same for Codex: its group offers "Codex (default model)" until a session reported its models.
+  const codexDefaultOffered =
+    (input.codexState === undefined || input.codexState === "ready" || input.codexState === "not_logged_in") &&
+    !codexCatalog.models.some((candidate) => modelGroupOf(candidate) === CODEX_ENGINE);
+  const codexDefaultRow = (): Omit<ModelRowView, "tabStop"> => ({
+    id: "",
+    name: messages.modelPickerAddonDefault(CODEX_ENGINE),
+    selected: taskEngine === CODEX_ENGINE && selection !== undefined && selection.source !== "task",
+    group: CODEX_ENGINE,
+    engine: CODEX_ENGINE,
+    runtimeDefault: true,
+  });
   const rawGroups = visible.map((group) => {
     const catalogRows = rowsOfGroup(group);
-    const allGroupRows = group === "claude" && claudeDefaultOffered ? [claudeDefaultRow(), ...catalogRows] : catalogRows;
+    const allGroupRows = group === "claude" && claudeDefaultOffered
+      ? [claudeDefaultRow(), ...catalogRows]
+      : group === CODEX_ENGINE && codexDefaultOffered ? [codexDefaultRow(), ...catalogRows] : catalogRows;
     // Claude's list: the Default row and the newest of each family up front, the rest behind "Older models (N)".
     const { shown, older } = group === "claude"
       ? splitOlderClaudeModels(allGroupRows, (row) => row.id === CLAUDE_DEFAULT_ROW_ID || row.runtimeDefault === true)
@@ -510,12 +568,14 @@ export function modelPickerView(input: {
               models: Object.freeze(olderModels),
             }),
           }),
-      ...(entry.catalogRows === 0 ? { empty: groupEmptyView(messages, entry.group, claudeAvailable, input.claudeState) } : {}),
+      ...(entry.catalogRows === 0
+        ? { empty: groupEmptyView(messages, entry.group, claudeAvailable, input.claudeState, codexAvailable, input.codexState) }
+        : {}),
     });
   });
   const models = groups.flatMap((entry) => [...entry.models, ...(entry.older?.models ?? [])]);
   const offeredEfforts = model?.reasoningEfforts ?? [];
-  const efforts = (taskEngine === "claude" ? effortsDescending(offeredEfforts) : offeredEfforts).map((candidate, index): EffortChoiceView => {
+  const efforts = (taskEngine !== "grok" ? effortsDescending(offeredEfforts) : offeredEfforts).map((candidate, index): EffortChoiceView => {
     const selected = candidate.id === effortId;
     return Object.freeze({
       id: candidate.id,
@@ -566,7 +626,7 @@ export function selectionForRow(
   // The default row pins nothing: it clears the task's override so the engine's own default applies.
   const change = row.runtimeDefault === true
     ? CLEAR_MODEL_OVERRIDE
-    : selectionAfterModelChange(catalogs[row.engine], row.id, currentEffort);
+    : selectionAfterModelChange(catalogOfEngine(catalogs, row.engine), row.id, currentEffort);
   return Object.freeze({
     ...change,
     group: row.group,

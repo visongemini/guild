@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { TaskSummaryProjection, TaskViewProjection, WorkspaceProjection } from "@guild/contracts";
-import { hasMixedEngines, taskEngineFixed, taskEngineOf } from "./task-engine.js";
+import { engineMarkerLetter, hasMixedEngines, taskEngineFixed, taskEngineOf } from "./task-engine.js";
 
 const task = (patch: Partial<TaskSummaryProjection> = {}): TaskSummaryProjection => ({
   taskId: "t" as never, workspaceId: "w" as never, title: "T", pinned: false, archived: false, updatedAtMs: 1, ...patch,
@@ -17,6 +17,7 @@ test("a task without an engine is a Grok task", () => {
   assert.equal(taskEngineOf(undefined), "grok");
   assert.equal(taskEngineOf(task()), "grok");
   assert.equal(taskEngineOf(task({ engine: "claude" })), "claude");
+  assert.equal(taskEngineOf(task({ engine: "codex" })), "codex");
 });
 
 test("the engine is open for a fresh task and fixed by anything a Run leaves behind", () => {
@@ -40,4 +41,16 @@ test("markers appear only while both engines are in use", () => {
   assert.equal(hasMixedEngines([workspace("claude", "claude")]), false);
   assert.equal(hasMixedEngines([workspace(undefined, "claude")]), true);
   assert.equal(hasMixedEngines([workspace("grok"), workspace("claude")]), true);
+  // A third engine counts like any other, even when Grok is not among them.
+  assert.equal(hasMixedEngines([workspace("codex", "codex")]), false);
+  assert.equal(hasMixedEngines([workspace("claude", "codex")]), true);
+  assert.equal(hasMixedEngines([workspace(undefined), workspace("codex")]), true);
+});
+
+test("each engine has its own marker letter, and Claude and Codex do not share one (PC-ENG-003)", () => {
+  assert.deepEqual(
+    (["grok", "claude", "codex"] as const).map((engine) => engineMarkerLetter(engine)),
+    ["G", "C", "X"],
+  );
+  assert.equal(new Set((["grok", "claude", "codex"] as const).map((engine) => engineMarkerLetter(engine))).size, 3);
 });

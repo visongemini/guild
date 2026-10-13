@@ -39,3 +39,15 @@ test("names a Claude start that is still going on instead of collapsing it to ru
   assert.equal(classifyComposerSendFailure("claude_start_timeout"), "claude_start");
   assert.equal(classifyComposerSendFailure(new Error("guild_operation_failed")), "runtime");
 });
+
+test("names an add-on engine start that is still going on the same way (PC-ENG-003)", () => {
+  assert.equal(
+    classifyComposerSendFailure(new Error(
+      "Error invoking remote method 'guild:v1:run:send': Error: engine_start_timeout",
+    )),
+    "engine_start",
+  );
+  assert.equal(classifyComposerSendFailure("engine_start_timeout"), "engine_start");
+  // A missing login is not a send failure the composer names: the error entry in the conversation says it.
+  assert.equal(classifyComposerSendFailure(new Error("engine_login_required")), "runtime");
+});

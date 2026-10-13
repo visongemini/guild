@@ -49,6 +49,7 @@ import { XIcon as X } from "@phosphor-icons/react/X";
 import type {
   BrowserCommand,
   BrowserPaneProjection,
+  GuildAddonEngine,
   GuildClaudePermissionMode,
   GuildEngine,
   GuildGrokModel,
@@ -82,7 +83,7 @@ import {
   nicknameInitial,
   parseGuildNickname,
 } from "@guild/contracts/desktop-ipc";
-import { modelGroupOf } from "@guild/contracts/grok-models";
+import { EMPTY_CODEX_MODEL_CATALOG, modelGroupOf } from "@guild/contracts/grok-models";
 import {
   createContext,
   memo,
@@ -134,6 +135,8 @@ import { useModalLayer } from "./modal-layer.js";
 import { applyModelSelectionChange } from "./apply-model-change.js";
 import { claudeDefaultModelOptions, claudeDefaultSelectValue, claudeDefaultsView, claudePermissionModeOf, claudeStatusOf, claudeStatusText } from "./claude-engine.js";
 import { CLAUDE_DEFAULT_ROW_ID } from "./claude-model-families.js";
+import { AddonEngineSettings } from "./AddonEngineSettings.js";
+import { addonPermissionModeOf, addonStatusOf } from "./addon-engine.js";
 import { ModelPicker } from "./ModelPicker.js";
 import { ModelSourcesSettings } from "./ModelSourcesSettings.js";
 import { OnlineReminderDialog } from "./OnlineReminderDialog.js";
@@ -145,7 +148,7 @@ import {
   onlineSourceKey,
   vendorLabelFor,
 } from "./online-reminder.js";
-import { hasMixedEngines, taskEngineFixed, taskEngineOf } from "./task-engine.js";
+import { engineMarkerLetter, hasMixedEngines, taskEngineFixed, taskEngineOf } from "./task-engine.js";
 import { RewindDialog } from "./RewindDialog.js";
 import { RunChangesCard, type RunCardData } from "./RunChangesCard.js";
 import { RunDiffView } from "./RunDiffView.js";
@@ -234,7 +237,7 @@ type ContextMenu =
   | { readonly type: "workspace"; readonly workspace: WorkspaceProjection; readonly x: number; readonly y: number }
   | { readonly type: "task"; readonly task: TaskSummaryProjection; readonly x: number; readonly y: number };
 
-type UiError = "bootstrap" | "claude_start" | "message" | "operation" | "recovery" | "runtime" | "workspace";
+type UiError = "bootstrap" | "claude_start" | "engine_start" | "message" | "operation" | "recovery" | "runtime" | "workspace";
 type SettingsTab = "general" | "engines" | "sources" | "privacy" | "about";
 const SETTINGS_TABS: readonly SettingsTab[] = Object.freeze(["general", "engines", "sources", "privacy", "about"]);
 type OnlineReminderRequest = Readonly<{ vendorLabel: string }>;
@@ -322,6 +325,7 @@ export function GuildApp({ api }: GuildAppProps) {
   // A switch between a Claude model and an Online / Local one restarts the engine and takes a while (D-062).
   const [modelSwitch, setModelSwitch] = useState<ModelSwitchState>();
   const [claudeSettingsFailed, setClaudeSettingsFailed] = useState(false);
+  const [codexSettingsFailed, setCodexSettingsFailed] = useState(false);
   const [rewindTarget, setRewindTarget] = useState<{ readonly runId: RunId }>();
   const rewindReturnFocus = useRef<HTMLElement | null>(null);
   const [runDiff, setRunDiff] = useState<{ readonly runId: RunId; readonly path: string | undefined }>();
@@ -959,13 +963,17 @@ export function GuildApp({ api }: GuildAppProps) {
     reasoningEffort: projection.runtimeSettings.claude?.reasoningEffort ?? null,
   });
   const claudeModelOptions = claudeDefaultModelOptions(baseMessages, claudeDefaults.catalog);
+  const codexSettings = projection.runtimeSettings.engines?.codex;
+  const codexStatus = addonStatusOf(codexSettings);
   const engineFixed = taskEngineFixed(activeTask, activeTask !== undefined && pendingSends.has(activeTask.task.taskId));
   const switchLine = modelSwitchLine(modelSwitch, activeTask?.task.taskId, baseMessages);
   const engineMarkers = hasMixedEngines(activeWorkspaces);
   // The wordmark names the engine of the open task: the Grok runtime's version, or Claude Code's when the main process reports it.
   const engineVersionLabel = activeEngine === "claude"
     ? claudeStatus?.version === undefined ? undefined : `Claude Code ${claudeStatus.version}`
-    : projection.runtimeVersion;
+    : activeEngine === "codex"
+      ? codexStatus?.version === undefined ? undefined : `Codex ${codexStatus.version}`
+      : projection.runtimeVersion;
   const claudeMode = claudePermissionModeOf(activeTask?.sessionModes, projection.runtimeSettings.claude?.permissionMode);
   // The native browser view paints above the DOM: hidden under anything the page draws over it, and off its tab.
   const browserHidden = browserPaneHidden({
@@ -976,10 +984,15 @@ export function GuildApp({ api }: GuildAppProps) {
       commandPaletteOpen || grokControlOpen || contextMenu !== undefined || rewindTarget !== undefined ||
       onlineReminder !== undefined || discardConfirm || contextUsageOpen,
   });
+  const codexMode = addonPermissionModeOf(activeTask?.sessionModes, codexSettings?.availablePermissionModes, codexSettings?.permissionMode);
   const permissionPill = activeEngine === "claude"
     ? claudeMode === undefined
       ? undefined
       : { warn: claudeMode === "bypassPermissions", label: messages.claudePermissionModeName(claudeMode) }
+    : activeEngine === "codex"
+    ? codexMode === undefined
+      ? undefined
+      : { warn: codexMode.endsWith("full-access"), label: messages.addonPermissionModeName("codex", codexMode) }
     : {
         warn: projection.runtimeSettings.permissionMode === "bypassPermissions",
         label: messages.permissionModeName(projection.runtimeSettings.permissionMode),
@@ -1692,6 +1705,22 @@ export function GuildApp({ api }: GuildAppProps) {
     });
   }
 
+  async function setEngineSettings(
+    engine: GuildAddonEngine,
+    model: string | null,
+    reasoningEffort: string | null,
+    permissionMode: string,
+  ) {
+    setCodexSettingsFailed(false);
+    await run(async () => {
+      try {
+        setProjection(await api.setEngineSettings({ engine, model, reasoningEffort, permissionMode }));
+      } catch {
+        setCodexSettingsFailed(true);
+      }
+    });
+  }
+
   /** The Claude catalog depends on the model sources; re-read the settings after they change. */
   async function refreshRuntimeSettings() {
     try {
@@ -2214,7 +2243,20 @@ export function GuildApp({ api }: GuildAppProps) {
               <div className="guild-account-actions">
                 <button ref={accountFirstActionRef} type="button" onClick={() => openProfileEditor()}><PencilSimple size={16} />{messages.editProfile}</button>
               </div>
-              {activeEngine === "claude" ? (
+              {activeEngine === "codex" ? (
+                <div className="guild-usage-card guild-usage-card-claude">
+                  <span>{messages.usageAddonHeading("codex")}</span>
+                  {codexStatus?.accountLabel === undefined
+                    ? <p>{messages.usageAddonAccountManaged("codex")}</p>
+                    : <div className="guild-usage-values"><strong>{codexStatus.accountLabel}</strong></div>}
+                  <p>{!contextWindow.available
+                    ? messages.contextUsageUnavailableCompact
+                    : contextWindow.hasSize
+                      ? messages.contextUsageLabel(contextWindow.usedLabel, contextWindow.sizeLabel, contextWindow.percent)
+                      : messages.contextUsageUsedOnly(contextWindow.usedLabel)}</p>
+                  <p>{messages.usageAddonQuota("codex")}</p>
+                </div>
+              ) : activeEngine === "claude" ? (
                 <div className="guild-usage-card guild-usage-card-claude">
                   <span>{messages.usageClaudeHeading}</span>
                   {claudeStatus?.accountLabel === undefined
@@ -2504,6 +2546,8 @@ export function GuildApp({ api }: GuildAppProps) {
                 ? messages.runtimeUnavailable
                 : error === "claude_start"
                   ? messages.claudeStartTimeout
+                : error === "engine_start"
+                  ? messages.addonStartTimeout(activeEngine === "codex" ? activeEngine : "codex")
                 : error === "recovery"
                   ? messages.sessionRecoveryContextRequired
                 : error === "workspace"
@@ -2774,6 +2818,7 @@ export function GuildApp({ api }: GuildAppProps) {
                 switching={modelSwitchRunning(modelSwitch, activeTask?.task.taskId)}
                 modalOpen={onlineReminder !== undefined}
                 {...(claudeStatus === undefined ? {} : { claudeState: claudeStatus.state })}
+                {...(codexStatus === undefined ? {} : { codexState: codexStatus.state })}
                 onApply={applyTaskRuntimeSettings}
                 onOpenModelSources={() => openSettings("sources")}
               />
@@ -2788,7 +2833,7 @@ export function GuildApp({ api }: GuildAppProps) {
                 >{messages.steerAction}<kbd aria-hidden="true">{messages.steerShortcut}</kbd></button>
               )}
               {running ? (
-                <button className="guild-send guild-stop" type="button" disabled={busy || activeTask?.task.activeRunState === "cancel_requested"} onClick={() => void cancelActiveRun()} aria-label={messages.stop} title={messages.stop}><Stop size={12} weight="fill" /></button>
+                <button className="guild-send guild-stop" type="button" disabled={busy || activeTask?.task.activeRunState === "cancel_requested"} onClick={() => void cancelActiveRun()} aria-label={messages.stop} title={activeEngine === "codex" ? `${messages.stop} \u00b7 ${messages.addonStopCaveat("codex")}` : messages.stop}><Stop size={12} weight="fill" /></button>
               ) : (
                 <button className="guild-send" type="submit" disabled={draft.trim().length === 0 || activeTask === undefined || !activeTask.canSend || busy || activePendingSend !== undefined || (running && promptAttachments.length > 0)} aria-label={messages.send} title={messages.send}>
                   {busy || pendingSendForActive !== undefined ? <SpinnerGap size={16} className="guild-spin" /> : <ArrowUp size={16} weight="bold" />}
@@ -3448,6 +3493,17 @@ export function GuildApp({ api }: GuildAppProps) {
                       );
                     })()}
                   </div>
+                  {codexSettings !== undefined && (
+                    <AddonEngineSettings
+                      engine="codex"
+                      messages={baseMessages}
+                      settings={codexSettings}
+                      catalog={modelCatalogs.codex ?? EMPTY_CODEX_MODEL_CATALOG}
+                      busy={busy}
+                      failed={codexSettingsFailed}
+                      onChange={(model, reasoningEffort, permissionMode) => void setEngineSettings("codex", model, reasoningEffort, permissionMode)}
+                    />
+                  )}
                 </div>
               )}
               {settingsTab === "sources" && (
@@ -3494,6 +3550,9 @@ export function GuildApp({ api }: GuildAppProps) {
                     <div className="guild-account-meta"><span>{messages.version}</span><span>{projection.appVersion}</span></div>
                     {projection.runtimeVersion !== undefined && (
                       <div className="guild-account-meta"><span>Grok</span><span>{projection.runtimeVersion}</span></div>
+                    )}
+                    {codexStatus?.version !== undefined && (
+                      <div className="guild-account-meta"><span>Codex</span><span>{codexStatus.version}</span></div>
                     )}
                     {claudeStatus?.version !== undefined && (
                       <div className="guild-account-meta"><span>Claude Code</span><span>{claudeStatus.version}</span></div>
@@ -3804,7 +3863,7 @@ export const WorkspaceTree = memo(function WorkspaceTree({ workspace, expanded, 
                   )}
                   {engineMarkers && (
                     <span className={`guild-task-engine ${taskEngineOf(task)}`} title={messages.taskEngineMarkerTitle(taskEngineOf(task))}>
-                      <span aria-hidden="true">{messages.taskEngineName(taskEngineOf(task)).charAt(0)}</span>
+                      <span aria-hidden="true">{engineMarkerLetter(taskEngineOf(task))}</span>
                       <span className="guild-sr-only">{messages.taskEngineMarkerTitle(taskEngineOf(task))}</span>
                     </span>
                   )}

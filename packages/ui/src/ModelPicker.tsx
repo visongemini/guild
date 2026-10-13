@@ -44,6 +44,8 @@ export type ModelPickerProps = Readonly<{
   engineFixed: boolean;
   /** Claude Code's state, when the main process reports one; see `modelPickerView`. */
   claudeState?: ClaudeStatusState;
+  /** Codex's state, when the main process reports one (the ChatGPT group); the same rules as `claudeState`. */
+  codexState?: ClaudeStatusState;
   /** A switch between a Claude model and an Online / Local one is running for this task (D-062): the trigger says so. */
   switching?: boolean;
   /**
@@ -107,6 +109,7 @@ export function ModelPicker({
   taskEngine,
   engineFixed,
   claudeState,
+  codexState,
   switching = false,
   modalOpen = false,
   onApply,
@@ -136,6 +139,7 @@ export function ModelPicker({
     switching,
     ...(olderOpen === undefined ? {} : { olderExpanded: olderOpen }),
     ...(claudeState === undefined ? {} : { claudeState }),
+    ...(codexState === undefined ? {} : { codexState }),
   });
   const locked = pickerIsLocked(view.disabledReason);
   const panelOpen = open && !locked;

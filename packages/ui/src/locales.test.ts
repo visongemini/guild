@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { GUILD_ADDON_PERMISSION_MODES } from "@guild/contracts";
 import { LOCALES, claudeOverrideKeys, messagesFor } from "./locales.js";
 
 test("Chinese and English catalogs expose the same keys", () => {
@@ -119,8 +120,8 @@ test("Guild 3.0 strings exist, are non-empty and mention no undefined in both ca
 test("the picker group names are the ones the product contract states", () => {
   const en = messagesFor("en-US");
   const zh = messagesFor("zh-CN");
-  assert.deepEqual((["grok", "claude", "online", "local"] as const).map(en.modelGroupName), ["Grok", "Claude", "Online", "Local"]);
-  assert.deepEqual((["grok", "claude", "online", "local"] as const).map(zh.modelGroupName), ["Grok", "Claude\uff08\u8ba2\u9605\uff09", "\u5728\u7ebf", "\u672c\u5730"]);
+  assert.deepEqual((["grok", "claude", "codex", "online", "local"] as const).map(en.modelGroupName), ["Grok", "Claude", "ChatGPT", "Online", "Local"]);
+  assert.deepEqual((["grok", "claude", "codex", "online", "local"] as const).map(zh.modelGroupName), ["Grok", "Claude\uff08\u8ba2\u9605\uff09", "ChatGPT\uff08\u8ba2\u9605\uff09", "\u5728\u7ebf", "\u672c\u5730"]);
   assert.equal(en.modelPickerGroupEmpty("online"), "No online models \u2014 add one in Settings \u203a Model sources");
   assert.equal(en.modelPickerClaudeUnavailable, "Claude Code not found or not logged in");
   assert.equal(en.onlineReminderTitle, "Confirm before sending to an online model");
@@ -188,4 +189,52 @@ test("the Claude start-timeout wording is retryable and names Claude in both lan
     "Claude is still starting (plugins and connectors can take a while). Try again in a moment.",
   );
   assert.match(messagesFor("zh-CN", "claude").claudeStartTimeout, /Claude 仍在启动.*稍后再试/u);
+});
+
+test("Guild 3.1 add-on engine strings exist, are non-empty and mention no undefined in both catalogs (PC-ENG-003, PC-I18N-001)", () => {
+  for (const locale of ["zh-CN", "en-US"] as const) {
+    const messages = messagesFor(locale);
+    const texts: string[] = [];
+    for (const engine of ["codex"] as const) {
+      texts.push(
+        messages.settingsAddonHeading(engine), messages.enginesAddonIntro(engine), messages.addonSettingsHelp(engine),
+        messages.addonSettingsFailed(engine), messages.addonDefaultModelOption(engine), messages.addonStartTimeout(engine),
+        messages.addonStopCaveat(engine), messages.addonInstallCommand(engine), messages.addonLoginCommand(engine),
+        messages.modelPickerAddonUnavailable(engine), messages.modelPickerAddonUnavailableHelp(engine),
+        messages.modelPickerAddonNotStarted(engine), messages.modelPickerAddonDefault(engine),
+        messages.addonStatusReady(engine, undefined), messages.addonStatusReady(engine, "ChatGPT Plus"),
+        messages.addonStatusNotFound(engine), messages.addonStatusNotLoggedIn(engine), messages.addonStatusUnavailable(engine),
+        messages.addonStatusIntegrityChanged(engine), messages.usageAddonHeading(engine),
+        messages.usageAddonAccountManaged(engine), messages.usageAddonQuota(engine),
+        messages.taskEngineName(engine), messages.taskEngineMarkerTitle(engine),
+      );
+      for (const mode of GUILD_ADDON_PERMISSION_MODES[engine]) {
+        texts.push(messages.addonPermissionModeName(engine, mode), messages.addonPermissionModeHelp(engine, mode));
+        // The mode ids are never shown raw: every mode has product wording.
+        assert.notEqual(messages.addonPermissionModeName(engine, mode), mode, `${locale}: ${mode}`);
+      }
+    }
+    for (const text of texts) {
+      assert.equal(text.trim().length > 0, true, `${locale}: empty string`);
+      assert.equal(text.includes("undefined"), false, `${locale}: ${text}`);
+    }
+  }
+});
+
+test("the Codex permission modes use the product's own Chinese words and the same four modes in English (3.0.2 labels)", () => {
+  const zh = messagesFor("zh-CN");
+  const en = messagesFor("en-US");
+  const modes = GUILD_ADDON_PERMISSION_MODES.codex;
+  assert.deepEqual(modes, ["read-only", "workspace-write", "agent", "agent-full-access"]);
+  assert.deepEqual(modes.map((mode) => zh.addonPermissionModeName("codex", mode)), ["\u53ea\u8bfb\uff0c\u9700\u786e\u8ba4", "\u5de5\u4f5c\u533a\u8bbf\u95ee", "\u81ea\u52a8\u5ba1\u67e5", "\u5b8c\u5168\u8bbf\u95ee"]);
+  assert.deepEqual(modes.map((mode) => en.addonPermissionModeName("codex", mode)), ["Read-only, ask first", "Workspace access", "Auto review", "Full access"]);
+  // An id the engine does not offer falls back to the id itself rather than to another engine's wording.
+  assert.equal(en.addonPermissionModeName("codex", "plan"), "plan");
+  assert.equal(en.addonPermissionModeHelp("codex", "plan"), "");
+});
+
+test("the Codex task and marker names are the engine's own in both languages", () => {
+  assert.deepEqual((["grok", "claude", "codex"] as const).map(messagesFor("en-US").taskEngineName), ["Grok", "Claude", "Codex"]);
+  assert.equal(messagesFor("en-US").taskEngineMarkerTitle("codex"), "Codex conversation");
+  assert.equal(messagesFor("zh-CN").taskEngineMarkerTitle("codex"), "Codex \u5bf9\u8bdd");
 });

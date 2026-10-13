@@ -228,6 +228,7 @@ span.guild-pill { cursor: default; }
 .guild-task-pin { width: 12px; height: 14px; display: grid; place-items: center; color: var(--guild-faint); }
 .guild-task-engine { flex: 0 0 auto; width: 14px; height: 14px; display: grid; place-items: center; border: 1px solid var(--guild-line-strong); border-radius: var(--guild-r-xs); color: var(--guild-faint); font-size: 9px; font-weight: 650; line-height: 1; }
 .guild-task-engine.claude { border-color: color-mix(in srgb, var(--guild-accent) 45%, var(--guild-line-strong)); color: var(--guild-accent-text); }
+.guild-task-engine.codex { border-color: color-mix(in srgb, var(--guild-fresh) 40%, var(--guild-line-strong)); color: var(--guild-fresh); }
 .guild-task-row-wrap:hover .guild-task-row { background: color-mix(in srgb, var(--guild-text) var(--guild-row-hover-pct), transparent); }
 .guild-task-row.active, .guild-task-row-wrap.active:hover .guild-task-row { background: color-mix(in srgb, var(--guild-text) var(--guild-row-selected-pct), transparent); }
 .guild-task-row.active .guild-task-title { font-weight: 560; }
@@ -1056,7 +1057,8 @@ span.guild-pill { cursor: default; }
 .guild-settings-block .guild-setting-help + .guild-setting-help { margin-top: var(--guild-s2); }
 /* Engines tab (PC-SET-002) */
 .guild-engine-heading { margin: 0 0 var(--guild-s2); color: var(--guild-text); font-size: var(--guild-fs-title); font-weight: 650; } /* same as .guild-settings-heading */
-.guild-engine-claude { padding-top: var(--guild-s4); border-top: 1px solid var(--guild-line); }
+.guild-engine-claude, .guild-engine-codex { padding-top: var(--guild-s4); border-top: 1px solid var(--guild-line); }
+.guild-engine-command { display: block; margin-top: 2px; padding: 3px var(--guild-s2); border-radius: var(--guild-r-xs); background: var(--guild-code-bg); color: var(--guild-code-text); font-family: var(--guild-font-mono); font-size: var(--guild-fs-sm); user-select: all; overflow-wrap: anywhere; }
 .guild-engine-status { margin: var(--guild-s2) 1px 1px; padding: var(--guild-s2) var(--guild-s3); display: grid; gap: 2px; border-radius: var(--guild-r-sm); background: var(--guild-soft); color: var(--guild-muted); font-size: var(--guild-fs-sm); line-height: 1.5; }
 .guild-engine-status strong { color: var(--guild-ok-text); font-weight: 600; }
 .guild-engine-status.not_found strong, .guild-engine-status.not_logged_in strong, .guild-engine-status.unavailable strong, .guild-engine-status.integrity_changed strong { color: var(--guild-wait-text); }

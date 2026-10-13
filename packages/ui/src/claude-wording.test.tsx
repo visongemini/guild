@@ -27,7 +27,7 @@ const GROK_ONLY_SURFACES: ReadonlyMap<string, string> = new Map([
   ["usageUnavailable", "the Grok usage card; a Claude task shows its own card"],
   ["viewOfficialUsage", "the Grok usage card; a Claude task shows its own card"],
   ["modelPickerEmpty", "the hint of the Grok group of the picker"],
-  ["modelPickerEngineNote", "the note that the first message chooses between Grok and Claude"],
+  ["modelPickerEngineNote", "the note that the first message chooses between Grok, Claude and ChatGPT"],
   ["aboutRole", "Settings > About, which names both engines"],
   ["privacyBrowserSyncHelp", "Settings > Privacy (global)"],
   ["officialSettingScope", "not shown to a Claude task"],

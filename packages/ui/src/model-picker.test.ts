@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   EMPTY_CLAUDE_MODEL_CATALOG,
+  EMPTY_CODEX_MODEL_CATALOG,
   defaultReasoningEffortOf,
   freezeGrokModelCatalog,
   freezeModelCatalog,
@@ -352,11 +353,13 @@ const CATALOGS = Object.freeze({ grok: REAL_CATALOG, claude: CLAUDE_CATALOG });
 const groupView = (view: ReturnType<typeof modelPickerView>, group: string) =>
   view.groups.find((entry) => entry.group === group)!;
 
-test("a task with a Run lists only its engine's groups, a task without one lists all four in order", () => {
+test("a task with a Run lists only its engine's groups, a task without one lists all five in order", () => {
   assert.deepEqual(visibleModelGroups("grok", true), ["grok"]);
   assert.deepEqual(visibleModelGroups("claude", true), ["claude", "online", "local"]);
-  assert.deepEqual(visibleModelGroups("grok", false), ["grok", "claude", "online", "local"]);
-  assert.deepEqual(visibleModelGroups("claude", false), ["grok", "claude", "online", "local"]);
+  assert.deepEqual(visibleModelGroups("codex", true), ["codex"]);
+  assert.deepEqual(visibleModelGroups("grok", false), ["grok", "claude", "codex", "online", "local"]);
+  assert.deepEqual(visibleModelGroups("claude", false), ["grok", "claude", "codex", "online", "local"]);
+  assert.deepEqual(visibleModelGroups("codex", false), ["grok", "claude", "codex", "online", "local"]);
   const fixed = modelPickerView({
     messages: EN, catalogs: CATALOGS, selection: selection("opus", "high"), taskEngine: "claude", engineFixed: true,
   });
@@ -366,7 +369,7 @@ test("a task with a Run lists only its engine's groups, a task without one lists
   const fresh = modelPickerView({
     messages: EN, catalogs: CATALOGS, selection: selection("grok-4.7", "high", "runtime"), taskEngine: "grok", engineFixed: false,
   });
-  assert.deepEqual(fresh.groups.map((entry) => entry.label), ["Grok", "Claude", "Online", "Local"]);
+  assert.deepEqual(fresh.groups.map((entry) => entry.label), ["Grok", "Claude", "ChatGPT", "Online", "Local"]);
   assert.equal(fresh.engineNote, EN.modelPickerEngineNote);
   // A Grok task that already ran keeps the old single, heading-less list.
   const grokFixed = modelPickerView({ messages: EN, catalogs: CATALOGS, selection: selection("grok-4.7", "high"), taskEngine: "grok", engineFixed: true });
@@ -374,11 +377,11 @@ test("a task with a Run lists only its engine's groups, a task without one lists
   assert.equal(grokFixed.groups.length, 1);
 });
 
-test("group headings are localized: Grok, Claude (subscription), Online, Local", () => {
+test("group headings are localized: Grok, Claude (subscription), ChatGPT (subscription), Online, Local", () => {
   const zh = modelPickerView({
     messages: ZH, catalogs: CATALOGS, selection: selection("grok-4.7", "high", "runtime"), taskEngine: "grok", engineFixed: false,
   });
-  assert.deepEqual(zh.groups.map((entry) => entry.label), ["Grok", "Claude\uff08\u8ba2\u9605\uff09", "\u5728\u7ebf", "\u672c\u5730"]);
+  assert.deepEqual(zh.groups.map((entry) => entry.label), ["Grok", "Claude\uff08\u8ba2\u9605\uff09", "ChatGPT\uff08\u8ba2\u9605\uff09", "\u5728\u7ebf", "\u672c\u5730"]);
 });
 
 test("rows go to the group their catalog entry names and only the task's own engine marks a selection", () => {
@@ -475,7 +478,7 @@ test("an empty Claude catalog offers Claude Code (default model), so a Claude ta
   // Once Claude lists its own models there is nothing to stand in for them.
   for (const claudeState of [undefined, "ready"] as const) {
     const listed = modelPickerView({ ...fresh, catalogs: CATALOGS, ...(claudeState === undefined ? {} : { claudeState }) });
-    assert.equal(listed.models.some((row) => row.runtimeDefault === true), false);
+    assert.equal(groupView(listed, "claude").models.some((row) => row.runtimeDefault === true), false);
     assert.equal(groupView(listed, "claude").empty, undefined);
   }
   // A task bound to Grok never sees the Claude group, so it never sees the row.
@@ -567,9 +570,14 @@ test("the catalogs come from modelCatalogs, falling back to the single Grok cata
   const legacy = modelCatalogsOf({ modelCatalog: REAL_CATALOG });
   assert.equal(legacy.grok, REAL_CATALOG);
   assert.equal(legacy.claude, EMPTY_CLAUDE_MODEL_CATALOG);
-  const both = modelCatalogsOf({ modelCatalog: { models: [] }, modelCatalogs: { grok: REAL_CATALOG, claude: CLAUDE_CATALOG } });
+  assert.equal(legacy.codex, EMPTY_CODEX_MODEL_CATALOG);
+  const both = modelCatalogsOf({
+    modelCatalog: { models: [] },
+    modelCatalogs: { grok: REAL_CATALOG, claude: CLAUDE_CATALOG, codex: EMPTY_CODEX_MODEL_CATALOG },
+  });
   assert.equal(both.grok, REAL_CATALOG);
   assert.equal(both.claude, CLAUDE_CATALOG);
+  assert.equal(both.codex, EMPTY_CODEX_MODEL_CATALOG);
 });
 
 test("a cancelled switch needs no notice", () => {
@@ -581,3 +589,112 @@ function freezeClaude(models: readonly { id: string; name: string; group: "claud
     models: models.map((model) => ({ ...model, reasoningEfforts: [], contextWindows: [] })),
   });
 }
+
+// ---- Guild 3.1 ChatGPT (Codex) group (PC-ENG-003, PC-MODEL-001)
+
+function freezeCodex(models: readonly { id: string; name: string; efforts?: readonly [string, boolean][]; description?: string }[]) {
+  return freezeModelCatalog("codex", {
+    models: models.map((model) => ({
+      id: model.id,
+      name: model.name,
+      group: "codex",
+      ...(model.description === undefined ? {} : { description: model.description }),
+      reasoningEfforts: (model.efforts ?? []).map(([id, isDefault]) => ({ id, label: id, isDefault })),
+      contextWindows: [],
+    })),
+  });
+}
+
+const CODEX_CATALOG = freezeCodex([
+  { id: "gpt-6.1-sol", name: "GPT-6.1 Sol", description: "Frontier coding model.", efforts: [["low", false], ["medium", true], ["high", false], ["ultra", false]] },
+  { id: "gpt-6.1-luna", name: "GPT-6.1 Luna", efforts: [["low", false], ["medium", true]] },
+]);
+
+test("the ChatGPT group lists Codex's own models by id, with its own description and efforts strongest first", () => {
+  const catalogs = { grok: REAL_CATALOG, claude: CLAUDE_CATALOG, codex: CODEX_CATALOG };
+  const view = modelPickerView({
+    messages: EN, catalogs, selection: selection("gpt-6.1-sol", "medium"), taskEngine: "codex", engineFixed: true, codexState: "ready",
+  });
+  assert.deepEqual(view.groups.map((entry) => entry.group), ["codex"]);
+  // One group left: the list reads like a Grok task that already ran, without a heading.
+  assert.equal(view.showGroupHeadings, false);
+  assert.deepEqual(groupView(view, "codex").models.map((row) => [row.id, row.name, row.engine, row.group]), [
+    ["gpt-6.1-sol", "GPT-6.1 Sol", "codex", "codex"],
+    ["gpt-6.1-luna", "GPT-6.1 Luna", "codex", "codex"],
+  ]);
+  // Codex words its own models; Guild has no table of them to translate from.
+  assert.equal(groupView(view, "codex").models[0]!.description, "Frontier coding model.");
+  assert.deepEqual(view.models.filter((row) => row.selected).map((row) => row.id), ["gpt-6.1-sol"]);
+  assert.equal(view.triggerText, "GPT-6.1 Sol \u00b7 Medium");
+  // Strongest first, with ultra above high; the model's own default stays marked.
+  assert.deepEqual(view.efforts.map((effort) => effort.id), ["ultra", "high", "medium", "low"]);
+  assert.equal(view.efforts.find((effort) => effort.id === "medium")!.isDefault, true);
+  // No default row once the models are known.
+  assert.equal(view.models.some((row) => row.runtimeDefault === true), false);
+  assert.equal(groupView(view, "codex").empty, undefined);
+});
+
+test("before Codex has reported models its group offers one 'Codex (default model)' row and the hint", () => {
+  const catalogs = { grok: REAL_CATALOG, claude: CLAUDE_CATALOG, codex: EMPTY_CODEX_MODEL_CATALOG };
+  const fresh = { messages: EN, catalogs, selection: selection("grok-4.7", "high", "runtime"), taskEngine: "grok" as const, engineFixed: false };
+  for (const codexState of [undefined, "ready", "not_logged_in"] as const) {
+    const view = modelPickerView({ ...fresh, ...(codexState === undefined ? {} : { codexState }) });
+    const codex = groupView(view, "codex");
+    assert.deepEqual(
+      codex.models.map((row) => [row.id, row.name, row.group, row.engine, row.runtimeDefault, row.selected]),
+      [["", "Codex (default model)", "codex", "codex", true, false]],
+      String(codexState),
+    );
+    if (codexState === "not_logged_in") {
+      // The row still lets the task start (Codex reports the login on its first start); the hint says what is missing.
+      assert.equal(codex.empty?.kind, "claude_unavailable");
+      assert.equal(codex.empty?.text, EN.modelPickerAddonUnavailable("codex"));
+    } else {
+      assert.equal(codex.empty?.kind, "not_started", String(codexState));
+      assert.equal(codex.empty?.text, EN.modelPickerAddonNotStarted("codex"));
+    }
+    assert.equal(view.models.some((row) => row.group === "codex" && row.runtimeDefault === true), true);
+  }
+  // A missing or refused installation offers no row, only the way to fix it.
+  for (const codexState of ["not_found", "unavailable", "integrity_changed"] as const) {
+    const codex = groupView(modelPickerView({ ...fresh, codexState }), "codex");
+    assert.equal(codex.models.length, 0, codexState);
+    assert.equal(codex.empty?.kind, "claude_unavailable", codexState);
+  }
+  assert.equal(groupView(modelPickerView({ ...fresh, codexState: "not_found" }), "codex").empty?.text, EN.modelPickerAddonUnavailable("codex"));
+  assert.equal(groupView(modelPickerView({ ...fresh, codexState: "not_found" }), "codex").empty?.help, EN.modelPickerAddonUnavailableHelp("codex"));
+  assert.equal(groupView(modelPickerView({ ...fresh, codexState: "unavailable" }), "codex").empty?.text, EN.addonStatusUnavailable("codex"));
+  // A Grok task that already ran never sees the row.
+  assert.equal(modelPickerView({ ...fresh, engineFixed: true }).models.some((row) => row.group === "codex"), false);
+  // The zh wording is the owner-facing one.
+  assert.equal(groupView(modelPickerView({ ...fresh, messages: ZH }), "codex").models[0]!.name, "Codex\uff08\u9ed8\u8ba4\u6a21\u578b\uff09");
+});
+
+test("choosing a Codex row moves an unstarted task to Codex; the default row pins nothing", () => {
+  const catalogs = { grok: REAL_CATALOG, claude: CLAUDE_CATALOG, codex: CODEX_CATALOG };
+  const view = modelPickerView({
+    messages: EN, catalogs, selection: selection("grok-4.7", "high", "runtime"), taskEngine: "grok", engineFixed: false,
+  });
+  const luna = view.models.find((row) => row.id === "gpt-6.1-luna")!;
+  assert.deepEqual(selectionForRow(catalogs, luna, view.selectedEffortId, "grok"), {
+    model: "gpt-6.1-luna", reasoningEffort: "medium", group: "codex", engine: "codex",
+  });
+  // On a Codex task the engine does not change, so the move is not announced.
+  const sameEngine = selectionForRow(catalogs, luna, "low", "codex");
+  assert.equal("engine" in sameEngine, false);
+  assert.equal(sameEngine.model, "gpt-6.1-luna");
+  // The default row clears the override, whatever the catalog says.
+  const empty = { ...catalogs, codex: EMPTY_CODEX_MODEL_CATALOG };
+  const emptyView = modelPickerView({ messages: EN, catalogs: empty, selection: selection(null, null, "runtime"), taskEngine: "grok", engineFixed: false });
+  const defaultRow = emptyView.models.find((row) => row.group === "codex")!;
+  assert.deepEqual(selectionForRow(empty, defaultRow, null, "grok"), { model: null, reasoningEffort: null, group: "codex", engine: "codex" });
+});
+
+test("an absent Codex catalog reads as an empty one, so a pre-3.1 caller still works", () => {
+  const view = modelPickerView({
+    messages: EN, catalogs: { grok: REAL_CATALOG, claude: CLAUDE_CATALOG }, selection: selection("grok-4.7", "high", "runtime"),
+    taskEngine: "grok", engineFixed: false,
+  });
+  assert.equal(groupView(view, "codex").models[0]!.name, "Codex (default model)");
+  assert.equal(modelCatalogsOf({ modelCatalog: REAL_CATALOG }).codex, EMPTY_CODEX_MODEL_CATALOG);
+});

@@ -212,13 +212,15 @@ test("a new task's picker offers the Grok group next to the others and explains 
     taskEngine: "grok",
     engineFixed: false,
   });
-  assert.equal(markup.match(/role="group"/gu)?.length, 4);
+  assert.equal(markup.match(/role="group"/gu)?.length, 5);
   assert.match(markup, />Grok<\/div>/u);
+  assert.match(markup, />ChatGPT<\/div>/u);
   assert.match(markup, /<strong>Grok 4\.7 Fast<\/strong>/u);
   assert.match(markup, /<strong>Opus<\/strong>/u);
-  assert.match(markup, /class="guild-model-footnote guild-model-engine-note">The model you pick for the first message decides whether this conversation runs on Grok or Claude\./u);
+  assert.match(markup, /class="guild-model-footnote guild-model-engine-note">The model you pick for the first message decides whether this conversation runs on Grok, Claude or ChatGPT\./u);
   const zh = renderClaude({ messages: ZH, selection: selection("grok-4.7", "high", "runtime"), taskEngine: "grok", engineFixed: false });
   assert.match(zh, />Claude（订阅）<\/div>/u);
+  assert.match(zh, />ChatGPT（订阅）<\/div>/u);
   assert.match(zh, />在线<\/div>/u);
   assert.match(zh, />本地<\/div>/u);
 });

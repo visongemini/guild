@@ -84,7 +84,7 @@ test("Grok-only surfaces stay Grok-only: tools, control center, usage read and t
 
 test("the usage popover is Claude's own for a Claude task: account label, context usage, quota managed by Claude Code, no grok.com link", () => {
   const popover = between(app, 'className="guild-account-popover"', "guild-account-meta");
-  const claude = between(popover, '{activeEngine === "claude" ? (', ") : (");
+  const claude = between(popover, ': activeEngine === "claude" ? (', ") : (");
   assert.match(claude, /claudeStatus\?\.accountLabel === undefined/u);
   assert.match(claude, /messages\.usageClaudeAccountUnknown/u);
   assert.match(claude, /messages\.contextUsageLabel\(contextWindow\.usedLabel/u);
@@ -150,6 +150,33 @@ test("the settings dialog is wide enough for five tabs and the stylesheet styles
 });
 
 test("the wordmark names the version of the engine the open task runs on", () => {
-  assert.match(app, /const engineVersionLabel = activeEngine === "claude"\s*\n\s*\? claudeStatus\?\.version === undefined \? undefined : `Claude Code \$\{claudeStatus\.version\}`\s*\n\s*: projection\.runtimeVersion;/u);
+  assert.match(app, /const engineVersionLabel = activeEngine === "claude"\s*\n\s*\? claudeStatus\?\.version === undefined \? undefined : `Claude Code \$\{claudeStatus\.version\}`\s*\n\s*: activeEngine === "codex"\s*\n\s*\? codexStatus\?\.version === undefined \? undefined : `Codex \$\{codexStatus\.version\}`\s*\n\s*: projection\.runtimeVersion;/u);
   assert.match(app, /\{engineVersionLabel !== undefined && <small title=\{engineVersionLabel\}>\{engineVersionLabel\}<\/small>\}/u);
+});
+
+test("the Codex engine (PC-ENG-003) has its own Settings section, usage card, permission pill and no Grok-only link", () => {
+  // The Engines tab renders the add-on section after Claude's, and saves through the generic engine channel.
+  const engines = between(app, '{settingsTab === "engines" && (', '{settingsTab === "sources" && (');
+  assert.ok(engines.indexOf("guild-engine-claude") < engines.indexOf("<AddonEngineSettings"));
+  assert.match(engines, /\{codexSettings !== undefined && \(\s*\n\s*<AddonEngineSettings\s*\n\s*engine="codex"/u);
+  assert.match(engines, /void setEngineSettings\("codex", model, reasoningEffort, permissionMode\)/u);
+  assert.match(app, /api\.setEngineSettings\(\{ engine, model, reasoningEffort, permissionMode \}\)/u);
+  // The usage popover: the engine's own account label (a plan only when Codex reported one), context use, quota managed by Codex.
+  const popover = between(app, 'className="guild-account-popover"', "guild-account-meta");
+  const codex = between(popover, '{activeEngine === "codex" ? (', ") : activeEngine");
+  assert.match(codex, /codexStatus\?\.accountLabel === undefined/u);
+  assert.match(codex, /messages\.usageAddonAccountManaged\("codex"\)/u);
+  assert.match(codex, /messages\.usageAddonQuota\("codex"\)/u);
+  assert.match(codex, /messages\.contextUsageLabel\(contextWindow\.usedLabel/u);
+  assert.doesNotMatch(codex, /grok\.com|openExternal|usage\.status/u);
+  // The permission pill names the Codex mode, warning only for the full-access one.
+  assert.match(app, /warn: codexMode\.endsWith\("full-access"\), label: messages\.addonPermissionModeName\("codex", codexMode\)/u);
+  // The stop button tells the truth about foreground commands.
+  assert.match(app, /messages\.addonStopCaveat\("codex"\)/u);
+});
+
+test("the sidebar marker has a letter and a colour for Codex without taking more room", () => {
+  const style = cssBlock(".guild-task-engine.codex");
+  assert.match(style, /color:\s*var\(--guild-fresh\)/u);
+  assert.doesNotMatch(style, /width|height|flex/u);
 });

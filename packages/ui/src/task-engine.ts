@@ -29,17 +29,25 @@ export function taskEngineFixed(
 }
 
 /**
- * Engine markers on the sidebar rows appear only while both engines are in use, so a user who only
- * ever uses one engine sees no change at all, and with both every row carries a marker.
+ * The letter of an engine's marker on the sidebar rows. It is fixed, not the first letter of the engine's name,
+ * because Claude and Codex both begin with C.
+ */
+const ENGINE_MARKER_LETTERS: Readonly<Record<GuildEngine, string>> = Object.freeze({ grok: "G", claude: "C", codex: "X" });
+
+export function engineMarkerLetter(engine: GuildEngine): string {
+  return ENGINE_MARKER_LETTERS[engine];
+}
+
+/**
+ * Engine markers on the sidebar rows appear only while more than one engine is in use, so a user who only ever
+ * uses one engine sees no change at all, and with several every row carries a marker.
  */
 export function hasMixedEngines(workspaces: readonly Pick<WorkspaceProjection, "tasks">[]): boolean {
-  let sawClaude = false;
-  let sawGrok = false;
+  const seen = new Set<GuildEngine>();
   for (const workspace of workspaces) {
     for (const task of workspace.tasks) {
-      if (taskEngineOf(task) === "claude") sawClaude = true;
-      else sawGrok = true;
-      if (sawClaude && sawGrok) return true;
+      seen.add(taskEngineOf(task));
+      if (seen.size > 1) return true;
     }
   }
   return false;
