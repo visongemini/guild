@@ -70,7 +70,8 @@ export type LocatedCodexEngine = Readonly<{
 export type CodexLocatorOptions = ClaudeLocatorOptions & Readonly<{
   /**
    * Package directories of a `codex-acp` install to try before the usual places. Only the dev-only QA hook
-   * (`GUILD_DEV_CODEX_ACP`, see dev-hooks.ts) sets it, and only for an unpackaged app; the pin still applies.
+   * (`GUILD_DEV_CODEX_ACP`, see dev-hooks.ts) sets it, and only for an unpackaged app; the locator ignores it unless
+   * the development search is on (claude-locator.ts), and the pin still applies.
    */
   readonly extraAdapterRoots?: readonly string[];
 }>;
@@ -103,8 +104,9 @@ export async function locateCodexAdapter(options: CodexLocatorOptions = {}): Pro
   const context = resolveContext(options);
   let unsupported: string | undefined;
   const seenRoots = new Set<string>();
+  // The dev-only adapter root is honoured only in a development run, whatever the caller passed.
   const roots: Array<{ readonly root: string; readonly entryPath: string | undefined }> = [
-    ...(options.extraAdapterRoots ?? []).map((root) => ({ root, entryPath: undefined })),
+    ...(context.allowEnvironmentPath ? options.extraAdapterRoots ?? [] : []).map((root) => ({ root, entryPath: undefined })),
   ];
   for (const candidate of await findCandidates("adapter", "codex-acp", context)) {
     const root = adapterPackageRoot(candidate);

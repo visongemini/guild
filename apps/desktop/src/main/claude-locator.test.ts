@@ -1,11 +1,13 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { chmod, mkdir, mkdtemp, readFile, realpath, rm, symlink, utimes, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { after, afterEach, describe, it } from "node:test";
 import {
+  allowDevelopmentLocatorSearch,
   buildClaudeSearchPath,
+  buildTrustedSearchPath,
   ClaudeEngineIntegrityError,
   ClaudeLocatorError,
   invalidateClaudeLocatorCache,
@@ -14,11 +16,14 @@ import {
   locateClaudeEngine,
   locateNode,
   resetClaudeLaunchPinsForTesting,
+  resetDevelopmentLocatorSearchForTesting,
+  resolveContext,
   unexpectedEngineChange,
   type ClaudeLocatorErrorCode,
   type ClaudeLocatorOptions,
   type LocatedClaudeEngine,
 } from "./claude-locator.js";
+import { defaultPathTrustPolicy, type PathTrustPolicy } from "./trusted-location.js";
 
 // Nothing here runs a real node, adapter or claude: files carry only a Mach-O magic number (or a
 // shebang line) and version probes are answered by an injected function.
@@ -32,6 +37,7 @@ after(async () => {
 afterEach(() => {
   invalidateClaudeLocatorCache();
   resetClaudeLaunchPinsForTesting();
+  resetDevelopmentLocatorSearchForTesting();
 });
 
 type Sandbox = Readonly<{
@@ -58,6 +64,8 @@ async function sandbox(): Promise<Sandbox> {
       environment: { PATH: [bin, ...extraPath].join(delimiter) },
       homeDirectory: home,
       fallbackDirectories: [],
+      // These tests exercise the development search (PATH, fakes under the temp dir); the packaged rules have their own tests.
+      allowEnvironmentPath: true,
       ...(execute === undefined ? {} : { execute }),
     }),
   };
@@ -624,5 +632,200 @@ describe("Claude locator: what a re-locate may replace [PC-ENG-002]", () => {
     });
     assert.equal(unexpectedEngineChange(base, all), "node");
     assert.equal(unexpectedEngineChange(base, changed({ adapter: all.adapter, claude: all.claude })), "adapter");
+  });
+});
+
+// A packaged app (PC-ENG-002): the PATH it was started with chooses nothing, and only trusted files are candidates.
+describe("Claude locator: a packaged app takes nothing from the PATH it was started with [PC-ENG-002]", () => {
+  const uid = process.getuid?.() ?? 0;
+  /** The temp sandbox is under the real temp directory, which the default policy rightly refuses. */
+  const relaxed: PathTrustPolicy = Object.freeze({ currentUid: uid, adminGid: undefined, rejectedRoots: Object.freeze([]) });
+
+  type PackagedBox = Sandbox & Readonly<{
+    /** Stands for a prefix an attacker put in front of the PATH. */
+    evil: string;
+    /** Stands for /opt/homebrew/bin: the fixed directory the app trusts. */
+    trusted: string;
+    packaged: (execute?: ClaudeLocatorOptions["execute"], policy?: PathTrustPolicy) => ClaudeLocatorOptions;
+  }>;
+
+  async function packagedBox(): Promise<PackagedBox> {
+    const box = await sandbox();
+    const evil = join(box.root, "evil-prefix");
+    const trusted = join(box.root, "trusted-bin");
+    await mkdir(evil, { recursive: true });
+    await mkdir(trusted, { recursive: true });
+    return {
+      ...box,
+      evil,
+      trusted,
+      packaged: (execute, policy = relaxed) => ({
+        environment: { PATH: [evil, trusted, box.bin].join(delimiter) },
+        homeDirectory: box.home,
+        fallbackDirectories: [trusted],
+        ...(execute === undefined ? {} : { execute }),
+        allowEnvironmentPath: false,
+        pathTrust: policy,
+      }),
+    };
+  }
+
+  it("never executes a node that only a PATH-prepended directory provides, and reports node_missing", async () => {
+    const box = await packagedBox();
+    const fake = join(box.evil, "node");
+    await writeMachO(fake, "attacker");
+    await writeMachO(join(box.bin, "node"), "also-on-path");
+    const probe = answers({ [fake]: "v26.0.0", [join(box.bin, "node")]: "v26.0.0" });
+    await expectLocatorError(locateNode(box.packaged(probe.execute)), "node_missing");
+    assert.deepEqual(probe.calls, [], "nothing was run");
+  });
+
+  it("uses the trusted node and runs only that one, with the fake in front on the PATH", async () => {
+    const box = await packagedBox();
+    const fake = join(box.evil, "node");
+    const real = join(box.trusted, "node");
+    await writeMachO(fake, "attacker");
+    await writeMachO(real, "genuine");
+    const probe = answers({ [fake]: "v26.0.0", [real]: "v26.8.1\n" });
+    const located = await locateNode(box.packaged(probe.execute));
+    assert.equal(located.executablePath, real);
+    assert.equal(located.sha256, createHash("sha256").update(await readFile(real)).digest("hex"));
+    assert.deepEqual(probe.calls, [`${real} --version`]);
+    assert.equal(probe.calls.some((call) => call.startsWith(fake)), false);
+  });
+
+  it("takes the adapter and claude from the fixed directories only", async () => {
+    const box = await packagedBox();
+    const fakeClaude = join(box.evil, "claude");
+    await writeMachO(fakeClaude, "attacker");
+    const evilPrefix = join(box.root, "evil-global");
+    await writeAdapterPackage(evilPrefix, "0.89.1");
+    await mkdir(join(evilPrefix, "bin"), { recursive: true });
+    await symlink("../lib/node_modules/@agentclientprotocol/claude-agent-acp/dist/index.js", join(evilPrefix, "bin", "claude-agent-acp"));
+    const options = { ...box.packaged(answers({ [fakeClaude]: "9.9.9 (Claude Code)" }).execute), environment: { PATH: [join(evilPrefix, "bin"), box.evil].join(delimiter) } };
+    await expectLocatorError(locateClaudeAdapter(options), "adapter_missing");
+    await expectLocatorError(locateClaudeBinary(options), "claude_missing");
+    // The same files in a trusted place are found.
+    const prefix = join(box.root, "homebrew");
+    const { packageRoot } = await writeAdapterPackage(prefix, "0.89.1");
+    await mkdir(join(prefix, "bin"), { recursive: true });
+    await symlink("../lib/node_modules/@agentclientprotocol/claude-agent-acp/dist/index.js", join(prefix, "bin", "claude-agent-acp"));
+    assert.equal((await locateClaudeAdapter({ ...options, fallbackDirectories: [join(prefix, "bin")] })).packageRoot, packageRoot);
+    const claude = join(box.home, ".local", "bin", "claude");
+    await writeMachO(claude, "genuine");
+    assert.equal((await locateClaudeBinary({ ...options, execute: answers({ [claude]: "2.1.291 (Claude Code)" }).execute })).executablePath, claude);
+  });
+
+  it("builds a search path without the PATH, with the user's own and the fixed directories", () => {
+    assert.deepEqual(buildTrustedSearchPath("node", "/Users/example", ["/opt/homebrew/bin", "/usr/local/bin"]), [
+      "/Users/example/.local/bin", "/opt/homebrew/bin", "/usr/local/bin",
+    ]);
+    assert.deepEqual(buildTrustedSearchPath("adapter", "/Users/example", ["/opt/homebrew/bin"], ["/Users/example/.nvm/versions/node/v22.1.0/bin", "relative/bin"]), [
+      "/Users/example/.npm-global/bin", "/Users/example/.local/bin", "/opt/homebrew/bin", "/Users/example/.nvm/versions/node/v22.1.0/bin",
+    ]);
+    assert.deepEqual(buildTrustedSearchPath("claude", "/Users/example", ["/usr/local/bin"], ["/Users/example/.nvm/versions/node/v22.1.0/bin"]), [
+      "/Users/example/.local/bin", "/usr/local/bin",
+    ]);
+  });
+
+  it("refuses a node that anybody else could rewrite: group- or world-writable file, world-writable directory", async () => {
+    for (const [mode, dirMode, label] of [[0o775, 0o755, "group-writable file"], [0o757, 0o755, "world-writable file"], [0o755, 0o777, "world-writable directory"], [0o755, 0o775, "group-writable directory"]] as const) {
+      const box = await packagedBox();
+      const node = join(box.trusted, "node");
+      await writeMachO(node, label);
+      await chmod(node, mode);
+      await chmod(box.trusted, dirMode);
+      const probe = answers({ [node]: "v26.8.1" });
+      await expectLocatorError(locateNode(box.packaged(probe.execute)), "node_missing");
+      assert.deepEqual(probe.calls, [], label);
+      resetClaudeLaunchPinsForTesting();
+    }
+  });
+
+  it("accepts a directory that only the macOS admin group can write (a Homebrew prefix) but never such a file", async () => {
+    const box = await packagedBox();
+    const node = join(box.trusted, "node");
+    await writeMachO(node, "homebrew");
+    await chmod(box.trusted, 0o775);
+    const adminLike: PathTrustPolicy = { ...relaxed, adminGid: (await stat(box.trusted)).gid };
+    assert.equal((await locateNode(box.packaged(answers({ [node]: "v26.8.1" }).execute, adminLike))).executablePath, node);
+    resetClaudeLaunchPinsForTesting();
+    invalidateClaudeLocatorCache();
+    await chmod(node, 0o775);
+    await expectLocatorError(locateNode(box.packaged(answers({ [node]: "v26.8.1" }).execute, adminLike)), "node_missing");
+  });
+
+  it("refuses a node owned by somebody else, and a link whose real target is writable by others", async (context) => {
+    if (uid === 0) return context.skip("root owns everything");
+    const box = await packagedBox();
+    const node = join(box.trusted, "node");
+    await writeMachO(node, "owned-by-me");
+    const probe = answers({ [node]: "v26.8.1" });
+    await expectLocatorError(locateNode(box.packaged(probe.execute, { ...relaxed, currentUid: uid + 1 })), "node_missing");
+    assert.deepEqual(probe.calls, []);
+    // A Homebrew-style link in a trusted directory is followed, and the real target is judged, not the link.
+    const cellar = join(box.root, "cellar", "bin");
+    await writeMachO(join(cellar, "node"), "target");
+    await rm(node);
+    await symlink(join(cellar, "node"), node);
+    assert.equal((await locateNode(box.packaged(answers({ [join(cellar, "node")]: "v26.8.1" }).execute))).executablePath, join(cellar, "node"));
+    resetClaudeLaunchPinsForTesting();
+    invalidateClaudeLocatorCache();
+    await chmod(cellar, 0o777);
+    await expectLocatorError(locateNode(box.packaged(answers({ [join(cellar, "node")]: "v26.8.1" }).execute)), "node_missing");
+  });
+
+  it("refuses any file under a temporary directory with the default policy", async () => {
+    const box = await packagedBox();
+    const node = join(box.trusted, "node");
+    await writeMachO(node, "in-temp");
+    const probe = answers({ [node]: "v26.8.1" });
+    // This sandbox lives under the real temp directory, so the default policy must not trust it.
+    await expectLocatorError(locateNode({ ...box.packaged(probe.execute), pathTrust: defaultPathTrustPolicy() }), "node_missing");
+    await expectLocatorError(locateNode({ ...box.packaged(probe.execute), pathTrust: undefined }), "node_missing");
+    assert.deepEqual(probe.calls, []);
+  });
+
+  it("finds the real node of the newest supported releases of nvm, Volta and mise, never a shim or an old release", async () => {
+    const box = await packagedBox();
+    const nodes = {
+      nvm24: join(box.home, ".nvm", "versions", "node", "v24.1.0", "bin", "node"),
+      nvm22: join(box.home, ".nvm", "versions", "node", "v22.9.0", "bin", "node"),
+      nvm20: join(box.home, ".nvm", "versions", "node", "v20.1.0", "bin", "node"),
+      volta: join(box.home, ".volta", "tools", "image", "node", "26.0.0", "bin", "node"),
+      shim: join(box.home, ".volta", "bin", "node"),
+    };
+    for (const [label, path] of Object.entries(nodes)) await writeMachO(path, label);
+    const probe = answers({ [nodes.nvm24]: "v24.1.0", [nodes.nvm22]: "v22.9.0", [nodes.volta]: "v26.0.0", [nodes.nvm20]: "v20.1.0", [nodes.shim]: "v26.0.0" });
+    const located = await locateNode(box.packaged(probe.execute));
+    assert.equal(located.executablePath, nodes.nvm24, "the newest nvm release comes first");
+    assert.deepEqual(probe.calls, [`${nodes.nvm24} --version`], "only the chosen file was run");
+    assert.equal(probe.calls.some((call) => call.startsWith(nodes.shim) || call.startsWith(nodes.nvm20)), false);
+  });
+
+  it("keeps the first node of the launch: a later PATH-prepended fake neither replaces it nor runs", async () => {
+    const box = await packagedBox();
+    const real = join(box.trusted, "node");
+    await writeMachO(real, "genuine");
+    const probe = answers({ [real]: "v26.8.1" });
+    const first = await locateNode(box.packaged(probe.execute));
+    const fake = join(box.evil, "node");
+    await writeMachO(fake, "attacker");
+    const second = await locateNode(box.packaged(probe.execute));
+    assert.equal(second.executablePath, first.executablePath);
+    assert.deepEqual(probe.calls, [`${real} --version`], "the fake was never run");
+  });
+
+  it("searches the PATH only when the main process switched the development search on", async () => {
+    const box = await packagedBox();
+    assert.equal(resolveContext({}).allowEnvironmentPath, false, "off by default: a packaged app");
+    assert.notEqual(resolveContext({}).pathTrust, undefined);
+    allowDevelopmentLocatorSearch();
+    assert.equal(resolveContext({}).allowEnvironmentPath, true);
+    assert.equal(resolveContext({}).pathTrust, undefined);
+    assert.equal(resolveContext({ allowEnvironmentPath: false }).allowEnvironmentPath, false, "an explicit option wins");
+    const fake = join(box.evil, "node");
+    await writeMachO(fake, "found-in-development");
+    assert.equal((await locateNode({ ...box.packaged(answers({ [fake]: "v26.8.1" }).execute), allowEnvironmentPath: undefined as unknown as boolean })).executablePath, fake);
   });
 });

@@ -10,11 +10,23 @@ import {
   pinClaudeAdapter,
   type ClaudeAdapterPin,
 } from "@guild/runtime-grok";
+import {
+  defaultPathTrustPolicy,
+  findPathTrustProblem,
+  versionManagerBinDirectories,
+  type PathTrustPolicy,
+} from "./trusted-location.js";
 
 /**
  * PC-ENG-002: finds the user-installed pieces of the Claude engine without ever reading Claude
  * credentials: `node` (>= 22), the `claude-agent-acp` adapter package and the `claude` binary.
  * Mirrors runtime-locator.ts: results are cached per binary identity and re-checked on every call.
+ *
+ * A packaged app never searches the `PATH` it was started with: whoever starts it (a launcher, a login item, a
+ * shell with a prefixed `PATH`) must not be able to choose the `node` or the adapter that later receives credentials.
+ * It looks in a fixed list of absolute directories and uses only files whose real path is trusted (see
+ * trusted-location.ts). Only an unpackaged development run (`allowDevelopmentLocatorSearch`, called by the main
+ * process when `app.isPackaged` is false) keeps the `PATH` search the QA scripts rely on.
  */
 
 export type ClaudeLocatorErrorCode =
@@ -123,10 +135,18 @@ export function unexpectedEngineChange(
 export type ClaudeLocatorOptions = Readonly<{
   environment?: NodeJS.ProcessEnv;
   homeDirectory?: string;
-  /** Searched after the user's PATH. Defaults to the Homebrew and system locations. */
+  /** Searched after the user's PATH (a development run) or on its own (a packaged app). Defaults to the Homebrew and system locations. */
   fallbackDirectories?: readonly string[];
   /** Runs `file args...` and returns stdout; defaults to execFile with a minimal environment. */
   execute?: (file: string, args: readonly string[], environment: Readonly<Record<string, string>>) => Promise<string>;
+  /**
+   * Development runs only: also search the `PATH` of `environment`, ahead of the fixed directories, and skip the
+   * ownership and permission checks of trusted-location.ts. Absent means the process-wide setting, which is "no" until the
+   * main process calls `allowDevelopmentLocatorSearch` for an unpackaged app. A packaged app never sets this.
+   */
+  allowEnvironmentPath?: boolean;
+  /** Replaces the ownership and temporary-directory rules of a packaged app; tests only. */
+  pathTrust?: PathTrustPolicy;
 }>;
 
 export type ClaudeSearchKind = "node" | "adapter" | "claude";
@@ -140,8 +160,24 @@ const DEFAULT_FALLBACK_DIRECTORIES = Object.freeze([
   "/sbin",
 ]);
 
+let developmentLocatorSearch = false;
+
 /**
- * Directories to search for one component, most specific first. Finder-launched apps get a
+ * Lets the locators of this process search the `PATH` and use files wherever they are. The main process calls it once at
+ * startup, and only when `app.isPackaged` is false; nothing a packaged app can be given (environment, file, setting)
+ * reaches this switch.
+ */
+export function allowDevelopmentLocatorSearch(): void {
+  developmentLocatorSearch = true;
+}
+
+/** Back to the packaged behaviour. Tests only. */
+export function resetDevelopmentLocatorSearchForTesting(): void {
+  developmentLocatorSearch = false;
+}
+
+/**
+ * Directories to search for one component in a development run, most specific first. Finder-launched apps get a
  * minimal PATH, so the user's usual install locations are added explicitly.
  */
 export function buildClaudeSearchPath(
@@ -158,6 +194,28 @@ export function buildClaudeSearchPath(
     : kind === "claude"
       ? [local, ...userPath, ...fallbackDirectories]
       : [...userPath, local, ...fallbackDirectories];
+  const directories = ordered.map((value) => value.trim()).filter((value) => isAbsolute(value));
+  return Object.freeze([...new Set(directories)]);
+}
+
+/**
+ * Directories a packaged app searches for one component, most specific first, and nothing else: no `PATH`. The same
+ * places as `buildClaudeSearchPath` minus the user's PATH, plus the `bin` directories of the newest releases of
+ * `nvm`, Volta, `asdf`, `fnm` and `mise` (real directories, never their shims) for `node` and the adapters.
+ */
+export function buildTrustedSearchPath(
+  kind: ClaudeSearchKind,
+  homeDirectory: string,
+  fallbackDirectories: readonly string[],
+  versionManagerDirectories: readonly string[] = [],
+): readonly string[] {
+  const local = join(homeDirectory, ".local", "bin");
+  const npmGlobal = join(homeDirectory, ".npm-global", "bin");
+  const ordered = kind === "adapter"
+    ? [npmGlobal, local, ...fallbackDirectories, ...versionManagerDirectories]
+    : kind === "claude"
+      ? [local, ...fallbackDirectories]
+      : [local, ...fallbackDirectories, ...versionManagerDirectories];
   const directories = ordered.map((value) => value.trim()).filter((value) => isAbsolute(value));
   return Object.freeze([...new Set(directories)]);
 }
@@ -340,11 +398,16 @@ export type LocatorContext = Readonly<{
   fallbackDirectories: readonly string[];
   execute: NonNullable<ClaudeLocatorOptions["execute"]>;
   probeEnvironment: Readonly<Record<string, string>>;
+  /** True for a development run: the PATH is searched and no file is judged. False (the default) for a packaged app. */
+  allowEnvironmentPath: boolean;
+  /** The rules a packaged app applies to every file it would run; absent in a development run. */
+  pathTrust: PathTrustPolicy | undefined;
 }>;
 
 export function resolveContext(options: ClaudeLocatorOptions): LocatorContext {
   const environment = options.environment ?? process.env;
   const homeDirectory = options.homeDirectory ?? homedir();
+  const allowEnvironmentPath = options.allowEnvironmentPath ?? developmentLocatorSearch;
   return Object.freeze({
     environment,
     homeDirectory,
@@ -355,23 +418,41 @@ export function resolveContext(options: ClaudeLocatorOptions): LocatorContext {
       PATH: [...DEFAULT_FALLBACK_DIRECTORIES].join(delimiter),
       HOME: homeDirectory,
     }),
+    allowEnvironmentPath,
+    pathTrust: allowEnvironmentPath ? undefined : options.pathTrust ?? defaultPathTrustPolicy(),
   });
 }
 
-/** Real paths of every `name` found on the search path for `kind`, in order, without duplicates. */
+/**
+ * Real paths of every `name` found for `kind`, in order, without duplicates. A development run searches the PATH of the
+ * environment and the fixed directories. A packaged app searches the fixed directories only (never the PATH it was
+ * started with) and returns only files whose whole real path is trusted, so nothing it returns has been run, and an
+ * untrusted file is simply not a candidate.
+ */
 export async function findCandidates(
   kind: ClaudeSearchKind,
   name: string,
   context: LocatorContext,
 ): Promise<readonly string[]> {
-  const directories = buildClaudeSearchPath(kind, context.environment.PATH, context.homeDirectory, context.fallbackDirectories);
+  const directories = context.allowEnvironmentPath
+    ? buildClaudeSearchPath(kind, context.environment.PATH, context.homeDirectory, context.fallbackDirectories)
+    : buildTrustedSearchPath(
+        kind,
+        context.homeDirectory,
+        context.fallbackDirectories,
+        kind === "claude" ? [] : await versionManagerBinDirectories(context.homeDirectory, MINIMUM_NODE_MAJOR),
+      );
   const found = new Set<string>();
   for (const directory of directories) {
+    let real: string;
     try {
-      found.add(await realpath(join(directory, name)));
+      real = await realpath(join(directory, name));
     } catch {
       // Not in this directory.
+      continue;
     }
+    if (context.pathTrust !== undefined && (await findPathTrustProblem(real, context.pathTrust)) !== undefined) continue;
+    found.add(real);
   }
   return [...found];
 }

@@ -81,8 +81,17 @@ created and never changes. Process topology stays one engine process per task (D
   never starts. The Claude status reads "Claude engine files changed unexpectedly; restart Guild to
   accept updated engine files, or reinstall claude-agent-acp". The code is on the IPC failure allowlist;
   the state clears when a later session opens with the pinned files back in place, or after a restart.
-- Locator: `claude-agent-acp` from `~/.npm-global/bin`, the user's PATH and Homebrew paths;
-  `claude` from `~/.local/bin/claude` / PATH (Mach-O). `node` from PATH (>= 22).
+- Locator (packaged app, since the 3.1 security review, D-068): `claude-agent-acp` from `~/.npm-global/bin`,
+  `~/.local/bin`, the Homebrew and system directories and the newest releases of nvm, Volta, asdf, fnm and mise;
+  `claude` from `~/.local/bin/claude` and the Homebrew and system directories (Mach-O); `node` (>= 22) from the same
+  places as the adapter. **The `PATH` the app was started with is never read**: whoever starts the app (a launcher, a
+  login item, a shell with a prefixed `PATH`) cannot choose the program that later receives credentials. A file is a
+  candidate only when its real path is trusted: not under a temporary directory, owned by the current user or root,
+  not writable by others, and not writable by the group unless it is a directory of the macOS `admin` group (a
+  Homebrew prefix); the version-manager shims are never used. Nothing is executed before it has passed those checks
+  and been hashed. An unpackaged development run keeps the old `PATH` search and skips the checks (the QA scripts
+  need it); only the main process switches that on, and only when `app.isPackaged` is false. A node or adapter the
+  checks refuse reads as not found.
 - Env (allowlist + Guild-owned values): PATH, HOME, USER, LOGNAME (claude looks up its Keychain login by account name; without USER it reports "not logged in" [WP-A smoke]), LANG/LC_*, TMPDIR, proxy vars, SSL vars,
   `NO_PROXY=127.0.0.1,localhost` (always), `CLAUDE_CODE_EXECUTABLE=<pinned claude>`. Strip every
   inherited `ANTHROPIC_*` and `CLAUDE_CODE_*` variable first. Do NOT inject the Grok OpenViking

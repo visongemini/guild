@@ -67,7 +67,8 @@ export type LocatedGeminiEngine = Readonly<{
 export type GeminiLocatorOptions = ClaudeLocatorOptions & Readonly<{
   /**
    * Package directories of a `@google/gemini-cli` install to try before the usual places. Only the dev-only QA hook
-   * (`GUILD_DEV_GEMINI_CLI`, see dev-hooks.ts) sets it, and only for an unpackaged app; the pin still applies.
+   * (`GUILD_DEV_GEMINI_CLI`, see dev-hooks.ts) sets it, and only for an unpackaged app; the locator ignores it unless
+   * the development search is on (claude-locator.ts), and the pin still applies.
    */
   readonly extraPackageRoots?: readonly string[];
 }>;
@@ -98,8 +99,9 @@ async function candidateRoots(
   options: GeminiLocatorOptions,
 ): Promise<ReadonlyArray<{ readonly root: string; readonly entryPath: string | undefined }>> {
   const context = resolveContext(options);
+  // The dev-only package root is honoured only in a development run, whatever the caller passed.
   const roots: Array<{ readonly root: string; readonly entryPath: string | undefined }> = [
-    ...(options.extraPackageRoots ?? []).map((root) => ({ root, entryPath: undefined })),
+    ...(context.allowEnvironmentPath ? options.extraPackageRoots ?? [] : []).map((root) => ({ root, entryPath: undefined })),
   ];
   for (const candidate of await findCandidates("adapter", "gemini", context)) {
     const root = geminiPackageRoot(candidate);

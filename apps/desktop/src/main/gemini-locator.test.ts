@@ -6,6 +6,7 @@ import { after, afterEach, describe, it } from "node:test";
 import {
   invalidateClaudeLocatorCache,
   resetClaudeLaunchPinsForTesting,
+  resetDevelopmentLocatorSearchForTesting,
   type ClaudeLocatorOptions,
 } from "./claude-locator.js";
 import {
@@ -38,6 +39,7 @@ after(async () => {
 afterEach(() => {
   invalidateClaudeLocatorCache();
   resetClaudeLaunchPinsForTesting();
+  resetDevelopmentLocatorSearchForTesting();
 });
 
 type Sandbox = Readonly<{
@@ -63,6 +65,8 @@ async function sandbox(): Promise<Sandbox> {
       environment: { PATH: [bin, ...extraPath].join(delimiter) },
       homeDirectory: home,
       fallbackDirectories: [],
+      // These tests exercise the development search (PATH, fakes under the temp dir); the packaged rules have their own tests.
+      allowEnvironmentPath: true,
       ...(execute === undefined ? {} : { execute }),
     }),
   };
@@ -278,5 +282,42 @@ describe("Gemini locator: what a re-locate may replace [PC-ENG-004]", () => {
     assert.equal(unexpectedGeminiEngineChange(base, changed({ node: { executablePath: "/opt/node/bin/node" } })), "node");
     assert.equal(unexpectedGeminiEngineChange(base, changed({ node: { version: "26.9.0" } })), undefined, "the version label alone is not a change");
     assert.equal(unexpectedGeminiEngineChange(base, changed({ node: { sha256: "b".repeat(64) }, cli: { fingerprintSha256: "d".repeat(64) } })), "node");
+  });
+});
+
+describe("Gemini locator: a packaged app takes nothing from the PATH it was started with [PC-ENG-004]", () => {
+  const relaxed = Object.freeze({ currentUid: process.getuid?.() ?? 0, adminGid: undefined, rejectedRoots: Object.freeze([] as string[]) });
+
+  it("never runs a PATH-prepended node nor takes a PATH-prepended CLI, and ignores the dev-only package root", async () => {
+    const box = await sandbox();
+    const evil = join(box.root, "evil-prefix");
+    const trusted = join(box.root, "trusted-bin");
+    await mkdir(evil, { recursive: true });
+    await mkdir(trusted, { recursive: true });
+    const fakeNode = join(evil, "node");
+    await writeMachO(fakeNode, "attacker");
+    const evilCli = await installCli(join(box.root, "evil-global"), "0.63.0");
+    const executed: string[] = [];
+    const options: GeminiLocatorOptions = {
+      environment: { PATH: [join(box.root, "evil-global", "bin"), evil].join(delimiter) },
+      homeDirectory: box.home,
+      fallbackDirectories: [trusted],
+      execute: async (file) => { executed.push(file); return "v26.8.1"; },
+      allowEnvironmentPath: false,
+      pathTrust: relaxed,
+      extraPackageRoots: [evilCli.packageRoot],
+    };
+    await expectLocatorError(locateGeminiEngine(options), "node_missing");
+    await expectLocatorError(locateGeminiCli(options), "cli_missing");
+    assert.equal(executed.length, 0, "the attacker's node was never run");
+    // The genuine pieces in the trusted places are used, and still only the trusted node is run.
+    const node = join(trusted, "node");
+    await writeMachO(node, "genuine");
+    const installed = await installCli(join(box.root, "trusted-global"), "0.63.0");
+    await symlink(join(box.root, "trusted-global", "bin", "gemini"), join(trusted, "gemini"));
+    const engine = await locateGeminiEngine({ ...options, execute: async (file) => { executed.push(file); return file === node ? "v26.8.1" : ""; } });
+    assert.equal(engine.node.executablePath, node);
+    assert.equal(engine.cli.packageRoot, installed.packageRoot);
+    assert.deepEqual(executed, [`${node}`]);
   });
 });

@@ -16,6 +16,7 @@ import type { DesktopApplicationService } from "./application-service.js";
 import { createBrowserPaneBridge, type BrowserPaneBridge, type BrowserPaneIpcPort } from "./browser-pane-bridge.js";
 import { configureBrowserPaneProcess } from "./browser-pane.js";
 import { createElectronBrowserPane } from "./browser-pane-electron.js";
+import { allowDevelopmentLocatorSearch } from "./claude-locator.js";
 import { resolveDevHooks } from "./dev-hooks.js";
 import { createDockIconApplier } from "./dock-icon.js";
 import { createElectronRouterFetches } from "./electron-router-fetch.js";
@@ -67,6 +68,9 @@ let rendererRecoveryFailures = 0;
 let rendererRecoveryErrorPending = false;
 // Dev-only QA hooks; a packaged app ignores them (see dev-hooks.ts).
 const devHooks = resolveDevHooks({ isPackaged: app.isPackaged, env: process.env });
+// A packaged app takes `node` and the engine adapters only from fixed, trusted locations and never from the PATH it was
+// started with; only an unpackaged development run searches the PATH (claude-locator.ts, trusted-location.ts).
+if (!app.isPackaged) allowDevelopmentLocatorSearch();
 const fixtureRequested = !app.isPackaged && process.env["GUILD_DESKTOP_FIXTURE"] === "1";
 const fixtureCapturePath = fixtureRequested
   ? validatedFixtureCapturePath(process.env["GUILD_FIXTURE_CAPTURE_PATH"])

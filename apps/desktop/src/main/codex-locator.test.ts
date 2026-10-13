@@ -7,6 +7,7 @@ import { codexPlatformTarget } from "@guild/runtime-grok";
 import {
   invalidateClaudeLocatorCache,
   resetClaudeLaunchPinsForTesting,
+  resetDevelopmentLocatorSearchForTesting,
   type ClaudeLocatorOptions,
 } from "./claude-locator.js";
 import {
@@ -39,6 +40,7 @@ after(async () => {
 afterEach(() => {
   invalidateClaudeLocatorCache();
   resetClaudeLaunchPinsForTesting();
+  resetDevelopmentLocatorSearchForTesting();
 });
 
 type Sandbox = Readonly<{
@@ -64,6 +66,8 @@ async function sandbox(): Promise<Sandbox> {
       environment: { PATH: [bin, ...extraPath].join(delimiter) },
       homeDirectory: home,
       fallbackDirectories: [],
+      // These tests exercise the development search (PATH, fakes under the temp dir); the packaged rules have their own tests.
+      allowEnvironmentPath: true,
       ...(execute === undefined ? {} : { execute }),
     }),
   };
@@ -350,5 +354,42 @@ describe("Codex locator: what a re-locate may replace [PC-ENG-003]", () => {
     const all = changed({ node: { sha256: "b".repeat(64) }, adapter: { fingerprintSha256: "d".repeat(64) }, core: { sizeBytes: 1 } });
     assert.equal(unexpectedCodexEngineChange(base, all), "node");
     assert.equal(unexpectedCodexEngineChange(base, changed({ adapter: all.adapter, core: all.core })), "adapter");
+  });
+});
+
+describe("Codex locator: a packaged app takes nothing from the PATH it was started with [PC-ENG-003]", () => {
+  const relaxed = Object.freeze({ currentUid: process.getuid?.() ?? 0, adminGid: undefined, rejectedRoots: Object.freeze([] as string[]) });
+
+  it("never runs a PATH-prepended node nor takes a PATH-prepended adapter, and ignores the dev-only adapter root", async () => {
+    const box = await sandbox();
+    const evil = join(box.root, "evil-prefix");
+    const trusted = join(box.root, "trusted-bin");
+    await mkdir(evil, { recursive: true });
+    await mkdir(trusted, { recursive: true });
+    await writeMachO(join(evil, "node"), "attacker");
+    const evilAdapter = await installAdapter(join(box.root, "evil-global"), "2.2.2");
+    await writeCore(evilAdapter.packageRoot);
+    const executed: string[] = [];
+    const options: CodexLocatorOptions = {
+      environment: { PATH: [join(box.root, "evil-global", "bin"), evil].join(delimiter) },
+      homeDirectory: box.home,
+      fallbackDirectories: [trusted],
+      execute: async (file) => { executed.push(file); return "v26.8.1"; },
+      allowEnvironmentPath: false,
+      pathTrust: relaxed,
+      extraAdapterRoots: [evilAdapter.packageRoot],
+    };
+    await expectLocatorError(locateCodexEngine(options), "node_missing");
+    await expectLocatorError(locateCodexAdapter(options), "adapter_missing");
+    assert.equal(executed.length, 0, "the attacker's node was never run");
+    const node = join(trusted, "node");
+    await writeMachO(node, "genuine");
+    const installed = await installAdapter(join(box.root, "trusted-global"), "2.2.2");
+    await writeCore(installed.packageRoot);
+    await symlink(join(box.root, "trusted-global", "bin", "codex-acp"), join(trusted, "codex-acp"));
+    const engine = await locateCodexEngine({ ...options, execute: async (file) => { executed.push(file); return file === node ? "v26.8.1" : ""; } });
+    assert.equal(engine.node.executablePath, node);
+    assert.equal(engine.adapter.packageRoot, installed.packageRoot);
+    assert.deepEqual(executed, [node]);
   });
 });
