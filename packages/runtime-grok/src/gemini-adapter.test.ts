@@ -168,7 +168,8 @@ class RecordingSink implements AcpV1AdapterSink {
 }
 
 function adapterOptions(process: FakeProcess, sink: RecordingSink): AcpV1AdapterOptions {
-  return { adapterEpoch: 7, clock, process, sink, profile: GEMINI_ENGINE_PROFILE };
+  // A short quiet period keeps the load tests quick; the default is checked on its own.
+  return { adapterEpoch: 7, clock, process, sink, profile: GEMINI_ENGINE_PROFILE, timeouts: { replayQuietMs: 40 } };
 }
 
 async function startGemini(
@@ -692,4 +693,66 @@ describe("Gemini dialect: loading a session (docs/21 section 8.6)", () => {
     assert.ok(session.modelCatalog?.models.some((entry) => entry.id === "gemini-3.1-pro-preview"), "the customtools spelling is normalised");
     await adapter.close();
   });
+  it("keeps the barrier open for a history the CLI streams after its answer, which it does (it never waits for the replay)", async () => {
+    const process = new FakeProcess();
+    const sink = new RecordingSink();
+    const adapter = await startGemini(process, sink);
+    const loading = adapter.loadSession(TOOL_SESSION_ID, FIXTURE_CWD);
+    const request = await waitForOutbound(process, ACP_V1_METHODS.sessionLoad);
+    const frames = fixture.loadReplay.frames;
+    // The first frames go out before the answer, the rest after it, with gaps shorter than the quiet period.
+    for (const frame of frames.slice(0, 2)) process.emitMessages(frame.msg);
+    process.emitMessages({ jsonrpc: "2.0", id: request.id, result: fixture.loadReplay.result } as WireMessage);
+    for (const frame of frames.slice(2)) {
+      await new Promise((resolve) => setTimeout(resolve, 15));
+      process.emitMessages(frame.msg);
+    }
+    const session = await loading;
+    assert.equal(session.establishedBy, "load");
+    assert.equal(sink.replayBarriers.length, 1);
+    const replayed = sink.updates.filter((entry) => entry.ingestMode === "replay");
+    assert.equal(replayed.length, sink.updates.length, "nothing arrived after the barrier closed");
+    const users = replayed.flatMap((entry) => entry.update.type === "turn" && entry.update.payload.type === "user_text_chunk" ? [entry.update.payload.text] : []);
+    assert.equal(users.length, 1, "the prompt that followed the answer is part of the replay");
+    const answers = replayed.flatMap((entry) => entry.update.type === "turn" && entry.update.payload.type === "agent_text_chunk" ? [entry.update.payload.text] : []);
+    assert.deepEqual(answers, ["done"]);
+    // The replayed tool call names its file relative to the workspace, which Guild cannot read as a path: it alone is dropped.
+    const dropped = sink.engineSignals.flatMap((signal) => signal.type === "late_update_dropped" ? [signal.discriminator] : []);
+    assert.deepEqual(dropped, ["tool_call"]);
+    await adapter.close();
+  });
+
+  it("closes the barrier at once for a history that was all sent before the answer, after the quiet period", async () => {
+    const process = new FakeProcess();
+    const sink = new RecordingSink();
+    const adapter = await startGemini(process, sink);
+    const loading = adapter.loadSession(TOOL_SESSION_ID, FIXTURE_CWD);
+    const request = await waitForOutbound(process, ACP_V1_METHODS.sessionLoad);
+    for (const frame of fixture.loadReplay.frames) process.emitMessages(frame.msg);
+    const answeredAt = Date.now();
+    process.emitMessages({ jsonrpc: "2.0", id: request.id, result: fixture.loadReplay.result } as WireMessage);
+    await loading;
+    assert.ok(Date.now() - answeredAt >= 35, "the load waited for the quiet period after the answer");
+    assert.equal(sink.replayBarriers.length, 1);
+    await adapter.close();
+  });
+
+  it("fails the load with a timeout when the history is still streaming after the longest wait, and never commits the barrier", async () => {
+    const process = new FakeProcess();
+    const sink = new RecordingSink();
+    const adapter = await startGemini(process, sink, fixture.initialize, { timeouts: { replayQuietMs: 40, replayMaxMs: 200 } });
+    const loading = adapter.loadSession(TOOL_SESSION_ID, FIXTURE_CWD);
+    const request = await waitForOutbound(process, ACP_V1_METHODS.sessionLoad);
+    process.emitMessages({ jsonrpc: "2.0", id: request.id, result: fixture.loadReplay.result } as WireMessage);
+    const chunk = fixture.loadReplay.frames[1]!.msg;
+    const stream = setInterval(() => process.emitMessages(chunk), 10);
+    try {
+      await assert.rejects(loading, hasAdapterCode("request_timeout"));
+    } finally {
+      clearInterval(stream);
+    }
+    assert.equal(sink.replayBarriers.length, 0);
+    await adapter.close();
+  });
+
 });

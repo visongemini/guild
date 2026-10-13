@@ -156,11 +156,24 @@ export const GEMINI_ACP_ADAPTER_DEFAULT_TIMEOUTS = Object.freeze({
   sessionMs: 180_000,
 });
 
+/**
+ * Gemini: `session/load` answers before the history is replayed (the CLI starts streaming it without waiting and
+ * returns its answer at once), so the replay barrier stays open until no replay frame has arrived for this long, and
+ * at most for the second value after the answer (docs/21 7). A history that is still streaming then is a timeout, not
+ * a history to judge.
+ */
+export const GEMINI_REPLAY_QUIET_MS = 400;
+export const GEMINI_REPLAY_MAX_MS = 15_000;
+
 export type AcpV1AdapterTimeouts = {
   readonly authenticateMs?: number;
   readonly initializeMs?: number;
   readonly sessionMs?: number;
   readonly writeMs?: number;
+  /** Gemini only: the quiet period that ends a replay (default {@link GEMINI_REPLAY_QUIET_MS}); ignored by other dialects. */
+  readonly replayQuietMs?: number;
+  /** Gemini only: the longest a replay may keep streaming after the load answer (default {@link GEMINI_REPLAY_MAX_MS}). */
+  readonly replayMaxMs?: number;
 };
 
 export type AcpV1AdapterErrorCode =
@@ -502,6 +515,8 @@ type SessionTransport = {
    * so the adapter keeps the current values itself and returns them from `setConfigOption`.
    */
   geminiOptions: readonly RuntimeConfigOption[] | undefined;
+  /** When the last `session/update` for the session arrived (`Date.now()`), decodable or not; a Gemini replay ends when none has for a while. */
+  lastUpdateAtMs: number;
 };
 
 type PermissionPreparationOutcome =
@@ -529,7 +544,7 @@ type PendingPermissionFlush = {
   writeReceived: boolean;
 };
 
-type AdapterTimeouts = Required<AcpV1AdapterTimeouts>;
+type AdapterTimeouts = Required<Omit<AcpV1AdapterTimeouts, "replayQuietMs" | "replayMaxMs">>;
 
 const DEFAULT_CLOCK: AcpV1AdapterClock = Object.freeze({
   monotonicMs: () => performance.now(),
@@ -557,6 +572,8 @@ export class AcpV1Adapter {
   private readonly process: AcpV1ProcessPort;
   private readonly sink: AcpV1AdapterSink;
   private readonly timeouts: AdapterTimeouts;
+  private readonly replayQuietMs: number;
+  private readonly replayMaxMs: number;
   private readonly sessions = new Map<string, SessionTransport>();
   private readonly sessionProvenance = new WeakMap<object, SessionTransport>();
   private readonly pendingPermissionFlushes = new Map<string, PendingPermissionFlush>();
@@ -609,6 +626,12 @@ export class AcpV1Adapter {
         "writeMs",
       ),
     });
+    this.replayQuietMs = this.profile.dialect === "gemini"
+      ? positiveSafeInteger(options.timeouts?.replayQuietMs ?? GEMINI_REPLAY_QUIET_MS, "replayQuietMs")
+      : 0;
+    this.replayMaxMs = this.profile.dialect === "gemini"
+      ? positiveSafeInteger(options.timeouts?.replayMaxMs ?? GEMINI_REPLAY_MAX_MS, "replayMaxMs")
+      : 0;
     this.clock = options.clock ?? DEFAULT_CLOCK;
     this.process = options.process;
     this.sink = options.sink;
@@ -1123,10 +1146,15 @@ export class AcpV1Adapter {
         (response) => {
           const state = this.decodeProtocol(() => decodeLoadSessionResult(response, this.profile.dialect));
           this.replacePublicSession(provisional, "load", state);
-          provisional.phase = "barrier_committing";
+          // Gemini keeps streaming the history after its answer: the barrier stays open until it has gone quiet.
+          if (this.replayQuietMs === 0) provisional.phase = "barrier_committing";
           return state;
         },
       );
+      if (this.replayQuietMs > 0) {
+        await this.awaitReplayQuiet(provisional);
+        provisional.phase = "barrier_committing";
+      }
       const updatesBeforeBarrier = provisional.updateTail;
       const commit = this.enqueueSink(provisional, async () => {
         await updatesBeforeBarrier;
@@ -1159,6 +1187,23 @@ export class AcpV1Adapter {
         }
       }
       throw this.normalizeOperationFailure(cause);
+    }
+  }
+
+  /**
+   * Waits until no `session/update` of a loading session has arrived for the quiet period, counting the load answer as
+   * activity. Fails with a timeout when the history is still streaming after the longest wait, and with whatever
+   * ends the adapter if it ends meanwhile.
+   */
+  private async awaitReplayQuiet(session: SessionTransport): Promise<void> {
+    const startedAt = Date.now();
+    session.lastUpdateAtMs = Math.max(session.lastUpdateAtMs, startedAt);
+    for (;;) {
+      this.assertReady();
+      const now = Date.now();
+      if (now - session.lastUpdateAtMs >= this.replayQuietMs) return;
+      if (now - startedAt >= this.replayMaxMs) throw new AcpV1AdapterError("request_timeout");
+      await new Promise<void>((resolve) => setTimeout(resolve, Math.min(25, this.replayQuietMs)));
     }
   }
 
@@ -1408,6 +1453,7 @@ export class AcpV1Adapter {
       sinkTail: Promise.resolve(),
       updateTail: Promise.resolve(),
       geminiOptions: undefined,
+      lastUpdateAtMs: 0,
     };
     this.sessions.set(identity.sessionId, transport);
     this.sessionProvenance.set(publicSession, transport);
@@ -1632,6 +1678,7 @@ export class AcpV1Adapter {
         return;
       }
       const session = this.sessions.get(sessionId);
+      if (session !== undefined) session.lastUpdateAtMs = Date.now();
       // The official Grok agent multiplexes reviewer/worker session updates on the
       // root ACP connection. They are not part of Guild's bound conversation and
       // must not be allowed to mutate or terminate it.
