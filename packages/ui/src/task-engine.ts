@@ -29,10 +29,11 @@ export function taskEngineFixed(
 }
 
 /**
- * The letter of an engine's marker on the sidebar rows. It is fixed, not the first letter of the engine's name,
- * because Claude and Codex both begin with C.
+ * The letters of an engine's marker on the sidebar rows. They are fixed, not the first letter of the engine's name,
+ * because Claude and Codex both begin with C, and Grok and Gemini with G: Gemini gets the letter pair "Ge" (docs/21
+ * section 8.9), which the marker fits in the same 14 px box.
  */
-const ENGINE_MARKER_LETTERS: Readonly<Record<GuildEngine, string>> = Object.freeze({ grok: "G", claude: "C", codex: "X" });
+const ENGINE_MARKER_LETTERS: Readonly<Record<GuildEngine, string>> = Object.freeze({ grok: "G", claude: "C", codex: "X", gemini: "Ge" });
 
 export function engineMarkerLetter(engine: GuildEngine): string {
   return ENGINE_MARKER_LETTERS[engine];

@@ -390,9 +390,10 @@ test("the markup of a native task: tags aria-hidden on the Online and Local rows
   assert.match(markup, new RegExp(`<span id="${describedBy.replace(/[:]/gu, "\\:")}" class="guild-sr-only">切换后要重启 Claude Code，再接上这段对话</span>`, "u"));
   // The English wording.
   assert.equal(render({ messages: EN }).match(/<em class="guild-model-restart-tag" aria-hidden="true">Restarts<\/em>/gu)?.length, 2);
-  // A task with no turn yet shows none of it.
+  // A task with no turn yet shows none of it. (Its Gemini group is described by its billing line; no row is described.)
   const fresh = render({ engineFixed: false, selection: selection(null, null, "runtime") });
-  assert.doesNotMatch(fresh, /guild-model-restart-tag|aria-describedby|guild-sr-only">切换后/u);
+  assert.doesNotMatch(fresh, /guild-model-restart-tag|guild-sr-only">切换后/u);
+  assert.equal(optionTags(fresh).some((tag) => /aria-describedby/u.test(tag)), false);
 });
 
 test("the markup of a routed task: Claude rows tagged and choosable, one tab stop, 'Use default' tagged too", () => {

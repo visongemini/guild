@@ -57,6 +57,7 @@ import type {
   GuildGrokReasoningEffort,
   GuildGrokStartupSettings,
   DesktopBootstrapProjection,
+  GuildDockIcon,
   GuildLocale,
   GuildNewTaskWorkspaceMode,
   GuildRendererApi,
@@ -79,11 +80,12 @@ import type {
   WorkspaceProjection,
 } from "@guild/contracts";
 import {
+  GUILD_DEFAULT_DOCK_ICON,
   canonicalGuildExternalUrl,
   nicknameInitial,
   parseGuildNickname,
 } from "@guild/contracts/desktop-ipc";
-import { EMPTY_CODEX_MODEL_CATALOG, modelGroupOf } from "@guild/contracts/grok-models";
+import { EMPTY_CODEX_MODEL_CATALOG, EMPTY_GEMINI_MODEL_CATALOG, modelGroupOf } from "@guild/contracts/grok-models";
 import {
   createContext,
   memo,
@@ -136,7 +138,8 @@ import { applyModelSelectionChange } from "./apply-model-change.js";
 import { claudeDefaultModelOptions, claudeDefaultSelectValue, claudeDefaultsView, claudePermissionModeOf, claudeStatusOf, claudeStatusText } from "./claude-engine.js";
 import { CLAUDE_DEFAULT_ROW_ID } from "./claude-model-families.js";
 import { AddonEngineSettings } from "./AddonEngineSettings.js";
-import { addonPermissionModeOf, addonStatusOf } from "./addon-engine.js";
+import { addonModeIsFullAccess, addonPermissionModeOf, addonStatusOf, saveAndConfirmEngineApiKey } from "./addon-engine.js";
+import { DockIconSetting } from "./DockIconSetting.js";
 import { ModelPicker } from "./ModelPicker.js";
 import { ModelSourcesSettings } from "./ModelSourcesSettings.js";
 import { OnlineReminderDialog } from "./OnlineReminderDialog.js";
@@ -164,6 +167,7 @@ import { composerEnterAction, steerButtonState } from "./steer.js";
 import { newTaskWorkspace, noTaskComposerPlaceholder, noTaskWorkspaceChip } from "./welcome.js";
 import {
   MODEL_PICKER_SEPARATOR,
+  addonEngineOfGroup,
   globalDefaultView,
   modelCatalogsOf,
   modelPickerView,
@@ -325,7 +329,11 @@ export function GuildApp({ api }: GuildAppProps) {
   // A switch between a Claude model and an Online / Local one restarts the engine and takes a while (D-062).
   const [modelSwitch, setModelSwitch] = useState<ModelSwitchState>();
   const [claudeSettingsFailed, setClaudeSettingsFailed] = useState(false);
-  const [codexSettingsFailed, setCodexSettingsFailed] = useState(false);
+  // The add-on engine whose last Settings save failed (each section shows only its own).
+  const [addonSettingsFailed, setAddonSettingsFailed] = useState<GuildAddonEngine>();
+  // The API key binding of an engine paid for per use (Gemini): a save or the native confirmation is running, or failed.
+  const [engineKeyBusy, setEngineKeyBusy] = useState(false);
+  const [engineKeyFailed, setEngineKeyFailed] = useState(false);
   const [rewindTarget, setRewindTarget] = useState<{ readonly runId: RunId }>();
   const rewindReturnFocus = useRef<HTMLElement | null>(null);
   const [runDiff, setRunDiff] = useState<{ readonly runId: RunId; readonly path: string | undefined }>();
@@ -965,6 +973,8 @@ export function GuildApp({ api }: GuildAppProps) {
   const claudeModelOptions = claudeDefaultModelOptions(baseMessages, claudeDefaults.catalog);
   const codexSettings = projection.runtimeSettings.engines?.codex;
   const codexStatus = addonStatusOf(codexSettings);
+  const geminiSettings = projection.runtimeSettings.engines?.gemini;
+  const geminiStatus = addonStatusOf(geminiSettings);
   const engineFixed = taskEngineFixed(activeTask, activeTask !== undefined && pendingSends.has(activeTask.task.taskId));
   const switchLine = modelSwitchLine(modelSwitch, activeTask?.task.taskId, baseMessages);
   const engineMarkers = hasMixedEngines(activeWorkspaces);
@@ -973,6 +983,8 @@ export function GuildApp({ api }: GuildAppProps) {
     ? claudeStatus?.version === undefined ? undefined : `Claude Code ${claudeStatus.version}`
     : activeEngine === "codex"
       ? codexStatus?.version === undefined ? undefined : `Codex ${codexStatus.version}`
+    : activeEngine === "gemini"
+      ? geminiStatus?.version === undefined ? undefined : `Gemini CLI ${geminiStatus.version}`
       : projection.runtimeVersion;
   const claudeMode = claudePermissionModeOf(activeTask?.sessionModes, projection.runtimeSettings.claude?.permissionMode);
   // The native browser view paints above the DOM: hidden under anything the page draws over it, and off its tab.
@@ -985,6 +997,7 @@ export function GuildApp({ api }: GuildAppProps) {
       onlineReminder !== undefined || discardConfirm || contextUsageOpen,
   });
   const codexMode = addonPermissionModeOf(activeTask?.sessionModes, codexSettings?.availablePermissionModes, codexSettings?.permissionMode);
+  const geminiMode = addonPermissionModeOf(activeTask?.sessionModes, geminiSettings?.availablePermissionModes, geminiSettings?.permissionMode);
   const permissionPill = activeEngine === "claude"
     ? claudeMode === undefined
       ? undefined
@@ -993,6 +1006,10 @@ export function GuildApp({ api }: GuildAppProps) {
     ? codexMode === undefined
       ? undefined
       : { warn: codexMode.endsWith("full-access"), label: messages.addonPermissionModeName("codex", codexMode) }
+    : activeEngine === "gemini"
+    ? geminiMode === undefined
+      ? undefined
+      : { warn: addonModeIsFullAccess("gemini", geminiMode), label: messages.addonPermissionModeName("gemini", geminiMode) }
     : {
         warn: projection.runtimeSettings.permissionMode === "bypassPermissions",
         label: messages.permissionModeName(projection.runtimeSettings.permissionMode),
@@ -1711,14 +1728,37 @@ export function GuildApp({ api }: GuildAppProps) {
     reasoningEffort: string | null,
     permissionMode: string,
   ) {
-    setCodexSettingsFailed(false);
+    setAddonSettingsFailed(undefined);
     await run(async () => {
       try {
         setProjection(await api.setEngineSettings({ engine, model, reasoningEffort, permissionMode }));
       } catch {
-        setCodexSettingsFailed(true);
+        setAddonSettingsFailed(engine);
       }
     });
+  }
+
+  /**
+   * Confirm in the key binding of an engine paid for per use (PC-ENG-004): saves the file and variable names when they
+   * changed, then the main process shows its native confirmation. A cancelled dialog is no failure: the projection then
+   * still says the binding is not confirmed.
+   */
+  async function confirmEngineApiKey(engine: GuildAddonEngine, keyFile: string | null, keyVariable: string) {
+    const current = projection?.runtimeSettings.engines?.[engine]?.apiKey;
+    if (current === undefined) return;
+    setEngineKeyFailed(false);
+    setEngineKeyBusy(true);
+    try {
+      await run(async () => {
+        try {
+          await saveAndConfirmEngineApiKey(api, { engine, current, keyFile, keyVariable }, setProjection);
+        } catch {
+          setEngineKeyFailed(true);
+        }
+      });
+    } finally {
+      setEngineKeyBusy(false);
+    }
   }
 
   /** The Claude catalog depends on the model sources; re-read the settings after they change. */
@@ -1938,12 +1978,14 @@ export function GuildApp({ api }: GuildAppProps) {
     newTaskWorkspaceMode: GuildNewTaskWorkspaceMode,
     browserSyncEnabled = projection?.browserSyncEnabled ?? false,
     taskNotificationsEnabled = projection?.generalSettings.taskNotificationsEnabled ?? true,
+    dockIcon: GuildDockIcon = projection?.generalSettings.dockIcon ?? GUILD_DEFAULT_DOCK_ICON,
   ) {
     await run(async () => setProjection(await api.setGeneralSettings({
       restoreLastTask,
       newTaskWorkspaceMode,
       browserSyncEnabled,
       taskNotificationsEnabled,
+      dockIcon,
     })));
   }
 
@@ -2256,6 +2298,16 @@ export function GuildApp({ api }: GuildAppProps) {
                       : messages.contextUsageUsedOnly(contextWindow.usedLabel)}</p>
                   <p>{messages.usageAddonQuota("codex")}</p>
                 </div>
+              ) : activeEngine === "gemini" ? (
+                <div className="guild-usage-card guild-usage-card-claude">
+                  <span>{messages.usageAddonHeading("gemini")}</span>
+                  <p>{!contextWindow.available
+                    ? messages.contextUsageUnavailableCompact
+                    : contextWindow.hasSize
+                      ? messages.contextUsageLabel(contextWindow.usedLabel, contextWindow.sizeLabel, contextWindow.percent)
+                      : messages.contextUsageUsedOnly(contextWindow.usedLabel)}</p>
+                  <p>{messages.usageAddonQuota("gemini")}</p>
+                </div>
               ) : activeEngine === "claude" ? (
                 <div className="guild-usage-card guild-usage-card-claude">
                   <span>{messages.usageClaudeHeading}</span>
@@ -2547,7 +2599,7 @@ export function GuildApp({ api }: GuildAppProps) {
                 : error === "claude_start"
                   ? messages.claudeStartTimeout
                 : error === "engine_start"
-                  ? messages.addonStartTimeout(activeEngine === "codex" ? activeEngine : "codex")
+                  ? messages.addonStartTimeout(addonEngineOfGroup(activeEngine) ?? "codex")
                 : error === "recovery"
                   ? messages.sessionRecoveryContextRequired
                 : error === "workspace"
@@ -2819,6 +2871,7 @@ export function GuildApp({ api }: GuildAppProps) {
                 modalOpen={onlineReminder !== undefined}
                 {...(claudeStatus === undefined ? {} : { claudeState: claudeStatus.state })}
                 {...(codexStatus === undefined ? {} : { codexState: codexStatus.state })}
+                {...(geminiStatus === undefined ? {} : { geminiState: geminiStatus.state })}
                 onApply={applyTaskRuntimeSettings}
                 onOpenModelSources={() => openSettings("sources")}
               />
@@ -2833,7 +2886,7 @@ export function GuildApp({ api }: GuildAppProps) {
                 >{messages.steerAction}<kbd aria-hidden="true">{messages.steerShortcut}</kbd></button>
               )}
               {running ? (
-                <button className="guild-send guild-stop" type="button" disabled={busy || activeTask?.task.activeRunState === "cancel_requested"} onClick={() => void cancelActiveRun()} aria-label={messages.stop} title={activeEngine === "codex" ? `${messages.stop} \u00b7 ${messages.addonStopCaveat("codex")}` : messages.stop}><Stop size={12} weight="fill" /></button>
+                <button className="guild-send guild-stop" type="button" disabled={busy || activeTask?.task.activeRunState === "cancel_requested"} onClick={() => void cancelActiveRun()} aria-label={messages.stop} title={activeEngine === "codex" ? `${messages.stop} \u00b7 ${messages.addonStopCaveat("codex")}` : activeEngine === "gemini" ? `${messages.stop} \u00b7 ${messages.addonStopCaveat("gemini")}` : messages.stop}><Stop size={12} weight="fill" /></button>
               ) : (
                 <button className="guild-send" type="submit" disabled={draft.trim().length === 0 || activeTask === undefined || !activeTask.canSend || busy || activePendingSend !== undefined || (running && promptAttachments.length > 0)} aria-label={messages.send} title={messages.send}>
                   {busy || pendingSendForActive !== undefined ? <SpinnerGap size={16} className="guild-spin" /> : <ArrowUp size={16} weight="bold" />}
@@ -3240,6 +3293,17 @@ export function GuildApp({ api }: GuildAppProps) {
                       {messages.newTaskWorkspaceLast}
                     </button>
                   </div>
+                  <DockIconSetting
+                    messages={messages}
+                    value={projection.generalSettings.dockIcon ?? GUILD_DEFAULT_DOCK_ICON}
+                    onChange={(icon) => void setGeneralSettings(
+                      projection.generalSettings.restoreLastTask,
+                      projection.generalSettings.newTaskWorkspaceMode,
+                      projection.browserSyncEnabled,
+                      projection.generalSettings.taskNotificationsEnabled,
+                      icon,
+                    )}
+                  />
                 </div>
               )}
               {settingsTab === "engines" && (
@@ -3500,8 +3564,22 @@ export function GuildApp({ api }: GuildAppProps) {
                       settings={codexSettings}
                       catalog={modelCatalogs.codex ?? EMPTY_CODEX_MODEL_CATALOG}
                       busy={busy}
-                      failed={codexSettingsFailed}
+                      failed={addonSettingsFailed === "codex"}
                       onChange={(model, reasoningEffort, permissionMode) => void setEngineSettings("codex", model, reasoningEffort, permissionMode)}
+                    />
+                  )}
+                  {geminiSettings !== undefined && (
+                    <AddonEngineSettings
+                      engine="gemini"
+                      messages={baseMessages}
+                      settings={geminiSettings}
+                      catalog={modelCatalogs.gemini ?? EMPTY_GEMINI_MODEL_CATALOG}
+                      busy={busy}
+                      failed={addonSettingsFailed === "gemini"}
+                      keyBusy={engineKeyBusy}
+                      keyFailed={engineKeyFailed}
+                      onChange={(model, reasoningEffort, permissionMode) => void setEngineSettings("gemini", model, reasoningEffort, permissionMode)}
+                      onConfirmKey={(keyFile, keyVariable) => void confirmEngineApiKey("gemini", keyFile, keyVariable)}
                     />
                   )}
                 </div>
@@ -3553,6 +3631,9 @@ export function GuildApp({ api }: GuildAppProps) {
                     )}
                     {codexStatus?.version !== undefined && (
                       <div className="guild-account-meta"><span>Codex</span><span>{codexStatus.version}</span></div>
+                    )}
+                    {geminiStatus?.version !== undefined && (
+                      <div className="guild-account-meta"><span>Gemini CLI</span><span>{geminiStatus.version}</span></div>
                     )}
                     {claudeStatus?.version !== undefined && (
                       <div className="guild-account-meta"><span>Claude Code</span><span>{claudeStatus.version}</span></div>

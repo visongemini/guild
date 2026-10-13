@@ -62,8 +62,9 @@ test("from an empty Claude catalog the Claude group lists one selectable row, th
 test("the row is reachable and activated by keyboard: a native button in the roving listbox, between its neighbours", () => {
   const options = optionTags(render({ claudeState: "ready" }));
   const names = options.map((tag) => tag.startsWith("<button") ? "button" : "hint");
-  // 4 Grok rows, the default row, then the Claude hint, the ChatGPT default row and its hint, the two group hints with their actions.
-  assert.deepEqual(names, ["button", "button", "button", "button", "button", "hint", "button", "hint", "hint", "button", "hint", "button"]);
+  // 4 Grok rows, the default row, then the Claude hint, the ChatGPT default row and its hint, the Gemini default row and
+  // its hint, the two group hints with their actions.
+  assert.deepEqual(names, ["button", "button", "button", "button", "button", "hint", "button", "hint", "button", "hint", "hint", "button", "hint", "button"]);
   // Every option takes focus (a row by its tab stop, the rest at tabindex -1), so the arrow keys reach all of them.
   assert.equal(options.every((tag) => /tabindex="-?\d"/u.test(tag)), true);
   assert.equal(options.filter((tag) => /tabindex="0"/u.test(tag)).length, 1, "one roving tab stop");

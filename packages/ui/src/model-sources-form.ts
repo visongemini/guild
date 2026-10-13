@@ -20,7 +20,8 @@ export const SOURCE_LIMITS = Object.freeze({
   maxContextWindow: 100_000_000,
 });
 
-const KEY_VARIABLE_PATTERN = /^[A-Z_][A-Z0-9_]{0,63}$/u;
+/** The contract's key variable grammar (`parseModelSourceKeyVariable`); the engine key binding uses it too. */
+export const KEY_VARIABLE_PATTERN = /^[A-Z_][A-Z0-9_]{0,63}$/u;
 const MODEL_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:[\]-]{0,127}$/u;
 const SOURCE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/u;
 
@@ -134,11 +135,11 @@ function isBlankRow(row: ModelRowForm): boolean {
   return row.id.trim() === "" && row.label.trim() === "" && row.contextWindow.trim() === "";
 }
 
-function secretLike(text: string): boolean {
+export function secretLike(text: string): boolean {
   return /^(?:sk-|Bearer\s|eyJ)/iu.test(text) || text.length > SOURCE_LIMITS.keyVariableLength;
 }
 
-function isAbsolutePath(text: string): boolean {
+export function isAbsolutePath(text: string): boolean {
   return (text.startsWith("/") || /^[A-Za-z]:[\\/]/u.test(text)) && !text.split(/[\\/]/u).includes("..");
 }
 

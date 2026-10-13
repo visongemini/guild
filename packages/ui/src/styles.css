@@ -48,6 +48,8 @@
   --guild-run: #B1612A; --guild-wait: #B07A08; --guild-wait-text: #8A5A00; --guild-fresh: #2F6FEB;
   --guild-error: #D2453F; --guild-error-text: #AD3731; --guild-ok: #2E8B57; --guild-ok-text: #1F7045;
   --guild-add: #2E8B57; --guild-del: #C8423C;
+  /* Engine marks: the Gemini letter pair on the sidebar (the other engines reuse the accent and fresh tokens). */
+  --guild-gemini: #7A55D3;
   --guild-focus: color-mix(in srgb, var(--guild-accent) 80%, transparent);
   --guild-focus-border: color-mix(in srgb, var(--guild-accent) 85%, var(--guild-surface));
   --guild-ring-track: color-mix(in srgb, var(--guild-text) 14%, transparent);
@@ -75,6 +77,7 @@
   --guild-run: #E39A5B; --guild-wait: #E2B140; --guild-wait-text: #E2B140; --guild-fresh: #6EA1FF;
   --guild-error: #F07068; --guild-error-text: #F07068; --guild-ok: #5DBB85; --guild-ok-text: #5DBB85;
   --guild-add: #5DBB85; --guild-del: #F07068;
+  --guild-gemini: #A88CFF;
   --guild-avatar-from: #9A5873; --guild-avatar-to: #6A57A8; --guild-avatar-text: #FFFFFF;
   --guild-scrim: rgb(0 0 0 / .5); --guild-scrim-strong: rgb(0 0 0 / .78);
   --guild-viewer-chrome: rgb(25 23 20 / .82); --guild-viewer-text: #F4F1E9;
@@ -121,6 +124,9 @@ button:disabled { cursor: default; }
 .guild-segmented button:hover:not(.selected):not(:disabled) { background: var(--guild-hover); }
 .guild-segmented button.selected { background: var(--guild-surface); color: var(--guild-text); box-shadow: var(--guild-shadow-1); font-weight: 600; }
 .guild-segmented button:disabled { cursor: not-allowed; opacity: .55; }
+/* Settings > General > Dock icon: the segmented control with a 64 px preview above each label. */
+.guild-dock-icons button { height: auto; min-height: 28px; padding: var(--guild-s2); display: grid; justify-items: center; gap: var(--guild-s1); }
+.guild-dock-icons img { width: 64px; height: 64px; display: block; }
 kbd { font: 500 11px var(--guild-font-ui); color: var(--guild-faint); padding: 1px 5px; border-radius: 4px; border: 1px solid var(--guild-line); background: var(--guild-soft); }
 .guild-pill { height: 28px; padding: 0 var(--guild-s2); display: inline-flex; align-items: center; gap: 6px; border: 1px solid transparent; border-radius: var(--guild-r-md); background: transparent; color: var(--guild-muted); font-size: var(--guild-fs-sm); font-weight: 500; white-space: nowrap; cursor: pointer; transition: background-color var(--guild-dur-1) var(--guild-ease), color var(--guild-dur-1) var(--guild-ease), border-color var(--guild-dur-1) var(--guild-ease); }
 span.guild-pill { cursor: default; }
@@ -229,6 +235,8 @@ span.guild-pill { cursor: default; }
 .guild-task-engine { flex: 0 0 auto; width: 14px; height: 14px; display: grid; place-items: center; border: 1px solid var(--guild-line-strong); border-radius: var(--guild-r-xs); color: var(--guild-faint); font-size: 9px; font-weight: 650; line-height: 1; }
 .guild-task-engine.claude { border-color: color-mix(in srgb, var(--guild-accent) 45%, var(--guild-line-strong)); color: var(--guild-accent-text); }
 .guild-task-engine.codex { border-color: color-mix(in srgb, var(--guild-fresh) 40%, var(--guild-line-strong)); color: var(--guild-fresh); }
+/* "Ge" is two letters in the same 14 px box: a step smaller and slightly tighter, so the row does not move. */
+.guild-task-engine.gemini { border-color: color-mix(in srgb, var(--guild-gemini) 40%, var(--guild-line-strong)); color: var(--guild-gemini); font-size: 8px; letter-spacing: -.03em; }
 .guild-task-row-wrap:hover .guild-task-row { background: color-mix(in srgb, var(--guild-text) var(--guild-row-hover-pct), transparent); }
 .guild-task-row.active, .guild-task-row-wrap.active:hover .guild-task-row { background: color-mix(in srgb, var(--guild-text) var(--guild-row-selected-pct), transparent); }
 .guild-task-row.active .guild-task-title { font-weight: 560; }
@@ -789,6 +797,8 @@ span.guild-pill { cursor: default; }
 .guild-model-group-heading { position: sticky; top: -6px; z-index: 2; margin: 0 -6px 2px; padding: 6px calc(6px + var(--guild-s2)) 4px; background: var(--guild-surface); }
 .guild-model-group-heading::after { content: ""; position: absolute; left: 0; right: 0; top: 100%; height: 10px; background: linear-gradient(to bottom, var(--guild-surface), transparent); opacity: 0; pointer-events: none; transition: opacity var(--guild-dur-2) var(--guild-ease); }
 .guild-model-group-heading[data-stuck="true"]::after { opacity: 1; }
+/* A muted line under a group's heading (Gemini: billed per use); it scrolls with the rows, the heading stays. */
+.guild-model-group-hint { display: block; margin: -2px var(--guild-s2) var(--guild-s1); color: var(--guild-faint); font-size: var(--guild-fs-meta); line-height: 1.4; }
 /* Scroll cues: zero-height sticky markers at both ends of the popover draw a fade only on an edge with content past it. */
 .guild-model-fade { position: sticky; z-index: 1; height: 0; margin: 0; padding: 0; pointer-events: none; }
 .guild-model-fade.top { top: -6px; margin-bottom: -2px; }
@@ -1057,7 +1067,20 @@ span.guild-pill { cursor: default; }
 .guild-settings-block .guild-setting-help + .guild-setting-help { margin-top: var(--guild-s2); }
 /* Engines tab (PC-SET-002) */
 .guild-engine-heading { margin: 0 0 var(--guild-s2); color: var(--guild-text); font-size: var(--guild-fs-title); font-weight: 650; } /* same as .guild-settings-heading */
-.guild-engine-claude, .guild-engine-codex { padding-top: var(--guild-s4); border-top: 1px solid var(--guild-line); }
+.guild-engine-claude, .guild-engine-codex, .guild-engine-gemini { padding-top: var(--guild-s4); border-top: 1px solid var(--guild-line); }
+/* The API key binding of an engine paid for per use (PC-ENG-004): two name fields, the facts, one Confirm control. */
+.guild-engine-key { margin-top: var(--guild-s4); }
+.guild-engine-key .guild-setting-field { margin-top: var(--guild-s2); gap: var(--guild-s1); }
+.guild-engine-key .guild-setting-field .guild-setting-help { margin: 0; }
+.guild-engine-key-facts { margin: var(--guild-s3) 1px 0; padding: var(--guild-s2) var(--guild-s3); display: grid; gap: 2px; border-radius: var(--guild-r-sm); background: var(--guild-soft); font-size: var(--guild-fs-sm); line-height: 1.5; }
+.guild-engine-key-facts div { display: grid; grid-template-columns: minmax(96px, auto) minmax(0, 1fr); gap: var(--guild-s3); }
+.guild-engine-key-facts dt { color: var(--guild-muted); }
+.guild-engine-key-facts dd { min-width: 0; margin: 0; color: var(--guild-text); overflow-wrap: anywhere; }
+.guild-engine-key-facts code { color: var(--guild-code-text); font-family: var(--guild-font-mono); font-size: var(--guild-fs-sm); }
+.guild-engine-key-facts dd.confirmed, .guild-engine-key-facts dd.usable { color: var(--guild-ok-text); font-weight: 600; }
+.guild-engine-key-facts dd.unconfirmed, .guild-engine-key-facts dd.unusable { color: var(--guild-wait-text); font-weight: 600; }
+.guild-engine-key-actions { margin-top: var(--guild-s3); display: flex; gap: var(--guild-s2); }
+.guild-engine-key-actions .guild-soft-button { display: inline-flex; align-items: center; gap: 6px; }
 .guild-engine-command { display: block; margin-top: 2px; padding: 3px var(--guild-s2); border-radius: var(--guild-r-xs); background: var(--guild-code-bg); color: var(--guild-code-text); font-family: var(--guild-font-mono); font-size: var(--guild-fs-sm); user-select: all; overflow-wrap: anywhere; }
 .guild-engine-status { margin: var(--guild-s2) 1px 1px; padding: var(--guild-s2) var(--guild-s3); display: grid; gap: 2px; border-radius: var(--guild-r-sm); background: var(--guild-soft); color: var(--guild-muted); font-size: var(--guild-fs-sm); line-height: 1.5; }
 .guild-engine-status strong { color: var(--guild-ok-text); font-weight: 600; }

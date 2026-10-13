@@ -51,3 +51,16 @@ test("names an add-on engine start that is still going on the same way (PC-ENG-0
   // A missing login is not a send failure the composer names: the error entry in the conversation says it.
   assert.equal(classifyComposerSendFailure(new Error("engine_login_required")), "runtime");
 });
+
+test("a Gemini task without a usable API key is a runtime failure the conversation explains (PC-ENG-004)", () => {
+  assert.equal(
+    classifyComposerSendFailure(new Error("Error invoking remote method 'guild:v1:run:send': Error: engine_key_required")),
+    "runtime",
+  );
+  assert.equal(classifyComposerSendFailure("engine_key_required"), "runtime");
+  // Nested in a cause, as Electron sometimes wraps it, it is still the same failure, not a message problem.
+  assert.equal(classifyComposerSendFailure(new Error("guild_operation_failed", { cause: new Error("engine_key_required") })), "runtime");
+  // The neighbouring codes keep their own meaning.
+  assert.equal(classifyComposerSendFailure(new Error("engine_start_timeout")), "engine_start");
+  assert.equal(classifyComposerSendFailure(new Error("engine_login_required")), "runtime");
+});

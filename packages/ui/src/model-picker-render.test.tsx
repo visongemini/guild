@@ -4,7 +4,7 @@ import test from "node:test";
 import { EMPTY_CLAUDE_MODEL_CATALOG, freezeModelCatalog, type GrokModelCatalog, type SetTaskRuntimeSettingsResponse, type TaskModelSelectionProjection } from "@guild/contracts";
 import { renderToStaticMarkup } from "react-dom/server";
 import { messagesFor } from "./locales.js";
-import { CLAUDE_CATALOG, REAL_CATALOG } from "./model-catalog.fixture.js";
+import { CLAUDE_CATALOG, GEMINI_CATALOG, REAL_CATALOG } from "./model-catalog.fixture.js";
 import { ModelPicker, type ModelPickerProps } from "./ModelPicker.js";
 
 const EN = messagesFor("en-US");
@@ -212,15 +212,17 @@ test("a new task's picker offers the Grok group next to the others and explains 
     taskEngine: "grok",
     engineFixed: false,
   });
-  assert.equal(markup.match(/role="group"/gu)?.length, 5);
+  assert.equal(markup.match(/role="group"/gu)?.length, 6);
   assert.match(markup, />Grok<\/div>/u);
   assert.match(markup, />ChatGPT<\/div>/u);
+  assert.match(markup, />Gemini \(API, pay-as-you-go\)<\/div>/u);
   assert.match(markup, /<strong>Grok 4\.7 Fast<\/strong>/u);
   assert.match(markup, /<strong>Opus<\/strong>/u);
-  assert.match(markup, /class="guild-model-footnote guild-model-engine-note">The model you pick for the first message decides whether this conversation runs on Grok, Claude or ChatGPT\./u);
+  assert.match(markup, /class="guild-model-footnote guild-model-engine-note">The model you pick for the first message decides whether this conversation runs on Grok, Claude, ChatGPT or Gemini\./u);
   const zh = renderClaude({ messages: ZH, selection: selection("grok-4.7", "high", "runtime"), taskEngine: "grok", engineFixed: false });
   assert.match(zh, />Claude（订阅）<\/div>/u);
   assert.match(zh, />ChatGPT（订阅）<\/div>/u);
+  assert.match(zh, />Gemini（API 按量）<\/div>/u);
   assert.match(zh, />在线<\/div>/u);
   assert.match(zh, />本地<\/div>/u);
 });
@@ -305,4 +307,47 @@ test("the grouped picker keeps arrow-key navigation over every option and opens 
   // The popover opens on the selected row, else the first row (a hint is also an option, but not what a person came to pick).
   assert.match(source, /querySelector<HTMLElement>\('\[role="option"\]\[aria-selected="true"\]'\) \?\?\s*\n\s*popover\.querySelector<HTMLElement>\('button\[role="option"\]:not\(\[aria-disabled="true"\]\)'\)/u);
   assert.match(source, /role="option" aria-disabled="true" aria-selected="false" tabIndex=\{-1\}/u);
+});
+
+// ---- Guild 3.1 part 2: the Gemini group (PC-ENG-004, PC-MODEL-001)
+
+test("a Gemini task's picker shows the billing line under the group, its models and no effort control at all", () => {
+  const catalogs = Object.freeze({ grok: REAL_CATALOG, claude: CLAUDE_CATALOG, gemini: GEMINI_CATALOG });
+  const markup = render({
+    catalogs, selection: selection("gemini-3.8-flash", "high"), taskEngine: "gemini", geminiState: "ready", initialOpen: true,
+  });
+  // The trigger names the model alone: no effort, even a stored one.
+  assert.match(markup, /<span>Gemini 3\.8 Flash<\/span>/u);
+  assert.doesNotMatch(markup, /Gemini 3\.8 Flash \u00b7/u);
+  // The one group, described by its billing line, which is not a heading and not an option.
+  const group = /<div class="guild-model-group" role="group" aria-labelledby="([^"]+)" aria-describedby="([^"]+)">/u.exec(markup);
+  assert.ok(group !== null);
+  assert.equal(group[2], `${group[1]}-hint`);
+  assert.match(markup, new RegExp(`<small id="${group[2]!.replace(/[:]/gu, "\\:")}" class="guild-model-group-hint">Billed per use on your Google AI Studio account</small>`, "u"));
+  assert.doesNotMatch(markup, /guild-model-hint"[^>]*>Billed per use/u);
+  assert.match(markup, /<strong>Gemini 3\.5 Flash-Lite<\/strong>/u);
+  // No effort heading, no effort radios, no "no efforts" hint.
+  assert.doesNotMatch(markup, /guild-model-efforts|role="radiogroup"/u);
+  assert.doesNotMatch(markup, new RegExp(`class="guild-model-heading">${EN.reasoningEffort}<`, "u"));
+  assert.doesNotMatch(markup, new RegExp(EN.modelPickerNoEfforts, "u"));
+  // Chinese.
+  const zh = render({ messages: ZH, catalogs, selection: selection("gemini-3.8-flash", null), taskEngine: "gemini", initialOpen: true });
+  assert.match(zh, /class="guild-model-group-hint">按 Google AI Studio 账户的用量计费<\/small>/u);
+});
+
+test("a new task's picker lists the Gemini default row with what it starts on, under the Gemini heading and its billing line", () => {
+  const markup = render({
+    catalogs: Object.freeze({ grok: REAL_CATALOG, claude: CLAUDE_CATALOG }),
+    selection: selection("grok-4.7", "high", "runtime"), taskEngine: "grok", engineFixed: false, initialOpen: true,
+  });
+  const gemini = markup.match(/aria-labelledby="[^"]+-group-gemini"[^>]*>(.*?)<div class="guild-model-group" role="group" aria-labelledby="[^"]+-group-online"/su)?.[1] ?? "";
+  assert.match(gemini, /class="guild-model-heading guild-model-group-heading">Gemini \(API, pay-as-you-go\)<\/div><small[^>]*class="guild-model-group-hint">Billed per use on your Google AI Studio account<\/small>/u);
+  assert.match(gemini, /<strong>Gemini \(default model\)<\/strong>.*<small class="guild-model-row-description">Starts on the cheapest Flash model the session offers\.<\/small>/su);
+  // With no usable key there is no row, only the way to fix it.
+  const noKey = render({
+    catalogs: Object.freeze({ grok: REAL_CATALOG, claude: CLAUDE_CATALOG }), geminiState: "not_logged_in",
+    selection: selection("grok-4.7", "high", "runtime"), taskEngine: "grok", engineFixed: false, initialOpen: true,
+  });
+  assert.doesNotMatch(noKey, /Gemini \(default model\)/u);
+  assert.match(noKey, /<p>Gemini not found or no API key<\/p><small>Install the Gemini CLI/u);
 });

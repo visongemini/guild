@@ -150,7 +150,7 @@ test("the settings dialog is wide enough for five tabs and the stylesheet styles
 });
 
 test("the wordmark names the version of the engine the open task runs on", () => {
-  assert.match(app, /const engineVersionLabel = activeEngine === "claude"\s*\n\s*\? claudeStatus\?\.version === undefined \? undefined : `Claude Code \$\{claudeStatus\.version\}`\s*\n\s*: activeEngine === "codex"\s*\n\s*\? codexStatus\?\.version === undefined \? undefined : `Codex \$\{codexStatus\.version\}`\s*\n\s*: projection\.runtimeVersion;/u);
+  assert.match(app, /const engineVersionLabel = activeEngine === "claude"\s*\n\s*\? claudeStatus\?\.version === undefined \? undefined : `Claude Code \$\{claudeStatus\.version\}`\s*\n\s*: activeEngine === "codex"\s*\n\s*\? codexStatus\?\.version === undefined \? undefined : `Codex \$\{codexStatus\.version\}`\s*\n\s*: activeEngine === "gemini"\s*\n\s*\? geminiStatus\?\.version === undefined \? undefined : `Gemini CLI \$\{geminiStatus\.version\}`\s*\n\s*: projection\.runtimeVersion;/u);
   assert.match(app, /\{engineVersionLabel !== undefined && <small title=\{engineVersionLabel\}>\{engineVersionLabel\}<\/small>\}/u);
 });
 
@@ -179,4 +179,70 @@ test("the sidebar marker has a letter and a colour for Codex without taking more
   const style = cssBlock(".guild-task-engine.codex");
   assert.match(style, /color:\s*var\(--guild-fresh\)/u);
   assert.doesNotMatch(style, /width|height|flex/u);
+});
+
+test("the Gemini engine (PC-ENG-004) has its own Settings section with the key binding, usage card, permission pill and stop caveat", () => {
+  // The Engines tab renders the Gemini section after Codex's, saves through the generic engine channel and binds the key.
+  const engines = between(app, '{settingsTab === "engines" && (', '{settingsTab === "sources" && (');
+  assert.ok(engines.indexOf('engine="codex"') < engines.indexOf('engine="gemini"'));
+  assert.match(engines, /\{geminiSettings !== undefined && \(\s*\n\s*<AddonEngineSettings\s*\n\s*engine="gemini"/u);
+  assert.match(engines, /catalog=\{modelCatalogs\.gemini \?\? EMPTY_GEMINI_MODEL_CATALOG\}/u);
+  assert.match(engines, /failed=\{addonSettingsFailed === "gemini"\}/u);
+  assert.match(engines, /failed=\{addonSettingsFailed === "codex"\}/u);
+  assert.match(engines, /keyBusy=\{engineKeyBusy\}\s*\n\s*keyFailed=\{engineKeyFailed\}/u);
+  assert.match(engines, /void setEngineSettings\("gemini", model, reasoningEffort, permissionMode\)/u);
+  assert.match(engines, /onConfirmKey=\{\(keyFile, keyVariable\) => void confirmEngineApiKey\("gemini", keyFile, keyVariable\)\}/u);
+  // The key calls: the stored binding is the baseline, both preload calls go through one helper, each projection is applied.
+  const confirm = between(app, "async function confirmEngineApiKey(", "async function ");
+  assert.match(confirm, /const current = projection\?\.runtimeSettings\.engines\?\.\[engine\]\?\.apiKey;/u);
+  assert.match(confirm, /setEngineKeyFailed\(false\);\s*\n\s*setEngineKeyBusy\(true\);/u);
+  assert.match(confirm, /await saveAndConfirmEngineApiKey\(api, \{ engine, current, keyFile, keyVariable \}, setProjection\);/u);
+  assert.match(confirm, /catch \{\s*\n\s*setEngineKeyFailed\(true\);/u);
+  assert.match(confirm, /finally \{\s*\n\s*setEngineKeyBusy\(false\);/u);
+  const helper = between(app, 'import { addonModeIsFullAccess', ";\n");
+  assert.match(helper, /saveAndConfirmEngineApiKey/u);
+  // The usage popover: "Gemini API (pay-as-you-go)", the token count, the billing note; no plan label, no cost, no grok.com.
+  const popover = between(app, 'className="guild-account-popover"', "guild-account-meta");
+  const gemini = between(popover, ': activeEngine === "gemini" ? (', ") : activeEngine");
+  assert.match(gemini, /messages\.usageAddonHeading\("gemini"\)/u);
+  assert.match(gemini, /messages\.contextUsageUsedOnly\(contextWindow\.usedLabel\)/u);
+  assert.match(gemini, /messages\.usageAddonQuota\("gemini"\)/u);
+  assert.doesNotMatch(gemini, /accountLabel|usageAddonAccountManaged|cost|grok\.com|openExternal|usage\.status/u);
+  // The permission pill names the Gemini mode, warning only for YOLO.
+  assert.match(app, /const geminiMode = addonPermissionModeOf\(activeTask\?\.sessionModes, geminiSettings\?\.availablePermissionModes, geminiSettings\?\.permissionMode\);/u);
+  assert.match(app, /warn: addonModeIsFullAccess\("gemini", geminiMode\), label: messages\.addonPermissionModeName\("gemini", geminiMode\)/u);
+  // Stop and the start timeout speak of Gemini; the picker hears Gemini's state; About names the CLI's version.
+  assert.match(app, /activeEngine === "gemini" \? `\$\{messages\.stop\} \\u00b7 \$\{messages\.addonStopCaveat\("gemini"\)\}`/u);
+  assert.match(app, /messages\.addonStartTimeout\(addonEngineOfGroup\(activeEngine\) \?\? "codex"\)/u);
+  const picker = between(app, "<ModelPicker", "/>\n              {steerButton.visible");
+  assert.match(picker, /geminiState: geminiStatus\.state/u);
+  assert.match(app, /<div className="guild-account-meta"><span>Gemini CLI<\/span><span>\{geminiStatus\.version\}<\/span><\/div>/u);
+});
+
+test("the sidebar marker has the letter pair and a colour of its own for Gemini in the same box", () => {
+  const style = cssBlock(".guild-task-engine.gemini");
+  assert.match(style, /color:\s*var\(--guild-gemini\)/u);
+  assert.match(style, /border-color:\s*color-mix\(in srgb, var\(--guild-gemini\) 40%, var\(--guild-line-strong\)\)/u);
+  // A step smaller so two letters fit; the 14 px box and the row are untouched.
+  assert.match(style, /font-size:\s*8px/u);
+  assert.doesNotMatch(style, /width|height|flex|padding|margin/u);
+  assert.match(cssBlock(".guild-task-engine"), /width:\s*14px/u);
+  assert.match(css, /--guild-gemini:\s*#[0-9A-Fa-f]{6};[^]*:root\[data-theme="dark"\][^]*--guild-gemini:\s*#[0-9A-Fa-f]{6};/u);
+  for (const name of [
+    "guild-engine-gemini", "guild-engine-key", "guild-engine-key-facts", "guild-engine-key-actions", "guild-dock-icons",
+    "guild-model-group-hint",
+  ]) {
+    assert.match(css, new RegExp(`\\.${name}[\\s,:{.\\[]`, "u"), `${name} is not styled`);
+  }
+});
+
+test("Settings > General saves the Dock icon at once with the other general settings (PC-SET-002)", () => {
+  const save = between(app, "async function setGeneralSettings(", "async function refreshUsage");
+  assert.match(save, /dockIcon: GuildDockIcon = projection\?\.generalSettings\.dockIcon \?\? GUILD_DEFAULT_DOCK_ICON,/u);
+  assert.match(save, /api\.setGeneralSettings\(\{\s*\n\s*restoreLastTask,\s*\n\s*newTaskWorkspaceMode,\s*\n\s*browserSyncEnabled,\s*\n\s*taskNotificationsEnabled,\s*\n\s*dockIcon,\s*\n\s*\}\)/u);
+  const general = between(app, '{settingsTab === "general" && (', '{settingsTab === "engines" && (');
+  assert.match(general, /<DockIconSetting\s*\n\s*messages=\{messages\}\s*\n\s*value=\{projection\.generalSettings\.dockIcon \?\? GUILD_DEFAULT_DOCK_ICON\}/u);
+  assert.match(general, /onChange=\{\(icon\) => void setGeneralSettings\(\s*\n\s*projection\.generalSettings\.restoreLastTask,\s*\n\s*projection\.generalSettings\.newTaskWorkspaceMode,\s*\n\s*projection\.browserSyncEnabled,\s*\n\s*projection\.generalSettings\.taskNotificationsEnabled,\s*\n\s*icon,\s*\n\s*\)\}/u);
+  // The other general settings keep the stored Dock icon (the default parameter), so a toggle never resets it.
+  assert.match(general, /onClick=\{\(\) => void setGeneralSettings\(projection\.generalSettings\.restoreLastTask, "ask"\)\}/u);
 });

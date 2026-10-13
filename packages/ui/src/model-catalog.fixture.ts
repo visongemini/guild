@@ -87,3 +87,21 @@ export const CLAUDE_ADAPTER_CATALOG: ModelCatalog = freezeModelCatalog("claude",
   ],
   runtimeDefaultModelId: "default",
 });
+
+/**
+ * A Gemini-engine catalog as the main process builds it from the models gemini-cli 0.63.0 reported at `session/new`
+ * on 2026-10-13 (docs/21 section 7), without `auto`. Names and descriptions are test data. Gemini has no effort setting
+ * over ACP, so no model lists one.
+ */
+const geminiRow = (id: string, name: string, description?: string) =>
+  ({ id, name, group: "gemini" as const, ...(description === undefined ? {} : { description }), reasoningEfforts: [], contextWindows: [] });
+export const GEMINI_CATALOG: ModelCatalog = freezeModelCatalog("gemini", {
+  engine: "gemini",
+  models: [
+    geminiRow("gemini-3.1-pro-preview", "Gemini 3.1 Pro (preview)", "Most capable, priced per use"),
+    geminiRow("gemini-3-flash-preview", "Gemini 3 Flash (preview)"),
+    geminiRow("gemini-2.5-pro", "Gemini 2.5 Pro"),
+    geminiRow("gemini-3.8-flash", "Gemini 3.8 Flash"),
+    geminiRow("gemini-3.5-flash-lite", "Gemini 3.5 Flash-Lite", "Fastest and cheapest"),
+  ],
+});

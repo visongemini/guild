@@ -120,8 +120,8 @@ test("Guild 3.0 strings exist, are non-empty and mention no undefined in both ca
 test("the picker group names are the ones the product contract states", () => {
   const en = messagesFor("en-US");
   const zh = messagesFor("zh-CN");
-  assert.deepEqual((["grok", "claude", "codex", "online", "local"] as const).map(en.modelGroupName), ["Grok", "Claude", "ChatGPT", "Online", "Local"]);
-  assert.deepEqual((["grok", "claude", "codex", "online", "local"] as const).map(zh.modelGroupName), ["Grok", "Claude\uff08\u8ba2\u9605\uff09", "ChatGPT\uff08\u8ba2\u9605\uff09", "\u5728\u7ebf", "\u672c\u5730"]);
+  assert.deepEqual((["grok", "claude", "codex", "gemini", "online", "local"] as const).map(en.modelGroupName), ["Grok", "Claude", "ChatGPT", "Gemini (API, pay-as-you-go)", "Online", "Local"]);
+  assert.deepEqual((["grok", "claude", "codex", "gemini", "online", "local"] as const).map(zh.modelGroupName), ["Grok", "Claude\uff08\u8ba2\u9605\uff09", "ChatGPT\uff08\u8ba2\u9605\uff09", "Gemini\uff08API \u6309\u91cf\uff09", "\u5728\u7ebf", "\u672c\u5730"]);
   assert.equal(en.modelPickerGroupEmpty("online"), "No online models \u2014 add one in Settings \u203a Model sources");
   assert.equal(en.modelPickerClaudeUnavailable, "Claude Code not found or not logged in");
   assert.equal(en.onlineReminderTitle, "Confirm before sending to an online model");
@@ -191,15 +191,22 @@ test("the Claude start-timeout wording is retryable and names Claude in both lan
   assert.match(messagesFor("zh-CN", "claude").claudeStartTimeout, /Claude 仍在启动.*稍后再试/u);
 });
 
-test("Guild 3.1 add-on engine strings exist, are non-empty and mention no undefined in both catalogs (PC-ENG-003, PC-I18N-001)", () => {
+test("Guild 3.1 add-on engine strings exist, are non-empty and mention no undefined in both catalogs (PC-ENG-003, PC-ENG-004, PC-I18N-001)", () => {
   for (const locale of ["zh-CN", "en-US"] as const) {
     const messages = messagesFor(locale);
     const texts: string[] = [];
-    for (const engine of ["codex"] as const) {
+    for (const engine of ["codex", "gemini"] as const) {
+      // Codex logs in with a command; Gemini takes an API key bound in Settings and has no login command at all.
+      const login = messages.addonLoginCommand(engine);
+      assert.equal(login === undefined, engine === "gemini", `${locale}: ${engine} login command`);
+      const defaultHelp = messages.modelPickerAddonDefaultHelp(engine);
+      assert.equal(defaultHelp === undefined, engine === "codex", `${locale}: ${engine} default row help`);
       texts.push(
+        ...(login === undefined ? [] : [login]),
+        ...(defaultHelp === undefined ? [] : [defaultHelp]),
         messages.settingsAddonHeading(engine), messages.enginesAddonIntro(engine), messages.addonSettingsHelp(engine),
         messages.addonSettingsFailed(engine), messages.addonDefaultModelOption(engine), messages.addonStartTimeout(engine),
-        messages.addonStopCaveat(engine), messages.addonInstallCommand(engine), messages.addonLoginCommand(engine),
+        messages.addonStopCaveat(engine), messages.addonInstallCommand(engine),
         messages.modelPickerAddonUnavailable(engine), messages.modelPickerAddonUnavailableHelp(engine),
         messages.modelPickerAddonNotStarted(engine), messages.modelPickerAddonDefault(engine),
         messages.addonStatusReady(engine, undefined), messages.addonStatusReady(engine, "ChatGPT Plus"),
@@ -237,4 +244,49 @@ test("the Codex task and marker names are the engine's own in both languages", (
   assert.deepEqual((["grok", "claude", "codex"] as const).map(messagesFor("en-US").taskEngineName), ["Grok", "Claude", "Codex"]);
   assert.equal(messagesFor("en-US").taskEngineMarkerTitle("codex"), "Codex conversation");
   assert.equal(messagesFor("zh-CN").taskEngineMarkerTitle("codex"), "Codex \u5bf9\u8bdd");
+});
+
+test("the Gemini modes use Guild's own words in both languages, and only the picker group paid per use has a billing line (PC-ENG-004)", () => {
+  const zh = messagesFor("zh-CN");
+  const en = messagesFor("en-US");
+  const order = ["default", "autoEdit", "plan", "yolo"] as const;
+  assert.deepEqual([...GUILD_ADDON_PERMISSION_MODES.gemini].sort(), [...order].sort());
+  assert.deepEqual(order.map((mode) => en.addonPermissionModeName("gemini", mode)), ["Default", "Auto-edit", "Plan", "Full access (YOLO)"]);
+  assert.deepEqual(order.map((mode) => zh.addonPermissionModeName("gemini", mode)), ["默认", "自动编辑", "规划", "完全访问 (YOLO)"]);
+  assert.match(en.addonPermissionModeHelp("gemini", "plan"), /Read-only/u);
+  // An id Gemini does not offer falls back to the id, never to Codex's wording.
+  assert.equal(en.addonPermissionModeName("gemini", "agent-full-access"), "agent-full-access");
+  assert.equal(en.modelGroupHint("gemini"), "Billed per use on your Google AI Studio account");
+  assert.equal(zh.modelGroupHint("gemini"), "按 Google AI Studio 账户的用量计费");
+  for (const group of ["grok", "claude", "codex", "online", "local"] as const) {
+    assert.equal(en.modelGroupHint(group), undefined, group);
+    assert.equal(zh.modelGroupHint(group), undefined, group);
+  }
+  assert.equal(en.modelPickerAddonDefault("gemini"), "Gemini (default model)");
+  assert.equal(zh.modelPickerAddonDefault("gemini"), "Gemini（默认模型）");
+});
+
+test("the Gemini key binding and Dock icon strings exist, are non-empty and mention no undefined in both catalogs (PC-SET-002)", () => {
+  for (const locale of ["zh-CN", "en-US"] as const) {
+    const messages = messagesFor(locale);
+    const texts = [
+      messages.engineKeyHeading, messages.engineKeyVariableHint("GEMINI_API_KEY"), messages.engineKeyHostLabel,
+      messages.engineKeyConfirmationLabel, messages.engineKeyConfirmed("generativelanguage.googleapis.com"),
+      messages.engineKeyNotConfirmed, messages.engineKeyStateLabel, messages.engineKeyConfirm,
+      messages.engineKeyConfirmHelp("generativelanguage.googleapis.com"), messages.engineKeyFailed,
+      messages.dockIcon, messages.dockIconHelp, messages.dockIconName("dark"), messages.dockIconName("light"),
+      ...(["unconfirmed", "unchecked", "usable", "unusable"] as const).map((state) => messages.engineKeyStateName(state)),
+    ];
+    for (const text of texts) {
+      assert.equal(text.trim().length > 0, true, `${locale}: empty string`);
+      assert.equal(text.includes("undefined"), false, `${locale}: ${text}`);
+    }
+    assert.equal(new Set((["unconfirmed", "unchecked", "usable", "unusable"] as const).map((state) => messages.engineKeyStateName(state))).size, 4);
+    assert.match(messages.engineKeyVariableHint("GEMINI_API_KEY"), /GEMINI_API_KEY/u);
+    assert.match(messages.engineKeyConfirmed("generativelanguage.googleapis.com"), /generativelanguage\.googleapis\.com/u);
+  }
+  assert.equal(messagesFor("en-US").engineKeyConfirm, "Confirm…");
+  assert.equal(messagesFor("zh-CN").engineKeyConfirm, "确认…");
+  assert.deepEqual([messagesFor("en-US").dockIcon, messagesFor("en-US").dockIconName("dark"), messagesFor("en-US").dockIconName("light")], ["Dock icon", "Dark", "Light"]);
+  assert.deepEqual([messagesFor("zh-CN").dockIcon, messagesFor("zh-CN").dockIconName("dark"), messagesFor("zh-CN").dockIconName("light")], ["Dock 图标", "深色", "浅色"]);
 });
