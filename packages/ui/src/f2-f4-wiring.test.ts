@@ -107,6 +107,6 @@ test("a draft can only be saved into the task it belongs to; archiving the open 
   assert.match(app, /if \(action === "archive"\) await persistCurrentDraft\(\);\s*\n\s*setProjection\(await api\.updateTask\(\{ taskId: task\.taskId, action \}\)\);/u);
   // Both branch paths save the open task's text before the fork becomes the active task.
   assert.equal(app.match(/await persistCurrentDraft\(\);\s*\n\s*const task = await api\.forkTask\(/gu)?.length, 2);
-  // Safety net: when the active task changes by any path, the left task's text goes back to that task.
-  assert.match(app, /const leftTaskId = activeTaskIdRef\.current;\s*\n\s*const leftText = draftRef\.current;[\s\S]{0,400}void api\.setDraft\(\{ taskId: leftTaskId, text: leftText \}\)/u);
+  // The reconciliation never writes the left task's text itself (a late write could overwrite a newer draft).
+  assert.doesNotMatch(app, /const leftText = draftRef\.current;/u);
 });

@@ -728,17 +728,12 @@ export function GuildApp({ api }: GuildAppProps) {
 
   // The composer text belongs to activeTaskIdRef's task. Any projection that changes the active task by another
   // path (archive, delete, restore, a workspace action) loads the new task's draft first; until it has, nothing is
-  // saved, so the text of the task that was left can never overwrite another task's draft.
+  // saved, so the text of the task that was left can never overwrite another task's draft. Paths that switch tasks
+  // save the open task's text first (persistCurrentDraft); this effect never writes on their behalf, because a late
+  // write of old text could overwrite a newer saved draft.
   useEffect(() => {
     const nextTaskId = projection?.activeTask?.task.taskId;
     if (nextTaskId === activeTaskIdRef.current) return;
-    const leftTaskId = activeTaskIdRef.current;
-    const leftText = draftRef.current;
-    // Safety net for any path that did not save first: the text typed into the task being left goes back to that
-    // task (best effort; an archived or deleted task simply refuses it).
-    if (leftTaskId !== undefined && leftText.length > 0 && !pendingSends.has(leftTaskId) && !isComposerTextTooLong(leftText)) {
-      void api.setDraft({ taskId: leftTaskId, text: leftText }).catch(() => undefined);
-    }
     activeTaskIdRef.current = nextTaskId;
     setDraft(projection?.activeTask?.draft ?? "");
   }, [projection?.activeTask?.task.taskId, projection?.activeTask?.draft]);
