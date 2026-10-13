@@ -445,14 +445,27 @@ test("profile and general settings stay closed and validate nicknames", () => {
       newTaskWorkspaceMode: "last",
       browserSyncEnabled: false,
       taskNotificationsEnabled: true,
+      dockIcon: "light",
     }),
     {
       restoreLastTask: true,
       newTaskWorkspaceMode: "last",
       browserSyncEnabled: false,
       taskNotificationsEnabled: true,
+      dockIcon: "light",
     },
   );
+  for (const dockIcon of ["Light", "", "auto", "blue", 1, null, undefined]) {
+    assert.throws(() =>
+      parseDesktopRequest(DESKTOP_IPC_CHANNELS.setGeneralSettings, {
+        restoreLastTask: true,
+        newTaskWorkspaceMode: "last",
+        browserSyncEnabled: false,
+        taskNotificationsEnabled: true,
+        dockIcon,
+      }),
+    TypeError, String(dockIcon));
+  }
   assert.throws(() =>
     parseDesktopRequest(DESKTOP_IPC_CHANNELS.saveProfile, {
       nickname: "\nBDV",
@@ -465,6 +478,7 @@ test("profile and general settings stay closed and validate nicknames", () => {
       newTaskWorkspaceMode: "always",
       browserSyncEnabled: false,
       taskNotificationsEnabled: true,
+      dockIcon: "dark",
     }),
   );
   assert.deepEqual(
@@ -800,9 +814,13 @@ test("createTask accepts an optional engine and nothing else new (PC-ENG-001)", 
     parseDesktopRequest(DESKTOP_IPC_CHANNELS.createTask, { workspaceId, engine: "codex" }),
     { workspaceId, engine: "codex" },
   );
+  assert.deepEqual(
+    parseDesktopRequest(DESKTOP_IPC_CHANNELS.createTask, { workspaceId, engine: "gemini" }),
+    { workspaceId, engine: "gemini" },
+  );
   assert.deepEqual(parseDesktopRequest(DESKTOP_IPC_CHANNELS.createTask, { workspaceId }), { workspaceId });
   for (const rejected of [
-    { workspaceId, engine: "gemini" },
+    { workspaceId, engine: "mistral" },
     { workspaceId, engine: "Claude" },
     { workspaceId, engine: "" },
     { workspaceId, engine: null },
@@ -822,7 +840,7 @@ test("setTaskEngine takes a task id and an engine; the routed marker has no chan
     {},
     { taskId: "task-1" },
     { engine: "claude" },
-    { taskId: "task-1", engine: "gemini" },
+    { taskId: "task-1", engine: "mistral" },
     { taskId: "", engine: "claude" },
     { taskId: "task-1", engine: "claude", routed: true },
     { taskId: "task-1", engine: "claude", expectedRevision: 1 },
@@ -894,6 +912,8 @@ test("add-on engine defaults are validated by the engine's own grammar and modes
     { engine: "grok", model: null, reasoningEffort: null, permissionMode: "workspace-write" },
     { engine: "claude", model: null, reasoningEffort: null, permissionMode: "default" },
     { engine: "gemini", model: null, reasoningEffort: null, permissionMode: "workspace-write" },
+    { engine: "gemini", model: null, reasoningEffort: null, permissionMode: "acceptEdits" },
+    { engine: "mistral", model: null, reasoningEffort: null, permissionMode: "default" },
     { engine: "codex", model: "gpt 6", reasoningEffort: null, permissionMode: "workspace-write" },
     { engine: "codex", model: null, reasoningEffort: "High", permissionMode: "workspace-write" },
     { engine: "codex", model: null, reasoningEffort: null, permissionMode: "default" },
@@ -906,6 +926,75 @@ test("add-on engine defaults are validated by the engine's own grammar and modes
   }
   // There is no channel that carries a Codex credential or an authentication choice.
   assert.equal(Object.values(DESKTOP_IPC_CHANNELS).some((channel) => /codex|openai/iu.test(channel)), false);
+});
+
+test("Gemini defaults take the CLI's own camel-case modes and no effort of their own [PC-ENG-004, PC-SET-002]", () => {
+  for (const permissionMode of ["default", "autoEdit", "yolo", "plan"]) {
+    assert.deepEqual(
+      parseDesktopRequest(DESKTOP_IPC_CHANNELS.setEngineSettings, {
+        engine: "gemini", model: "gemini-3.5-flash-lite", reasoningEffort: null, permissionMode,
+      }),
+      { engine: "gemini", model: "gemini-3.5-flash-lite", reasoningEffort: null, permissionMode },
+    );
+  }
+  assert.deepEqual(
+    parseDesktopRequest(DESKTOP_IPC_CHANNELS.setEngineSettings, {
+      engine: "gemini", model: null, reasoningEffort: null, permissionMode: "default",
+    }),
+    { engine: "gemini", model: null, reasoningEffort: null, permissionMode: "default" },
+  );
+  for (const rejected of [
+    { engine: "gemini", model: "gemini 3", reasoningEffort: null, permissionMode: "default" },
+    { engine: "gemini", model: null, reasoningEffort: null, permissionMode: "read-only" },
+    { engine: "gemini", model: null, reasoningEffort: null, permissionMode: "Yolo" },
+    { engine: "gemini", model: null, reasoningEffort: null, permissionMode: "default", apiKey: "x" },
+  ]) {
+    assert.throws(() => parseDesktopRequest(DESKTOP_IPC_CHANNELS.setEngineSettings, rejected), TypeError, JSON.stringify(rejected));
+  }
+});
+
+test("an engine's API key is named by file and variable only, and the confirmation names no host a renderer could choose [PC-ENG-004]", () => {
+  assert.deepEqual(
+    parseDesktopRequest(DESKTOP_IPC_CHANNELS.setEngineApiKey, { engine: "gemini", keyFile: null, keyVariable: "GEMINI_API_KEY" }),
+    { engine: "gemini", keyFile: null, keyVariable: "GEMINI_API_KEY" },
+  );
+  assert.deepEqual(
+    parseDesktopRequest(DESKTOP_IPC_CHANNELS.setEngineApiKey, { engine: "gemini", keyFile: "/Users/me/.config/keys.env", keyVariable: "MY_KEY_2" }),
+    { engine: "gemini", keyFile: "/Users/me/.config/keys.env", keyVariable: "MY_KEY_2" },
+  );
+  assert.deepEqual(
+    parseDesktopRequest(DESKTOP_IPC_CHANNELS.confirmEngineApiKey, { engine: "gemini" }),
+    { engine: "gemini" },
+  );
+  for (const rejected of [
+    { engine: "codex", keyFile: null, keyVariable: "GEMINI_API_KEY" },
+    { engine: "claude", keyFile: null, keyVariable: "GEMINI_API_KEY" },
+    { engine: "grok", keyFile: null, keyVariable: "GEMINI_API_KEY" },
+    { engine: "mistral", keyFile: null, keyVariable: "GEMINI_API_KEY" },
+    { engine: "gemini", keyFile: "relative.env", keyVariable: "GEMINI_API_KEY" },
+    { engine: "gemini", keyFile: "/a/../b", keyVariable: "GEMINI_API_KEY" },
+    { engine: "gemini", keyFile: "", keyVariable: "GEMINI_API_KEY" },
+    { engine: "gemini", keyFile: null, keyVariable: "gemini_api_key" },
+    { engine: "gemini", keyFile: null, keyVariable: "" },
+    { engine: "gemini", keyFile: null, keyVariable: "AIzaSyD-not-a-name" },
+    { engine: "gemini", keyFile: null },
+    { engine: "gemini", keyVariable: "GEMINI_API_KEY" },
+    { engine: "gemini", keyFile: null, keyVariable: "GEMINI_API_KEY", key: "AIzaSyD0000000000000000000000000000000" },
+    { engine: "gemini", keyFile: null, keyVariable: "GEMINI_API_KEY", host: "evil.example" },
+    { engine: "gemini", keyFile: null, keyVariable: "GEMINI_API_KEY", confirmedHost: "generativelanguage.googleapis.com" },
+  ]) {
+    assert.throws(() => parseDesktopRequest(DESKTOP_IPC_CHANNELS.setEngineApiKey, rejected), TypeError, JSON.stringify(rejected));
+  }
+  for (const rejected of [
+    { engine: "codex" }, { engine: "mistral" }, {}, { engine: "gemini", host: "evil.example" },
+    { engine: "gemini", confirmed: true }, { engine: "gemini", keyVariable: "GEMINI_API_KEY" },
+  ]) {
+    assert.throws(() => parseDesktopRequest(DESKTOP_IPC_CHANNELS.confirmEngineApiKey, rejected), TypeError, JSON.stringify(rejected));
+  }
+  // The renderer can name a file and a variable; no channel returns a key or sets the confirmed host.
+  assert.equal(Object.values(DESKTOP_IPC_CHANNELS).some((channel) => /gemini|google/iu.test(channel)), false);
+  assert.equal((DESKTOP_EVENT_CHANNELS as readonly string[]).includes(DESKTOP_IPC_CHANNELS.setEngineApiKey), false);
+  assert.equal((DESKTOP_EVENT_CHANNELS as readonly string[]).includes(DESKTOP_IPC_CHANNELS.confirmEngineApiKey), false);
 });
 
 test("model source requests carry no secret and no confirmation a renderer could forge [PC-ROUTE-002]", () => {
@@ -988,6 +1077,8 @@ test("the Guild 3.0 channels are registered, unique invoke channels in the close
     DESKTOP_IPC_CHANNELS.setTaskEngine,
     DESKTOP_IPC_CHANNELS.setClaudeSettings,
     DESKTOP_IPC_CHANNELS.setEngineSettings,
+    DESKTOP_IPC_CHANNELS.setEngineApiKey,
+    DESKTOP_IPC_CHANNELS.confirmEngineApiKey,
     DESKTOP_IPC_CHANNELS.listModelSources,
     DESKTOP_IPC_CHANNELS.upsertModelSource,
     DESKTOP_IPC_CHANNELS.deleteModelSource,

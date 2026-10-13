@@ -14,6 +14,7 @@ import {
 import type { RunState } from "./run-events.js";
 import {
   GUILD_CLAUDE_PERMISSION_MODES,
+  engineApiKeySpec,
   isAddonEngine,
   parseGuildAddonPermissionMode,
   parseGuildClaudeModel,
@@ -45,6 +46,8 @@ import {
 import {
   parseModelSourceDraft,
   parseModelSourceIdRequest,
+  parseModelSourceKeyFile,
+  parseModelSourceKeyVariable,
   type ConfirmModelSourceRequest,
   type ConfirmModelSourceResponse,
   type TestModelSourceRequest,
@@ -188,6 +191,8 @@ export const DESKTOP_IPC_CHANNELS = Object.freeze({
   setTaskEngine: "guild:v1:task:engine:set",
   setClaudeSettings: "guild:v1:settings:claude",
   setEngineSettings: "guild:v1:settings:engine",
+  setEngineApiKey: "guild:v1:settings:engine-key",
+  confirmEngineApiKey: "guild:v1:settings:engine-key:confirm",
   listModelSources: "guild:v1:model-sources:list",
   upsertModelSource: "guild:v1:model-sources:upsert",
   deleteModelSource: "guild:v1:model-sources:delete",
@@ -231,6 +236,10 @@ export function canonicalGuildExternalUrl(value: string): string {
   return parsed.href;
 }
 export const GUILD_NICKNAME_MAX_LENGTH = 32;
+/** The Dock icon the user picks in Settings > General (PC-SET-002): `dark` is the bundle icon, `light` the alternate. */
+export const GUILD_DOCK_ICONS = Object.freeze(["dark", "light"] as const);
+export type GuildDockIcon = (typeof GUILD_DOCK_ICONS)[number];
+export const GUILD_DEFAULT_DOCK_ICON: GuildDockIcon = "dark";
 export const GUILD_NEW_TASK_WORKSPACE_MODES = Object.freeze(["ask", "last"] as const);
 export type GuildNewTaskWorkspaceMode = (typeof GUILD_NEW_TASK_WORKSPACE_MODES)[number];
 export const GUILD_AVATAR_REJECTION_REASONS = Object.freeze([
@@ -555,7 +564,31 @@ export type AddonEngineSettingsProjection = {
   readonly reasoningEffort: string | null;
   readonly permissionMode: string;
   readonly availablePermissionModes: readonly string[];
+  /** The API key binding of an engine that is paid for per use (Gemini); absent for an engine with no key field. */
+  readonly apiKey?: EngineApiKeyProjection;
 };
+
+/**
+ * What the renderer sees of an engine's API key binding (PC-ENG-004): the names of the file and variable the key is
+ * read from, the host it may be sent to and whether the user confirmed that. Never a key, and never a path the
+ * renderer could not already have typed itself.
+ */
+export type EngineApiKeyProjection = Readonly<{
+  /** Absolute path of the env file, or null for `defaultKeyFile`. */
+  keyFile: string | null;
+  keyVariable: string;
+  /** The only host the key is sent to. */
+  host: string;
+  /** The user confirmed this file, variable and host in the native dialog. */
+  confirmed: boolean;
+  /** The file used when `keyFile` is null. */
+  defaultKeyFile: string;
+  /**
+   * What the main process found when it last looked: `usable` (confirmed and the variable has a value),
+   * `unusable` (confirmed but the file or variable gives nothing), `unconfirmed`, or `unchecked` (not looked yet).
+   */
+  state: "unconfirmed" | "unchecked" | "usable" | "unusable";
+}>;
 
 /** Defaults a new Claude-engine task starts from. Same rules as the Grok defaults, Claude grammar. */
 export type ClaudeEngineSettingsProjection = {
@@ -591,6 +624,8 @@ export type GeneralSettingsProjection = {
   readonly restoreLastTask: boolean;
   readonly newTaskWorkspaceMode: GuildNewTaskWorkspaceMode;
   readonly taskNotificationsEnabled: boolean;
+  /** The Dock icon (PC-SET-002); the main process applies it. */
+  readonly dockIcon: GuildDockIcon;
   readonly lastWorkspaceId?: WorkspaceId;
 };
 
@@ -725,6 +760,16 @@ export type SetEngineSettingsRequest = {
   readonly reasoningEffort: string | null;
   readonly permissionMode: string;
 };
+/** Names the file and variable an engine's API key is read from; any change voids the confirmation. */
+export type SetEngineApiKeyRequest = {
+  readonly engine: GuildAddonEngine;
+  readonly keyFile: string | null;
+  readonly keyVariable: string;
+};
+/** Asks the main process to show the native confirmation that binds the key to the engine's host. */
+export type ConfirmEngineApiKeyRequest = {
+  readonly engine: GuildAddonEngine;
+};
 /** Per-workspace privacy preferences (PC-PRIV-001). */
 export type WorkspacePrefsProjection = {
   readonly workspaceId: WorkspaceId;
@@ -751,6 +796,7 @@ export type SetGeneralSettingsRequest = {
   readonly newTaskWorkspaceMode: GuildNewTaskWorkspaceMode;
   readonly browserSyncEnabled: boolean;
   readonly taskNotificationsEnabled: boolean;
+  readonly dockIcon: GuildDockIcon;
 };
 export type OpenUserDataRequest = Readonly<Record<string, never>>;
 export type OpenRuntimeDiagnosticsRequest = Readonly<Record<string, never>>;
@@ -924,6 +970,8 @@ export type DesktopRequestByChannel = {
   readonly [DESKTOP_IPC_CHANNELS.setTaskEngine]: SetTaskEngineRequest;
   readonly [DESKTOP_IPC_CHANNELS.setClaudeSettings]: SetClaudeSettingsRequest;
   readonly [DESKTOP_IPC_CHANNELS.setEngineSettings]: SetEngineSettingsRequest;
+  readonly [DESKTOP_IPC_CHANNELS.setEngineApiKey]: SetEngineApiKeyRequest;
+  readonly [DESKTOP_IPC_CHANNELS.confirmEngineApiKey]: ConfirmEngineApiKeyRequest;
   readonly [DESKTOP_IPC_CHANNELS.listModelSources]: ListModelSourcesRequest;
   readonly [DESKTOP_IPC_CHANNELS.upsertModelSource]: UpsertModelSourceRequest;
   readonly [DESKTOP_IPC_CHANNELS.deleteModelSource]: DeleteModelSourceRequest;
@@ -984,6 +1032,8 @@ export type DesktopResponseByChannel = {
   readonly [DESKTOP_IPC_CHANNELS.setTaskEngine]: TaskViewProjection;
   readonly [DESKTOP_IPC_CHANNELS.setClaudeSettings]: DesktopBootstrapProjection;
   readonly [DESKTOP_IPC_CHANNELS.setEngineSettings]: DesktopBootstrapProjection;
+  readonly [DESKTOP_IPC_CHANNELS.setEngineApiKey]: DesktopBootstrapProjection;
+  readonly [DESKTOP_IPC_CHANNELS.confirmEngineApiKey]: DesktopBootstrapProjection;
   readonly [DESKTOP_IPC_CHANNELS.listModelSources]: ListModelSourcesResponse;
   readonly [DESKTOP_IPC_CHANNELS.upsertModelSource]: UpsertModelSourceResponse;
   readonly [DESKTOP_IPC_CHANNELS.deleteModelSource]: EmptyDesktopResponse;
@@ -1109,6 +1159,12 @@ export type GuildRendererApi = Readonly<{
   readonly setEngineSettings: (
     request: SetEngineSettingsRequest,
   ) => Promise<DesktopBootstrapProjection>;
+  readonly setEngineApiKey: (
+    request: SetEngineApiKeyRequest,
+  ) => Promise<DesktopBootstrapProjection>;
+  readonly confirmEngineApiKey: (
+    request: ConfirmEngineApiKeyRequest,
+  ) => Promise<DesktopBootstrapProjection>;
   readonly listModelSources: () => Promise<ListModelSourcesResponse>;
   readonly upsertModelSource: (
     request: UpsertModelSourceRequest,
@@ -1186,6 +1242,13 @@ export function parseGuildGrokStartupSettings(value: unknown): GuildGrokStartupS
     subagentsEnabled: record["subagentsEnabled"] as boolean,
     maxTurns: maxTurns as number | null,
   });
+}
+
+export function parseGuildDockIcon(value: unknown): GuildDockIcon {
+  if (typeof value !== "string" || !(GUILD_DOCK_ICONS as readonly string[]).includes(value)) {
+    throw new TypeError("invalid_dock_icon");
+  }
+  return value as GuildDockIcon;
 }
 
 export function parseGuildNewTaskWorkspaceMode(
@@ -1727,6 +1790,17 @@ export function parseDesktopRequest<Channel extends DesktopInvokeChannel>(
       const permissionMode = parseGuildAddonPermissionMode(engine, record["permissionMode"]);
       return Object.freeze({ engine, model, reasoningEffort, permissionMode }) as DesktopRequestByChannel[Channel];
     }
+    case DESKTOP_IPC_CHANNELS.setEngineApiKey: {
+      const record = exactRecord(input, ["engine", "keyFile", "keyVariable"]);
+      const engine = parseKeyedAddonEngine(record["engine"]);
+      const keyFile = record["keyFile"] === null ? null : parseModelSourceKeyFile(record["keyFile"]);
+      const keyVariable = parseModelSourceKeyVariable(record["keyVariable"]);
+      return Object.freeze({ engine, keyFile, keyVariable }) as DesktopRequestByChannel[Channel];
+    }
+    case DESKTOP_IPC_CHANNELS.confirmEngineApiKey: {
+      const record = exactRecord(input, ["engine"]);
+      return Object.freeze({ engine: parseKeyedAddonEngine(record["engine"]) }) as DesktopRequestByChannel[Channel];
+    }
     case DESKTOP_IPC_CHANNELS.setSidebarWidth: {
       const record = exactRecord(input, ["width"]);
       const width = record["width"];
@@ -1747,6 +1821,7 @@ export function parseDesktopRequest<Channel extends DesktopInvokeChannel>(
         "newTaskWorkspaceMode",
         "browserSyncEnabled",
         "taskNotificationsEnabled",
+        "dockIcon",
       ]);
       if (
         typeof record["restoreLastTask"] !== "boolean" ||
@@ -1762,12 +1837,20 @@ export function parseDesktopRequest<Channel extends DesktopInvokeChannel>(
         ),
         browserSyncEnabled: record["browserSyncEnabled"],
         taskNotificationsEnabled: record["taskNotificationsEnabled"],
+        dockIcon: parseGuildDockIcon(record["dockIcon"]),
       }) as DesktopRequestByChannel[Channel];
     }
     default:
       // Push-only event channels and any dynamically built name are never requests.
       throw new TypeError("unregistered_channel");
   }
+}
+
+/** An add-on engine that takes an API key (Gemini); any other engine is refused. */
+function parseKeyedAddonEngine(value: unknown): GuildAddonEngine {
+  const engine = parseGuildEngine(value);
+  if (!isAddonEngine(engine) || engineApiKeySpec(engine) === undefined) throw new TypeError("invalid_engine");
+  return engine;
 }
 
 function parseGrokManagementParameters(

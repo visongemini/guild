@@ -1468,9 +1468,16 @@ VALUES(20, 'run_model_labels', CAST(unixepoch('subsec') * 1000 AS INTEGER));
 //    routed_at_ms stays legal only on a Claude task.
 // 2. The two triggers that keep a task's runtime model in its engine's grammar now treat Grok as the strict engine
 //    (a missing task row counts as Grok, as before) and every other engine as the wider grammar the store checks.
-// 3. engine_defaults holds the Guild-level model, effort and permission mode of each add-on engine (Codex first).
+// 3. engine_defaults holds the Guild-level model, effort and permission mode of each add-on engine (Codex, Gemini).
 //    A missing row means "follow the engine's own default and the engine's default permission mode"; the CHECKs
-//    give only the shape, the store validates the values against the engine's own grammar and modes.
+//    give only the shape, the store validates the values against the engine's own grammar and modes. A permission
+//    mode id may carry upper-case letters (Gemini's `autoEdit`).
+// 4. (Guild 3.1 part 2, PC-ENG-004, PC-SET-002; 3.1 is unreleased, so these extend V21 instead of adding V22.)
+//    engine_key_bindings holds, per add-on engine that is paid for per use (Gemini), the NAMES of the env file and
+//    variable its API key is read from and the host the user confirmed the key may be sent to. There is no column
+//    that could hold a key. app_settings.dock_icon is the Dock icon the user chose ('dark' is the bundle icon).
+//    The engine columns of task_metadata and runtime_model_catalog already accept the identifier shape of the
+//    foundation, so the 'gemini' engine value and Gemini model ids (letters, digits, dots, dashes) need nothing.
 const MIGRATION_V21 = String.raw`
 CREATE TABLE guild_meta_next (
   singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
@@ -1644,9 +1651,30 @@ CREATE TABLE engine_defaults (
   permission_mode TEXT NOT NULL CHECK(
     length(permission_mode) BETWEEN 1 AND 32
     AND permission_mode GLOB '[a-z]*'
-    AND permission_mode NOT GLOB '*[^a-z0-9-]*'
+    AND permission_mode NOT GLOB '*[^A-Za-z0-9-]*'
   )
 ) STRICT;
+
+CREATE TABLE engine_key_bindings (
+  engine TEXT PRIMARY KEY CHECK(
+    length(engine) BETWEEN 2 AND 16
+    AND engine GLOB '[a-z]*'
+    AND engine NOT GLOB '*[^a-z0-9]*'
+  ),
+  key_file TEXT CHECK(key_file IS NULL OR length(key_file) BETWEEN 1 AND 4096),
+  key_variable TEXT NOT NULL CHECK(
+    length(key_variable) BETWEEN 1 AND 64
+    AND key_variable GLOB '[A-Z_]*'
+    AND key_variable NOT GLOB '*[^A-Z0-9_]*'
+  ),
+  confirmed_host TEXT CHECK(confirmed_host IS NULL OR length(confirmed_host) BETWEEN 1 AND 300),
+  revision INTEGER NOT NULL CHECK(revision >= 1),
+  updated_at_ms INTEGER NOT NULL CHECK(updated_at_ms >= 0)
+) STRICT;
+
+ALTER TABLE app_settings
+ADD COLUMN dock_icon TEXT NOT NULL DEFAULT 'dark'
+CHECK(dock_icon IN ('dark', 'light'));
 
 INSERT INTO schema_migrations(version, name, applied_at_ms)
 VALUES(21, 'n_engine_foundation', CAST(unixepoch('subsec') * 1000 AS INTEGER));
