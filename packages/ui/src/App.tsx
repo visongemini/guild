@@ -348,7 +348,7 @@ export function GuildApp({ api }: GuildAppProps) {
   const autoScrollPinned = useRef(true);
   const autoScrollTaskId = useRef<string | undefined>(undefined);
   const seenWorkspaceIds = useRef<Set<string>>(new Set());
-  const activeTaskIdRef = useRef<string | undefined>(undefined);
+  const activeTaskIdRef = useRef<TaskSummaryProjection["taskId"] | undefined>(undefined);
   const streamOverlay = useMemo(() => new StreamOverlayStore(() => activeTaskIdRef.current), []);
   const sendInFlightRef = useRef<ReadonlySet<string>>(new Set());
   const operationInFlightRef = useRef(false);
@@ -732,6 +732,13 @@ export function GuildApp({ api }: GuildAppProps) {
   useEffect(() => {
     const nextTaskId = projection?.activeTask?.task.taskId;
     if (nextTaskId === activeTaskIdRef.current) return;
+    const leftTaskId = activeTaskIdRef.current;
+    const leftText = draftRef.current;
+    // Safety net for any path that did not save first: the text typed into the task being left goes back to that
+    // task (best effort; an archived or deleted task simply refuses it).
+    if (leftTaskId !== undefined && leftText.length > 0 && !pendingSends.has(leftTaskId) && !isComposerTextTooLong(leftText)) {
+      void api.setDraft({ taskId: leftTaskId, text: leftText }).catch(() => undefined);
+    }
     activeTaskIdRef.current = nextTaskId;
     setDraft(projection?.activeTask?.draft ?? "");
   }, [projection?.activeTask?.task.taskId, projection?.activeTask?.draft]);
@@ -1526,6 +1533,7 @@ export function GuildApp({ api }: GuildAppProps) {
     setContextMenu(undefined);
     if (menu?.type !== "task") return;
     await run(async () => {
+      await persistCurrentDraft();
       const task = await api.forkTask({ taskId: menu.task.taskId });
       setProjection((current) => current === undefined ? current : { ...current, activeTask: task });
     });
@@ -1777,6 +1785,7 @@ export function GuildApp({ api }: GuildAppProps) {
     const taskId = activeTask?.task.taskId;
     if (taskId === undefined || (item.kind !== "user" && item.kind !== "assistant")) return;
     await run(async () => {
+      await persistCurrentDraft();
       const task = await api.forkTask({ taskId, throughSequence: item.sequence });
       setProjection((current) => current === undefined ? current : { ...current, activeTask: task });
     });

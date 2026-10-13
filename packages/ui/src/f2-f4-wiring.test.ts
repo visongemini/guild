@@ -101,8 +101,12 @@ test("a draft can only be saved into the task it belongs to; archiving the open 
   // Owner check: the debounced save skips while the projection's active task is not the composer's task.
   assert.match(app, /useEffect\(\(\) => \{\s*\n\s*const taskId = projection\?\.activeTask\?\.task\.taskId;\s*\n\s*if \(taskId !== activeTaskIdRef\.current\) return;/u);
   // Reconciliation: any projection that changes the active task loads that task's draft into the composer.
-  assert.match(app, /const nextTaskId = projection\?\.activeTask\?\.task\.taskId;\s*\n\s*if \(nextTaskId === activeTaskIdRef\.current\) return;\s*\n\s*activeTaskIdRef\.current = nextTaskId;\s*\n\s*setDraft\(projection\?\.activeTask\?\.draft \?\? ""\);/u);
+  assert.match(app, /const nextTaskId = projection\?\.activeTask\?\.task\.taskId;\s*\n\s*if \(nextTaskId === activeTaskIdRef\.current\) return;[\s\S]{0,700}activeTaskIdRef\.current = nextTaskId;\s*\n\s*setDraft\(projection\?\.activeTask\?\.draft \?\? ""\);/u);
   // The text of the task being archived, restored or deleted is saved to that task before the projection moves on.
   assert.match(app, /async function updateContext\(action[^)]*\) \{[\s\S]{0,200}await run\(async \(\) => \{\s*\n\s*await persistCurrentDraft\(\);/u);
   assert.match(app, /if \(action === "archive"\) await persistCurrentDraft\(\);\s*\n\s*setProjection\(await api\.updateTask\(\{ taskId: task\.taskId, action \}\)\);/u);
+  // Both branch paths save the open task's text before the fork becomes the active task.
+  assert.equal(app.match(/await persistCurrentDraft\(\);\s*\n\s*const task = await api\.forkTask\(/gu)?.length, 2);
+  // Safety net: when the active task changes by any path, the left task's text goes back to that task.
+  assert.match(app, /const leftTaskId = activeTaskIdRef\.current;\s*\n\s*const leftText = draftRef\.current;[\s\S]{0,400}void api\.setDraft\(\{ taskId: leftTaskId, text: leftText \}\)/u);
 });
