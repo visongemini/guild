@@ -30,9 +30,9 @@ export function onlineReminderNeeded(input: OnlineReminderInput): boolean {
 }
 
 /**
- * The vendor a model belongs to: the model source that lists it, together with the host that source sends to
- * (an agreement for one host says nothing about another, so a source edited to a new address, or deleted and
- * recreated under the same id elsewhere, asks again), else a key made from the model id (a model no source
+ * The vendor a model belongs to: the model source that lists it, together with the full address that source sends
+ * to (an agreement for one address says nothing about another, so a source edited to a new host or path, or deleted
+ * and recreated under the same id elsewhere, asks again), else a key made from the model id (a model no source
  * lists still gets one stable key, so it is asked about once, not on every switch).
  */
 export function onlineSourceKey(
@@ -41,13 +41,16 @@ export function onlineSourceKey(
 ): string {
   const source = sources.find((candidate) => candidate.models.some((model) => model.id === modelId));
   if (source === undefined) return `model:${modelId}`;
-  let host = "";
+  let address = "";
   try {
-    host = source.baseUrl === undefined ? "" : new URL(source.baseUrl).host.toLowerCase();
+    if (source.baseUrl !== undefined) {
+      const url = new URL(source.baseUrl);
+      address = `${url.protocol}//${url.host.toLowerCase()}${url.pathname.replace(/\/+$/u, "")}`;
+    }
   } catch {
-    host = "";
+    address = "";
   }
-  return host === "" ? `source:${source.id}` : `source:${source.id}@${host}`;
+  return address === "" ? `source:${source.id}` : `source:${source.id}@${address}`;
 }
 
 /** Which vendors each task agreed to send to; survives a restart when a store is given. */
@@ -107,9 +110,10 @@ export function createOnlineConsentLedger(storage?: Pick<Storage, "getItem" | "s
 }
 
 /**
- * The vendors a task already sends to: the ones it agreed to, plus the vendor of the Online model it runs on now
- * (the person was asked, or chose not to be, when they got there). Going Online A -> Claude -> Online B therefore
- * knows A and not B.
+ * The vendors a task already agreed to send to, as recorded when the reminder was answered (or skipped because the
+ * workspace silenced it). Going Online A -> Claude -> Online B therefore knows A and not B. The Online model a task
+ * runs on now is not counted implicitly any more (D-065): its source may have been edited to another address since
+ * the agreement, and a task from before the ledger was kept asks once more instead.
  */
 export function agreedSourcesOf(input: Readonly<{
   ledger: OnlineConsentLedger;
@@ -118,11 +122,7 @@ export function agreedSourcesOf(input: Readonly<{
   currentGroup: ModelGroup | undefined;
   sources: readonly Pick<ModelSourceProjection, "id" | "models">[];
 }>): ReadonlySet<string> {
-  const agreed = new Set(input.ledger.agreedSources(input.taskId));
-  if (input.currentGroup === "online" && input.currentModelId !== null) {
-    agreed.add(onlineSourceKey(input.currentModelId, input.sources));
-  }
-  return agreed;
+  return new Set(input.ledger.agreedSources(input.taskId));
 }
 
 /**

@@ -52,8 +52,8 @@ test("Claude, Local and Grok models never ask", () => {
 
 test("a model belongs to the source that lists it, else it is its own key", () => {
   const sources = [source("DeepSeek", ["deepseek-v4-flash", "deepseek-v4-reasoner"]), source("Other", ["other-1"])];
-  assert.equal(onlineSourceKey("deepseek-v4-reasoner", sources), "source:deepseek@api.example.com");
-  assert.equal(onlineSourceKey("other-1", sources), "source:other@api.example.com");
+  assert.equal(onlineSourceKey("deepseek-v4-reasoner", sources), "source:deepseek@https://api.example.com/anthropic");
+  assert.equal(onlineSourceKey("other-1", sources), "source:other@https://api.example.com/anthropic");
   assert.equal(onlineSourceKey("ghost", sources), "model:ghost");
   assert.equal(onlineSourceKey("ghost", []), "model:ghost");
 });
@@ -87,9 +87,10 @@ test("consent is per task and per vendor: Online A -> Claude -> Online B asks ag
   // Both vendors are known to t1 now; another task starts from nothing.
   assert.equal(asks("t1", "other-1", ["opus", "claude"]), false);
   assert.equal(asks("t3", "ds-flash", ["opus", "claude"]), true);
-  // The vendor a task already runs on counts as agreed even with no entry (a default the person set), and the
-  // workspace opt-out silences every vendor.
-  assert.equal(asks("t4", "ds-reasoner", ["ds-flash", "online"]), false);
+  // D-065: the vendor a task already runs on no longer counts as agreed without an entry (its source may point
+  // elsewhere since), so it asks once and then remembers; the workspace opt-out silences every vendor.
+  assert.equal(asks("t4", "ds-reasoner", ["ds-flash", "online"]), true);
+  assert.equal(asks("t4", "ds-flash", ["ds-reasoner", "online"]), false);
   assert.equal(asks("t5", "other-1", ["opus", "claude"], true), false);
   assert.equal(asks("t5", "ds-flash", ["opus", "claude"], true), false);
   // A model no source lists is its own vendor key: asked once, not on every switch.
@@ -251,7 +252,8 @@ test("an agreement is bound to the host the source sends to, and the in-memory l
   const deepseek = { id: "deepseek", models: [{ id: "ds-flash" }], baseUrl: "https://api.deepseek.com/anthropic" };
   const moved = { ...deepseek, baseUrl: "https://elsewhere.example/anthropic" };
   const key = onlineSourceKey("ds-flash", [deepseek] as never);
-  assert.equal(key, "source:deepseek@api.deepseek.com");
+  assert.equal(key, "source:deepseek@https://api.deepseek.com/anthropic");
+  assert.notEqual(onlineSourceKey("ds-flash", [{ ...deepseek, baseUrl: "https://api.deepseek.com/other" }] as never), key, "a new path is a new vendor too");
   assert.notEqual(onlineSourceKey("ds-flash", [moved] as never), key, "a new address is a new vendor to agree to");
   const ledger = createOnlineConsentLedger();
   ledger.agree("task-1", key);
