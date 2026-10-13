@@ -26,7 +26,9 @@
  * restart.
  * Environment: GUILD_QA_STAMP (reuse a run), GUILD_QA_ONLY=A,B (subset), GUILD_QA_KEEP_APP=1,
  * GUILD_QA_CODEX_ACP=<package directory of a codex-acp install> (handed to the unpackaged app as the dev-only
- * GUILD_DEV_CODEX_ACP; check I runs only when it is set; the production lookup is never changed).
+ * GUILD_DEV_CODEX_ACP; check I runs only when it is set; the production lookup is never changed),
+ * GUILD_QA_KEY_FILE=<env file with the source keys> (default ~/.config/guild/keys.env),
+ * GUILD_QA_LOCAL_URL=<base URL of the Local llama.cpp source> (default http://llm-box:8080).
  *
  * Usage: node scripts/run-guild3-qa.mjs
  */
@@ -44,7 +46,7 @@ import { seedQaData } from "./seed-guild3-qa.mjs";
 const repoRoot = fileURLToPath(new URL("..", import.meta.url));
 const desktopRoot = join(repoRoot, "apps", "desktop");
 const electronBinary = join(desktopRoot, "node_modules", "electron", "dist", "Electron.app", "Contents", "MacOS", "Electron");
-const keyFile = join(homedir(), ".config", "guild", "keys.env");
+const keyFile = process.env.GUILD_QA_KEY_FILE ?? join(homedir(), ".config", "guild", "keys.env");
 
 const stamp = process.env.GUILD_QA_STAMP ?? new Date().toISOString().replace(/[-:]/gu, "").replace(/\..*$/u, "").replace("T", "-");
 const workspaceDir = `/tmp/guild3-qa-ws-${stamp}`;

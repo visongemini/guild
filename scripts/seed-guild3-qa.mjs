@@ -13,7 +13,7 @@ import { randomUUID } from "node:crypto";
 import { basename, isAbsolute, join } from "node:path";
 import { pathToFileURL } from "node:url";
 
-const DEFAULT_KEY_FILE = `${process.env.HOME}/.config/guild/keys.env`;
+const DEFAULT_KEY_FILE = process.env.GUILD_QA_KEY_FILE ?? `${process.env.HOME}/.config/guild/keys.env`;
 
 export const QA_SOURCES = Object.freeze([
   Object.freeze({
@@ -30,7 +30,7 @@ export const QA_SOURCES = Object.freeze([
     id: "lan-llama",
     kind: "local",
     label: "LAN llama.cpp",
-    baseUrl: "http://llm-box:8080",
+    baseUrl: process.env.GUILD_QA_LOCAL_URL ?? "http://llm-box:8080",
     keyFile: DEFAULT_KEY_FILE,
     keyVariable: "QWEN_LOCAL_API_KEY",
     models: Object.freeze([{ id: "local-27b-model", label: "Local Model 27B" }]),
