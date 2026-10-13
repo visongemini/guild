@@ -329,7 +329,9 @@ acceptance_tests:
     proves: >-
       A new task's picker offers the Grok group and the first turn fixes the engine, a Claude task on
       the user's subscription completes a file write and read behind a permission card, survives quit
-      and resume, shows no gateway in /status, and renders each reduced-capability state truthfully.
+      and resume, shows no gateway in /status, and renders each reduced-capability state truthfully. A
+      Codex task on the user's ChatGPT subscription completes a tool turn behind a permission card,
+      names the model that answered, appears in the sidebar with the Codex marker and resumes after quit.
   AT-ROUTER-001:
     layer: packaged-integration
     phase: 3
@@ -992,19 +994,19 @@ requirements:
     sources: [docs/00-PROVENANCE-CHARTER.md, docs/03-ROADMAP-AND-GATES.md]
 
   - id: PC-ENG-001
-    title: Two engines with a per-task engine binding
+    title: Per-task engine binding across the supported engines
     statement: >-
-      Guild runs a task on one of two engines, the official Grok process or the user-installed
-      Claude Code adapter. The task's engine is set when its first turn is created and never changes;
-      the model group chosen for that turn fixes it. One engine process serves each active task. A
-      capability an engine lacks is shown as a named reduced state in Chinese and English and is never
-      simulated.
+      Guild runs a task on one of three engines, the official Grok process, the user-installed Claude
+      Code adapter or the user-installed Codex adapter. The task's engine is set when its first turn is
+      created and never changes; the model group chosen for that turn fixes it. One engine process
+      serves each active task. A capability an engine lacks is shown as a named reduced state in
+      Chinese and English and is never simulated.
     severity: P0
     phase: 3
     acceptance_stories: [AS-001, AS-011, AS-013]
     acceptance_tests: [AT-ENGINE-001, AT-I18N-001, EV-RELEASE-001]
     implementation_commits: []
-    sources: [docs/20-GUILD3-DUAL-ENGINE.md, docs/04-DECISION-LOG.md, docs/01-PRODUCT-CONTRACT.md]
+    sources: [docs/20-GUILD3-DUAL-ENGINE.md, docs/21-GUILD31-ENGINES.md, docs/04-DECISION-LOG.md, docs/01-PRODUCT-CONTRACT.md]
 
   - id: PC-ENG-002
     title: Pinned user-installed Claude engine without credential access
@@ -1022,11 +1024,30 @@ requirements:
     implementation_commits: []
     sources: [docs/20-GUILD3-DUAL-ENGINE.md, docs/04-DECISION-LOG.md]
 
+  - id: PC-ENG-003
+    title: Pinned user-installed Codex engine without credential access
+    statement: >-
+      The Codex engine runs the user-installed ACP adapter @agentclientprotocol/codex-acp (major 2) under
+      the user's node, together with the Codex core that adapter ships, and Guild distributes none of
+      it. The adapter is pinned by a version range and a SHA-256 over its installed package.json and dist
+      tree, its Codex core by real path, version and size, and a mismatch refuses to start with a named
+      error. The child environment is an allowlist with no inherited CODEX_ or OPENAI_ variable, and
+      OpenViking recall and capture are switched off. Guild never reads Codex credentials, never calls the
+      adapter's authenticate method and offers no API key field; a missing login is shown as a named
+      reduced state with the command to run. The model, reasoning effort and permission mode are applied
+      after every session start, and a session never runs with a looser permission mode than the setting.
+    severity: P0
+    phase: 3
+    acceptance_stories: [AS-011]
+    acceptance_tests: [AT-ENGINE-001, IT-SEC-001, EV-RELEASE-001]
+    implementation_commits: []
+    sources: [docs/21-GUILD31-ENGINES.md, docs/04-DECISION-LOG.md]
+
   - id: PC-MODEL-001
     title: Grouped model picker limited to reported or configured models
     statement: >-
-      The model picker groups models as Grok, Claude, Online and Local. A Grok task lists only models
-      the official Grok process reports. A Claude task lists the models its adapter reports plus the
+      The model picker groups models as Grok, Claude, ChatGPT (Codex), Online and Local. A Grok task lists
+      only models the official Grok process reports, and a Codex task only the models its adapter reports. A Claude task lists the models its adapter reports plus the
       enabled Online and Local models of sources the user configured and confirmed. Nothing from any
       other origin is selectable. Inside a Claude task the model can change between turns, in both
       directions between a Claude subscription model and an Online or Local model. The engine process

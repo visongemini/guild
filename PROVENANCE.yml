@@ -35,6 +35,14 @@ external_runtimes:
     credentials_policy: guild_never_reads_claude_credentials
     network_policy: no_shared_gateway
     network_note: loopback_model_router
+  - name: user_installed_codex_adapter
+    components:
+      - codex-acp
+      - codex_core_shipped_with_the_adapter
+    distribution: user_installed_not_distributed_with_guild
+    transport_target: ACP_over_stdio
+    credentials_policy: guild_never_reads_codex_credentials
+    network_policy: no_shared_gateway
 
 evidence_required:
   - independently_initialized_clean_repository_without_governance_git_objects

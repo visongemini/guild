@@ -26,3 +26,9 @@ Claude Code (the `claude` executable) and the Claude Code ACP adapter
 software. They are not vendored in this repository, are not distributed with
 Guild, and retain their separate terms and trademarks. Guild is not
 affiliated with, endorsed by, or sponsored by Anthropic.
+
+The Codex ACP adapter (`@agentclientprotocol/codex-acp`) and the Codex core it
+ships as a dependency (`@openai/codex`, a native executable) are external
+user-installed software. They are not vendored in this repository, are not
+distributed with Guild, and retain their separate terms and trademarks. Guild is
+not affiliated with, endorsed by, or sponsored by OpenAI.

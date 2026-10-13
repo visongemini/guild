@@ -1238,3 +1238,29 @@ Consequences
   itself: only a recorded answer does, so a source edited to another address always asks again. The workspace
   "don't remind me again" preference is unchanged.
 - Requirements: PC-PRIV-001.
+
+## D-066 — Guild 3.1: a third engine, OpenAI Codex, on a generic engine foundation
+
+- Date: 2026-10-13
+- Status: accepted
+- Context: the owner has a ChatGPT subscription and wants Codex in the same window as Grok and Claude Code, and a
+  fourth engine (Gemini) right after. The brief and the measured protocol facts are `docs/21-GUILD31-ENGINES.md`
+  (spike of 2026-10-13 with `@agentclientprotocol/codex-acp` 2.2.2).
+- Decision
+  - The engine list is data. `codex` joins `grok` and `claude`; a registry holds each engine's picker groups, sidebar
+    marker and permission modes, and engines that are neither Grok nor Claude are *add-on engines* (user-installed ACP
+    adapter, own login, no router). Schema 21 makes the engine columns accept an identifier shape instead of a name
+    list and adds `engine_defaults`, so the next add-on engine needs no migration.
+  - Codex runs the user-installed `@agentclientprotocol/codex-acp` (major 2) under the user's pinned `node`; the
+    adapter's own Codex core (`@openai/codex-darwin-*`, a native binary in the adapter's `node_modules`) is pinned by path,
+    version and size and handed to the adapter as `CODEX_PATH`. The login is the user's own (`codex login`); Guild never
+    reads `~/.codex`, never calls `authenticate`, never offers an API key field, and strips every inherited `CODEX_*` and
+    `OPENAI_*` variable.
+  - OpenViking is off for Codex through `OPENVIKING_AUTO_RECALL=false` and `OPENVIKING_AUTO_CAPTURE=false` (the Codex
+    plugin ignores `OPENVIKING_MEMORY_ENABLED`) plus the Grok block. There is no model router for Codex.
+  - The model, effort and permission mode are config options applied after every start, because a resumed Codex session
+    forgets all three. A permission mode is never looser than the setting, a model the session does not offer refuses
+    the prompt. Steer uses `_session/steering` only while Guild's prompt is in flight, because Codex ignores
+    `idleBehavior` and would start a turn nobody sees.
+  - Stop does not stop a foreground command Codex already started; this is stated to the user, not hidden.
+- Requirements: PC-ENG-001, PC-ENG-003, PC-MODEL-001, PC-SET-002.
