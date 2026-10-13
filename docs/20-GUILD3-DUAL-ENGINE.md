@@ -98,8 +98,10 @@ created and never changes. Process topology stays one engine process per task (D
   checks refuse reads as not found.
 - Staging root (D-070): the directory those copies live in (`<temp>/guild-v2-runtime`, shared with Grok's) is checked by
   one rule when it is created and again before every stage and every spawn: a real directory, owned by the current user,
-  mode 0700 (looser but ours: tightened; not ours or a link: refused), in a parent that is owned by the user or root and
-  not writable by group or others unless sticky. A refusal names `staging_root_unsafe` and nothing is copied or run.
+  mode 0700 (looser but ours: tightened; not ours or a link: refused), under a parent and every directory above it up to
+  `/` that is owned by the user or root and not writable by group or others unless sticky (an ancestor others can write
+  could be renamed away with the root in it; `/tmp` passes because it is sticky). A refusal names `staging_root_unsafe` and
+  nothing is copied or run.
 - Private install (D-070): what a launch runs in place cannot be copied (the `claude` binary keeps its keychain and
   auto-update behaviour where it is; `node` loads the adapter package in place; the Codex adapter spawns the native core
   and its helpers), so a packaged app requires that nobody but the user and root can rewrite it: the real path, every

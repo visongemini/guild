@@ -1026,7 +1026,8 @@ requirements:
       writable by neither group nor others, with no administrator-group exemption, checked again right
       before every spawn; otherwise the engine is refused with a status that names the path. The copies
       of node and of the probe run from a staging directory that is the user's alone (not a link, owned by
-      the user, mode 0700, in a parent others cannot rewrite), checked before every stage and spawn.
+      the user, mode 0700, under no directory up to / that others can rewrite), checked before every
+      stage and spawn.
       Guild never reads Claude credentials and never calls the adapter's authenticate method; a
       missing login is shown as a named reduced state.
     severity: P0

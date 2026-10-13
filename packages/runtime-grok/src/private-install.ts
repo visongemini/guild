@@ -71,6 +71,7 @@ export const PRIVATE_INSTALL_ENTRY_LIMIT = 150_000;
 
 const S_IWGRP = 0o020;
 const S_IWOTH = 0o002;
+const S_ISVTX = 0o1000;
 const CHUNK = 48;
 const MAX_DEPTH = 256;
 
@@ -87,9 +88,18 @@ export class InstallNotPrivateError extends AdapterPinError {
   }
 }
 
-/** The pure rule for one entry: the owner, then who can write to it. */
-export function privateInstallProblemOfStats(stats: PrivateInstallStats, uid: number): PrivateInstallProblem | undefined {
+/**
+ * The pure rule for one entry: the owner, then who can write to it. With `stickyDirectoriesOk` a directory that has the sticky
+ * bit may be writable by group and others (as `/tmp` is): they cannot rename or remove what the user owns in it. Engine files
+ * never get that allowance; the staging root's ancestors do (staging-root.ts).
+ */
+export function privateInstallProblemOfStats(
+  stats: PrivateInstallStats,
+  uid: number,
+  stickyDirectoriesOk = false,
+): PrivateInstallProblem | undefined {
   if (stats.uid !== uid && stats.uid !== 0) return "not_owned";
+  if (stickyDirectoriesOk && stats.isDirectory && (stats.mode & S_ISVTX) !== 0) return undefined;
   if ((stats.mode & S_IWOTH) !== 0) return "world_writable";
   if ((stats.mode & S_IWGRP) !== 0) return "group_writable";
   return undefined;
@@ -175,13 +185,22 @@ async function scanRoot(
   return undefined;
 }
 
-/** `real` and every folder above it: owned by the user or root, writable by neither group nor others. */
-async function checkChain(real: string, state: ScanState): Promise<PrivateInstallFinding | undefined> {
-  const { io } = state;
+/**
+ * `real` (a real path: links already resolved) and every folder above it up to `/`: each owned by the user or root and writable
+ * by neither group nor others. This is the one chain walk of the package: the engine files use it as it stands, and the
+ * staging root's ancestors use it with `stickyDirectoriesOk` (staging-root.ts). `verified` remembers the folders already judged
+ * in one call, so a shared prefix is looked at once.
+ */
+export async function findChainProblem(
+  real: string,
+  io: Pick<PrivateInstallIo, "uid" | "lstat">,
+  stickyDirectoriesOk = false,
+  verified: Set<string> = new Set(),
+): Promise<PrivateInstallFinding | undefined> {
   let current = real;
   for (let depth = 0; depth < MAX_DEPTH; depth += 1) {
-    const isRoot = current === real;
-    if (!isRoot && state.verifiedDirectories.has(current)) return undefined;
+    const isStart = current === real;
+    if (!isStart && verified.has(current)) return undefined;
     let stats: PrivateInstallStats;
     try {
       stats = await io.lstat(current);
@@ -190,14 +209,18 @@ async function checkChain(real: string, state: ScanState): Promise<PrivateInstal
     }
     // The caller passes a real path, so a link on it means the tree changed under the caller.
     if (stats.isSymbolicLink) return { problem: "linked", path: current };
-    const problem = privateInstallProblemOfStats(stats, io.uid);
+    const problem = privateInstallProblemOfStats(stats, io.uid, stickyDirectoriesOk);
     if (problem !== undefined) return { problem, path: current };
-    if (!isRoot) state.verifiedDirectories.add(current);
+    if (!isStart) verified.add(current);
     const parent = dirname(current);
     if (parent === current) return undefined;
     current = parent;
   }
   return { problem: "unreadable", path: real };
+}
+
+async function checkChain(real: string, state: ScanState): Promise<PrivateInstallFinding | undefined> {
+  return findChainProblem(real, state.io, false, state.verifiedDirectories);
 }
 
 async function scanDirectory(

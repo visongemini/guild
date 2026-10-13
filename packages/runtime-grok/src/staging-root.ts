@@ -1,5 +1,6 @@
 import { chmod, lstat, mkdir, realpath } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join } from "node:path";
+import { findChainProblem, type PrivateInstallProblem } from "./private-install.js";
 
 /**
  * PC-SEC-001, PC-ENG-002, PC-ENG-003: the directory the executables Guild runs are copied into (Grok, node, the probe copy of
@@ -10,9 +11,11 @@ import { basename, dirname, isAbsolute, join } from "node:path";
  *
  *  - the root itself is a real directory (not a link), owned by the current user, mode 0700. One that is ours but looser
  *    is tightened; one that is not ours is refused, and so is one that is a link or a file;
- *  - its parent (the real directory the link-free path leads through) is owned by the current user or root and cannot be
- *    written by group or others, unless it has the sticky bit (as `/tmp` does), which keeps others from renaming or
- *    removing what is ours.
+ *  - its parent (the real directory the link-free path leads through) and every directory above the parent up to `/` is owned
+ *    by the current user or root and cannot be written by group or others, unless it has the sticky bit (as `/tmp` does),
+ *    which keeps others from renaming or removing what is ours. Whoever can write any ancestor can rename it, and with it the
+ *    root and the verified copies in it, between the check and the exec. The walk is the one the engine files use
+ *    (private-install.ts `findChainProblem`) with the sticky allowance.
  *
  * Owner and mode come through `StagingRootIo`, so the checks are testable without a second account.
  */
@@ -21,8 +24,10 @@ export type StagingRootProblem =
   | "not_absolute"
   | "parent_missing"
   | "parent_not_directory"
-  | "parent_not_ours"
-  | "parent_writable"
+  | "ancestor_not_ours"
+  | "ancestor_writable"
+  | "ancestor_linked"
+  | "ancestor_unreadable"
   | "root_is_link"
   | "root_not_directory"
   | "root_not_ours"
@@ -32,11 +37,24 @@ export type StagingRootProblem =
 
 export class StagingRootError extends Error {
   readonly problem: StagingRootProblem;
+  /** For the `ancestor_*` problems: the directory above the root that others may be able to rewrite. Not in the message. */
+  readonly path: string | undefined;
 
-  constructor(problem: StagingRootProblem) {
+  constructor(problem: StagingRootProblem, path?: string) {
     super(`staging root is not private: ${problem}`);
     this.name = "StagingRootError";
     this.problem = problem;
+    this.path = path;
+  }
+}
+
+function ancestorProblemOf(problem: PrivateInstallProblem): StagingRootProblem {
+  switch (problem) {
+    case "not_owned": return "ancestor_not_ours";
+    case "group_writable":
+    case "world_writable": return "ancestor_writable";
+    case "linked": return "ancestor_linked";
+    default: return "ancestor_unreadable";
   }
 }
 
@@ -73,8 +91,6 @@ export const DEFAULT_STAGING_ROOT_IO: StagingRootIo = Object.freeze({
   chmod: (path: string, mode: number) => chmod(path, mode),
 });
 
-const STICKY = 0o1000;
-const GROUP_OR_OTHER_WRITE = 0o022;
 const PRIVATE_MODE = 0o700;
 
 function codeOf(cause: unknown): string | undefined {
@@ -105,10 +121,9 @@ export async function secureStagingRoot(
     throw new StagingRootError("parent_missing");
   }
   if (!parentStats.isDirectory) throw new StagingRootError("parent_not_directory");
-  if (parentStats.uid !== io.uid && parentStats.uid !== 0) throw new StagingRootError("parent_not_ours");
-  if ((parentStats.mode & GROUP_OR_OTHER_WRITE) !== 0 && (parentStats.mode & STICKY) === 0) {
-    throw new StagingRootError("parent_writable");
-  }
+  // The parent and every ancestor up to `/`: one that others can write can be renamed away, root and verified copies with it.
+  const ancestor = await findChainProblem(realParent, io, true);
+  if (ancestor !== undefined) throw new StagingRootError(ancestorProblemOf(ancestor.problem), ancestor.path);
 
   const target = join(realParent, name);
   let stats = await lstatOrMissing(io, target);

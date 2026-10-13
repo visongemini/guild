@@ -1367,10 +1367,14 @@ Consequences
 - Decision
   - (a) One rule, `secureStagingRoot` (`packages/runtime-grok/src/staging-root.ts`), shared by every pin, so Grok, `node` and `claude`
     all get it: the root is a real directory (a link or a file is refused), owned by the current user, mode 0700 (one that is ours but
-    looser is tightened and read back; one that is not ours is refused), and its parent is owned by the user or root and not writable by
-    group or others unless it has the sticky bit (as `/tmp` does). It runs when a stage is created and again inside every
-    `verifyForSpawn`, so a root swapped for a link after the copy was verified stops the spawn. Owner and mode come through an injectable
-    `StagingRootIo`, so the tests cover a root owned by someone else, a symlinked root, a 0777 root and a non-sticky world-writable parent.
+    looser is tightened and read back; one that is not ours is refused), and its parent and **every directory above the parent up to `/`**
+    is owned by the user or root and not writable by group or others unless it has the sticky bit (as `/tmp` does); whoever can write
+    any ancestor can rename it, and the root and the verified copies with it, between the check and the exec. (The first version of
+    this rule looked at the parent only; the review of it asked for the whole chain.) The walk is the same code the engine files use
+    (`findChainProblem` in `private-install.ts`), with the sticky allowance on. It runs when a stage is created and again inside every
+    `verifyForSpawn`, so a root swapped for a link after the copy was verified, or an ancestor that became writable, stops the spawn.
+    Owner and mode come through an injectable `StagingRootIo`, so the tests cover a root owned by someone else, a symlinked root, a 0777
+    root, a non-sticky world-writable parent and grandparent, an ancestor owned by another account, and a sticky root-owned `/tmp`.
   - (b) No copy of `claude` is made for launches (how a moved native binary behaves with the keychain and auto-update is unproven).
     Instead, in a packaged app, every file Guild launches or has `node` load that is not run from a verified staged copy must be private
     to the user: the `claude` binary, the Claude adapter package (its `node_modules` included), the Codex adapter package, and the Codex

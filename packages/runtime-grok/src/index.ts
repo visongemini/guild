@@ -46,6 +46,7 @@ export {
   InstallNotPrivateError,
   PRIVATE_INSTALL_ENTRY_LIMIT,
   assertPrivateInstall,
+  findChainProblem,
   findPrivateInstallProblem,
   privateInstallProblemOfStats,
 } from "./private-install.js";

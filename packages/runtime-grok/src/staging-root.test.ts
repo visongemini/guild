@@ -27,9 +27,12 @@ const directory = (uid: number, mode: number): StagingRootStats => ({ uid, mode:
 const link: StagingRootStats = { uid: ME, mode: 0o120777, isDirectory: false, isSymbolicLink: true };
 const file: StagingRootStats = { uid: ME, mode: 0o100600, isDirectory: false, isSymbolicLink: false };
 
+/** `/` and `/var`, as on a Mac: root's, 0755. A test replaces one to make an ancestor unsafe. */
+const BASE: Record<string, StagingRootStats> = { "/": directory(0, 0o755), "/var": directory(0, 0o755) };
+
 /** A tiny file system: path -> stats, with the calls recorded. */
 function fakeIo(entries: Record<string, StagingRootStats>, uid = ME, options: { chmodTakes?: boolean; mkdirRace?: StagingRootStats } = {}): StagingRootIo & { calls: string[]; entries: Record<string, StagingRootStats> } {
-  const state = { ...entries };
+  const state = { ...BASE, ...entries };
   const calls: string[] = [];
   return {
     uid,
@@ -57,10 +60,11 @@ function fakeIo(entries: Record<string, StagingRootStats>, uid = ME, options: { 
   };
 }
 
-async function refused(promise: Promise<unknown>, problem: StagingRootProblem): Promise<void> {
+async function refused(promise: Promise<unknown>, problem: StagingRootProblem, path?: string): Promise<void> {
   await assert.rejects(promise, (cause: unknown) => {
     assert.ok(cause instanceof StagingRootError, String(cause));
     assert.equal(cause.problem, problem);
+    if (path !== undefined) assert.equal(cause.path, path, "the directory that others could rewrite is named");
     return true;
   });
 }
@@ -116,16 +120,65 @@ describe("staging root rules, with the owner and mode injected [PC-SEC-001]", ()
 
   it("refuses a parent others can write to unless it has the sticky bit, and a parent that is not ours or root's", async () => {
     const root = { [ROOT]: directory(ME, 0o700) };
-    await refused(secureStagingRoot(ROOT, { io: fakeIo({ [PARENT]: directory(ME, 0o777), ...root }) }), "parent_writable");
-    await refused(secureStagingRoot(ROOT, { io: fakeIo({ [PARENT]: directory(0, 0o777), ...root }) }), "parent_writable");
-    await refused(secureStagingRoot(ROOT, { io: fakeIo({ [PARENT]: directory(0, 0o775), ...root }) }), "parent_writable");
-    await refused(secureStagingRoot(ROOT, { io: fakeIo({ [PARENT]: directory(ME, 0o772), ...root }) }), "parent_writable");
-    await refused(secureStagingRoot(ROOT, { io: fakeIo({ [PARENT]: directory(OTHER, 0o755), ...root }) }), "parent_not_ours");
+    await refused(secureStagingRoot(ROOT, { io: fakeIo({ [PARENT]: directory(ME, 0o777), ...root }) }), "ancestor_writable", PARENT);
+    await refused(secureStagingRoot(ROOT, { io: fakeIo({ [PARENT]: directory(0, 0o777), ...root }) }), "ancestor_writable", PARENT);
+    await refused(secureStagingRoot(ROOT, { io: fakeIo({ [PARENT]: directory(0, 0o775), ...root }) }), "ancestor_writable", PARENT);
+    await refused(secureStagingRoot(ROOT, { io: fakeIo({ [PARENT]: directory(ME, 0o772), ...root }) }), "ancestor_writable", PARENT);
+    await refused(secureStagingRoot(ROOT, { io: fakeIo({ [PARENT]: directory(OTHER, 0o755), ...root }) }), "ancestor_not_ours", PARENT);
     await refused(secureStagingRoot(ROOT, { io: fakeIo({ [PARENT]: file, ...root }) }), "parent_not_directory");
     // /tmp: root-owned, world-writable, sticky: others cannot rename or remove what is ours.
     assert.equal(await secureStagingRoot(ROOT, { io: fakeIo({ [PARENT]: directory(0, 0o1777), ...root }) }), ROOT);
     assert.equal(await secureStagingRoot(ROOT, { io: fakeIo({ [PARENT]: directory(0, 0o755), ...root }) }), ROOT);
-    await refused(secureStagingRoot(ROOT, { io: fakeIo({ [PARENT]: directory(OTHER, 0o1777), ...root }) }), "parent_not_ours");
+    await refused(secureStagingRoot(ROOT, { io: fakeIo({ [PARENT]: directory(OTHER, 0o1777), ...root }) }), "ancestor_not_ours", PARENT);
+  });
+
+  it("walks every ancestor up to /, not just the parent: a grandparent others can write, or that is somebody else's, is refused", async () => {
+    const deep = "/var/a/b/c";
+    const root = `${deep}/guild-v2-runtime`;
+    const chain = { "/var/a": directory(ME, 0o755), "/var/a/b": directory(ME, 0o755), [deep]: directory(ME, 0o700), [root]: directory(ME, 0o700) };
+    assert.equal(await secureStagingRoot(root, { io: fakeIo(chain) }), root, "a clean chain passes");
+    // A grandparent that anybody can write without the sticky bit: renaming it moves the root and the verified copies away.
+    for (const mode of [0o777, 0o757, 0o772, 0o775]) {
+      await refused(secureStagingRoot(root, { io: fakeIo({ ...chain, "/var/a/b": directory(ME, mode) }) }), "ancestor_writable", "/var/a/b");
+      await refused(secureStagingRoot(root, { io: fakeIo({ ...chain, "/var/a": directory(0, mode) }) }), "ancestor_writable", "/var/a");
+    }
+    // An ancestor owned by another account, whatever its mode.
+    for (const mode of [0o700, 0o755]) {
+      await refused(secureStagingRoot(root, { io: fakeIo({ ...chain, "/var/a/b": directory(OTHER, mode) }) }), "ancestor_not_ours", "/var/a/b");
+    }
+    // The top of the chain counts too.
+    await refused(secureStagingRoot(root, { io: fakeIo({ ...chain, "/": directory(0, 0o777) }) }), "ancestor_writable", "/");
+    await refused(secureStagingRoot(root, { io: fakeIo({ ...chain, "/var": directory(OTHER, 0o755) }) }), "ancestor_not_ours", "/var");
+    // The nearest offender is the one named.
+    await refused(secureStagingRoot(root, { io: fakeIo({ ...chain, "/var/a": directory(OTHER, 0o755), "/var/a/b": directory(ME, 0o777) }) }), "ancestor_writable", "/var/a/b");
+  });
+
+  it("allows the sticky bit on an ancestor only for root's and the user's directories, the way /tmp is", async () => {
+    const deep = "/var/tmpish/mine";
+    const root = `${deep}/guild-v2-runtime`;
+    const chain = { "/var/tmpish": directory(0, 0o1777), [deep]: directory(ME, 0o755), [root]: directory(ME, 0o700) };
+    assert.equal(await secureStagingRoot(root, { io: fakeIo(chain) }), root, "a sticky, world-writable, root-owned grandparent");
+    await refused(secureStagingRoot(root, { io: fakeIo({ ...chain, "/var/tmpish": directory(OTHER, 0o1777) }) }), "ancestor_not_ours", "/var/tmpish");
+    // The sticky bit does not excuse a directory that is writable without it somewhere else on the chain.
+    await refused(secureStagingRoot(root, { io: fakeIo({ ...chain, [deep]: directory(ME, 0o777) }) }), "ancestor_writable", deep);
+  });
+
+  it("refuses a link or a missing directory on the chain", async () => {
+    const root = "/var/x/y/guild-v2-runtime";
+    const chain = { "/var/x": directory(ME, 0o755), "/var/x/y": directory(ME, 0o700), [root]: directory(ME, 0o700) };
+    assert.equal(await secureStagingRoot(root, { io: fakeIo(chain) }), root);
+    await refused(secureStagingRoot(root, { io: fakeIo({ ...chain, "/var/x": link }) }), "ancestor_linked", "/var/x");
+    const { "/var/x": _missing, ...without } = chain;
+    await refused(secureStagingRoot(root, { io: fakeIo(without) }), "ancestor_unreadable", "/var/x");
+  });
+
+  it("looks at the ancestors every time it is called, so a chmod between two calls is caught", async () => {
+    const deep = "/var/a/b";
+    const root = `${deep}/guild-v2-runtime`;
+    const io = fakeIo({ "/var/a": directory(ME, 0o755), [deep]: directory(ME, 0o700), [root]: directory(ME, 0o700) });
+    assert.equal(await secureStagingRoot(root, { io }), root);
+    io.entries["/var/a"] = directory(ME, 0o777);
+    await refused(secureStagingRoot(root, { io }), "ancestor_writable", "/var/a");
   });
 
   it("refuses a relative path", async () => {
@@ -168,14 +221,54 @@ describe("staging root on the real file system [PC-SEC-001]", () => {
     const { parent, root } = await fixture();
     await mkdir(root, { mode: 0o700 });
     await chmod(parent, 0o777);
-    await refused(secureStagingRoot(root), "parent_writable");
+    await refused(secureStagingRoot(root), "ancestor_writable", parent);
     await chmod(parent, 0o1777);
     assert.equal(await secureStagingRoot(root), root);
     await chmod(parent, 0o775);
-    await refused(secureStagingRoot(root), "parent_writable");
+    await refused(secureStagingRoot(root), "ancestor_writable", parent);
     await chmod(parent, 0o700);
     assert.equal(await secureStagingRoot(root), root);
     assert.equal(DEFAULT_STAGING_ROOT_IO.uid, process.getuid?.());
+  });
+
+  it("refuses a grandparent that anybody can write without the sticky bit, on the real file system", async () => {
+    const { parent } = await fixture();
+    const middle = join(parent, "middle");
+    const inner = join(middle, "inner");
+    const root = join(inner, "guild-v2-runtime");
+    await mkdir(inner, { recursive: true, mode: 0o700 });
+    await chmod(middle, 0o700);
+    assert.equal(await secureStagingRoot(root, { create: true }), root);
+    await chmod(middle, 0o777);
+    await refused(secureStagingRoot(root), "ancestor_writable", middle);
+    await refused(secureStagingRoot(root, { create: true }), "ancestor_writable", middle);
+    await chmod(middle, 0o1777);
+    assert.equal(await secureStagingRoot(root), root, "sticky: others cannot rename what is ours");
+    await chmod(middle, 0o700);
+    await chmod(parent, 0o775);
+    await refused(secureStagingRoot(root), "ancestor_writable", parent);
+    await chmod(parent, 0o700);
+  });
+
+  it("passes on this machine's real temporary directory and on a root directly under the sticky /tmp", async (context) => {
+    // The directories Guild actually uses: $TMPDIR (/var/folders/.../T on a Mac) and the shared /tmp.
+    const home = await mkdtemp(join(tmpdir(), "guild-staging-real-"));
+    roots.push(home);
+    assert.equal(await secureStagingRoot(join(home, "guild-v2-runtime"), { create: true }), join(await realpath(home), "guild-v2-runtime"));
+    const temp = await stat("/tmp").catch(() => undefined);
+    if (temp === undefined || (temp.mode & 0o1000) === 0) {
+      context.skip("/tmp is not a sticky directory here");
+      return;
+    }
+    const directory = await mkdtemp("/tmp/guild-staging-real-");
+    roots.push(directory);
+    const underTmp = join(directory, "guild-v2-runtime");
+    assert.equal(await secureStagingRoot(underTmp, { create: true }), join(await realpath(directory), "guild-v2-runtime"));
+    // Directly in /tmp, with nothing of ours above it but the sticky directory itself.
+    const direct = `/tmp/guild-staging-direct-${process.pid}`;
+    roots.push(direct);
+    assert.equal(await secureStagingRoot(direct, { create: true }), join(await realpath("/tmp"), `guild-staging-direct-${process.pid}`));
+    assert.equal((await stat(direct)).mode & 0o777, 0o700);
   });
 });
 
@@ -213,6 +306,32 @@ describe("the pin checks the staging root before it stages and again before ever
     const mine = await pinExecutableForTesting(executable, join(parent, "fresh-root"), sha256, {});
     assert.equal((await stat(join(parent, "fresh-root"))).mode & 0o777, 0o700);
     await mine.cleanup();
+  });
+
+  it("proves every ancestor again right before each spawn: a grandparent that became writable, or somebody else's, stops it", async () => {
+    const { parent, executable, sha256 } = await fixture();
+    for (const shared of [false, true]) {
+      const middle = join(parent, `middle-${shared ? "shared" : "private"}`);
+      const root = join(middle, "inner", "guild-v2-runtime");
+      await mkdir(join(middle, "inner"), { recursive: true, mode: 0o700 });
+      const pinned = shared
+        ? await pinExecutableSharedForTesting(executable, root, sha256, {})
+        : await pinExecutableForTesting(executable, root, sha256, {});
+      await pinned.verifyForSpawn();
+      // Somebody who can write the grandparent could rename the whole tree away between this check and the exec.
+      await chmod(middle, 0o777);
+      await refusedPin(pinned.verifyForSpawn());
+      await chmod(middle, 0o700);
+      await pinned.verifyForSpawn();
+      // The same through the injected owner: an ancestor that is no longer the user's.
+      const notMine: StagingRootIo = { ...DEFAULT_STAGING_ROOT_IO, uid: (process.getuid?.() ?? 0) + 1 };
+      const other = shared
+        ? pinExecutableSharedForTesting(executable, root, sha256, { stagingRootIo: notMine })
+        : pinExecutableForTesting(executable, root, sha256, { stagingRootIo: notMine });
+      await refusedPin(other);
+      await pinned.cleanup();
+      await forgetSharedStagesForTesting();
+    }
   });
 
   it("proves the root private again right before each spawn: a root swapped for a link after the copy was verified is refused", async () => {
