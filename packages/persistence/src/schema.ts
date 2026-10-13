@@ -1,7 +1,7 @@
 import type { DatabaseSync } from "node:sqlite";
 import { persistenceError } from "./errors.js";
 
-export const SCHEMA_VERSION = 20;
+export const SCHEMA_VERSION = 21;
 
 const MIGRATION_V1 = String.raw`
 CREATE TABLE schema_migrations (
@@ -1455,6 +1455,203 @@ INSERT INTO schema_migrations(version, name, applied_at_ms)
 VALUES(20, 'run_model_labels', CAST(unixepoch('subsec') * 1000 AS INTEGER));
 `;
 
+// V21 (Guild 3.1 N-engine foundation: PC-ENG-001, PC-ENG-003, PC-MODEL-001, PC-SET-002). Forward-only; no
+// historical conversation, run or permission row is read or rewritten (the rows of the two rebuilt tables are
+// copied column for column).
+// 1. task_metadata.engine and runtime_model_catalog.engine stop naming engines in a CHECK. They accept an
+//    identifier shape (a lowercase letter, then lowercase letters and digits, 2 to 16 characters) and the
+//    application's engine registry is the allowlist, so adding an engine is not a schema change. SQLite cannot
+//    alter a CHECK, so both tables are rebuilt (the twelve step procedure of the SQLite documentation, run with
+//    foreign keys off by migrateSchema, which also compares foreign_key_check before and after). task_metadata is
+//    the parent of many tables: its indexes and every trigger on it, and the two triggers of other tables that read
+//    it, are dropped before the rebuild and recreated with the same text (a rename validates every trigger). Its
+//    routed_at_ms stays legal only on a Claude task.
+// 2. The two triggers that keep a task's runtime model in its engine's grammar now treat Grok as the strict engine
+//    (a missing task row counts as Grok, as before) and every other engine as the wider grammar the store checks.
+// 3. engine_defaults holds the Guild-level model, effort and permission mode of each add-on engine (Codex first).
+//    A missing row means "follow the engine's own default and the engine's default permission mode"; the CHECKs
+//    give only the shape, the store validates the values against the engine's own grammar and modes.
+const MIGRATION_V21 = String.raw`
+CREATE TABLE guild_meta_next (
+  singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+  schema_version INTEGER NOT NULL CHECK(schema_version = 21),
+  clean_shutdown INTEGER NOT NULL CHECK(clean_shutdown IN (0, 1)),
+  last_integrity_at_ms INTEGER CHECK(last_integrity_at_ms IS NULL OR last_integrity_at_ms >= 0)
+) STRICT;
+
+INSERT INTO guild_meta_next(singleton, schema_version, clean_shutdown, last_integrity_at_ms)
+SELECT singleton, 21, clean_shutdown, last_integrity_at_ms FROM guild_meta;
+
+DROP TABLE guild_meta;
+ALTER TABLE guild_meta_next RENAME TO guild_meta;
+
+DROP TRIGGER workspace_disposition_is_monotonic;
+DROP TRIGGER task_runtime_model_follows_engine_on_insert;
+DROP TRIGGER task_runtime_model_follows_engine_on_update;
+
+CREATE TABLE task_metadata_next (
+  task_id TEXT PRIMARY KEY REFERENCES tasks(task_id) ON DELETE RESTRICT,
+  workspace_id TEXT NOT NULL REFERENCES workspaces(workspace_id) ON DELETE RESTRICT,
+  title TEXT NOT NULL CHECK(length(title) BETWEEN 1 AND 512),
+  disposition TEXT NOT NULL CHECK(disposition IN ('active', 'archived', 'deleted')),
+  revision INTEGER NOT NULL CHECK(revision >= 1),
+  created_at_ms INTEGER NOT NULL CHECK(created_at_ms >= 0),
+  updated_at_ms INTEGER NOT NULL CHECK(updated_at_ms >= created_at_ms),
+  last_activity_at_ms INTEGER NOT NULL CHECK(last_activity_at_ms >= created_at_ms),
+  archived_at_ms INTEGER CHECK(archived_at_ms IS NULL OR archived_at_ms >= created_at_ms),
+  deleted_at_ms INTEGER CHECK(deleted_at_ms IS NULL OR deleted_at_ms >= created_at_ms),
+  pinned INTEGER NOT NULL DEFAULT 0 CHECK(pinned IN (0, 1)),
+  engine TEXT NOT NULL DEFAULT 'grok' CHECK(
+    length(engine) BETWEEN 2 AND 16
+    AND engine GLOB '[a-z]*'
+    AND engine NOT GLOB '*[^a-z0-9]*'
+  ),
+  routed_at_ms INTEGER CHECK(routed_at_ms IS NULL OR (routed_at_ms >= 0 AND engine = 'claude')),
+  CHECK(
+    (disposition = 'active' AND archived_at_ms IS NULL AND deleted_at_ms IS NULL)
+    OR (disposition = 'archived' AND archived_at_ms IS NOT NULL AND deleted_at_ms IS NULL)
+    OR (disposition = 'deleted' AND deleted_at_ms IS NOT NULL)
+  )
+) STRICT;
+
+INSERT INTO task_metadata_next(
+  task_id, workspace_id, title, disposition, revision, created_at_ms, updated_at_ms, last_activity_at_ms,
+  archived_at_ms, deleted_at_ms, pinned, engine, routed_at_ms
+)
+SELECT
+  task_id, workspace_id, title, disposition, revision, created_at_ms, updated_at_ms, last_activity_at_ms,
+  archived_at_ms, deleted_at_ms, pinned, engine, routed_at_ms
+FROM task_metadata;
+
+DROP TABLE task_metadata;
+ALTER TABLE task_metadata_next RENAME TO task_metadata;
+
+CREATE INDEX task_metadata_workspace_activity
+  ON task_metadata(workspace_id, disposition, last_activity_at_ms DESC, task_id);
+
+CREATE INDEX task_metadata_workspace_pinned_activity
+  ON task_metadata(workspace_id, disposition, pinned DESC, last_activity_at_ms DESC, task_id);
+
+CREATE TRIGGER task_workspace_binding_is_immutable
+BEFORE UPDATE OF task_id, workspace_id, created_at_ms
+ON task_metadata
+WHEN
+  NEW.task_id IS NOT OLD.task_id
+  OR NEW.workspace_id IS NOT OLD.workspace_id
+  OR NEW.created_at_ms IS NOT OLD.created_at_ms
+BEGIN
+  SELECT RAISE(ABORT, 'task_workspace_binding_immutable');
+END;
+
+CREATE TRIGGER task_disposition_is_monotonic
+BEFORE UPDATE OF disposition ON task_metadata
+WHEN NOT (
+  NEW.disposition IS OLD.disposition
+  OR (OLD.disposition = 'active' AND NEW.disposition IN ('archived', 'deleted'))
+  OR (OLD.disposition = 'archived' AND NEW.disposition IN ('active', 'deleted'))
+)
+BEGIN
+  SELECT RAISE(ABORT, 'task_disposition_non_monotonic');
+END;
+
+CREATE TRIGGER task_engine_is_fixed_after_first_run
+BEFORE UPDATE OF engine ON task_metadata
+WHEN NEW.engine IS NOT OLD.engine
+  AND EXISTS (SELECT 1 FROM runs WHERE task_id = OLD.task_id)
+BEGIN
+  SELECT RAISE(ABORT, 'task_engine_fixed_after_first_run');
+END;
+
+CREATE TRIGGER task_routed_marker_is_sticky
+BEFORE UPDATE OF routed_at_ms ON task_metadata
+WHEN OLD.routed_at_ms IS NOT NULL AND NEW.routed_at_ms IS NOT OLD.routed_at_ms
+BEGIN
+  SELECT RAISE(ABORT, 'task_routed_marker_immutable');
+END;
+
+CREATE TRIGGER workspace_disposition_is_monotonic
+BEFORE UPDATE OF disposition ON workspaces
+WHEN NOT (
+  NEW.disposition IS OLD.disposition
+  OR (OLD.disposition = 'active' AND NEW.disposition IN ('archived', 'deleted'))
+  OR (OLD.disposition = 'archived' AND NEW.disposition IN ('active', 'deleted'))
+  OR (OLD.disposition = 'deleted' AND NEW.disposition = 'active'
+    AND NOT EXISTS (SELECT 1 FROM task_metadata WHERE workspace_id = OLD.workspace_id AND disposition <> 'deleted'))
+)
+BEGIN
+  SELECT RAISE(ABORT, 'workspace_disposition_non_monotonic');
+END;
+
+CREATE TRIGGER task_runtime_model_follows_engine_on_insert
+BEFORE INSERT ON task_runtime_settings
+WHEN NEW.model_id IS NOT NULL
+  AND COALESCE((SELECT engine FROM task_metadata WHERE task_id = NEW.task_id), 'grok') = 'grok'
+  AND NOT (
+    length(NEW.model_id) BETWEEN 1 AND 64
+    AND NEW.model_id GLOB 'grok-*'
+    AND NEW.model_id NOT GLOB '*[^A-Za-z0-9._:-]*'
+  )
+BEGIN
+  SELECT RAISE(ABORT, 'task_runtime_model_engine_mismatch');
+END;
+
+CREATE TRIGGER task_runtime_model_follows_engine_on_update
+BEFORE UPDATE OF model_id ON task_runtime_settings
+WHEN NEW.model_id IS NOT NULL
+  AND COALESCE((SELECT engine FROM task_metadata WHERE task_id = NEW.task_id), 'grok') = 'grok'
+  AND NOT (
+    length(NEW.model_id) BETWEEN 1 AND 64
+    AND NEW.model_id GLOB 'grok-*'
+    AND NEW.model_id NOT GLOB '*[^A-Za-z0-9._:-]*'
+  )
+BEGIN
+  SELECT RAISE(ABORT, 'task_runtime_model_engine_mismatch');
+END;
+
+CREATE TABLE runtime_model_catalog_next (
+  engine TEXT PRIMARY KEY CHECK(
+    length(engine) BETWEEN 2 AND 16
+    AND engine GLOB '[a-z]*'
+    AND engine NOT GLOB '*[^a-z0-9]*'
+  ),
+  catalog_json TEXT NOT NULL CHECK(length(catalog_json) BETWEEN 2 AND 262144),
+  runtime_version TEXT CHECK(runtime_version IS NULL OR length(runtime_version) BETWEEN 1 AND 128),
+  updated_at_ms INTEGER NOT NULL CHECK(updated_at_ms >= 0)
+) STRICT;
+
+INSERT INTO runtime_model_catalog_next(engine, catalog_json, runtime_version, updated_at_ms)
+SELECT engine, catalog_json, runtime_version, updated_at_ms FROM runtime_model_catalog;
+
+DROP TABLE runtime_model_catalog;
+ALTER TABLE runtime_model_catalog_next RENAME TO runtime_model_catalog;
+
+CREATE TABLE engine_defaults (
+  engine TEXT PRIMARY KEY CHECK(
+    length(engine) BETWEEN 2 AND 16
+    AND engine GLOB '[a-z]*'
+    AND engine NOT GLOB '*[^a-z0-9]*'
+  ),
+  model TEXT NOT NULL DEFAULT '' CHECK(model = '' OR (
+    length(model) BETWEEN 1 AND 128
+    AND model GLOB '[A-Za-z0-9]*'
+    AND model NOT GLOB '*[^]A-Za-z0-9._:[-]*'
+  )),
+  effort TEXT NOT NULL DEFAULT '' CHECK(effort = '' OR (
+    length(effort) BETWEEN 1 AND 32
+    AND effort GLOB '[a-z]*'
+    AND effort NOT GLOB '*[^a-z0-9_-]*'
+  )),
+  permission_mode TEXT NOT NULL CHECK(
+    length(permission_mode) BETWEEN 1 AND 32
+    AND permission_mode GLOB '[a-z]*'
+    AND permission_mode NOT GLOB '*[^a-z0-9-]*'
+  )
+) STRICT;
+
+INSERT INTO schema_migrations(version, name, applied_at_ms)
+VALUES(21, 'n_engine_foundation', CAST(unixepoch('subsec') * 1000 AS INTEGER));
+`;
+
 type IntegerRow = Record<string, unknown>;
 
 function exactInteger(row: IntegerRow | undefined, key: string): number {
@@ -1465,7 +1662,38 @@ function exactInteger(row: IntegerRow | undefined, key: string): number {
   return value;
 }
 
-export function migrateSchema(database: DatabaseSync): void {
+/**
+ * V21 rebuilds `task_metadata`, the parent of most tables, so it runs with foreign keys off (a pragma that only
+ * works outside a transaction) and proves the rebuild left the foreign keys as they were: the number of
+ * violations after must not exceed the number before (an intact database has none).
+ */
+function migrateToV21(database: DatabaseSync): void {
+  const foreignKeys = exactInteger(database.prepare("PRAGMA foreign_keys").get(), "foreign_keys");
+  database.exec("PRAGMA foreign_keys = OFF");
+  try {
+    const violationsBefore = database.prepare("PRAGMA foreign_key_check").all().length;
+    database.exec("BEGIN IMMEDIATE");
+    try {
+      database.exec(MIGRATION_V21);
+      if (database.prepare("PRAGMA foreign_key_check").all().length > violationsBefore) {
+        throw persistenceError("schema_integrity_failed");
+      }
+      database.exec("PRAGMA user_version = 21");
+      database.exec("COMMIT");
+    } catch (cause: unknown) {
+      if (database.isTransaction) database.exec("ROLLBACK");
+      throw persistenceError("schema_integrity_failed", cause);
+    }
+  } finally {
+    database.exec(`PRAGMA foreign_keys = ${foreignKeys === 1 ? "ON" : "OFF"}`);
+  }
+}
+
+/**
+ * Brings `database` to `targetVersion`, which is the current schema except in tests that need a database
+ * exactly as an older release left it (the migration test from a real v20 database builds one this way).
+ */
+export function migrateSchema(database: DatabaseSync, targetVersion: number = SCHEMA_VERSION): void {
   let version = exactInteger(
     database.prepare("PRAGMA user_version").get(),
     "user_version",
@@ -1715,9 +1943,14 @@ export function migrateSchema(database: DatabaseSync): void {
       throw persistenceError("schema_integrity_failed", cause);
     }
   }
-  if (version !== SCHEMA_VERSION) {
+  if (version === 20 && targetVersion >= 21) {
+    migrateToV21(database);
+    version = 21;
+  }
+  if (version !== targetVersion) {
     throw persistenceError("schema_integrity_failed");
   }
+  if (targetVersion !== SCHEMA_VERSION) return;
   const migrations = database
     .prepare("SELECT version, name FROM schema_migrations ORDER BY version")
     .all();
@@ -1725,7 +1958,7 @@ export function migrateSchema(database: DatabaseSync): void {
     .prepare("SELECT schema_version FROM guild_meta WHERE singleton = 1")
     .get();
   if (
-    migrations.length !== 20 ||
+    migrations.length !== 21 ||
     exactInteger(migrations[0], "version") !== 1 ||
     migrations[0]?.["name"] !== "initial_authoritative_aggregates" ||
     exactInteger(migrations[1], "version") !== 2 ||
@@ -1766,6 +1999,8 @@ export function migrateSchema(database: DatabaseSync): void {
     migrations[18]?.["name"] !== "dual_engine_and_model_sources" ||
     exactInteger(migrations[19], "version") !== 20 ||
     migrations[19]?.["name"] !== "run_model_labels" ||
+    exactInteger(migrations[20], "version") !== 21 ||
+    migrations[20]?.["name"] !== "n_engine_foundation" ||
     exactInteger(meta, "schema_version") !== SCHEMA_VERSION
   ) {
     throw persistenceError("schema_integrity_failed");

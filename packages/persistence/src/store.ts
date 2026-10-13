@@ -2,12 +2,16 @@ import type { DatabaseSync, StatementSync } from "node:sqlite";
 import { existsSync } from "node:fs";
 import { isMainThread } from "node:worker_threads";
 import {
+  GUILD_ADDON_DEFAULT_PERMISSION_MODE,
+  GUILD_ADDON_ENGINES,
+  GUILD_ENGINES,
   createRuntimeTurnEvent,
   freezeModelCatalog,
   isConstructedRuntimeTurnEvent,
   isTerminalRunState,
   modelSourceHost,
   parseAdapterEpoch,
+  parseGuildAddonPermissionMode,
   parseGuildClaudePermissionMode,
   parseGuildEngine,
   parseGuildGrokContextWindow,
@@ -34,6 +38,7 @@ import {
   type AdapterEpoch,
   type AdapterEpochStatus,
   type IdempotencyKey,
+  type GuildAddonEngine,
   type GuildClaudePermissionMode,
   type GuildEngine,
   type GuildGrokModel,
@@ -467,6 +472,13 @@ export type DraftRecord = {
   readonly updatedAtMs: number;
 };
 
+/** What a new task of an add-on engine starts from; `null` follows the engine's own default. */
+export type EngineDefaultsRecord = Readonly<{
+  model: string | null;
+  reasoningEffort: string | null;
+  permissionMode: string;
+}>;
+
 export type AppSettingsRecord = {
   readonly locale: GuildLocale;
   /** `null` follows the model the official runtime advertises as its default. */
@@ -479,6 +491,8 @@ export type AppSettingsRecord = {
   /** Claude-engine default effort; `null` follows the adapter's own default. */
   readonly claudeEffort: string | null;
   readonly claudePermissionMode: GuildClaudePermissionMode;
+  /** Guild-level defaults of every add-on engine (PC-SET-002); a missing row reads as "follow the engine". */
+  readonly engineDefaults: Readonly<Record<GuildAddonEngine, EngineDefaultsRecord>>;
   readonly sidebarWidth: number;
   readonly browserSyncEnabled: boolean;
   readonly nickname: string;
@@ -904,6 +918,13 @@ export interface GuildPersistence {
     readonly claudeModel?: string | null;
     readonly claudeEffort?: string | null;
     readonly claudePermissionMode?: GuildClaudePermissionMode;
+    /** Changes the defaults of one add-on engine; the fields left out keep their value. */
+    readonly engineDefaults?: Readonly<{
+      engine: GuildAddonEngine;
+      model?: string | null;
+      reasoningEffort?: string | null;
+      permissionMode?: string;
+    }>;
     readonly sidebarWidth?: number;
     readonly browserSyncEnabled?: boolean;
     readonly nickname?: string;
@@ -1513,6 +1534,31 @@ function parsedRuntimeSetting<T>(value: unknown, parse: (value: unknown) => T): 
 function parsedEngine(value: unknown): GuildEngine {
   try {
     return parseGuildEngine(value);
+  } catch (cause: unknown) {
+    throw persistenceError("domain_operation_rejected", cause);
+  }
+}
+
+function parsedEngineDefaultsChange(value: NonNullable<Parameters<GuildPersistence["updateAppSettings"]>[0]["engineDefaults"]>): Readonly<{
+  engine: GuildAddonEngine;
+  model: string | null | undefined;
+  reasoningEffort: string | null | undefined;
+  permissionMode: string | undefined;
+}> {
+  try {
+    const engine = parseGuildEngine(value.engine);
+    if (!(GUILD_ADDON_ENGINES as readonly string[]).includes(engine)) throw new TypeError("invalid_engine");
+    const addon = engine as GuildAddonEngine;
+    return freeze({
+      engine: addon,
+      model: value.model === undefined || value.model === null ? value.model : parseGuildModelId(addon, value.model),
+      reasoningEffort: value.reasoningEffort === undefined || value.reasoningEffort === null
+        ? value.reasoningEffort
+        : parseGuildReasoningEffort(addon, value.reasoningEffort),
+      permissionMode: value.permissionMode === undefined
+        ? undefined
+        : parseGuildAddonPermissionMode(addon, value.permissionMode),
+    });
   } catch (cause: unknown) {
     throw persistenceError("domain_operation_rejected", cause);
   }
@@ -4028,6 +4074,13 @@ class SqliteGuildPersistence implements GuildPersistence {
     readonly claudeModel?: string | null;
     readonly claudeEffort?: string | null;
     readonly claudePermissionMode?: GuildClaudePermissionMode;
+    /** Changes the defaults of one add-on engine; the fields left out keep their value. */
+    readonly engineDefaults?: Readonly<{
+      engine: GuildAddonEngine;
+      model?: string | null;
+      reasoningEffort?: string | null;
+      permissionMode?: string;
+    }>;
     readonly sidebarWidth?: number;
     readonly browserSyncEnabled?: boolean;
     readonly nickname?: string;
@@ -4061,6 +4114,7 @@ class SqliteGuildPersistence implements GuildPersistence {
     const claudePermissionMode = input.claudePermissionMode === undefined
       ? undefined
       : parseGuildClaudePermissionMode(input.claudePermissionMode);
+    const engineChange = input.engineDefaults === undefined ? undefined : parsedEngineDefaultsChange(input.engineDefaults);
     const sidebarWidth = input.sidebarWidth === undefined
       ? undefined
       : parsedSidebarWidth(input.sidebarWidth);
@@ -4122,6 +4176,18 @@ class SqliteGuildPersistence implements GuildPersistence {
         claudeModel: claudeModel === undefined ? current.claudeModel : claudeModel,
         claudeEffort: claudeEffort === undefined ? current.claudeEffort : claudeEffort,
         claudePermissionMode: claudePermissionMode ?? current.claudePermissionMode,
+        engineDefaults: engineChange === undefined
+          ? current.engineDefaults
+          : freeze({
+              ...current.engineDefaults,
+              [engineChange.engine]: freeze({
+                model: engineChange.model === undefined ? current.engineDefaults[engineChange.engine].model : engineChange.model,
+                reasoningEffort: engineChange.reasoningEffort === undefined
+                  ? current.engineDefaults[engineChange.engine].reasoningEffort
+                  : engineChange.reasoningEffort,
+                permissionMode: engineChange.permissionMode ?? current.engineDefaults[engineChange.engine].permissionMode,
+              }),
+            }),
         sidebarWidth: sidebarWidth ?? current.sidebarWidth,
         browserSyncEnabled:
           input.browserSyncEnabled ?? current.browserSyncEnabled,
@@ -4150,6 +4216,10 @@ class SqliteGuildPersistence implements GuildPersistence {
         next.claudeModel === current.claudeModel &&
         next.claudeEffort === current.claudeEffort &&
         next.claudePermissionMode === current.claudePermissionMode &&
+        GUILD_ADDON_ENGINES.every((engine) =>
+          next.engineDefaults[engine].model === current.engineDefaults[engine].model &&
+          next.engineDefaults[engine].reasoningEffort === current.engineDefaults[engine].reasoningEffort &&
+          next.engineDefaults[engine].permissionMode === current.engineDefaults[engine].permissionMode) &&
         next.sidebarWidth === current.sidebarWidth &&
         next.browserSyncEnabled === current.browserSyncEnabled &&
         next.nickname === current.nickname &&
@@ -4202,6 +4272,16 @@ class SqliteGuildPersistence implements GuildPersistence {
         );
       if (changes(update.changes) !== 1) {
         throw persistenceError("persistence_cas_conflict");
+      }
+      if (engineChange !== undefined) {
+        const written = next.engineDefaults[engineChange.engine];
+        this.#database
+          .prepare(`
+            INSERT INTO engine_defaults(engine, model, effort, permission_mode) VALUES(?, ?, ?, ?)
+            ON CONFLICT(engine) DO UPDATE SET
+              model = excluded.model, effort = excluded.effort, permission_mode = excluded.permission_mode
+          `)
+          .run(engineChange.engine, written.model ?? "", written.reasoningEffort ?? "", written.permissionMode);
       }
       return this.#requiredAppSettings();
     });
@@ -6567,11 +6647,14 @@ class SqliteGuildPersistence implements GuildPersistence {
     ) {
       throw persistenceError("aggregate_integrity_failed");
     }
+    // The schema checks only the shape of an engine name; the registry decides which names this build runs, so a
+    // task of an engine written by a later Guild fails closed here.
     const engineText = exactText(row, "engine");
+    const engine = GUILD_ENGINES.find((candidate) => candidate === engineText);
     const routedAtMs = optionalInteger(row, "routed_at_ms");
     if (
-      (engineText !== "grok" && engineText !== "claude") ||
-      (routedAtMs !== undefined && (routedAtMs < 0 || engineText !== "claude"))
+      engine === undefined ||
+      (routedAtMs !== undefined && (routedAtMs < 0 || engine !== "claude"))
     ) {
       throw persistenceError("aggregate_integrity_failed");
     }
@@ -6580,7 +6663,7 @@ class SqliteGuildPersistence implements GuildPersistence {
       workspaceId,
       title,
       pinned: exactInteger(row, "pinned") === 1,
-      engine: engineText,
+      engine,
       routedAtMs,
       disposition: parsedDisposition(exactText(row, "disposition")),
       revision: exactInteger(row, "revision"),
@@ -7605,6 +7688,7 @@ class SqliteGuildPersistence implements GuildPersistence {
     } catch (cause: unknown) {
       throw persistenceError("aggregate_integrity_failed", cause);
     }
+    const engineDefaults = this.#selectEngineDefaults();
     const restoreLastTask = exactInteger(row, "restore_last_task");
     if (restoreLastTask !== 0 && restoreLastTask !== 1) {
       throw persistenceError("aggregate_integrity_failed");
@@ -7659,6 +7743,7 @@ class SqliteGuildPersistence implements GuildPersistence {
       claudeModel,
       claudeEffort,
       claudePermissionMode,
+      engineDefaults,
       sidebarWidth,
       browserSyncEnabled: browserSync === 1,
       nickname,
@@ -7675,6 +7760,41 @@ class SqliteGuildPersistence implements GuildPersistence {
       revision: exactInteger(row, "revision"),
       updatedAtMs: exactInteger(row, "updated_at_ms"),
     });
+  }
+
+  /**
+   * The stored defaults of every add-on engine this build knows. A missing row follows the engine itself; a row of an
+   * engine this build does not know (written by a later Guild on the same schema) is ignored, a stored value the
+   * engine's own grammar or modes refuse is an integrity failure.
+   */
+  #selectEngineDefaults(): Readonly<Record<GuildAddonEngine, EngineDefaultsRecord>> {
+    const stored = new Map<string, SqlRow>(
+      this.#database.prepare("SELECT * FROM engine_defaults").all().map((row) => [exactText(row, "engine"), row]),
+    );
+    const defaults = {} as Record<GuildAddonEngine, EngineDefaultsRecord>;
+    for (const engine of GUILD_ADDON_ENGINES) {
+      const row = stored.get(engine);
+      if (row === undefined) {
+        defaults[engine] = freeze({
+          model: null,
+          reasoningEffort: null,
+          permissionMode: GUILD_ADDON_DEFAULT_PERMISSION_MODE[engine],
+        });
+        continue;
+      }
+      try {
+        const model = exactText(row, "model");
+        const effort = exactText(row, "effort");
+        defaults[engine] = freeze({
+          model: model === "" ? null : parseGuildModelId(engine, model),
+          reasoningEffort: effort === "" ? null : parseGuildReasoningEffort(engine, effort),
+          permissionMode: parseGuildAddonPermissionMode(engine, exactText(row, "permission_mode")),
+        });
+      } catch (cause: unknown) {
+        throw persistenceError("aggregate_integrity_failed", cause);
+      }
+    }
+    return freeze(defaults);
   }
 
   #requireTask(taskId: TaskId): void {

@@ -11,7 +11,7 @@
  *  - pure selection helpers shared by main, persistence and the renderer.
  *
  * Guild 3.0 (PC-ENG-001, PC-MODEL-001): the same catalog shape now also describes the Claude
- * engine. A catalog and each of its models carry an `engine` / `group` label, the model id grammar
+ * engine, and in 3.1 every add-on engine (Codex). A catalog and each of its models carry an `engine` / `group` label, the model id grammar
  * is chosen per engine (`parseGuildModelId`), and `freezeModelCatalog(engine, ...)` validates either.
  * The Grok-era names below keep their meaning and behavior for the Grok engine.
  */
@@ -67,7 +67,7 @@ export function parseGuildGrokReasoningEffort(value: unknown): GuildGrokReasonin
 export function parseGuildModelId(engine: GuildEngine, value: unknown): string {
   if (engine === "grok") return parseGuildGrokModel(value);
   if (typeof value !== "string" || !isClaudeModelId(value)) {
-    throw new TypeError("invalid_claude_model");
+    throw new TypeError(`invalid_${engine}_model`);
   }
   return value;
 }
@@ -89,9 +89,12 @@ export function isModelIdOfEngine(engine: GuildEngine, id: string): boolean {
 }
 
 export function parseGuildReasoningEffort(engine: GuildEngine, value: unknown): string {
-  return engine === "grok"
-    ? parseGuildGrokReasoningEffort(value)
-    : parseGuildClaudeReasoningEffort(value);
+  if (engine === "grok") return parseGuildGrokReasoningEffort(value);
+  try {
+    return parseGuildClaudeReasoningEffort(value);
+  } catch {
+    throw new TypeError(`invalid_${engine}_reasoning_effort`);
+  }
 }
 
 export function parseGuildGrokContextWindow(value: unknown): number {
@@ -166,6 +169,16 @@ export const EMPTY_CLAUDE_MODEL_CATALOG: ModelCatalog = Object.freeze({
   engine: "claude",
   models: Object.freeze([]),
 });
+
+export const EMPTY_CODEX_MODEL_CATALOG: ModelCatalog = Object.freeze({
+  engine: "codex",
+  models: Object.freeze([]),
+});
+
+/** The empty catalog of `engine`: what a picker shows before any session of that engine reported a list. */
+export function emptyModelCatalogOf(engine: GuildEngine): ModelCatalog {
+  return engine === "claude" ? EMPTY_CLAUDE_MODEL_CATALOG : engine === "codex" ? EMPTY_CODEX_MODEL_CATALOG : EMPTY_GROK_MODEL_CATALOG;
+}
 
 export function modelCatalogEngineOf(catalog: ModelCatalog): GuildEngine {
   return catalog.engine ?? "grok";

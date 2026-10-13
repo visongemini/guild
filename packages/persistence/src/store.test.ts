@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import {
+  chmodSync,
   existsSync,
   mkdtempSync,
   readFileSync,
@@ -38,13 +39,22 @@ import {
   type GuildPersistence,
 } from "./index.js";
 import * as packageRoot from "./index.js";
+import { migrateSchema } from "./schema.js";
 
 /**
- * Takes a freshly created (schema v19) database back to what a v18 install looks like: none of the
- * Guild 3.0 tables, columns, triggers or migration row. The downgrade fixtures below run it first, so
- * their old-schema databases migrate forward through V19 and V20 again.
+ * Takes a freshly created (current schema) database back to what a v18 install looks like: none of the
+ * Guild 3.0 and 3.1 tables, columns, triggers or migration rows. The downgrade fixtures below run it
+ * first, so their old-schema databases migrate forward through V19, V20 and V21 again. (The rebuilt
+ * task_metadata and runtime_model_catalog keep their V21 shape here; the migration test from a real v20
+ * database, which starts from the V20 tables, lives in the schema v21 describe block.)
  */
+const REMOVE_V21_SQL = `
+  DROP TABLE IF EXISTS engine_defaults;
+  DELETE FROM schema_migrations WHERE version = 21;
+`;
+
 const REMOVE_V20_SQL = `
+  ${REMOVE_V21_SQL}
   DROP TABLE IF EXISTS run_model_labels;
   DELETE FROM schema_migrations WHERE version = 20;
 `;
@@ -404,7 +414,7 @@ describe("main-only SQLite persistence", () => {
     store.close();
     const raw = new DatabaseSync(path);
     assert.equal(raw.prepare("PRAGMA journal_mode").get()?.["journal_mode"], "wal");
-    assert.equal(raw.prepare("PRAGMA user_version").get()?.["user_version"], 20);
+    assert.equal(raw.prepare("PRAGMA user_version").get()?.["user_version"], 21);
     const strictByTable = new Map(
       raw
         .prepare("PRAGMA table_list")
@@ -1121,7 +1131,7 @@ describe("main-only SQLite persistence", () => {
     const reopened = openGuildPersistence({ path });
     assert.equal(reopened.loadRun(taskId, runId).state, "completed");
     assert.equal(reopened.loadConversationEntry(taskId, "live-assistant-1").text, "Hello");
-    assert.equal(reopened.verifyIntegrity().schemaVersion, 20);
+    assert.equal(reopened.verifyIntegrity().schemaVersion, 21);
     reopened.close();
   });
 
@@ -1168,7 +1178,7 @@ describe("main-only SQLite persistence", () => {
     const next = store.commitLiveRuntimeEvent({ event: eventAt(257), mutation });
     assert.equal(next.ok, true);
     assert.equal(next.record?.text, "x".repeat(257));
-    assert.equal(store.verifyIntegrity().schemaVersion, 20);
+    assert.equal(store.verifyIntegrity().schemaVersion, 21);
     store.close();
   });
 
@@ -1227,7 +1237,7 @@ describe("main-only SQLite persistence", () => {
     raw.close();
 
     const migrated = openGuildPersistence({ path });
-    assert.equal(migrated.verifyIntegrity().schemaVersion, 20);
+    assert.equal(migrated.verifyIntegrity().schemaVersion, 21);
     assert.equal(migrated.loadRun(taskId, runId).state, "queued");
     assert.throws(
       () => migrated.loadTaskMetadata(taskId),
@@ -1372,7 +1382,7 @@ describe("main-only SQLite persistence", () => {
     });
     assert.equal(secondDispatch.run.runId, secondQueuedRunId);
     assert.equal(store.listQueuedTurns(taskId).length, 0);
-    assert.equal(store.verifyIntegrity().schemaVersion, 20);
+    assert.equal(store.verifyIntegrity().schemaVersion, 21);
     store.close();
   });
 
@@ -2870,7 +2880,7 @@ describe("main-only SQLite persistence", () => {
       assert.equal(merged.payload.text, texts.slice(1).join(""));
 
       const reopened = openGuildPersistence({ path });
-      assert.equal(reopened.verifyIntegrity().schemaVersion, 20);
+      assert.equal(reopened.verifyIntegrity().schemaVersion, 21);
       // Admission continues from the last covered sequence, so the stream resumes gaplessly.
       const next = reopened.commitLiveRuntimeEvent({
         event: textChunk(lastSequence + 1, "!"),
@@ -3224,12 +3234,12 @@ describe("main-only SQLite persistence", () => {
       downgrade.close();
 
       const migrated = openGuildPersistence({ path });
-      assert.equal(migrated.verifyIntegrity().schemaVersion, 20);
+      assert.equal(migrated.verifyIntegrity().schemaVersion, 21);
       migrated.close();
       assert.equal(snapshot(), before, "migration must not read-modify historical rows");
 
       const raw = new DatabaseSync(path);
-      assert.equal(raw.prepare("PRAGMA user_version").get()?.["user_version"], 20);
+      assert.equal(raw.prepare("PRAGMA user_version").get()?.["user_version"], 21);
       assert.match(
         String(raw.prepare("SELECT sql FROM sqlite_schema WHERE name = 'conversation_entry_is_append_only'").get()?.["sql"]),
         /octet_length/u,
@@ -3379,7 +3389,7 @@ describe("main-only SQLite persistence", () => {
 
       const reopened = openGuildPersistence({ path });
       assert.equal(reopened.loadLatestContextTokensUsed(taskId), 9_000);
-      assert.equal(reopened.verifyIntegrity().schemaVersion, 20);
+      assert.equal(reopened.verifyIntegrity().schemaVersion, 21);
       reopened.close();
     });
 
@@ -3560,7 +3570,7 @@ describe("main-only SQLite persistence", () => {
       const older = seedV15(t, "grok-4.5", "medium");
 
       const migrated = openGuildPersistence({ path: owner });
-      assert.equal(migrated.verifyIntegrity().schemaVersion, 20);
+      assert.equal(migrated.verifyIntegrity().schemaVersion, 21);
       const settings = migrated.loadAppSettings();
       assert.equal(settings.grokModel, "grok-4.7");
       assert.equal(settings.reasoningEffort, "high");
@@ -3591,7 +3601,7 @@ describe("main-only SQLite persistence", () => {
       }
 
       withRaw(owner, (raw) => {
-        assert.equal(raw.prepare("PRAGMA user_version").get()?.["user_version"], 20);
+        assert.equal(raw.prepare("PRAGMA user_version").get()?.["user_version"], 21);
         assert.deepEqual(
           raw.prepare("SELECT version, name FROM schema_migrations WHERE version >= 15 ORDER BY version")
             .all().map((row) => ({ ...row })),
@@ -3602,6 +3612,7 @@ describe("main-only SQLite persistence", () => {
             { version: 18, name: "task_worktrees" },
             { version: 19, name: "dual_engine_and_model_sources" },
             { version: 20, name: "run_model_labels" },
+            { version: 21, name: "n_engine_foundation" },
           ],
         );
         assert.deepEqual(
@@ -3670,7 +3681,7 @@ describe("main-only SQLite persistence", () => {
           /FOREIGN KEY constraint failed/u,
         );
         assert.throws(
-          () => raw.prepare("INSERT INTO runtime_model_catalog(engine, catalog_json, updated_at_ms) VALUES('codex', '{}', 1)").run(),
+          () => raw.prepare("INSERT INTO runtime_model_catalog(engine, catalog_json, updated_at_ms) VALUES('Codex', '{}', 1)").run(),
           /CHECK constraint failed/u,
         );
         assert.throws(
@@ -3783,7 +3794,7 @@ describe("main-only SQLite persistence", () => {
       const reopened = openGuildPersistence({ path });
       assert.equal(reopened.loadAppSettings().grokModel, "grok-4.6");
       assert.equal(reopened.loadAppSettings().reasoningEffort, null);
-      assert.equal(reopened.verifyIntegrity().schemaVersion, 20);
+      assert.equal(reopened.verifyIntegrity().schemaVersion, 21);
       reopened.close();
     });
 
@@ -3885,7 +3896,7 @@ describe("main-only SQLite persistence", () => {
 
       store = openGuildPersistence({ path });
       assert.deepEqual(store.loadTaskRuntimeSettings(taskId), updated);
-      assert.equal(store.verifyIntegrity().schemaVersion, 20);
+      assert.equal(store.verifyIntegrity().schemaVersion, 21);
       assert.throws(
         () => store.clearTaskRuntimeSettings({ taskId, expectedRevision: 1 }),
         failure("persistence_cas_conflict"),
@@ -3947,7 +3958,7 @@ describe("main-only SQLite persistence", () => {
       });
       store = openGuildPersistence({ path });
       assert.deepEqual(store.loadModelCatalogCache()?.catalog, catalog);
-      assert.equal(store.verifyIntegrity().schemaVersion, 20);
+      assert.equal(store.verifyIntegrity().schemaVersion, 21);
 
       // An identical list (even built with another key order) is not rewritten; a changed list
       // or runtime version is.
@@ -3999,7 +4010,7 @@ describe("main-only SQLite persistence", () => {
         });
         const reopened = openGuildPersistence({ path });
         assert.equal(reopened.loadModelCatalogCache(), undefined, damaged);
-        assert.equal(reopened.verifyIntegrity().schemaVersion, 20);
+        assert.equal(reopened.verifyIntegrity().schemaVersion, 21);
         reopened.saveModelCatalogCache({ catalog });
         assert.deepEqual(reopened.loadModelCatalogCache()?.catalog, catalog);
         reopened.close();
@@ -4072,7 +4083,7 @@ describe("Steer interjections and run checkpoints (schema v17)", () => {
 
     const reopened = openGuildPersistence({ path });
     assert.equal(reopened.loadInterjection(taskId, "interject-1")?.state, "delivered");
-    assert.equal(reopened.verifyIntegrity().schemaVersion, 20);
+    assert.equal(reopened.verifyIntegrity().schemaVersion, 21);
     reopened.close();
   });
 
@@ -4311,7 +4322,7 @@ describe("Steer interjections and run checkpoints (schema v17)", () => {
       `);
     });
     const migrated = openGuildPersistence({ path });
-    assert.equal(migrated.verifyIntegrity().schemaVersion, 20);
+    assert.equal(migrated.verifyIntegrity().schemaVersion, 21);
     assert.equal(migrated.loadConversationEntry(taskId, "history-1").text, "old");
     assert.deepEqual(migrated.listInterjections(taskId), []);
     assert.deepEqual(migrated.listRunCheckpoints(taskId), []);
@@ -4456,7 +4467,7 @@ describe("Task worktrees (schema v18)", () => {
       `);
     });
     const migrated = openGuildPersistence({ path });
-    assert.equal(migrated.verifyIntegrity().schemaVersion, 20);
+    assert.equal(migrated.verifyIntegrity().schemaVersion, 21);
     assert.equal(migrated.loadConversationEntry(taskId, "history-1").text, "old");
     assert.deepEqual(migrated.listTaskWorktrees(), []);
     assert.equal(migrated.createTaskWorktree(input).status, "active");
@@ -4560,7 +4571,7 @@ describe("Guild 3.0 dual engine, model sources and preferences (schema v19)", ()
     );
     assert.throws(
       () => store.createConversationTask({
-        taskId: must(parseTaskId("task-bad")), workspaceId, title: "x", engine: "codex" as never,
+        taskId: must(parseTaskId("task-bad")), workspaceId, title: "x", engine: "gemini" as never,
       }),
       failure("domain_operation_rejected"),
     );
@@ -4568,7 +4579,7 @@ describe("Guild 3.0 dual engine, model sources and preferences (schema v19)", ()
 
     const reopened = openGuildPersistence({ path });
     assert.equal(reopened.loadTaskMetadata(claudeTaskId).engine, "claude");
-    assert.equal(reopened.verifyIntegrity().schemaVersion, 20);
+    assert.equal(reopened.verifyIntegrity().schemaVersion, 21);
     reopened.close();
   });
 
@@ -4585,7 +4596,7 @@ describe("Guild 3.0 dual engine, model sources and preferences (schema v19)", ()
       failure("persistence_cas_conflict"),
     );
     assert.throws(
-      () => store.setTaskEngine({ taskId, expectedRevision: before.revision, engine: "codex" as never }),
+      () => store.setTaskEngine({ taskId, expectedRevision: before.revision, engine: "gemini" as never }),
       failure("domain_operation_rejected"),
     );
     assert.equal(store.loadTaskEngine(taskId), "grok", "a rejected change leaves the engine alone");
@@ -4618,7 +4629,7 @@ describe("Guild 3.0 dual engine, model sources and preferences (schema v19)", ()
         /task_engine_fixed_after_first_run/u,
       );
       assert.throws(
-        () => raw.prepare("UPDATE task_metadata SET engine = 'gemini' WHERE task_id = ?").run(claudeTaskId),
+        () => raw.prepare("UPDATE task_metadata SET engine = 'Gemini' WHERE task_id = ?").run(claudeTaskId),
         /CHECK constraint failed/u,
       );
     });
@@ -4708,7 +4719,7 @@ describe("Guild 3.0 dual engine, model sources and preferences (schema v19)", ()
 
     const reopened = openGuildPersistence({ path });
     assert.equal(reopened.loadTaskMetadata(claudeTaskId).routedAtMs, routed.routedAtMs);
-    assert.equal(reopened.verifyIntegrity().schemaVersion, 20);
+    assert.equal(reopened.verifyIntegrity().schemaVersion, 21);
     reopened.close();
 
     withRaw(path, (raw) => {
@@ -4830,7 +4841,7 @@ describe("Guild 3.0 dual engine, model sources and preferences (schema v19)", ()
     });
     assert.equal(updated.modelId, "local-27b-model");
     assert.equal(updated.contextWindow, 32_000);
-    assert.equal(store.verifyIntegrity().schemaVersion, 20);
+    assert.equal(store.verifyIntegrity().schemaVersion, 21);
     store.close();
 
     const reopened = openGuildPersistence({ path });
@@ -4925,7 +4936,7 @@ describe("Guild 3.0 dual engine, model sources and preferences (schema v19)", ()
       "nor a Claude list as the Grok one",
     );
     assert.throws(
-      () => store.saveModelCatalogCache({ engine: "codex" as never, catalog: grok }),
+      () => store.saveModelCatalogCache({ engine: "gemini" as never, catalog: grok }),
       failure("domain_operation_rejected"),
     );
     store.close();
@@ -4940,7 +4951,7 @@ describe("Guild 3.0 dual engine, model sources and preferences (schema v19)", ()
     store = openGuildPersistence({ path });
     assert.equal(store.loadModelCatalogCache("claude"), undefined);
     assert.deepEqual(store.loadModelCatalogCache()?.catalog, grok);
-    assert.equal(store.verifyIntegrity().schemaVersion, 20);
+    assert.equal(store.verifyIntegrity().schemaVersion, 21);
     store.close();
   });
 
@@ -5137,7 +5148,7 @@ describe("Guild 3.0 dual engine, model sources and preferences (schema v19)", ()
     const reopened = openGuildPersistence({ path });
     assert.deepEqual(reopened.listModelSources().map((source) => source.id), ["workstation", "other"]);
     assert.equal(reopened.loadModelSource("workstation")?.confirmedHost, "127.0.0.1:8081");
-    assert.equal(reopened.verifyIntegrity().schemaVersion, 20);
+    assert.equal(reopened.verifyIntegrity().schemaVersion, 21);
     reopened.close();
   });
 
@@ -5205,7 +5216,7 @@ describe("Guild 3.0 dual engine, model sources and preferences (schema v19)", ()
 
     const reopened = openGuildPersistence({ path });
     assert.equal(reopened.loadWorkspacePrefs(workspaceId).onlineReminderDismissed, true);
-    assert.equal(reopened.verifyIntegrity().schemaVersion, 20);
+    assert.equal(reopened.verifyIntegrity().schemaVersion, 21);
     reopened.close();
     withRaw(path, (raw) => {
       assert.throws(
@@ -5351,7 +5362,7 @@ describe("Guild 3.0 dual engine, model sources and preferences (schema v19)", ()
     });
 
     const migrated = openGuildPersistence({ path });
-    assert.equal(migrated.verifyIntegrity().schemaVersion, 20);
+    assert.equal(migrated.verifyIntegrity().schemaVersion, 21);
     // Tasks: same rows, all on the Grok engine, none routed.
     const taskAfter = migrated.loadTaskMetadata(taskId);
     assert.deepEqual({ ...taskAfter, engine: undefined, routedAtMs: undefined }, { ...taskBefore, engine: undefined, routedAtMs: undefined });
@@ -5397,12 +5408,13 @@ describe("Guild 3.0 dual engine, model sources and preferences (schema v19)", ()
           { version: 18, name: "task_worktrees" },
           { version: 19, name: "dual_engine_and_model_sources" },
           { version: 20, name: "run_model_labels" },
+          { version: 21, name: "n_engine_foundation" },
         ],
       );
-      assert.equal(raw.prepare("PRAGMA user_version").get()?.["user_version"], 20);
+      assert.equal(raw.prepare("PRAGMA user_version").get()?.["user_version"], 21);
       assert.deepEqual(
         raw.prepare("SELECT schema_version FROM guild_meta").all().map((row) => row["schema_version"]),
-        [20],
+        [21],
       );
       assert.deepEqual(
         raw.prepare("SELECT engine FROM runtime_model_catalog").all().map((row) => row["engine"]),
@@ -5424,14 +5436,14 @@ describe("Guild 3.0 dual engine, model sources and preferences (schema v19)", ()
     assert.equal(migrated.loadModelCatalogCache(), undefined);
     assert.equal(migrated.loadTaskRuntimeSettings(taskId), undefined);
     assert.equal(migrated.loadTaskEngine(taskId), "grok");
-    assert.equal(migrated.verifyIntegrity().schemaVersion, 20);
+    assert.equal(migrated.verifyIntegrity().schemaVersion, 21);
     migrated.close();
   });
 
   it("refuses a database from a newer schema", (t) => {
     const path = temporaryDatabase(t);
     conversationStore(path).close();
-    withRaw(path, (raw) => raw.exec("PRAGMA user_version = 21"));
+    withRaw(path, (raw) => raw.exec("PRAGMA user_version = 22"));
     assert.throws(() => openGuildPersistence({ path }), failure("schema_version_unsupported"));
   });
 });
@@ -5506,21 +5518,398 @@ describe("Per-Run model labels (schema v20)", () => {
       assert.equal(raw.prepare("SELECT count(*) AS n FROM sqlite_schema WHERE name = 'run_model_labels'").get()?.["n"], 0);
     });
     const migrated = openGuildPersistence({ path });
-    assert.equal(migrated.verifyIntegrity().schemaVersion, 20);
+    assert.equal(migrated.verifyIntegrity().schemaVersion, 21);
     assert.equal(migrated.listConversationEntries({ taskId, limit: 10 }).find((entry) => entry.entryId === "history-1")?.text, "old");
     assert.deepEqual(migrated.listRunModelLabels(taskId), []);
     migrated.recordRunModelLabel({ taskId, runId, label: "Opus 5.5" });
     migrated.close();
     withRaw(path, (raw) => {
-      assert.equal(raw.prepare("PRAGMA user_version").get()?.["user_version"], 20);
+      assert.equal(raw.prepare("PRAGMA user_version").get()?.["user_version"], 21);
       assert.deepEqual(
         raw.prepare("SELECT version, name FROM schema_migrations WHERE version >= 19 ORDER BY version").all().map((row) => ({ ...row })),
-        [{ version: 19, name: "dual_engine_and_model_sources" }, { version: 20, name: "run_model_labels" }],
+        [
+          { version: 19, name: "dual_engine_and_model_sources" },
+          { version: 20, name: "run_model_labels" },
+          { version: 21, name: "n_engine_foundation" },
+        ],
       );
       assert.equal(
         raw.prepare("SELECT strict FROM pragma_table_list WHERE name = 'run_model_labels'").get()?.["strict"],
         1,
       );
+    });
+  });
+});
+
+describe("N-engine foundation (schema v21)", () => {
+  const codexTaskId = must(parseTaskId("task-codex"));
+  const failure = (code: string) => (error: unknown) => error instanceof PersistenceError && error.code === code;
+  function withRaw<T>(path: string, operation: (raw: DatabaseSync) => T): T {
+    const raw = new DatabaseSync(path);
+    try {
+      return operation(raw);
+    } finally {
+      raw.close();
+    }
+  }
+
+  const schemaObjects = (raw: DatabaseSync) =>
+    new Map(
+      raw
+        .prepare("SELECT name, sql FROM sqlite_schema WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%'")
+        .all()
+        .map((row) => [String(row["name"]), String(row["sql"])] as const),
+    );
+
+  /** A database exactly as Guild 3.0.x left it: schema 20 with its tables, CHECKs, indexes and triggers. */
+  function v20Database(path: string): void {
+    const raw = new DatabaseSync(path);
+    try {
+      migrateSchema(raw, 20);
+      assert.equal(raw.prepare("PRAGMA user_version").get()?.["user_version"], 20);
+      raw.exec(`
+        INSERT INTO workspaces(workspace_id, canonical_path, display_name, disposition, revision, created_at_ms, updated_at_ms)
+        VALUES('workspace-1', '/tmp/guild-v20-workspace', 'Workspace', 'active', 1, 10, 10);
+        INSERT INTO tasks(task_id, owning_window_id, revision, created_at_ms, updated_at_ms) VALUES
+          ('task-grok', NULL, 1, 10, 10), ('task-claude', NULL, 1, 11, 11), ('task-pinned', NULL, 1, 12, 12);
+        INSERT INTO task_metadata(task_id, workspace_id, title, disposition, revision, created_at_ms, updated_at_ms, last_activity_at_ms, archived_at_ms, pinned, engine, routed_at_ms)
+        VALUES
+          ('task-grok', 'workspace-1', 'Grok task', 'active', 3, 10, 20, 20, NULL, 0, 'grok', NULL),
+          ('task-claude', 'workspace-1', 'Claude task', 'active', 4, 11, 30, 30, NULL, 0, 'claude', 25),
+          ('task-pinned', 'workspace-1', 'Pinned task', 'archived', 2, 12, 40, 40, 40, 1, 'grok', NULL);
+        INSERT INTO drafts(task_id, text_content, revision, created_at_ms, updated_at_ms) VALUES('task-claude', 'a draft', 2, 5, 6);
+        INSERT INTO task_runtime_settings(task_id, model_id, reasoning_effort, context_window, revision, updated_at_ms) VALUES
+          ('task-grok', 'grok-4.7', 'high', NULL, 1, 7), ('task-claude', 'deepseek-v4-flash', NULL, NULL, 2, 8);
+        INSERT INTO runtime_model_catalog(engine, catalog_json, runtime_version, updated_at_ms) VALUES
+          ('grok', '{"models":[]}', 'grok 1.0.13', 9), ('claude', '{"engine":"claude","models":[]}', NULL, 9);
+        UPDATE app_settings SET claude_model = 'opus', claude_permission_mode = 'plan', revision = revision + 3;
+      `);
+    } finally {
+      raw.close();
+    }
+    // The store opens only a private database file; this one was made by a bare connection.
+    chmodSync(path, 0o600);
+  }
+
+  it("migrates a real v20 database: every row survives, the foreign keys hold and the old guards still hold [PC-ENG-003]", (t) => {
+    const path = temporaryDatabase(t);
+    v20Database(path);
+    const before = withRaw(path, (raw) => {
+      // v20 names its engines in a CHECK: a third engine cannot be written.
+      assert.throws(
+        () => raw.prepare("UPDATE task_metadata SET engine = 'codex' WHERE task_id = 'task-grok'").run(),
+        /CHECK constraint failed/u,
+      );
+      assert.throws(
+        () => raw.prepare("INSERT INTO runtime_model_catalog(engine, catalog_json, updated_at_ms) VALUES('codex', '{}', 1)").run(),
+        /CHECK constraint failed/u,
+      );
+      return {
+        metadata: raw.prepare("SELECT * FROM task_metadata ORDER BY task_id").all().map((row) => ({ ...row })),
+        drafts: raw.prepare("SELECT * FROM drafts").all().map((row) => ({ ...row })),
+        runtime: raw.prepare("SELECT * FROM task_runtime_settings ORDER BY task_id").all().map((row) => ({ ...row })),
+        catalogs: raw.prepare("SELECT * FROM runtime_model_catalog ORDER BY engine").all().map((row) => ({ ...row })),
+        app: { ...raw.prepare("SELECT * FROM app_settings").get() },
+        objects: schemaObjects(raw),
+      };
+    });
+
+    const migrated = openGuildPersistence({ path });
+    assert.equal(migrated.verifyIntegrity().schemaVersion, 21);
+    assert.equal(migrated.loadTaskEngine(must(parseTaskId("task-claude"))), "claude");
+    assert.equal(migrated.loadTaskMetadata(must(parseTaskId("task-claude"))).routedAtMs, 25);
+    migrated.close();
+
+    withRaw(path, (raw) => {
+      assert.equal(raw.prepare("PRAGMA user_version").get()?.["user_version"], 21);
+      assert.deepEqual(raw.prepare("SELECT schema_version FROM guild_meta").all().map((row) => row["schema_version"]), [21]);
+      assert.deepEqual(raw.prepare("PRAGMA foreign_key_check").all(), []);
+      assert.equal(raw.prepare("PRAGMA integrity_check").get()?.["integrity_check"], "ok");
+      // Rows: column for column the same.
+      assert.deepEqual(raw.prepare("SELECT * FROM task_metadata ORDER BY task_id").all().map((row) => ({ ...row })), before.metadata);
+      assert.deepEqual(raw.prepare("SELECT * FROM drafts").all().map((row) => ({ ...row })), before.drafts);
+      assert.deepEqual(raw.prepare("SELECT * FROM task_runtime_settings ORDER BY task_id").all().map((row) => ({ ...row })), before.runtime);
+      assert.deepEqual(raw.prepare("SELECT * FROM runtime_model_catalog ORDER BY engine").all().map((row) => ({ ...row })), before.catalogs);
+      assert.deepEqual({ ...raw.prepare("SELECT * FROM app_settings").get() }, before.app);
+      assert.equal(raw.prepare("SELECT strict FROM pragma_table_list WHERE name = 'task_metadata'").get()?.["strict"], 1);
+      assert.equal(raw.prepare("SELECT strict FROM pragma_table_list WHERE name = 'engine_defaults'").get()?.["strict"], 1);
+
+      // Schema: only the rebuilt tables, the two model triggers, guild_meta and the new table differ.
+      const after = schemaObjects(raw);
+      const changed = new Set(["task_metadata", "runtime_model_catalog", "guild_meta", "engine_defaults",
+        "task_runtime_model_follows_engine_on_insert", "task_runtime_model_follows_engine_on_update"]);
+      assert.deepEqual([...after.keys()].filter((name) => !before.objects.has(name)), ["engine_defaults"]);
+      assert.deepEqual([...before.objects.keys()].filter((name) => !after.has(name)), []);
+      for (const [name, sql] of before.objects) {
+        if (changed.has(name)) continue;
+        assert.equal(after.get(name), sql, `${name} keeps its definition byte for byte`);
+      }
+      assert.notEqual(after.get("task_metadata"), before.objects.get("task_metadata"));
+      assert.match(after.get("task_metadata")!, /routed_at_ms >= 0 AND engine = 'claude'/u, "a routed marker stays Claude-only");
+
+      // The guards of 3.0 still hold on the rebuilt table.
+      assert.throws(
+        () => raw.prepare("UPDATE task_metadata SET workspace_id = 'other' WHERE task_id = 'task-grok'").run(),
+        /task_workspace_binding_immutable|FOREIGN KEY/u,
+      );
+      assert.throws(
+        () => raw.prepare("UPDATE task_metadata SET routed_at_ms = 99 WHERE task_id = 'task-claude'").run(),
+        /task_routed_marker_immutable/u,
+      );
+      assert.throws(
+        () => raw.prepare("UPDATE task_metadata SET routed_at_ms = 5 WHERE task_id = 'task-grok'").run(),
+        /CHECK constraint failed/u,
+        "routed_at_ms is only legal on a Claude task",
+      );
+      assert.throws(
+        () => raw.prepare("UPDATE task_metadata SET disposition = 'active' WHERE task_id = 'task-pinned'").run(),
+        /CHECK constraint failed/u,
+        "an archived task whose archive time is kept cannot become active: the disposition CHECK",
+      );
+      assert.throws(
+        () => raw.prepare("DELETE FROM tasks WHERE task_id = 'task-claude'").run(),
+        /FOREIGN KEY constraint failed/u,
+        "the children of task_metadata still point at it",
+      );
+      // Raw writers cannot invent an engine name that is not a shape.
+      for (const bad of ["Codex", "x", "co-dex", "", "a".repeat(17), "1codex"]) {
+        assert.throws(
+          () => raw.prepare("UPDATE task_metadata SET engine = ? WHERE task_id = 'task-pinned'").run(bad),
+          /CHECK constraint failed|task_engine_fixed/u,
+          JSON.stringify(bad),
+        );
+      }
+    });
+  });
+
+  it("is atomic: a failed rebuild leaves the v20 database untouched and foreign keys on", (t) => {
+    const path = temporaryDatabase(t);
+    v20Database(path);
+    const before = withRaw(path, (raw) => {
+      // A table of the same name as the one V21 creates makes the migration fail late, after the rebuilds.
+      raw.exec("CREATE TABLE engine_defaults (x INTEGER)");
+      return { metadata: raw.prepare("SELECT * FROM task_metadata ORDER BY task_id").all().map((row) => ({ ...row })), objects: schemaObjects(raw) };
+    });
+    const raw = new DatabaseSync(path);
+    try {
+      assert.equal(raw.prepare("PRAGMA foreign_keys").get()?.["foreign_keys"], 1);
+      assert.throws(() => migrateSchema(raw), failure("schema_integrity_failed"));
+      assert.equal(raw.prepare("PRAGMA foreign_keys").get()?.["foreign_keys"], 1, "restored after a failure");
+      assert.equal(raw.isTransaction, false);
+      assert.equal(raw.prepare("PRAGMA user_version").get()?.["user_version"], 20);
+      assert.deepEqual(raw.prepare("SELECT * FROM task_metadata ORDER BY task_id").all().map((row) => ({ ...row })), before.metadata);
+      assert.deepEqual(schemaObjects(raw), before.objects, "nothing of the half-done migration remains");
+      // Once the obstacle is gone it migrates, and foreign keys are on again afterwards.
+      raw.exec("DROP TABLE engine_defaults");
+      migrateSchema(raw);
+      assert.equal(raw.prepare("PRAGMA foreign_keys").get()?.["foreign_keys"], 1);
+      assert.equal(raw.prepare("PRAGMA user_version").get()?.["user_version"], 21);
+    } finally {
+      raw.close();
+    }
+  });
+
+  it("restores foreign keys to the state it found them in", (t) => {
+    const path = temporaryDatabase(t);
+    v20Database(path);
+    const raw = new DatabaseSync(path);
+    try {
+      raw.exec("PRAGMA foreign_keys = OFF");
+      migrateSchema(raw);
+      assert.equal(raw.prepare("PRAGMA foreign_keys").get()?.["foreign_keys"], 0);
+    } finally {
+      raw.close();
+    }
+  });
+
+  it("does not blame the migration for a foreign key violation the database already had; verifyIntegrity still reports it", (t) => {
+    const clean = temporaryDatabase(t);
+    v20Database(clean);
+    // A violation that exists before the migration is not the migration's doing.
+    withRaw(clean, (raw) => {
+      raw.exec("PRAGMA foreign_keys = OFF");
+      raw.exec("INSERT INTO drafts(task_id, text_content, revision, created_at_ms, updated_at_ms) VALUES('task-ghost', 'x', 1, 1, 1)");
+    });
+    const store = openGuildPersistence({ path: clean });
+    // verifyIntegrity is the guard for it, as it always was.
+    assert.throws(() => store.verifyIntegrity());
+    store.close();
+    withRaw(clean, (raw) => assert.equal(raw.prepare("PRAGMA user_version").get()?.["user_version"], 21));
+  });
+
+  it("a fresh install and a v20 install end in the same schema", (t) => {
+    const fresh = temporaryDatabase(t);
+    openGuildPersistence({ path: fresh }).close();
+    const migrated = temporaryDatabase(t);
+    v20Database(migrated);
+    openGuildPersistence({ path: migrated }).close();
+    const left = withRaw(fresh, schemaObjects);
+    const right = withRaw(migrated, schemaObjects);
+    assert.deepEqual([...left.keys()].sort(), [...right.keys()].sort());
+    for (const [name, sql] of left) {
+      if (name === "task_metadata" || name === "runtime_model_catalog" || name === "guild_meta") continue;
+      assert.equal(right.get(name), sql, name);
+    }
+    // The rebuilt tables are written by the same SQL on both paths.
+    assert.equal(right.get("task_metadata"), left.get("task_metadata"));
+    assert.equal(right.get("runtime_model_catalog"), left.get("runtime_model_catalog"));
+  });
+
+  it("stores a Codex task and its model override with the wider grammar, and refuses an engine it does not run [PC-ENG-003]", (t) => {
+    const path = temporaryDatabase(t);
+    const store = conversationStore(path);
+    store.createConversationTask({ taskId: codexTaskId, workspaceId, title: "Codex task", owningWindowId: windowId, engine: "codex" });
+    assert.equal(store.loadTaskEngine(codexTaskId), "codex");
+    assert.equal(store.loadTaskMetadata(codexTaskId).routedAtMs, undefined);
+    assert.throws(() => store.markTaskRouted({ taskId: codexTaskId }), failure("domain_operation_rejected"), "only a Claude task is routed");
+    store.saveTaskRuntimeSettings({
+      taskId: codexTaskId, expectedRevision: 0, modelId: "gpt-5.6-luna", reasoningEffort: "low", contextWindow: null,
+    });
+    store.saveTaskRuntimeSettings({
+      taskId, expectedRevision: 0, modelId: "grok-4.7", reasoningEffort: "high", contextWindow: null,
+    });
+    assert.equal(store.loadTaskRuntimeSettings(codexTaskId)?.modelId, "gpt-5.6-luna");
+    for (const bad of ["gpt 6", "", "gpt/6", "x".repeat(129)]) {
+      assert.throws(
+        () => store.saveTaskRuntimeSettings({ taskId: codexTaskId, expectedRevision: 1, modelId: bad, reasoningEffort: null, contextWindow: null }),
+        (error) => error instanceof PersistenceError,
+        JSON.stringify(bad),
+      );
+    }
+    assert.throws(
+      () => store.createConversationTask({ taskId: must(parseTaskId("task-gem")), workspaceId, title: "x", owningWindowId: windowId, engine: "gemini" as never }),
+      failure("domain_operation_rejected"),
+    );
+    // The Grok task keeps the official-model guarantee at the database, a Codex task takes the wider grammar.
+    store.close();
+    withRaw(path, (raw) => {
+      assert.throws(
+        () => raw.prepare("UPDATE task_runtime_settings SET model_id = 'gpt-6-sol' WHERE task_id = ?").run(String(taskId)),
+        /task_runtime_model_engine_mismatch|FOREIGN KEY|no such/u,
+      );
+      raw.prepare("UPDATE task_runtime_settings SET model_id = 'gpt-6-sol' WHERE task_id = ?").run(String(codexTaskId));
+    });
+    const reopened = openGuildPersistence({ path });
+    assert.equal(reopened.loadTaskEngine(codexTaskId), "codex");
+    assert.equal(reopened.loadTaskRuntimeSettings(codexTaskId)?.modelId, "gpt-6-sol");
+    reopened.close();
+  });
+
+  it("fails closed on a task of an engine this build does not run (written by a later Guild)", (t) => {
+    const path = temporaryDatabase(t);
+    const store = conversationStore(path);
+    store.close();
+    withRaw(path, (raw) => raw.prepare("UPDATE task_metadata SET engine = 'gemini' WHERE task_id = ?").run(String(taskId)));
+    const reopened = openGuildPersistence({ path });
+    assert.throws(() => reopened.loadTaskMetadata(taskId), failure("aggregate_integrity_failed"));
+    reopened.close();
+  });
+
+  it("caches the Codex model list as its own engine's row [PC-MODEL-001]", (t) => {
+    const path = temporaryDatabase(t);
+    const store = openGuildPersistence({ path });
+    const catalog = {
+      engine: "codex",
+      runtimeDefaultModelId: "gpt-6.1-sol",
+      models: [
+        { id: "gpt-6.1-sol", name: "6.1 Sol", group: "codex", reasoningEfforts: [{ id: "high", label: "High", isDefault: true }, { id: "ultra", label: "Ultra", isDefault: false }], contextWindows: [] },
+        { id: "gpt-5.6-luna", name: "5.6 Luna", group: "codex", reasoningEfforts: [], contextWindows: [] },
+      ],
+    };
+    assert.equal(store.loadModelCatalogCache("codex"), undefined);
+    store.saveModelCatalogCache({ engine: "codex", catalog: catalog as never, runtimeVersion: "codex-cli 0.160.1" });
+    assert.deepEqual(store.loadModelCatalogCache("codex")?.catalog.models.map((model) => model.id), ["gpt-6.1-sol", "gpt-5.6-luna"]);
+    assert.equal(store.loadModelCatalogCache("codex")?.runtimeVersion, "codex-cli 0.160.1");
+    assert.equal(store.loadModelCatalogCache("claude"), undefined, "the other engines' caches are separate");
+    assert.equal(store.loadModelCatalogCache(), undefined);
+    assert.throws(
+      () => store.saveModelCatalogCache({ engine: "claude", catalog: catalog as never }),
+      failure("domain_operation_rejected"),
+      "a Codex list is not stored as the Claude one",
+    );
+    assert.throws(
+      () => store.saveModelCatalogCache({ engine: "codex", catalog: { ...catalog, models: [{ ...catalog.models[0]!, group: "online" }] } as never }),
+      failure("domain_operation_rejected"),
+    );
+    store.close();
+    const reopened = openGuildPersistence({ path });
+    assert.equal(reopened.loadModelCatalogCache("codex")?.catalog.models.length, 2);
+    reopened.close();
+  });
+
+  it("keeps the Guild-level defaults of an add-on engine under compare-and-set [PC-SET-002]", (t) => {
+    const path = temporaryDatabase(t);
+    const store = openGuildPersistence({ path });
+    const initial = store.loadAppSettings();
+    assert.deepEqual(initial.engineDefaults.codex, { model: null, reasoningEffort: null, permissionMode: "workspace-write" });
+    // A Claude setting is untouched by an add-on engine's.
+    const claudeBefore = [initial.claudeModel, initial.claudeEffort, initial.claudePermissionMode];
+
+    const changed = store.updateAppSettings({
+      expectedRevision: initial.revision,
+      engineDefaults: { engine: "codex", model: "gpt-5.6-luna", reasoningEffort: "low", permissionMode: "read-only" },
+    });
+    assert.equal(changed.revision, initial.revision + 1);
+    assert.deepEqual(changed.engineDefaults.codex, { model: "gpt-5.6-luna", reasoningEffort: "low", permissionMode: "read-only" });
+    assert.deepEqual([changed.claudeModel, changed.claudeEffort, changed.claudePermissionMode], claudeBefore);
+
+    // Fields left out keep their value; an explicit null follows the engine again.
+    const partial = store.updateAppSettings({ expectedRevision: changed.revision, engineDefaults: { engine: "codex", permissionMode: "agent" } });
+    assert.deepEqual(partial.engineDefaults.codex, { model: "gpt-5.6-luna", reasoningEffort: "low", permissionMode: "agent" });
+    const cleared = store.updateAppSettings({ expectedRevision: partial.revision, engineDefaults: { engine: "codex", model: null, reasoningEffort: null } });
+    assert.deepEqual(cleared.engineDefaults.codex, { model: null, reasoningEffort: null, permissionMode: "agent" });
+
+    // The same values cost no revision; a stale revision is a conflict.
+    assert.equal(store.updateAppSettings({ expectedRevision: cleared.revision, engineDefaults: { engine: "codex", permissionMode: "agent" } }).revision, cleared.revision);
+    assert.throws(
+      () => store.updateAppSettings({ expectedRevision: initial.revision, engineDefaults: { engine: "codex", permissionMode: "read-only" } }),
+      failure("persistence_cas_conflict"),
+    );
+    for (const bad of [
+      { engine: "claude", permissionMode: "default" },
+      { engine: "grok", model: "grok-4.7" },
+      { engine: "gemini", model: "x" },
+      { engine: "codex", permissionMode: "default" },
+      { engine: "codex", permissionMode: "bypassPermissions" },
+      { engine: "codex", model: "gpt 6" },
+      { engine: "codex", reasoningEffort: "Ultra" },
+    ]) {
+      assert.throws(
+        () => store.updateAppSettings({ expectedRevision: cleared.revision, engineDefaults: bad as never }),
+        failure("domain_operation_rejected"),
+        JSON.stringify(bad),
+      );
+    }
+    store.close();
+
+    const reopened = openGuildPersistence({ path });
+    assert.deepEqual(reopened.loadAppSettings().engineDefaults.codex, { model: null, reasoningEffort: null, permissionMode: "agent" });
+    reopened.close();
+    // A stored value that the engine's own modes refuse is an integrity failure, a row of an unknown engine is ignored.
+    withRaw(path, (raw) => {
+      raw.exec("INSERT INTO engine_defaults(engine, model, effort, permission_mode) VALUES('gemini', 'g-1', '', 'auto')");
+    });
+    const withUnknown = openGuildPersistence({ path });
+    assert.deepEqual(withUnknown.loadAppSettings().engineDefaults.codex.permissionMode, "agent");
+    withUnknown.close();
+    withRaw(path, (raw) => raw.exec("UPDATE engine_defaults SET permission_mode = 'danger-full-access' WHERE engine = 'codex'"));
+    assert.throws(() => openGuildPersistence({ path }), failure("aggregate_integrity_failed"), "a damaged default fails closed at open");
+  });
+
+  it("refuses engine defaults whose shape the database CHECKs reject, whatever writes them", (t) => {
+    const path = temporaryDatabase(t);
+    openGuildPersistence({ path }).close();
+    withRaw(path, (raw) => {
+      const insert = (engine: string, model: string, effort: string, mode: string) =>
+        raw.prepare("INSERT INTO engine_defaults(engine, model, effort, permission_mode) VALUES(?, ?, ?, ?)").run(engine, model, effort, mode);
+      insert("codex", "gpt-6.1-sol", "ultra", "read-only");
+      for (const row of [
+        ["Codex", "", "", "agent"], ["c", "", "", "agent"], ["codex2", "bad model", "", "agent"],
+        ["codex3", "", "High", "agent"], ["codex4", "", "", ""], ["codex5", "", "", "Read Only"], ["codex6", "", "", "x'; --"],
+      ] as const) {
+        assert.throws(() => insert(row[0], row[1], row[2], row[3]), /CHECK constraint failed/u, JSON.stringify(row));
+      }
+      assert.throws(() => insert("codex", "", "", "agent"), /UNIQUE constraint failed|PRIMARY KEY/u);
     });
   });
 });

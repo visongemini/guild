@@ -1,14 +1,27 @@
 /**
- * Guild 3.0 engines (PC-ENG-001, PC-MODEL-001, D-057).
+ * Guild engines (PC-ENG-001, PC-ENG-003, PC-MODEL-001, D-057, D-066).
  *
  * A task runs on exactly one engine for its whole life: the official `grok agent stdio`
- * ("grok") or the user-installed Claude ACP adapter ("claude"). This leaf module holds only the
- * engine and picker-group vocabulary and the per-engine identifier grammar for Claude; the Grok
- * grammar and the catalog live in `grok-models.ts`, which builds on this module.
+ * ("grok"), the user-installed Claude ACP adapter ("claude") or the user-installed Codex ACP
+ * adapter ("codex"). This leaf module holds only the engine and picker-group vocabulary, the
+ * permission modes of the add-on engines and the per-engine identifier grammar; the Grok grammar
+ * and the catalog live in `grok-models.ts`, which builds on this module.
+ *
+ * "Add-on engine" (Guild 3.1) is every engine that is neither Grok nor Claude: a user-installed
+ * ACP adapter with the user's own login, no model router and Guild-level defaults stored per
+ * engine. A further add-on engine is one more entry in `GUILD_ADDON_ENGINES` and its tables below.
  */
 
-export const GUILD_ENGINES = Object.freeze(["grok", "claude"] as const);
+export const GUILD_ENGINES = Object.freeze(["grok", "claude", "codex"] as const);
 export type GuildEngine = (typeof GUILD_ENGINES)[number];
+
+/** Engines that run a user-installed ACP adapter on the user's own login, without the model router. */
+export const GUILD_ADDON_ENGINES = Object.freeze(["codex"] as const);
+export type GuildAddonEngine = (typeof GUILD_ADDON_ENGINES)[number];
+
+export function isAddonEngine(engine: GuildEngine): engine is GuildAddonEngine {
+  return (GUILD_ADDON_ENGINES as readonly string[]).includes(engine);
+}
 
 /** Engine of every task that existed before Guild 3.0 and of a new task that names none. */
 export const GUILD_DEFAULT_ENGINE: GuildEngine = "grok";
@@ -22,9 +35,10 @@ export function parseGuildEngine(value: unknown): GuildEngine {
 
 /**
  * Picker groups. `grok` belongs to the Grok engine; `claude` (subscription), `online` (vendor
- * endpoints) and `local` (llama.cpp / Ollama) are all selectable inside a Claude-engine task.
+ * endpoints) and `local` (llama.cpp / Ollama) are all selectable inside a Claude-engine task; each
+ * add-on engine owns the group of its own name (`codex`, shown as "ChatGPT").
  */
-export const GUILD_MODEL_GROUPS = Object.freeze(["grok", "claude", "online", "local"] as const);
+export const GUILD_MODEL_GROUPS = Object.freeze(["grok", "claude", "codex", "online", "local"] as const);
 export type ModelGroup = (typeof GUILD_MODEL_GROUPS)[number];
 
 export function parseModelGroup(value: unknown): ModelGroup {
@@ -37,7 +51,13 @@ export function parseModelGroup(value: unknown): ModelGroup {
 const MODEL_GROUPS_OF_ENGINE: Readonly<Record<GuildEngine, readonly ModelGroup[]>> = Object.freeze({
   grok: Object.freeze(["grok"] as const),
   claude: Object.freeze(["claude", "online", "local"] as const),
+  codex: Object.freeze(["codex"] as const),
 });
+
+/** The engine a picker group belongs to: Online and Local models run inside a Claude task. */
+export function engineOfModelGroup(group: ModelGroup): GuildEngine {
+  return group === "grok" ? "grok" : group === "codex" ? "codex" : "claude";
+}
 
 /** The groups a catalog of `engine` may carry; the first one is the default for an unlabelled model. */
 export function modelGroupsOfEngine(engine: GuildEngine): readonly ModelGroup[] {
@@ -97,4 +117,35 @@ export function parseGuildClaudePermissionMode(value: unknown): GuildClaudePermi
     throw new TypeError("invalid_claude_permission_mode");
   }
   return value as GuildClaudePermissionMode;
+}
+
+/**
+ * Permission modes of the Codex adapter's `mode` config option (verified with codex-acp 2.2.2):
+ * `read-only` asks before edits and commands, `workspace-write` edits the workspace and asks for
+ * the rest, `agent` ("Auto review") lets an automated reviewer decide, `agent-full-access` asks
+ * nothing.
+ */
+export const GUILD_CODEX_PERMISSION_MODES = Object.freeze([
+  "read-only",
+  "workspace-write",
+  "agent",
+  "agent-full-access",
+] as const);
+export type GuildCodexPermissionMode = (typeof GUILD_CODEX_PERMISSION_MODES)[number];
+
+/** The modes each add-on engine offers, by the ids its adapter uses. */
+export const GUILD_ADDON_PERMISSION_MODES: Readonly<Record<GuildAddonEngine, readonly string[]>> = Object.freeze({
+  codex: GUILD_CODEX_PERMISSION_MODES,
+});
+
+/** The mode a fresh install starts an add-on engine's tasks in. Never the adapter's own default (an automated reviewer decides there). */
+export const GUILD_ADDON_DEFAULT_PERMISSION_MODE: Readonly<Record<GuildAddonEngine, string>> = Object.freeze({
+  codex: "workspace-write",
+});
+
+export function parseGuildAddonPermissionMode(engine: GuildAddonEngine, value: unknown): string {
+  if (typeof value !== "string" || !GUILD_ADDON_PERMISSION_MODES[engine].includes(value)) {
+    throw new TypeError(`invalid_${engine}_permission_mode`);
+  }
+  return value;
 }

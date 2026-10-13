@@ -2,7 +2,9 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   EMPTY_CLAUDE_MODEL_CATALOG,
+  EMPTY_CODEX_MODEL_CATALOG,
   EMPTY_GROK_MODEL_CATALOG,
+  emptyModelCatalogOf,
   defaultReasoningEffortOf,
   freezeGrokModelCatalog,
   freezeModelCatalog,
@@ -233,6 +235,52 @@ test("a Claude catalog follows the Claude id grammar and carries claude, online 
   // The same data is not a Grok catalog: Claude ids do not pass the D-011 policy.
   assert.throws(() => freezeModelCatalog("grok", claudeRaw), /grok_model_catalog_unofficial_model/u);
   assert.throws(() => freezeGrokModelCatalog(claudeRaw), /grok_model_catalog_/u);
+});
+
+const codexRaw = {
+  engine: "codex",
+  runtimeDefaultModelId: "gpt-6.1-sol",
+  models: [
+    { id: "gpt-6.1-sol", name: "6.1 Sol", group: "codex", description: "Latest workhorse model.", reasoningEfforts: [effort("low"), effort("high", true), effort("ultra")], contextWindows: [] },
+    { id: "gpt-5.6-luna", name: "5.6 Luna", group: "codex", reasoningEfforts: [effort("low"), effort("max")], contextWindows: [] },
+  ],
+};
+
+test("a Codex catalog uses the shared adapter grammar and only the codex group (PC-ENG-003, PC-MODEL-001)", () => {
+  const catalog = freezeModelCatalog("codex", codexRaw);
+  assert.equal(catalog.engine, "codex");
+  assert.equal(modelCatalogEngineOf(catalog), "codex");
+  assert.deepEqual(catalog.models.map((model) => [model.id, modelGroupOf(model)]), [
+    ["gpt-6.1-sol", "codex"],
+    ["gpt-5.6-luna", "codex"],
+  ]);
+  assert.equal(runtimeDefaultModelOf(catalog)?.id, "gpt-6.1-sol");
+  assert.equal(defaultReasoningEffortOf(grokModelById(catalog, "gpt-6.1-sol")), "high");
+  assert.deepEqual(freezeModelCatalog("codex", JSON.parse(JSON.stringify(catalog))), catalog, "round trips through the JSON cache");
+  // An absent label defaults to the engine's own group.
+  const unlabelled = freezeModelCatalog("codex", { models: [{ id: "gpt-6-sol", name: "n", reasoningEfforts: [], contextWindows: [] }] });
+  assert.equal(unlabelled.models[0]!.group, "codex");
+  assert.deepEqual(freezeModelCatalog("codex", { models: [] }), EMPTY_CODEX_MODEL_CATALOG);
+  assert.equal(emptyModelCatalogOf("codex"), EMPTY_CODEX_MODEL_CATALOG);
+  assert.equal(emptyModelCatalogOf("claude"), EMPTY_CLAUDE_MODEL_CATALOG);
+  assert.equal(emptyModelCatalogOf("grok"), EMPTY_GROK_MODEL_CATALOG);
+
+  const withModel = (patch: Record<string, unknown>) => ({
+    models: [{ id: "gpt-6-sol", name: "n", reasoningEfforts: [], contextWindows: [], ...patch }],
+  });
+  for (const [label, pattern, value] of [
+    ["the claude group", /codex_model_catalog_invalid_group/u, withModel({ group: "claude" })],
+    ["an online group", /codex_model_catalog_invalid_group/u, withModel({ group: "online" })],
+    ["a space in an id", /codex_model_catalog_invalid_model/u, withModel({ id: "gpt 6" })],
+    ["a claude engine label", /codex_model_catalog_engine_mismatch/u, { ...codexRaw, engine: "claude" }],
+    ["a default not in the list", /codex_model_catalog_unknown_default_model/u, { ...codexRaw, runtimeDefaultModelId: "gpt-9" }],
+    ["a bad effort id", /codex_model_catalog_invalid_effort_id/u, withModel({ reasoningEfforts: [effort("Ultra")] })],
+  ] as Array<[string, RegExp, unknown]>) {
+    assert.throws(() => freezeModelCatalog("codex", value), pattern, label);
+  }
+  // A Claude catalog does not take the codex group, and a Grok catalog does not take codex ids.
+  assert.throws(() => freezeModelCatalog("claude", { models: [{ id: "opus", name: "n", group: "codex", reasoningEfforts: [], contextWindows: [] }] }), /claude_model_catalog_invalid_group/u);
+  assert.throws(() => freezeModelCatalog("grok", codexRaw), /grok_model_catalog_/u);
 });
 
 test("a Claude catalog may hold native models plus the models of every source, a Grok catalog stays at 32", () => {

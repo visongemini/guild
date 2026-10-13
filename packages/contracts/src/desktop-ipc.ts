@@ -14,10 +14,13 @@ import {
 import type { RunState } from "./run-events.js";
 import {
   GUILD_CLAUDE_PERMISSION_MODES,
+  isAddonEngine,
+  parseGuildAddonPermissionMode,
   parseGuildClaudeModel,
   parseGuildClaudePermissionMode,
   parseGuildClaudeReasoningEffort,
   parseGuildEngine,
+  type GuildAddonEngine,
   type GuildClaudePermissionMode,
   type GuildEngine,
 } from "./engines.js";
@@ -25,7 +28,9 @@ import {
   parseGuildGrokContextWindow,
   parseGuildGrokModel,
   parseGuildGrokReasoningEffort,
+  parseGuildModelId,
   parseGuildModelIdOfAnyEngine,
+  parseGuildReasoningEffort,
   type GrokModelCatalog,
   type GuildGrokModel,
   type GuildGrokReasoningEffort,
@@ -182,6 +187,7 @@ export const DESKTOP_IPC_CHANNELS = Object.freeze({
   runGrokManagement: "guild:v1:grok:management:run",
   setTaskEngine: "guild:v1:task:engine:set",
   setClaudeSettings: "guild:v1:settings:claude",
+  setEngineSettings: "guild:v1:settings:engine",
   listModelSources: "guild:v1:model-sources:list",
   upsertModelSource: "guild:v1:model-sources:upsert",
   deleteModelSource: "guild:v1:model-sources:delete",
@@ -403,13 +409,13 @@ export type TaskViewProjection = {
 };
 
 /**
- * What the Claude engine reported about itself, for the usage panel and the composer (PC-ENG-001,
- * PC-FALLBACK-001). Quota and billing belong to Claude Code, so there is nothing to meter here.
+ * What a Claude or add-on engine reported about itself, for the usage panel and the composer
+ * (PC-ENG-001, PC-FALLBACK-001). Quota and billing belong to the engine, so there is nothing to meter here.
  */
 export type EngineStatusProjection = Readonly<{
   /** Plan label of the logged-in account, for example "Claude Max". Never an e-mail address. */
   accountLabel?: string;
-  /** The engine reported that nobody is logged in: the user must run `claude` once in Terminal. */
+  /** The engine reported that nobody is logged in: the user must log in with the engine's own command. */
   loginRequired?: true;
 }>;
 
@@ -508,6 +514,8 @@ export type RuntimeSettingsProjection = {
   readonly canChange: boolean;
   /** Claude-engine defaults (PC-SET-002). Absent until the main process supplies them. */
   readonly claude?: ClaudeEngineSettingsProjection;
+  /** Defaults and state of each add-on engine (PC-SET-002, PC-ENG-003). Absent until the main process supplies them. */
+  readonly engines?: Readonly<Partial<Record<GuildAddonEngine, AddonEngineSettingsProjection>>>;
   /**
    * Last model list each engine advertised (PC-MODEL-001). `modelCatalog` above stays the Grok
    * catalog for the existing UI; `modelCatalogs.grok` is the same value. The Claude catalog also
@@ -526,6 +534,28 @@ export const GUILD_CLAUDE_ENGINE_STATUSES = Object.freeze([
   "ready", "not_found", "not_logged_in", "unavailable", "integrity_changed",
 ] as const);
 export type GuildClaudeEngineStatus = (typeof GUILD_CLAUDE_ENGINE_STATUSES)[number];
+
+/** The same states for every engine that is installed separately (Claude Code and the add-on engines). */
+export type GuildEngineStatus = GuildClaudeEngineStatus;
+
+/**
+ * Defaults and state of an add-on engine (Codex): the Claude shape, with the engine's own permission modes by id.
+ * `permissionMode` is one of `availablePermissionModes`.
+ */
+export type AddonEngineSettingsProjection = {
+  /** Absent until the main process has looked for the engine. */
+  readonly status?: GuildEngineStatus;
+  /** Plan label of the logged-in account, for example "ChatGPT Pro". Never an e-mail address. */
+  readonly accountLabel?: string;
+  /** Version of the engine's core, for example the installed Codex. */
+  readonly version?: string;
+  /** Default model id; null follows the engine's own default. */
+  readonly model: string | null;
+  /** Default effort; null follows the engine. */
+  readonly reasoningEffort: string | null;
+  readonly permissionMode: string;
+  readonly availablePermissionModes: readonly string[];
+};
 
 /** Defaults a new Claude-engine task starts from. Same rules as the Grok defaults, Claude grammar. */
 export type ClaudeEngineSettingsProjection = {
@@ -688,6 +718,12 @@ export type SetClaudeSettingsRequest = {
   readonly model: string | null;
   readonly reasoningEffort: string | null;
   readonly permissionMode: GuildClaudePermissionMode;
+};
+export type SetEngineSettingsRequest = {
+  readonly engine: GuildAddonEngine;
+  readonly model: string | null;
+  readonly reasoningEffort: string | null;
+  readonly permissionMode: string;
 };
 /** Per-workspace privacy preferences (PC-PRIV-001). */
 export type WorkspacePrefsProjection = {
@@ -887,6 +923,7 @@ export type DesktopRequestByChannel = {
   readonly [DESKTOP_IPC_CHANNELS.runGrokManagement]: RunGrokManagementRequest;
   readonly [DESKTOP_IPC_CHANNELS.setTaskEngine]: SetTaskEngineRequest;
   readonly [DESKTOP_IPC_CHANNELS.setClaudeSettings]: SetClaudeSettingsRequest;
+  readonly [DESKTOP_IPC_CHANNELS.setEngineSettings]: SetEngineSettingsRequest;
   readonly [DESKTOP_IPC_CHANNELS.listModelSources]: ListModelSourcesRequest;
   readonly [DESKTOP_IPC_CHANNELS.upsertModelSource]: UpsertModelSourceRequest;
   readonly [DESKTOP_IPC_CHANNELS.deleteModelSource]: DeleteModelSourceRequest;
@@ -946,6 +983,7 @@ export type DesktopResponseByChannel = {
   readonly [DESKTOP_IPC_CHANNELS.runGrokManagement]: RunGrokManagementResponse;
   readonly [DESKTOP_IPC_CHANNELS.setTaskEngine]: TaskViewProjection;
   readonly [DESKTOP_IPC_CHANNELS.setClaudeSettings]: DesktopBootstrapProjection;
+  readonly [DESKTOP_IPC_CHANNELS.setEngineSettings]: DesktopBootstrapProjection;
   readonly [DESKTOP_IPC_CHANNELS.listModelSources]: ListModelSourcesResponse;
   readonly [DESKTOP_IPC_CHANNELS.upsertModelSource]: UpsertModelSourceResponse;
   readonly [DESKTOP_IPC_CHANNELS.deleteModelSource]: EmptyDesktopResponse;
@@ -1067,6 +1105,9 @@ export type GuildRendererApi = Readonly<{
   readonly setTaskEngine: (request: SetTaskEngineRequest) => Promise<TaskViewProjection>;
   readonly setClaudeSettings: (
     request: SetClaudeSettingsRequest,
+  ) => Promise<DesktopBootstrapProjection>;
+  readonly setEngineSettings: (
+    request: SetEngineSettingsRequest,
   ) => Promise<DesktopBootstrapProjection>;
   readonly listModelSources: () => Promise<ListModelSourcesResponse>;
   readonly upsertModelSource: (
@@ -1674,6 +1715,17 @@ export function parseDesktopRequest<Channel extends DesktopInvokeChannel>(
         : parseGuildClaudeReasoningEffort(record["reasoningEffort"]);
       const permissionMode = parseGuildClaudePermissionMode(record["permissionMode"]);
       return Object.freeze({ model, reasoningEffort, permissionMode }) as DesktopRequestByChannel[Channel];
+    }
+    case DESKTOP_IPC_CHANNELS.setEngineSettings: {
+      const record = exactRecord(input, ["engine", "model", "reasoningEffort", "permissionMode"]);
+      const engine = parseGuildEngine(record["engine"]);
+      if (!isAddonEngine(engine)) throw new TypeError("invalid_engine");
+      const model = record["model"] === null ? null : parseGuildModelId(engine, record["model"]);
+      const reasoningEffort = record["reasoningEffort"] === null
+        ? null
+        : parseGuildReasoningEffort(engine, record["reasoningEffort"]);
+      const permissionMode = parseGuildAddonPermissionMode(engine, record["permissionMode"]);
+      return Object.freeze({ engine, model, reasoningEffort, permissionMode }) as DesktopRequestByChannel[Channel];
     }
     case DESKTOP_IPC_CHANNELS.setSidebarWidth: {
       const record = exactRecord(input, ["width"]);

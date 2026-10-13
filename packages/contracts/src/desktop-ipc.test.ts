@@ -796,9 +796,13 @@ test("createTask accepts an optional engine and nothing else new (PC-ENG-001)", 
     parseDesktopRequest(DESKTOP_IPC_CHANNELS.createTask, { workspaceId, engine: "grok", isolation: "worktree" }),
     { workspaceId, isolation: "worktree", engine: "grok" },
   );
+  assert.deepEqual(
+    parseDesktopRequest(DESKTOP_IPC_CHANNELS.createTask, { workspaceId, engine: "codex" }),
+    { workspaceId, engine: "codex" },
+  );
   assert.deepEqual(parseDesktopRequest(DESKTOP_IPC_CHANNELS.createTask, { workspaceId }), { workspaceId });
   for (const rejected of [
-    { workspaceId, engine: "codex" },
+    { workspaceId, engine: "gemini" },
     { workspaceId, engine: "Claude" },
     { workspaceId, engine: "" },
     { workspaceId, engine: null },
@@ -870,6 +874,38 @@ test("Claude-engine defaults are validated with the Claude grammar and the five 
     model: "opus", reasoningEffort: null, permissionMode: "default",
     startup: { webSearchEnabled: true, planEnabled: true, subagentsEnabled: true, maxTurns: null },
   }), /invalid_grok_model/u);
+});
+
+test("add-on engine defaults are validated by the engine's own grammar and modes [PC-SET-002, PC-ENG-003]", () => {
+  assert.deepEqual(
+    parseDesktopRequest(DESKTOP_IPC_CHANNELS.setEngineSettings, {
+      engine: "codex", model: "gpt-5.6-luna", reasoningEffort: "low", permissionMode: "read-only",
+    }),
+    { engine: "codex", model: "gpt-5.6-luna", reasoningEffort: "low", permissionMode: "read-only" },
+  );
+  assert.deepEqual(
+    parseDesktopRequest(DESKTOP_IPC_CHANNELS.setEngineSettings, {
+      engine: "codex", model: null, reasoningEffort: null, permissionMode: "workspace-write",
+    }),
+    { engine: "codex", model: null, reasoningEffort: null, permissionMode: "workspace-write" },
+    "null follows the engine's own default",
+  );
+  for (const rejected of [
+    { engine: "grok", model: null, reasoningEffort: null, permissionMode: "workspace-write" },
+    { engine: "claude", model: null, reasoningEffort: null, permissionMode: "default" },
+    { engine: "gemini", model: null, reasoningEffort: null, permissionMode: "workspace-write" },
+    { engine: "codex", model: "gpt 6", reasoningEffort: null, permissionMode: "workspace-write" },
+    { engine: "codex", model: null, reasoningEffort: "High", permissionMode: "workspace-write" },
+    { engine: "codex", model: null, reasoningEffort: null, permissionMode: "default" },
+    { engine: "codex", model: null, reasoningEffort: null, permissionMode: "bypassPermissions" },
+    { engine: "codex", model: null, reasoningEffort: null },
+    { model: null, reasoningEffort: null, permissionMode: "workspace-write" },
+    { engine: "codex", model: null, reasoningEffort: null, permissionMode: "workspace-write", apiKey: "x" },
+  ]) {
+    assert.throws(() => parseDesktopRequest(DESKTOP_IPC_CHANNELS.setEngineSettings, rejected), TypeError, JSON.stringify(rejected));
+  }
+  // There is no channel that carries a Codex credential or an authentication choice.
+  assert.equal(Object.values(DESKTOP_IPC_CHANNELS).some((channel) => /codex|openai/iu.test(channel)), false);
 });
 
 test("model source requests carry no secret and no confirmation a renderer could forge [PC-ROUTE-002]", () => {
@@ -951,6 +987,7 @@ test("the Guild 3.0 channels are registered, unique invoke channels in the close
   const added = [
     DESKTOP_IPC_CHANNELS.setTaskEngine,
     DESKTOP_IPC_CHANNELS.setClaudeSettings,
+    DESKTOP_IPC_CHANNELS.setEngineSettings,
     DESKTOP_IPC_CHANNELS.listModelSources,
     DESKTOP_IPC_CHANNELS.upsertModelSource,
     DESKTOP_IPC_CHANNELS.deleteModelSource,

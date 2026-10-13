@@ -4,6 +4,7 @@ export {
   type AutomaticPermissionSettlementResult,
   type AdapterEpochRecord,
   type AppSettingsRecord,
+  type EngineDefaultsRecord,
   type CanonicalTaskRestore,
   type ConversationEntryCreationResult,
   type ConversationEntryKind,
