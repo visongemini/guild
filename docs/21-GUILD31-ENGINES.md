@@ -121,6 +121,8 @@ Before any Codex session exists the group offers one row, "Codex (default model)
 follows Codex's own default (same rule as Claude Code's first run). `fast-mode` and `collaboration_mode` are not shown.
 After every start (new, resume, load) the stored selection is applied before the first prompt, because a resumed
 session forgets it (section 2); a model the session does not offer refuses the prompt (`model_selection_failed`).
+Clearing a task's own model pins nothing: the live session keeps the model it runs (the projection says so, as for Grok) and
+a session that starts afterwards runs on Codex's own pick or the Settings default.
 
 ### 4.4 Permission mode
 Guild's selector shows the four adapter modes with its own Chinese and English wording: Read-only, Workspace access
@@ -156,6 +158,18 @@ cancelled, never shown.
 2. Quit and reopen Guild; the task resumes (the stored model and permission mode are applied before the next turn).
 3. The sidebar shows the task with the Codex marker; Settings > Engines shows the Codex section and its status.
 4. Grok and Claude tasks behave as in 3.0.5.
+
+Automated as check I of `scripts/run-guild3-qa.mjs` (run with `GUILD_QA_CODEX_ACP=<codex-acp package directory>`, which the script
+hands to the unpackaged app as the dev-only `GUILD_DEV_CODEX_ACP`; a packaged app ignores it, and the locator pins whatever it
+finds there like any other install). It uses a fresh isolated data directory, the cheapest model of the account (the first
+`Luna` entry of the list, effort low), the `read-only` mode so that a shell write needs approval, decides the card through the
+UI, then quits and relaunches Guild and sends a second turn. It asserts: the ChatGPT group lists every model the account
+reports, the card appears and clears, the file is written, the footer and the stored label name the model, the adapter process
+has `CODEX_PATH` set, the OpenViking switches off and no Anthropic or OpenAI variable, the sidebar shows the `X` marker next
+to the Grok and Claude markers, the account card is Codex's (plan label only when reported), Settings > Engines shows the Codex
+section, the same Codex rollout holds both turns after the restart, and the mode and model are applied again before the
+second turn. The rollouts the run created (those naming its workspace) are removed at the end; Codex's own index and database
+rows for them are left alone.
 
 ## 6. What the owner installs
 `npm install -g @agentclientprotocol/codex-acp` (Node >= 22 already on PATH; the package brings its own Codex core), and

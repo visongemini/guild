@@ -19,8 +19,13 @@
  * and the router never serves Anthropic, a claude-* model or a Claude credential), D Opus -> Local model
  * (cross-mode again, no Online reminder), E browser pane + agent tools + take over (on a fresh native
  * Claude task), F settings tabs, G reduced capability (usage popover), H permission card lifecycle after
- * a UI approval.
- * Environment: GUILD_QA_STAMP (reuse a run), GUILD_QA_ONLY=A,B (subset), GUILD_QA_KEEP_APP=1.
+ * a UI approval, I Codex (ChatGPT subscription; Guild 3.1): the account's models in the ChatGPT group, the cheapest
+ * chosen, one tool turn behind a permission card approved in the UI, the per-turn model line, a Guild restart that
+ * resumes the same session with the stored model and permission mode, the engine marker in the sidebar and the Codex
+ * section of Settings > Engines.
+ * Environment: GUILD_QA_STAMP (reuse a run), GUILD_QA_ONLY=A,B (subset), GUILD_QA_KEEP_APP=1,
+ * GUILD_QA_CODEX_ACP=<package directory of a codex-acp install> (handed to the unpackaged app as the dev-only
+ * GUILD_DEV_CODEX_ACP; check I runs only when it is set; the production lookup is never changed).
  *
  * Usage: node scripts/run-guild3-qa.mjs
  */
@@ -31,7 +36,7 @@ import {
   appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { seedQaData } from "./seed-guild3-qa.mjs";
 
@@ -44,7 +49,8 @@ const stamp = process.env.GUILD_QA_STAMP ?? new Date().toISOString().replace(/[-
 const workspaceDir = `/tmp/guild3-qa-ws-${stamp}`;
 const dataDir = `/tmp/guild3-qa-data-${stamp}`;
 const evidenceDir = `/tmp/guild3-qa-evidence-${stamp}`;
-const only = new Set((process.env.GUILD_QA_ONLY ?? "A,B,C,D,E,F,G,H").split(",").map((value) => value.trim().toUpperCase()).filter(Boolean));
+const codexAcpRoot = process.env.GUILD_QA_CODEX_ACP;
+const only = new Set((process.env.GUILD_QA_ONLY ?? `A,B,C,D,E,F,G,H${codexAcpRoot === undefined ? "" : ",I"}`).split(",").map((value) => value.trim().toUpperCase()).filter(Boolean));
 const TERMINAL = new Set(["completed", "failed", "cancelled", "interrupted"]);
 
 mkdirSync(evidenceDir, { recursive: true });
@@ -167,6 +173,7 @@ async function launchApp() {
       ...process.env,
       GUILD_DEV_DATA_DIR: dataDir,
       GUILD_DEV_CLAUDE_CAPTURE_OFF: "1",
+      ...(codexAcpRoot === undefined ? {} : { GUILD_DEV_CODEX_ACP: codexAcpRoot }),
     },
   });
   closeSync(out);
@@ -589,6 +596,35 @@ function claudeTranscripts() {
     readdirSync(join(root, name)).filter((file) => file.endsWith(".jsonl")).map((file) => join(root, name, file)));
 }
 
+const codexSessionsRoot = join(homedir(), ".codex", "sessions");
+let codexRolloutsAtStart; // Set of rollout paths that existed before check I; only newer ones that name the QA workspace are ours.
+
+function codexRolloutFiles() {
+  return existsSync(codexSessionsRoot) ? [...walk(codexSessionsRoot)].filter((path) => path.endsWith(".jsonl")) : [];
+}
+
+/** Rollouts this run created: new since check I began and naming the QA workspace as their working directory. */
+function qaCodexRollouts() {
+  if (codexRolloutsAtStart === undefined) return [];
+  return codexRolloutFiles().filter((path) => !codexRolloutsAtStart.has(path) && readFileSync(path, "utf8").includes(`guild3-qa-ws-${stamp}`));
+}
+
+function cleanCodexRollouts() {
+  const removed = [];
+  for (const path of qaCodexRollouts()) {
+    rmSync(path, { force: true });
+    removed.push(path.replace(codexSessionsRoot, ""));
+  }
+  return removed;
+}
+
+function codexAdapterProcess() {
+  trackDescendants();
+  return descendantsOf(app.pid).find((entry) => /codex-acp/u.test(entry.command) && !/app-server/u.test(entry.command));
+}
+
+const escapeRegExp = (text) => text.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+
 function readLines(path) {
   return existsSync(path) ? readFileSync(path, "utf8").split("\n").filter(Boolean).map((line) => { try { return JSON.parse(line); } catch { return undefined; } }).filter(Boolean) : [];
 }
@@ -640,7 +676,7 @@ document.getElementById("press").addEventListener("click", () => {
 // ---------------------------------------------------------------------------------------------
 
 const results = [];
-const state = { claudeTaskId: undefined, grokTaskId: undefined };
+const state = { claudeTaskId: undefined, grokTaskId: undefined, codexTaskId: undefined };
 
 async function runCheck(id, title, fn) {
   if (!only.has(id[0])) return;
@@ -1169,6 +1205,200 @@ async function checkH(id, engine, fileName) {
   return details;
 }
 
+/**
+ * I: Codex through its ChatGPT subscription (docs/21 section 5). Guild never reads or sends the Codex login: the
+ * adapter and its Codex core use the user's own `codex login`. The adapter is found through the dev-only
+ * GUILD_DEV_CODEX_ACP hook (a scratch install); the pins apply to it as to any install.
+ */
+async function checkI(record) {
+  const details = { issues: [] };
+  record.details = details; // kept in the report when a step fails
+  codexRolloutsAtStart = new Set(codexRolloutFiles());
+  const fileName = "codex-qa.txt";
+
+  // 0. Guild found the adapter and the core and says so; nothing about the login is read by Guild.
+  const opened = await until("codex engine ready in Settings", async () => {
+    const codex = (await call("bootstrap")).runtimeSettings.engines?.codex;
+    return codex?.status === "ready" ? codex : undefined;
+  }, { timeout: 90_000, interval: 500 });
+  details.statusAtOpen = { status: opened.status, version: opened.version ?? null, accountLabel: opened.accountLabel ?? null, permissionMode: opened.permissionMode };
+  // Ask before writing, so the card appears for a file in the workspace. Restored in the data dir's own settings at the end.
+  await call("setEngineSettings", { engine: "codex", model: null, reasoningEffort: null, permissionMode: "read-only" });
+
+  // 1. A fresh Codex task; a Grok task next to it makes the sidebar show the engine markers.
+  const created = await call("createTask", { workspaceId, engine: "codex" });
+  const taskId = created.task.taskId;
+  state.codexTaskId = taskId;
+  details.taskId = taskId;
+  details.engineAtCreate = created.task.engine;
+  if (created.task.engine !== "codex") throw new Error(`the task engine is ${created.task.engine}`);
+  await call("openTask", { taskId });
+  // A session without a turn lists the account's models (no prompt is sent).
+  await call("loadSlashCommands", { taskId }).catch((error) => details.issues.push(`slash commands: ${safeText(error.message, 120)}`));
+  const catalog = await until("codex model list", async () => {
+    const models = (await call("bootstrap")).runtimeSettings.modelCatalogs?.codex?.models ?? [];
+    return models.length > 0 ? models : undefined;
+  }, { timeout: 120_000, interval: 500 });
+  details.accountModels = catalog.map((model) => ({ id: model.id, name: model.name, efforts: model.reasoningEfforts.map((effort) => effort.id) }));
+  const cheapest = catalog.find((model) => /luna/iu.test(model.id)) ?? catalog.at(-1);
+  details.chosenModel = { id: cheapest.id, name: cheapest.name };
+
+  // 2. The ChatGPT group lists those models; the cheapest is chosen in the picker.
+  details.viewBeforePick = await call("openTask", { taskId }).then((view) => ({ engine: view.task.engine, canChange: view.modelSelection.canChange, modelId: view.modelSelection.modelId, source: view.modelSelection.source, runState: view.task.activeRunState ?? null, canSend: view.canSend }));
+  details.triggerBeforePick = await cdp.evaluate(`(() => { const t = document.querySelector(".guild-model-picker-trigger"); return t ? { text: (t.textContent || "").trim(), disabled: t.disabled === true, title: t.getAttribute("title") || "", aria: t.getAttribute("aria-label") || "" } : null; })()`);
+  const picked = await pickModel("I", `^\\s*${escapeRegExp(cheapest.name)}`);
+  details.pickerGroups = picked.groups;
+  const chatGroup = picked.groups.find((group) => /ChatGPT/u.test(group.group));
+  if (chatGroup === undefined) throw new Error(`the picker has no ChatGPT group: ${JSON.stringify(picked.groups.map((group) => group.group))}`);
+  if (!cheapest.name || !chatGroup.rows.includes(cheapest.name) || chatGroup.rows.length < catalog.length) {
+    throw new Error(`the ChatGPT group does not list the account's models: ${JSON.stringify(chatGroup)}`);
+  }
+  const selected = await waitSelection(taskId, `^${escapeRegExp(cheapest.id)}$`, { timeout: 60_000 });
+  details.selectionAfterPick = { modelId: selected.modelSelection.modelId, source: selected.modelSelection.source };
+  const lowest = cheapest.reasoningEfforts.find((effort) => effort.id === "low") ?? cheapest.reasoningEfforts[0];
+  if (lowest !== undefined) {
+    const saved = await call("setTaskRuntimeSettings", { taskId, model: cheapest.id, reasoningEffort: lowest.id });
+    details.effortChoice = { effort: lowest.id, status: saved.status };
+    if (saved.status !== "applied" && saved.status !== "saved") throw new Error(`the effort choice was ${saved.status}`);
+  }
+  await shot("I", "codex-model-chosen");
+
+  // 3. One turn that writes a file: the permission card is decided through the UI.
+  // Read-only mode: a write is refused by the sandbox unless Codex asks for approval, which is the card this check needs.
+  const prompt = `Run exactly this shell command in the workspace root: printf ok > ${fileName} && cat ${fileName}. The workspace sandbox is read-only, so ask for approval to run it outside the sandbox (escalated permissions) instead of giving up. When it has run, tell me its output and end your reply with CODEX-QA-OK.`;
+  const sent = await call("sendMessage", { taskId, text: prompt });
+  if (sent.status !== "started") throw new Error(`send_not_started:${sent.status}`);
+  const seen = await until("pending permission card or end of run", async () => {
+    if (await domExists(".guild-permission")) return "card";
+    const view = await call("openTask", { taskId });
+    return TERMINAL.has(view.task.activeRunState ?? "") && view.timeline.some((item) => item.runId === sent.runId) ? "ended" : undefined;
+  }, { timeout: 300_000, interval: 300 });
+  if (seen === "ended") throw new Error("the run ended without a permission card (inconclusive)");
+  await sleep(500);
+  details.pendingCardTitle = safeText(await domText(".guild-permission-title"), 120);
+  details.cardButtons = (await domText(".guild-permission-actions")).split("\n").map((text) => text.trim()).filter(Boolean).slice(0, 8);
+  await shot("I", "card-pending");
+  await clickDom(".guild-permission-actions button.primary");
+  const done = await waitForRun("I", taskId, sent.runId, { timeout: 360_000, approve: true });
+  const reply = assistantTextOf(done.view, sent.runId);
+  const filePath = join(workspaceDir, fileName);
+  const fileText = existsSync(filePath) ? readFileSync(filePath, "utf8") : undefined;
+  details.fileText = fileText === undefined ? null : fileText.trim();
+  details.replyHasMarker = reply.includes("CODEX-QA-OK");
+  details.toolCalls = done.view.timeline.filter((item) => item.kind === "tool" && item.runId === sent.runId).length;
+  details.afterApprovalUi = await settleUi("I");
+  if (fileText === undefined || fileText.trim() !== "ok") throw new Error(`${fileName} content ${JSON.stringify(fileText)}`);
+  if (details.afterApprovalUi.stalePermissionCards > 0) throw new Error("the permission card is still shown after it was approved and the run completed");
+  if (details.afterApprovalUi.countingChangesStuck) throw new Error("'Counting changes' never settled");
+
+  // 4. The footer names the model of the turn, as the record and as the line under the turn.
+  const modelLine = await until("per-turn model line", async () => {
+    const text = await domText(".guild-turn-model");
+    return text.includes(cheapest.name) ? text : undefined;
+  }, { timeout: 20_000, interval: 300 });
+  details.turnModelLine = safeText(modelLine, 160);
+  details.runModelRecord = (done.view.runModels ?? []).find((entry) => entry.runId === sent.runId)?.label ?? null;
+  if (details.runModelRecord !== cheapest.name) throw new Error(`the run's model label is ${JSON.stringify(details.runModelRecord)}, expected ${cheapest.name}`);
+  await shot("I", "codex-turn-done");
+
+  // 5. The adapter process: pinned Codex core, no router, no Claude or OpenAI variable, memory plugin switched off.
+  const adapter = codexAdapterProcess();
+  details.adapterProcess = adapter === undefined ? null : { pid: adapter.pid, command: safeText(adapter.command, 160) };
+  details.hasAppServerChild = adapter !== undefined && descendantsOf(adapter.pid).some((entry) => /app-server/u.test(entry.command));
+  details.env = adapter === undefined ? null : {
+    codexPathSet: processEnvHas(adapter.pid, "CODEX_PATH"),
+    codexPathIsCoreInScratch: processEnvValueStartsWith(adapter.pid, "CODEX_PATH", dirname(dirname(dirname(codexAcpRoot)))),
+    noAnthropicBase: !processEnvHas(adapter.pid, "ANTHROPIC_BASE_URL"),
+    noAnthropicToken: !processEnvHas(adapter.pid, "ANTHROPIC_AUTH_TOKEN"),
+    noOpenAiKey: !processEnvHas(adapter.pid, "OPENAI_API_KEY"),
+    recallOff: processEnvValueIs(adapter.pid, "OPENVIKING_AUTO_RECALL", "false"),
+    captureOff: processEnvValueIs(adapter.pid, "OPENVIKING_AUTO_CAPTURE", "false"),
+  };
+  if (adapter === undefined || !details.hasAppServerChild) throw new Error("no codex-acp process with a Codex core child was found");
+  const badEnv = Object.entries(details.env).filter(([, ok]) => ok !== true).map(([name]) => name);
+  if (badEnv.length > 0) throw new Error(`the Codex process environment is wrong: ${badEnv.join(", ")}`);
+
+  // 6. The sidebar row carries the Codex marker; the account card is Codex's own; Settings shows the Codex section.
+  const marker = await cdp.evaluate(`(() => { const e = document.querySelector(".guild-task-engine.codex"); return e ? { text: (e.textContent || "").trim(), title: e.getAttribute("title") || "" } : null; })()`);
+  details.sidebarMarker = marker;
+  // The markers show while the sidebar holds tasks of more than one engine (a full run has Grok and Claude tasks).
+  const sidebarEngines = new Set((await call("bootstrap")).workspaces.flatMap((workspace) => workspace.tasks.map((task) => task.engine ?? "grok")));
+  details.sidebarEngines = [...sidebarEngines].sort();
+  if (sidebarEngines.size > 1) {
+    if (marker === null) throw new Error("the sidebar shows no Codex marker");
+    // The text is the letter plus the hidden name of the engine; the letter is what the row shows.
+    if (!/codex/iu.test(marker.title) || !marker.text.startsWith("X")) throw new Error(`the marker is ${JSON.stringify(marker)}`);
+  } else {
+    details.issues.push("only Codex tasks in the sidebar: no engine markers are shown, so none was checked (run the other checks too)");
+  }
+  await shot("I", "sidebar-codex-marker");
+  if (!(await domExists(".guild-account-popover"))) await clickDom(".guild-profile");
+  await until("usage popover", () => domExists(".guild-account-popover"), { timeout: 10_000 });
+  await sleep(500);
+  details.accountCard = safeText(await domText(".guild-account-popover .guild-usage-card"), 300);
+  details.accountCardHasGrokLink = await domExists(".guild-usage-link");
+  await shot("I", "account-card");
+  await cdp.evaluate(`document.querySelector(".guild-account-popover")?.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }))`);
+  if (!/ChatGPT/u.test(details.accountCard) || details.accountCardHasGrokLink || /grok/iu.test(details.accountCard)) {
+    throw new Error(`the account card is not Codex's: ${details.accountCard}`);
+  }
+  await openSettings();
+  await clickDom("#guild-settings-tab-engines");
+  await sleep(500);
+  const sectionText = await domText("#guild-settings-panel-engines .guild-engine-codex");
+  details.codexSection = safeText(sectionText, 500);
+  details.codexSectionModes = ["Read-only|只读", "Workspace access|工作区访问", "Auto review|自动审查", "Full access|完全访问"].map((pattern) => new RegExp(pattern, "u").test(sectionText));
+  await shot("I", "settings-codex-section");
+  await cdp.evaluate(`document.querySelector(".guild-dialog-settings")?.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }))`);
+  await sleep(400);
+  if (!/Codex/u.test(sectionText) || !/Ready|已就绪/u.test(sectionText) || !details.codexSectionModes.every(Boolean)) {
+    throw new Error(`the Codex section of Settings is wrong: ${details.codexSection}`);
+  }
+
+  // 7. Quit and reopen Guild: the same session resumes; the stored model and permission mode are applied first.
+  record.details = details;
+  const rolloutsBefore = qaCodexRollouts().length;
+  details.quit = await quitApp();
+  await launchApp();
+  const reopened = await call("openTask", { taskId });
+  details.engineAfterRestart = reopened.task.engine;
+  details.selectionAfterRestart = { modelId: reopened.modelSelection.modelId, source: reopened.modelSelection.source };
+  if (reopened.task.engine !== "codex") throw new Error("the task engine changed across the restart");
+  if (reopened.modelSelection.modelId !== cheapest.id) throw new Error(`the model after the restart is ${reopened.modelSelection.modelId}`);
+  if ((reopened.runModels ?? []).find((entry) => entry.runId === sent.runId)?.label !== cheapest.name) throw new Error("the first turn lost its model line across the restart");
+  const follow = `Without using any tools: what exact text did ${fileName} contain? Reply with just that text. End with CODEX-RESUME-OK.`;
+  let resumed;
+  try {
+    resumed = await sendAndWait("I", taskId, follow, { timeout: 360_000 });
+  } catch (error) {
+    details.issues.push(`first follow-up after restart failed: ${safeText(error.message, 160)}`);
+    await shot("I", "restore-first-attempt-failed");
+    await sleep(20_000);
+    resumed = await sendAndWait("I", taskId, follow, { timeout: 360_000 });
+  }
+  const resumedReply = assistantTextOf(resumed.view, resumed.runId);
+  details.resumedReplyMentionsOk = /\bok\b/iu.test(resumedReply);
+  details.noSessionRestoredNotice = !resumed.view.timeline.some((item) => item.kind === "notice" && item.noticeType === "session_restored");
+  details.sessionModeAfterResume = resumed.view.sessionModes?.currentModeId ?? null;
+  details.secondRunModelRecord = (resumed.view.runModels ?? []).find((entry) => entry.runId === resumed.runId)?.label ?? null;
+  details.rolloutFilesBeforeRestart = rolloutsBefore;
+  const rollouts = qaCodexRollouts();
+  details.rolloutFilesAfterRestart = rollouts.length;
+  details.rolloutHoldingBothTurns = rollouts.filter((path) => {
+    const text = readFileSync(path, "utf8");
+    return text.includes("CODEX-QA-OK") && text.includes("CODEX-RESUME-OK");
+  }).length;
+  await shot("I", "codex-after-restart");
+  if (!details.resumedReplyMentionsOk) throw new Error("the resumed turn does not remember the file's content");
+  if (details.sessionModeAfterResume !== "read-only") throw new Error(`the permission mode after the resume is ${details.sessionModeAfterResume}`);
+  if (details.secondRunModelRecord !== cheapest.name) throw new Error(`the resumed turn ran on ${JSON.stringify(details.secondRunModelRecord)}, expected ${cheapest.name}`);
+  if (details.rolloutHoldingBothTurns !== 1) throw new Error(`expected one Codex rollout with both turns, found ${details.rolloutHoldingBothTurns}`);
+
+  // The setting this check changed in the QA data dir goes back to Guild's default.
+  await call("setEngineSettings", { engine: "codex", model: null, reasoningEffort: null, permissionMode: "workspace-write" });
+  return details;
+}
+
 // ---------------------------------------------------------------------------------------------
 // Secret scan, cleanup, report
 // ---------------------------------------------------------------------------------------------
@@ -1295,16 +1525,20 @@ async function main() {
   if (state.claudeTaskId !== undefined) await runCheck("G2", "Reduced capability: usage popover (routed session)", () => checkG("G2", "routed"));
   await runCheck("H1", "Claude: permission card clears after a UI approval", () => checkH("H1", "claude", "dom.txt"));
   await runCheck("H2", "Grok: permission card clears after a UI approval", () => checkH("H2", "grok", "dom-grok.txt"));
+  if (codexAcpRoot === undefined) skip("I", "Codex", "GUILD_QA_CODEX_ACP is not set");
+  else await runCheck("I", "Codex: ChatGPT group, cheapest model, tool turn behind a permission card, model line, restart and resume, sidebar marker, Settings", checkI);
 
   const quit = process.env.GUILD_QA_KEEP_APP === "1" ? { stage: "kept" } : await quitApp();
   pageServer?.close();
   const secrets = scanSecrets();
   const removedTranscripts = cleanClaudeTranscripts();
+  const removedCodexRollouts = cleanCodexRollouts();
   const portClosed = !(await portOpen(debugPort));
-  const extra = { quit, secrets, removedTranscripts, portClosed, pageHits };
+  const extra = { quit, secrets, removedTranscripts, removedCodexRollouts, portClosed, pageHits };
   writeReport(extra);
   log("secret scan", JSON.stringify({ ...secrets, literalSkFiles: undefined, boundaryFiles: undefined }));
   log("removed claude transcripts", JSON.stringify(removedTranscripts));
+  log("removed codex rollouts", JSON.stringify(removedCodexRollouts));
   const failed = results.filter((entry) => entry.status === "fail");
   log(`RESULT ${results.map((entry) => `${entry.id}:${entry.status}`).join(" ")}`);
   process.exitCode = failed.length === 0 && secrets.keyValueHits === 0 ? 0 : 1;
