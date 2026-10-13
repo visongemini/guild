@@ -89,7 +89,11 @@ created and never changes. Process topology stays one engine process per task (D
   candidate only when its real path is trusted: not under a temporary directory, owned by the current user or root,
   not writable by others, and not writable by the group unless it is a directory of the macOS `admin` group (a
   Homebrew prefix); the version-manager shims are never used. Nothing is executed before it has passed those checks
-  and been hashed. An unpackaged development run keeps the old `PATH` search and skips the checks (the QA scripts
+  and been hashed, and the file at its own path is never executed at all: the candidate is hashed, copied into Guild's
+  private staging directory (a descriptor copy that fails if the source changed meanwhile), the copy is hashed again
+  against the first hash, and only that verified staged copy answers `node --version` or `claude --version` (the shared
+  stage of the `node` is the one the launches reuse; the `claude` copy is private and removed afterwards). A file replaced
+  in a directory others can write between the check and the first run therefore makes the staging fail instead of run. An unpackaged development run keeps the old `PATH` search and skips the checks (the QA scripts
   need it); only the main process switches that on, and only when `app.isPackaged` is false. A node or adapter the
   checks refuse reads as not found.
 - Env (allowlist + Guild-owned values): PATH, HOME, USER, LOGNAME (claude looks up its Keychain login by account name; without USER it reports "not logged in" [WP-A smoke]), LANG/LC_*, TMPDIR, proxy vars, SSL vars,

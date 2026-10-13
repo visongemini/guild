@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { chmod, mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { after, afterEach, describe, it } from "node:test";
 import {
   allowDevelopmentLocatorSearch,
   buildClaudeSearchPath,
+  createProbeStager,
   buildTrustedSearchPath,
   ClaudeEngineIntegrityError,
   ClaudeLocatorError,
@@ -22,6 +23,7 @@ import {
   type ClaudeLocatorErrorCode,
   type ClaudeLocatorOptions,
   type LocatedClaudeEngine,
+  type ProbeStager,
 } from "./claude-locator.js";
 import { defaultPathTrustPolicy, type PathTrustPolicy } from "./trusted-location.js";
 
@@ -635,7 +637,8 @@ describe("Claude locator: what a re-locate may replace [PC-ENG-002]", () => {
   });
 });
 
-// A packaged app (PC-ENG-002): the PATH it was started with chooses nothing, and only trusted files are candidates.
+// A packaged app (PC-ENG-002): the PATH it was started with chooses nothing, only trusted files are candidates, and only a
+// verified staged copy of a candidate is ever executed.
 describe("Claude locator: a packaged app takes nothing from the PATH it was started with [PC-ENG-002]", () => {
   const uid = process.getuid?.() ?? 0;
   /** The temp sandbox is under the real temp directory, which the default policy rightly refuses. */
@@ -646,6 +649,8 @@ describe("Claude locator: a packaged app takes nothing from the PATH it was star
     evil: string;
     /** Stands for /opt/homebrew/bin: the fixed directory the app trusts. */
     trusted: string;
+    /** The private staging directory the probe copies go to. */
+    staging: string;
     packaged: (execute?: ClaudeLocatorOptions["execute"], policy?: PathTrustPolicy) => ClaudeLocatorOptions;
   }>;
 
@@ -653,12 +658,15 @@ describe("Claude locator: a packaged app takes nothing from the PATH it was star
     const box = await sandbox();
     const evil = join(box.root, "evil-prefix");
     const trusted = join(box.root, "trusted-bin");
+    const staging = join(box.root, "staging");
     await mkdir(evil, { recursive: true });
     await mkdir(trusted, { recursive: true });
+    await mkdir(staging, { recursive: true, mode: 0o700 });
     return {
       ...box,
       evil,
       trusted,
+      staging,
       packaged: (execute, policy = relaxed) => ({
         environment: { PATH: [evil, trusted, box.bin].join(delimiter) },
         homeDirectory: box.home,
@@ -666,32 +674,138 @@ describe("Claude locator: a packaged app takes nothing from the PATH it was star
         ...(execute === undefined ? {} : { execute }),
         allowEnvironmentPath: false,
         pathTrust: policy,
+        stagingRoot: staging,
       }),
+    };
+  }
+
+  /**
+   * A probe that answers by what the executed file contains (the payload after the Mach-O magic): a packaged app runs the
+   * staged copy, whose path is not the original's. Records where each run was and what was in the file at that moment.
+   */
+  function probesByPayload(table: Readonly<Record<string, string>>): {
+    execute: NonNullable<ClaudeLocatorOptions["execute"]>;
+    runs: Array<{ file: string; payload: string }>;
+  } {
+    const runs: Array<{ file: string; payload: string }> = [];
+    return {
+      runs,
+      execute: async (file) => {
+        const payload = (await readFile(file)).subarray(4).toString();
+        runs.push({ file, payload });
+        const answer = table[payload];
+        if (answer === undefined) throw new Error("probe failed");
+        return answer;
+      },
     };
   }
 
   it("never executes a node that only a PATH-prepended directory provides, and reports node_missing", async () => {
     const box = await packagedBox();
-    const fake = join(box.evil, "node");
-    await writeMachO(fake, "attacker");
+    await writeMachO(join(box.evil, "node"), "attacker");
     await writeMachO(join(box.bin, "node"), "also-on-path");
-    const probe = answers({ [fake]: "v26.0.0", [join(box.bin, "node")]: "v26.0.0" });
+    const probe = probesByPayload({ attacker: "v26.0.0", "also-on-path": "v26.0.0" });
     await expectLocatorError(locateNode(box.packaged(probe.execute)), "node_missing");
-    assert.deepEqual(probe.calls, [], "nothing was run");
+    assert.deepEqual(probe.runs, [], "nothing was run");
+    assert.deepEqual(await readdir(box.staging), [], "nothing was even copied");
   });
 
-  it("uses the trusted node and runs only that one, with the fake in front on the PATH", async () => {
+  it("uses the trusted node and runs only a verified staged copy of that one, never the original, with the fake in front on the PATH", async () => {
     const box = await packagedBox();
-    const fake = join(box.evil, "node");
     const real = join(box.trusted, "node");
-    await writeMachO(fake, "attacker");
+    await writeMachO(join(box.evil, "node"), "attacker");
     await writeMachO(real, "genuine");
-    const probe = answers({ [fake]: "v26.0.0", [real]: "v26.8.1\n" });
+    const probe = probesByPayload({ attacker: "v26.0.0", genuine: "v26.8.1\n" });
     const located = await locateNode(box.packaged(probe.execute));
-    assert.equal(located.executablePath, real);
+    assert.equal(located.executablePath, real, "the pin names the original");
     assert.equal(located.sha256, createHash("sha256").update(await readFile(real)).digest("hex"));
-    assert.deepEqual(probe.calls, [`${real} --version`]);
-    assert.equal(probe.calls.some((call) => call.startsWith(fake)), false);
+    assert.equal(probe.runs.length, 1);
+    const ran = probe.runs[0]!;
+    assert.equal(ran.payload, "genuine", "the attacker's file was not run");
+    assert.notEqual(ran.file, real, "the original was not run");
+    assert.ok(ran.file.startsWith(`${box.staging}/.grok-pin-`) && ran.file.endsWith("/node"), ran.file);
+    assert.equal(createHash("sha256").update(await readFile(ran.file)).digest("hex"), located.sha256, "the copy that ran is the hashed bytes");
+    assert.equal((await stat(ran.file)).mode & 0o222, 0, "read-only");
+  });
+
+  it("refuses a node that was swapped between the hash and the copy: it is not run, and the next candidate is tried", async () => {
+    const box = await packagedBox();
+    const first = join(box.trusted, "node");
+    const second = join(box.home, ".local", "bin", "node");
+    await writeMachO(first, "genuine");
+    await writeMachO(second, "second");
+    const probe = probesByPayload({ genuine: "v26.8.1", swapped: "v26.0.0", second: "v26.9.0" });
+    const real = createProbeStager(box.staging);
+    // Whoever can write the directory replaces the file after the locator hashed it and before it is copied.
+    const stage: ProbeStager = async (candidate, sha256, kind) => {
+      if (candidate === first) await writeMachO(first, "swapped");
+      return real(candidate, sha256, kind);
+    };
+    const located = await locateNode({ ...box.packaged(probe.execute), stageExecutable: stage });
+    assert.equal(located.executablePath, second, "the swapped file was refused and a trusted one used");
+    assert.deepEqual(probe.runs.map((run) => run.payload), ["second"], "the swapped bytes never ran");
+  });
+
+  it("is node_missing when the only candidate is swapped after it was hashed", async () => {
+    const box = await packagedBox();
+    const only = join(box.trusted, "node");
+    await writeMachO(only, "genuine");
+    const probe = probesByPayload({ genuine: "v26.8.1", swapped: "v26.0.0" });
+    const real = createProbeStager(box.staging);
+    const stage: ProbeStager = async (candidate, sha256, kind) => {
+      await writeMachO(candidate, "swapped");
+      return real(candidate, sha256, kind);
+    };
+    await expectLocatorError(locateNode({ ...box.packaged(probe.execute), stageExecutable: stage }), "node_missing");
+    assert.deepEqual(probe.runs, []);
+  });
+
+  it("stages once: a second locate reuses the cached identity and the shared copy and runs nothing again", async () => {
+    const box = await packagedBox();
+    await writeMachO(join(box.trusted, "node"), "genuine");
+    const probe = probesByPayload({ genuine: "v26.8.1" });
+    const first = await locateNode(box.packaged(probe.execute));
+    const second = await locateNode(box.packaged(probe.execute));
+    assert.equal(second, first);
+    assert.equal(probe.runs.length, 1);
+    assert.equal((await readdir(box.staging)).length, 1);
+  });
+
+  it("probes claude on a private verified copy that is gone afterwards, never on the original", async () => {
+    const box = await packagedBox();
+    const claude = join(box.home, ".local", "bin", "claude");
+    await writeMachO(claude, "genuine-claude");
+    const probe = probesByPayload({ "genuine-claude": "2.1.291 (Claude Code)" });
+    const located = await locateClaudeBinary(box.packaged(probe.execute));
+    assert.equal(located.executablePath, claude);
+    assert.equal(located.version, "2.1.291");
+    assert.equal(probe.runs.length, 1);
+    assert.notEqual(probe.runs[0]!.file, claude);
+    assert.ok(probe.runs[0]!.file.startsWith(`${box.staging}/.grok-pin-`), probe.runs[0]!.file);
+    assert.deepEqual(await readdir(box.staging), [], "the private copy was removed");
+    // A claude swapped after the hash is not run.
+    await rm(claude);
+    await writeMachO(claude, "genuine-claude-2");
+    const real = createProbeStager(box.staging);
+    const swapped: ProbeStager = async (candidate, sha256, kind) => {
+      await writeMachO(candidate, "swapped");
+      return real(candidate, sha256, kind);
+    };
+    const refused = probesByPayload({ swapped: "9.9.9 (Claude Code)", "genuine-claude-2": "2.1.292 (Claude Code)" });
+    await expectLocatorError(locateClaudeBinary({ ...box.packaged(refused.execute), stageExecutable: swapped }), "claude_missing");
+    assert.deepEqual(refused.runs, []);
+    assert.deepEqual(await readdir(box.staging), [], "a failed staging leaves nothing behind either");
+  });
+
+  it("a development run still probes the file itself, with no copy", async () => {
+    const box = await packagedBox();
+    const node = join(box.evil, "node");
+    await writeMachO(node, "dev-node");
+    const probe = answers({ [node]: "v26.8.1" });
+    const located = await locateNode({ ...box.packaged(probe.execute), allowEnvironmentPath: true, pathTrust: undefined });
+    assert.equal(located.executablePath, node);
+    assert.deepEqual(probe.calls, [`${node} --version`]);
+    assert.deepEqual(await readdir(box.staging), []);
   });
 
   it("takes the adapter and claude from the fixed directories only", async () => {
@@ -702,9 +816,11 @@ describe("Claude locator: a packaged app takes nothing from the PATH it was star
     await writeAdapterPackage(evilPrefix, "0.89.1");
     await mkdir(join(evilPrefix, "bin"), { recursive: true });
     await symlink("../lib/node_modules/@agentclientprotocol/claude-agent-acp/dist/index.js", join(evilPrefix, "bin", "claude-agent-acp"));
-    const options = { ...box.packaged(answers({ [fakeClaude]: "9.9.9 (Claude Code)" }).execute), environment: { PATH: [join(evilPrefix, "bin"), box.evil].join(delimiter) } };
+    const attacker = probesByPayload({ attacker: "9.9.9 (Claude Code)" });
+    const options = { ...box.packaged(attacker.execute), environment: { PATH: [join(evilPrefix, "bin"), box.evil].join(delimiter) } };
     await expectLocatorError(locateClaudeAdapter(options), "adapter_missing");
     await expectLocatorError(locateClaudeBinary(options), "claude_missing");
+    assert.deepEqual(attacker.runs, []);
     // The same files in a trusted place are found.
     const prefix = join(box.root, "homebrew");
     const { packageRoot } = await writeAdapterPackage(prefix, "0.89.1");
@@ -713,7 +829,8 @@ describe("Claude locator: a packaged app takes nothing from the PATH it was star
     assert.equal((await locateClaudeAdapter({ ...options, fallbackDirectories: [join(prefix, "bin")] })).packageRoot, packageRoot);
     const claude = join(box.home, ".local", "bin", "claude");
     await writeMachO(claude, "genuine");
-    assert.equal((await locateClaudeBinary({ ...options, execute: answers({ [claude]: "2.1.291 (Claude Code)" }).execute })).executablePath, claude);
+    const genuine = probesByPayload({ genuine: "2.1.291 (Claude Code)" });
+    assert.equal((await locateClaudeBinary({ ...options, execute: genuine.execute })).executablePath, claude);
   });
 
   it("builds a search path without the PATH, with the user's own and the fixed directories", () => {
@@ -735,9 +852,9 @@ describe("Claude locator: a packaged app takes nothing from the PATH it was star
       await writeMachO(node, label);
       await chmod(node, mode);
       await chmod(box.trusted, dirMode);
-      const probe = answers({ [node]: "v26.8.1" });
+      const probe = probesByPayload({ [label]: "v26.8.1" });
       await expectLocatorError(locateNode(box.packaged(probe.execute)), "node_missing");
-      assert.deepEqual(probe.calls, [], label);
+      assert.deepEqual(probe.runs, [], label);
       resetClaudeLaunchPinsForTesting();
     }
   });
@@ -748,11 +865,11 @@ describe("Claude locator: a packaged app takes nothing from the PATH it was star
     await writeMachO(node, "homebrew");
     await chmod(box.trusted, 0o775);
     const adminLike: PathTrustPolicy = { ...relaxed, adminGid: (await stat(box.trusted)).gid };
-    assert.equal((await locateNode(box.packaged(answers({ [node]: "v26.8.1" }).execute, adminLike))).executablePath, node);
+    assert.equal((await locateNode(box.packaged(probesByPayload({ homebrew: "v26.8.1" }).execute, adminLike))).executablePath, node);
     resetClaudeLaunchPinsForTesting();
     invalidateClaudeLocatorCache();
     await chmod(node, 0o775);
-    await expectLocatorError(locateNode(box.packaged(answers({ [node]: "v26.8.1" }).execute, adminLike)), "node_missing");
+    await expectLocatorError(locateNode(box.packaged(probesByPayload({ homebrew: "v26.8.1" }).execute, adminLike)), "node_missing");
   });
 
   it("refuses a node owned by somebody else, and a link whose real target is writable by others", async (context) => {
@@ -760,30 +877,30 @@ describe("Claude locator: a packaged app takes nothing from the PATH it was star
     const box = await packagedBox();
     const node = join(box.trusted, "node");
     await writeMachO(node, "owned-by-me");
-    const probe = answers({ [node]: "v26.8.1" });
+    const probe = probesByPayload({ "owned-by-me": "v26.8.1", target: "v26.8.1" });
     await expectLocatorError(locateNode(box.packaged(probe.execute, { ...relaxed, currentUid: uid + 1 })), "node_missing");
-    assert.deepEqual(probe.calls, []);
+    assert.deepEqual(probe.runs, []);
     // A Homebrew-style link in a trusted directory is followed, and the real target is judged, not the link.
     const cellar = join(box.root, "cellar", "bin");
     await writeMachO(join(cellar, "node"), "target");
     await rm(node);
     await symlink(join(cellar, "node"), node);
-    assert.equal((await locateNode(box.packaged(answers({ [join(cellar, "node")]: "v26.8.1" }).execute))).executablePath, join(cellar, "node"));
+    assert.equal((await locateNode(box.packaged(probe.execute))).executablePath, join(cellar, "node"));
     resetClaudeLaunchPinsForTesting();
     invalidateClaudeLocatorCache();
     await chmod(cellar, 0o777);
-    await expectLocatorError(locateNode(box.packaged(answers({ [join(cellar, "node")]: "v26.8.1" }).execute)), "node_missing");
+    await expectLocatorError(locateNode(box.packaged(probe.execute)), "node_missing");
   });
 
   it("refuses any file under a temporary directory with the default policy", async () => {
     const box = await packagedBox();
     const node = join(box.trusted, "node");
     await writeMachO(node, "in-temp");
-    const probe = answers({ [node]: "v26.8.1" });
+    const probe = probesByPayload({ "in-temp": "v26.8.1" });
     // This sandbox lives under the real temp directory, so the default policy must not trust it.
     await expectLocatorError(locateNode({ ...box.packaged(probe.execute), pathTrust: defaultPathTrustPolicy() }), "node_missing");
     await expectLocatorError(locateNode({ ...box.packaged(probe.execute), pathTrust: undefined }), "node_missing");
-    assert.deepEqual(probe.calls, []);
+    assert.deepEqual(probe.runs, []);
   });
 
   it("finds the real node of the newest supported releases of nvm, Volta and mise, never a shim or an old release", async () => {
@@ -796,24 +913,22 @@ describe("Claude locator: a packaged app takes nothing from the PATH it was star
       shim: join(box.home, ".volta", "bin", "node"),
     };
     for (const [label, path] of Object.entries(nodes)) await writeMachO(path, label);
-    const probe = answers({ [nodes.nvm24]: "v24.1.0", [nodes.nvm22]: "v22.9.0", [nodes.volta]: "v26.0.0", [nodes.nvm20]: "v20.1.0", [nodes.shim]: "v26.0.0" });
+    const probe = probesByPayload({ nvm24: "v24.1.0", nvm22: "v22.9.0", volta: "v26.0.0", nvm20: "v20.1.0", shim: "v26.0.0" });
     const located = await locateNode(box.packaged(probe.execute));
     assert.equal(located.executablePath, nodes.nvm24, "the newest nvm release comes first");
-    assert.deepEqual(probe.calls, [`${nodes.nvm24} --version`], "only the chosen file was run");
-    assert.equal(probe.calls.some((call) => call.startsWith(nodes.shim) || call.startsWith(nodes.nvm20)), false);
+    assert.deepEqual(probe.runs.map((run) => run.payload), ["nvm24"], "only a copy of the chosen file was run");
   });
 
   it("keeps the first node of the launch: a later PATH-prepended fake neither replaces it nor runs", async () => {
     const box = await packagedBox();
     const real = join(box.trusted, "node");
     await writeMachO(real, "genuine");
-    const probe = answers({ [real]: "v26.8.1" });
+    const probe = probesByPayload({ genuine: "v26.8.1", attacker: "v26.0.0" });
     const first = await locateNode(box.packaged(probe.execute));
-    const fake = join(box.evil, "node");
-    await writeMachO(fake, "attacker");
+    await writeMachO(join(box.evil, "node"), "attacker");
     const second = await locateNode(box.packaged(probe.execute));
     assert.equal(second.executablePath, first.executablePath);
-    assert.deepEqual(probe.calls, [`${real} --version`], "the fake was never run");
+    assert.deepEqual(probe.runs.map((run) => run.payload), ["genuine"], "the fake was never run");
   });
 
   it("searches the PATH only when the main process switched the development search on", async () => {

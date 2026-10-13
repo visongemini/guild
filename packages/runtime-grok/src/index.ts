@@ -48,7 +48,7 @@ export * from "./json-rpc-peer.js";
 export * from "./json-value.js";
 export * from "./ndjson.js";
 export * from "./xai-extensions.js";
-export { isMachOExecutableFile, pinExecutableShared, pruneStalePinnedExecutables } from "./executable-pin.js";
+export { isMachOExecutableFile, pinExecutable, pinExecutableShared, pruneStalePinnedExecutables } from "./executable-pin.js";
 export {
   EngineProcessHost,
   GrokProcessHost,

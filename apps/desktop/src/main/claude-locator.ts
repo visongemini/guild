@@ -1,13 +1,15 @@
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
 import { createReadStream, type BigIntStats } from "node:fs";
-import { lstat, realpath } from "node:fs/promises";
-import { homedir } from "node:os";
+import { lstat, mkdir, realpath } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, join } from "node:path";
 import {
   AdapterPinError,
   isMachOExecutableFile,
   pinClaudeAdapter,
+  pinExecutable,
+  pinExecutableShared,
   type ClaudeAdapterPin,
 } from "@guild/runtime-grok";
 import {
@@ -27,6 +29,11 @@ import {
  * It looks in a fixed list of absolute directories and uses only files whose real path is trusted (see
  * trusted-location.ts). Only an unpackaged development run (`allowDevelopmentLocatorSearch`, called by the main
  * process when `app.isPackaged` is false) keeps the `PATH` search the QA scripts rely on.
+ *
+ * The original file is never executed either. A candidate is hashed, copied into Guild's private staging directory (a
+ * descriptor copy that fails if the source changed meanwhile), the copy is hashed again against the first hash, and only the
+ * verified staged copy answers `--version`: a file swapped into a directory that others (the macOS admin group) can write
+ * after the trust check cannot win the first execution. Launches already run the staged copy (the process host pins it).
  */
 
 export type ClaudeLocatorErrorCode =
@@ -147,7 +154,47 @@ export type ClaudeLocatorOptions = Readonly<{
   allowEnvironmentPath?: boolean;
   /** Replaces the ownership and temporary-directory rules of a packaged app; tests only. */
   pathTrust?: PathTrustPolicy;
+  /** The private directory that holds the staged copies a packaged app probes. Defaults to the one the runtimes use. */
+  stagingRoot?: string;
+  /** Replaces the staging of the probe; tests only. A development run probes the file itself. */
+  stageExecutable?: ProbeStager;
 }>;
+
+/** A file Guild may run `--version` on: the path to execute and the release of what was made to get it. */
+export type StagedProbe = Readonly<{ path: string; release: () => Promise<void> }>;
+export type ProbeStager = (candidate: string, sha256: string, kind: "node" | "claude") => Promise<StagedProbe>;
+
+/** Where a packaged app stages what it probes: the same private directory the process hosts pin their executables in. */
+export function defaultProbeStagingRoot(): string {
+  return join(tmpdir(), "guild-v2-runtime");
+}
+
+/**
+ * The stager of a packaged app. The caller has hashed `candidate`; the copy is verified against that hash, so a file replaced
+ * after the hash makes the staging fail rather than run. `node` uses the shared stage the launches reuse (one copy per
+ * hash, kept); `claude` is a private copy removed after the probe. Throws when the copy cannot be proven identical.
+ */
+export function createProbeStager(stagingRoot: string): ProbeStager {
+  return async (candidate, sha256, kind) => {
+    await mkdir(stagingRoot, { recursive: true, mode: 0o700 });
+    if (kind === "node") {
+      const pinned = await pinExecutableShared(candidate, stagingRoot, sha256);
+      await pinned.verifyForSpawn();
+      return Object.freeze({ path: pinned.stagedExecutablePath, release: async () => undefined });
+    }
+    const pinned = await pinExecutable(candidate, stagingRoot, sha256);
+    try {
+      await pinned.verifyForSpawn();
+    } catch (cause) {
+      await pinned.cleanup().catch(() => undefined);
+      throw cause;
+    }
+    return Object.freeze({ path: pinned.stagedExecutablePath, release: async () => { await pinned.cleanup(); } });
+  };
+}
+
+/** A development run executes the file where it is, as before. */
+const probeInPlace: ProbeStager = async (candidate) => Object.freeze({ path: candidate, release: async () => undefined });
 
 export type ClaudeSearchKind = "node" | "adapter" | "claude";
 
@@ -258,12 +305,13 @@ export async function locateNode(options: ClaudeLocatorOptions = {}): Promise<Lo
       launchNode = cached;
       return cached;
     }
-    // Hash before the first run, so what is probed is what was hashed (the staged copy is checked
-    // against this hash again at every spawn).
+    // Hash before the first run, so what is probed is what was hashed: a packaged app runs `--version` on a verified
+    // staged copy of exactly these bytes (a development run on the file itself), and the staged copy is checked against
+    // this hash again at every spawn.
     const identity = await identityOf(candidate);
     const sha256 = await digestFile(candidate).catch(() => undefined);
     if (sha256 === undefined) continue;
-    const version = parseNodeVersion(await context.execute(candidate, ["--version"], context.probeEnvironment).catch(() => ""));
+    const version = parseNodeVersion(await probeVersion(context, "node", candidate, sha256));
     if (version === undefined) continue;
     if (!isSupportedNode(version)) {
       tooOld ??= version;
@@ -334,9 +382,10 @@ export async function locateClaudeBinary(
     }
     const cached = await readCache(claudeCache, candidate);
     if (cached !== undefined) return cached;
-    const version = /^(\d+\.\d+\.\d+)/u.exec(
-      (await context.execute(candidate, ["--version"], context.probeEnvironment).catch(() => "")).trim(),
-    )?.[1];
+    // Packaged: hashed first (once per identity), then probed on a verified private copy that is removed afterwards.
+    const sha256 = context.pathTrust === undefined ? "" : await digestFile(candidate).catch(() => undefined);
+    if (sha256 === undefined) continue;
+    const version = /^(\d+\.\d+\.\d+)/u.exec((await probeVersion(context, "claude", candidate, sha256)).trim())?.[1];
     if (version === undefined) continue;
     const identity = await identityOf(candidate);
     const located: LocatedClaudeBinary = Object.freeze({ executablePath: candidate, version });
@@ -402,6 +451,8 @@ export type LocatorContext = Readonly<{
   allowEnvironmentPath: boolean;
   /** The rules a packaged app applies to every file it would run; absent in a development run. */
   pathTrust: PathTrustPolicy | undefined;
+  /** Makes the file a version probe may execute from a candidate: a verified staged copy (packaged) or the file itself. */
+  stage: ProbeStager;
 }>;
 
 export function resolveContext(options: ClaudeLocatorOptions): LocatorContext {
@@ -420,7 +471,31 @@ export function resolveContext(options: ClaudeLocatorOptions): LocatorContext {
     }),
     allowEnvironmentPath,
     pathTrust: allowEnvironmentPath ? undefined : options.pathTrust ?? defaultPathTrustPolicy(),
+    stage: options.stageExecutable ?? (allowEnvironmentPath
+      ? probeInPlace
+      : createProbeStager(options.stagingRoot ?? defaultProbeStagingRoot())),
   });
+}
+
+/** `candidate --version` on the file the context allows to run, or "" when it cannot be made or does not answer. */
+async function probeVersion(
+  context: LocatorContext,
+  kind: "node" | "claude",
+  candidate: string,
+  sha256: string,
+): Promise<string> {
+  let staged: StagedProbe;
+  try {
+    staged = await context.stage(candidate, sha256, kind);
+  } catch {
+    // A file that cannot be proven identical to the one that was hashed is not run.
+    return "";
+  }
+  try {
+    return await context.execute(staged.path, ["--version"], context.probeEnvironment).catch(() => "");
+  } finally {
+    await staged.release().catch(() => undefined);
+  }
 }
 
 /**

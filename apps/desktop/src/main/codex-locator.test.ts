@@ -364,8 +364,10 @@ describe("Codex locator: a packaged app takes nothing from the PATH it was start
     const box = await sandbox();
     const evil = join(box.root, "evil-prefix");
     const trusted = join(box.root, "trusted-bin");
+    const staging = join(box.root, "staging");
     await mkdir(evil, { recursive: true });
     await mkdir(trusted, { recursive: true });
+    await mkdir(staging, { recursive: true, mode: 0o700 });
     await writeMachO(join(evil, "node"), "attacker");
     const evilAdapter = await installAdapter(join(box.root, "evil-global"), "2.2.2");
     await writeCore(evilAdapter.packageRoot);
@@ -377,6 +379,7 @@ describe("Codex locator: a packaged app takes nothing from the PATH it was start
       execute: async (file) => { executed.push(file); return "v26.8.1"; },
       allowEnvironmentPath: false,
       pathTrust: relaxed,
+      stagingRoot: staging,
       extraAdapterRoots: [evilAdapter.packageRoot],
     };
     await expectLocatorError(locateCodexEngine(options), "node_missing");
@@ -387,9 +390,12 @@ describe("Codex locator: a packaged app takes nothing from the PATH it was start
     const installed = await installAdapter(join(box.root, "trusted-global"), "2.2.2");
     await writeCore(installed.packageRoot);
     await symlink(join(box.root, "trusted-global", "bin", "codex-acp"), join(trusted, "codex-acp"));
-    const engine = await locateCodexEngine({ ...options, execute: async (file) => { executed.push(file); return file === node ? "v26.8.1" : ""; } });
+    const engine = await locateCodexEngine({ ...options, execute: async (file) => { executed.push(file); return "v26.8.1"; } });
     assert.equal(engine.node.executablePath, node);
     assert.equal(engine.adapter.packageRoot, installed.packageRoot);
-    assert.deepEqual(executed, [node]);
+    // Only a verified staged copy of the trusted node was run, never the file at its own path.
+    assert.equal(executed.length, 1);
+    assert.notEqual(executed[0], node);
+    assert.ok(executed[0]!.startsWith(`${staging}/.grok-pin-`) && executed[0]!.endsWith("/node"), executed[0]);
   });
 });

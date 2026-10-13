@@ -292,8 +292,10 @@ describe("Gemini locator: a packaged app takes nothing from the PATH it was star
     const box = await sandbox();
     const evil = join(box.root, "evil-prefix");
     const trusted = join(box.root, "trusted-bin");
+    const staging = join(box.root, "staging");
     await mkdir(evil, { recursive: true });
     await mkdir(trusted, { recursive: true });
+    await mkdir(staging, { recursive: true, mode: 0o700 });
     const fakeNode = join(evil, "node");
     await writeMachO(fakeNode, "attacker");
     const evilCli = await installCli(join(box.root, "evil-global"), "0.63.0");
@@ -305,6 +307,7 @@ describe("Gemini locator: a packaged app takes nothing from the PATH it was star
       execute: async (file) => { executed.push(file); return "v26.8.1"; },
       allowEnvironmentPath: false,
       pathTrust: relaxed,
+      stagingRoot: staging,
       extraPackageRoots: [evilCli.packageRoot],
     };
     await expectLocatorError(locateGeminiEngine(options), "node_missing");
@@ -315,9 +318,11 @@ describe("Gemini locator: a packaged app takes nothing from the PATH it was star
     await writeMachO(node, "genuine");
     const installed = await installCli(join(box.root, "trusted-global"), "0.63.0");
     await symlink(join(box.root, "trusted-global", "bin", "gemini"), join(trusted, "gemini"));
-    const engine = await locateGeminiEngine({ ...options, execute: async (file) => { executed.push(file); return file === node ? "v26.8.1" : ""; } });
+    const engine = await locateGeminiEngine({ ...options, execute: async (file) => { executed.push(file); return "v26.8.1"; } });
     assert.equal(engine.node.executablePath, node);
     assert.equal(engine.cli.packageRoot, installed.packageRoot);
-    assert.deepEqual(executed, [`${node}`]);
+    assert.equal(executed.length, 1);
+    assert.notEqual(executed[0], node);
+    assert.ok(executed[0]!.startsWith(`${staging}/.grok-pin-`) && executed[0]!.endsWith("/node"), executed[0]);
   });
 });
