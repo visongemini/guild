@@ -151,6 +151,7 @@ export function registerDesktopIpc(
       request.newTaskWorkspaceMode,
       request.browserSyncEnabled,
       request.taskNotificationsEnabled,
+      request.dockIcon,
     ));
   handle(DESKTOP_IPC_CHANNELS.openUserData, async () => {
     await service.openUserData();
@@ -170,6 +171,10 @@ export function registerDesktopIpc(
     service.setClaudeSettings(request.model, request.reasoningEffort, request.permissionMode));
   handle(DESKTOP_IPC_CHANNELS.setEngineSettings, async (request) =>
     service.setEngineSettings(request.engine, request.model, request.reasoningEffort, request.permissionMode));
+  handle(DESKTOP_IPC_CHANNELS.setEngineApiKey, async (request) =>
+    service.setEngineApiKey(request.engine, request.keyFile, request.keyVariable));
+  handle(DESKTOP_IPC_CHANNELS.confirmEngineApiKey, async (request) =>
+    service.confirmEngineApiKey(request.engine));
 
   const modelSources = extras.modelSources;
   if (modelSources !== undefined) {

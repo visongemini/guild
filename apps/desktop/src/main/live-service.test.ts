@@ -924,7 +924,8 @@ describe("live desktop service", () => {
     services.push(service);
 
     const startup = { webSearchEnabled: true, planEnabled: true, subagentsEnabled: true, maxTurns: null };
-    assert.deepEqual((await service.bootstrap()).runtimeSettings, {
+    const { engines: freshEngines, modelCatalogs: freshCatalogs, ...freshRest } = (await service.bootstrap()).runtimeSettings;
+    assert.deepEqual(freshRest, {
       model: null,
       reasoningEffort: null,
       modelCatalog: { models: [] },
@@ -938,16 +939,24 @@ describe("live desktop service", () => {
         permissionMode: "default",
         availablePermissionModes: GUILD_CLAUDE_PERMISSION_MODES,
       },
-      engines: {
-        codex: {
-          model: null,
-          reasoningEffort: null,
-          permissionMode: "workspace-write",
-          availablePermissionModes: GUILD_CODEX_PERMISSION_MODES,
-        },
-      },
-      modelCatalogs: { grok: { models: [] }, claude: { engine: "claude", models: [] }, codex: { engine: "codex", models: [] } },
     }, "a new install follows the runtime default and has no model list yet");
+    assert.deepEqual(freshEngines?.codex, {
+      model: null,
+      reasoningEffort: null,
+      permissionMode: "workspace-write",
+      availablePermissionModes: GUILD_CODEX_PERMISSION_MODES,
+    });
+    // Gemini: its own modes, no model yet, no key bound (its status follows the key look, which runs off the critical path).
+    assert.deepEqual(
+      [freshEngines?.gemini?.model, freshEngines?.gemini?.reasoningEffort, freshEngines?.gemini?.permissionMode, freshEngines?.gemini?.apiKey?.state],
+      [null, null, "default", "unconfirmed"],
+    );
+    assert.deepEqual(freshCatalogs, {
+      grok: { models: [] },
+      claude: { engine: "claude", models: [] },
+      codex: { engine: "codex", models: [] },
+      gemini: { engine: "gemini", models: [] },
+    });
 
     // No list yet: any official-looking pair is accepted; the runtime validates it per session.
     const withWorkspace = await service.chooseWorkspace();
@@ -1267,6 +1276,7 @@ describe("live desktop service", () => {
       "hex",
     ));
     const opened: string[] = [];
+    const dockIcons: string[] = [];
     const first = createLiveDesktopService({
       appVersion: "2.0.0-test",
       databasePath: join(root, "guild.sqlite3"),
@@ -1276,6 +1286,9 @@ describe("live desktop service", () => {
       chooseAvatarFile: async () => source,
       openUserData: async () => {
         opened.push(root);
+      },
+      applyDockIcon: (icon) => {
+        dockIcons.push(icon);
       },
       runtimeFactory: fakeRuntimeFactory(),
     });
@@ -1293,7 +1306,11 @@ describe("live desktop service", () => {
     const saved = await first.saveProfile(" 小云 ", { previewToken: chosen.previewToken });
     assert.equal(saved.profile.nickname, "小云");
     assert.match(saved.profile.avatarGrantUrl ?? "", /^guild-media:\/\/media\/.+\.png$/u);
-    const general = await first.setGeneralSettings(false, "last", false, false);
+    assert.equal(bootstrapped.generalSettings.dockIcon, "dark");
+    assert.deepEqual(dockIcons, [], "the default is the bundle icon: a launch on it changes nothing");
+    const general = await first.setGeneralSettings(false, "last", false, false, "light");
+    assert.equal(general.generalSettings.dockIcon, "light");
+    assert.deepEqual(dockIcons, ["light"], "the choice reaches the Dock at once");
     assert.equal(general.generalSettings.restoreLastTask, false);
     assert.equal(general.generalSettings.newTaskWorkspaceMode, "last");
     assert.equal(general.browserSyncEnabled, false);
@@ -1304,16 +1321,22 @@ describe("live desktop service", () => {
     await first.close();
     services.splice(services.indexOf(first), 1);
 
+    const reopenedDockIcons: string[] = [];
     const reopened = createLiveDesktopService({
       appVersion: "2.0.0-test",
       databasePath: join(root, "guild.sqlite3"),
       stagingRoot: join(root, "staging-2"),
       mediaRoot,
       chooseWorkspace: async () => undefined,
+      applyDockIcon: (icon) => {
+        reopenedDockIcons.push(icon);
+      },
       runtimeFactory: fakeRuntimeFactory(),
     });
     services.push(reopened);
     const restored = await reopened.bootstrap();
+    assert.equal(restored.generalSettings.dockIcon, "light", "the choice survives a restart");
+    assert.deepEqual(reopenedDockIcons, ["light"], "and is applied again at startup");
     assert.equal(restored.profile.nickname, "小云");
     assert.equal(restored.profile.avatarGrantUrl, saved.profile.avatarGrantUrl);
     assert.equal(restored.generalSettings.restoreLastTask, false);
@@ -1323,6 +1346,10 @@ describe("live desktop service", () => {
     const reset = await reopened.saveProfile("BDV", "reset");
     assert.equal(reset.profile.avatarGrantUrl, undefined);
     await assert.rejects(reopened.saveProfile("\nnope", "keep"));
+    // A faulty Dock call never turns the saved choice into an error, and an unknown choice is refused.
+    const quiet = await reopened.setGeneralSettings(false, "last", false, false, "dark");
+    assert.equal(quiet.generalSettings.dockIcon, "dark");
+    await assert.rejects(reopened.setGeneralSettings(false, "last", false, false, "blue" as never));
     const tooLarge = join(root, "huge.png");
     await writeFile(tooLarge, Buffer.alloc(5 * 1024 * 1024 + 12, 0x89));
     const oversized = createLiveDesktopService({

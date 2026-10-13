@@ -1,9 +1,10 @@
 import { restoreMessages } from "./restore-messages.js";
 import { finishRestoreShutdown, finishLocalRestore, recoverLocalRestore } from "./local-backup.js";
+import { existsSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { isAbsolute, join, normalize } from "node:path";
-import { app, dialog, Notification, powerMonitor, shell, type BrowserWindow } from "electron";
+import { app, dialog, nativeImage, Notification, powerMonitor, shell, type BrowserWindow } from "electron";
 import type { GuildLocale } from "@guild/contracts";
 import { openGuildPersistence } from "@guild/persistence";
 import {
@@ -16,6 +17,7 @@ import { createBrowserPaneBridge, type BrowserPaneBridge, type BrowserPaneIpcPor
 import { configureBrowserPaneProcess } from "./browser-pane.js";
 import { createElectronBrowserPane } from "./browser-pane-electron.js";
 import { resolveDevHooks } from "./dev-hooks.js";
+import { createDockIconApplier } from "./dock-icon.js";
 import { createElectronRouterFetches } from "./electron-router-fetch.js";
 import { registerDesktopIpc } from "./ipc-handlers.js";
 import { createLiveDesktopService } from "./live-service.js";
@@ -27,6 +29,7 @@ import {
   type ModelRouterHost,
 } from "./model-router-host.js";
 import { createModelSourcesService, type ModelSourcesService } from "./model-sources-service.js";
+import type { HostConfirmationPrompt } from "./model-source-messages.js";
 import { RouterDiagnosticLog } from "./router-diagnostic-log.js";
 import { createGuildWindow } from "./window-security.js";
 import {
@@ -134,27 +137,41 @@ app.whenReady().then(async () => {
       },
     });
     modelRouterHost = routerHost;
+    // The one native dialog that binds a key to a host: a model source's and an engine's use the same (PC-ROUTE-002,
+    // PC-ENG-004). Cancel is the default button; only "Allow" confirms, and nothing in the renderer can answer it.
+    const confirmHost = async (prompt: HostConfirmationPrompt): Promise<boolean> => {
+      const options = {
+        type: "warning" as const,
+        title: "Guild",
+        message: prompt.message,
+        detail: prompt.detail,
+        buttons: [prompt.cancelLabel, prompt.allowLabel],
+        defaultId: 0,
+        cancelId: 0,
+        noLink: true,
+      };
+      const owner = guildWindow;
+      const answer = owner !== undefined && !owner.isDestroyed()
+        ? await dialog.showMessageBox(owner, options)
+        : await dialog.showMessageBox(options);
+      return answer.response === 1;
+    };
+    // The Dock icon the user chose (PC-SET-002): the dark one is the bundle's own PNG, the light one a packaged resource.
+    const dockIcons = createDockIconApplier({
+      platform: process.platform,
+      dock: app.dock,
+      iconDirectory: app.isPackaged ? process.resourcesPath : join(app.getAppPath(), "build"),
+      loadImage: (path) => {
+        const image = nativeImage.createFromPath(path);
+        return image.isEmpty() ? undefined : image;
+      },
+      fileExists: existsSync,
+    });
     modelSources = createModelSourcesService({
       store: persistence,
       defaultKeyFile,
       getLocale: currentLocale,
-      confirmHost: async (prompt) => {
-        const options = {
-          type: "warning" as const,
-          title: "Guild",
-          message: prompt.message,
-          detail: prompt.detail,
-          buttons: [prompt.cancelLabel, prompt.allowLabel],
-          defaultId: 0,
-          cancelId: 0,
-          noLink: true,
-        };
-        const owner = guildWindow;
-        const answer = owner !== undefined && !owner.isDestroyed()
-          ? await dialog.showMessageBox(owner, options)
-          : await dialog.showMessageBox(options);
-        return answer.response === 1;
-      },
+      confirmHost,
       onChanged: () => {
         void routerHost.refresh();
       },
@@ -175,6 +192,12 @@ app.whenReady().then(async () => {
         browserMcp: bridge.mcp,
         claudeCaptureOff: devHooks.claudeCaptureOff,
         ...(devHooks.codexAdapterRoot === undefined ? {} : { codexAdapterRoot: devHooks.codexAdapterRoot }),
+        ...(devHooks.geminiCliRoot === undefined ? {} : { geminiCliRoot: devHooks.geminiCliRoot }),
+        defaultKeyFile,
+        confirmEngineKey: confirmHost,
+        applyDockIcon: (icon) => {
+          dockIcons.apply(icon);
+        },
         appVersion: app.getVersion(),
         databasePath: join(app.getPath("userData"), "guild.sqlite3"),
         initialLocale: app.getLocale().toLowerCase().startsWith("zh") ? "zh-CN" : "en-US",

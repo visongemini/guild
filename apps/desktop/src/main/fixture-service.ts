@@ -12,6 +12,8 @@ import {
   resolveEffectiveSelection,
   type DesktopBootstrapProjection,
   type GuildClaudePermissionMode,
+  type GuildAddonEngine,
+  type GuildDockIcon,
   type GuildEngine,
   type GuildLocale,
   type GuildGrokModel,
@@ -163,6 +165,17 @@ const FIXTURE_CODEX_CATALOG = freezeModelCatalog("codex", {
   ],
 });
 
+/** What the Gemini picker offers: the models a session lists (never the CLI's own `auto`), no efforts. */
+const FIXTURE_GEMINI_CATALOG = freezeModelCatalog("gemini", {
+  engine: "gemini",
+  runtimeDefaultModelId: "gemini-3.5-flash-lite",
+  models: [
+    { id: "gemini-3.5-flash-lite", name: "gemini-3.5-flash-lite", group: "gemini", reasoningEfforts: [], contextWindows: [] },
+    { id: "gemini-3-flash-preview", name: "gemini-3-flash-preview", group: "gemini", reasoningEfforts: [], contextWindows: [] },
+    { id: "gemini-3.1-pro-preview", name: "gemini-3.1-pro-preview", group: "gemini", reasoningEfforts: [], contextWindows: [] },
+  ],
+});
+
 export function createFixtureDesktopService(): DesktopApplicationService {
   const listeners = new Set<(projection: DesktopBootstrapProjection) => void>();
   let locale: GuildLocale = "zh-CN";
@@ -174,8 +187,15 @@ export function createFixtureDesktopService(): DesktopApplicationService {
   let claudeModel: string | null = null;
   let claudeEffort: string | null = null;
   let claudePermissionMode: GuildClaudePermissionMode = "default";
-  let codexDefaults: Readonly<{ model: string | null; reasoningEffort: string | null; permissionMode: string }> =
-    Object.freeze({ model: null, reasoningEffort: null, permissionMode: GUILD_ADDON_DEFAULT_PERMISSION_MODE.codex });
+  type AddonDefaults = Readonly<{ model: string | null; reasoningEffort: string | null; permissionMode: string }>;
+  const addonDefaults: Record<GuildAddonEngine, AddonDefaults> = {
+    codex: Object.freeze({ model: null, reasoningEffort: null, permissionMode: GUILD_ADDON_DEFAULT_PERMISSION_MODE.codex }),
+    gemini: Object.freeze({ model: null, reasoningEffort: null, permissionMode: GUILD_ADDON_DEFAULT_PERMISSION_MODE.gemini }),
+  };
+  // The Gemini key binding the way the main process keeps it: names and a confirmation, never a key.
+  let geminiKey: Readonly<{ keyFile: string | null; keyVariable: string; confirmed: boolean }> =
+    Object.freeze({ keyFile: null, keyVariable: "GEMINI_API_KEY", confirmed: false });
+  let dockIcon: GuildDockIcon = "dark";
   const taskEngines = new Map<string, GuildEngine>();
   let startup: GuildGrokStartupSettings = GUILD_DEFAULT_GROK_STARTUP_SETTINGS;
   let sidebarWidth = 280;
@@ -218,17 +238,19 @@ export function createFixtureDesktopService(): DesktopApplicationService {
     const override = taskOverrides.get(task.task.taskId);
     const taskEngine = taskEngines.get(task.task.taskId);
     const claude = taskEngine === "claude";
-    const codex = taskEngine === "codex";
+    const addon = taskEngine === "codex" || taskEngine === "gemini" ? taskEngine : undefined;
     const resolved = resolveEffectiveSelection({
       ...(override === undefined
         ? {}
         : { task: { modelId: override.model, reasoningEffort: override.reasoningEffort } }),
       global: claude
         ? { modelId: claudeModel, reasoningEffort: claudeEffort }
-        : codex
-          ? { modelId: codexDefaults.model, reasoningEffort: codexDefaults.reasoningEffort }
+        : addon !== undefined
+          ? { modelId: addonDefaults[addon].model, reasoningEffort: addonDefaults[addon].reasoningEffort }
           : { modelId: grokModel, reasoningEffort },
-      catalog: claude ? FIXTURE_CLAUDE_CATALOG : codex ? FIXTURE_CODEX_CATALOG : FIXTURE_MODEL_CATALOG,
+      catalog: claude
+        ? FIXTURE_CLAUDE_CATALOG
+        : addon === "codex" ? FIXTURE_CODEX_CATALOG : addon === "gemini" ? FIXTURE_GEMINI_CATALOG : FIXTURE_MODEL_CATALOG,
     });
     const state = task.task.activeRunState;
     const turnLive = state !== undefined &&
@@ -275,16 +297,36 @@ export function createFixtureDesktopService(): DesktopApplicationService {
             status: "ready" as const,
             accountLabel: "ChatGPT Plus",
             version: "0.160.1",
-            ...codexDefaults,
+            ...addonDefaults.codex,
             availablePermissionModes: GUILD_ADDON_PERMISSION_MODES.codex,
           }),
+          gemini: Object.freeze({
+            status: geminiKey.confirmed ? "ready" as const : "not_logged_in" as const,
+            version: "0.63.0",
+            ...addonDefaults.gemini,
+            availablePermissionModes: GUILD_ADDON_PERMISSION_MODES.gemini,
+            apiKey: Object.freeze({
+              keyFile: geminiKey.keyFile,
+              keyVariable: geminiKey.keyVariable,
+              host: "generativelanguage.googleapis.com",
+              confirmed: geminiKey.confirmed,
+              defaultKeyFile: "/Users/bdv/.config/guild/keys.env",
+              state: geminiKey.confirmed ? "usable" as const : "unconfirmed" as const,
+            }),
+          }),
         }),
-        modelCatalogs: Object.freeze({ grok: FIXTURE_MODEL_CATALOG, claude: FIXTURE_CLAUDE_CATALOG, codex: FIXTURE_CODEX_CATALOG }),
+        modelCatalogs: Object.freeze({
+          grok: FIXTURE_MODEL_CATALOG,
+          claude: FIXTURE_CLAUDE_CATALOG,
+          codex: FIXTURE_CODEX_CATALOG,
+          gemini: FIXTURE_GEMINI_CATALOG,
+        }),
       }),
       generalSettings: Object.freeze({
         restoreLastTask,
         newTaskWorkspaceMode,
         taskNotificationsEnabled,
+        dockIcon,
         lastWorkspaceId: "workspace-cowork" as WorkspaceId,
       }),
       profile: Object.freeze({ nickname }),
@@ -611,9 +653,25 @@ export function createFixtureDesktopService(): DesktopApplicationService {
       publish();
       return projection;
     },
-    setEngineSettings: async (_engine, nextModel, nextEffort, nextPermissionMode) => {
-      codexDefaults = Object.freeze({ model: nextModel, reasoningEffort: nextEffort, permissionMode: nextPermissionMode });
+    setEngineSettings: async (engine, nextModel, nextEffort, nextPermissionMode) => {
+      if (engine !== "codex" && engine !== "gemini") throw new Error("runtime_settings_change_unavailable");
+      addonDefaults[engine] = Object.freeze({ model: nextModel, reasoningEffort: nextEffort, permissionMode: nextPermissionMode });
       activeTask = withModelSelection(activeTask);
+      publish();
+      return projection;
+    },
+    setEngineApiKey: async (engine, nextKeyFile, nextKeyVariable) => {
+      if (engine !== "gemini") throw new Error("engine_key_unavailable");
+      // Naming other names voids the confirmation, as in the store.
+      const same = geminiKey.keyFile === nextKeyFile && geminiKey.keyVariable === nextKeyVariable;
+      geminiKey = Object.freeze({ keyFile: nextKeyFile, keyVariable: nextKeyVariable, confirmed: same && geminiKey.confirmed });
+      publish();
+      return projection;
+    },
+    confirmEngineApiKey: async (engine) => {
+      if (engine !== "gemini") throw new Error("engine_key_unavailable");
+      // The fixture has no native dialog: it stands in for an "Allow".
+      geminiKey = Object.freeze({ ...geminiKey, confirmed: true });
       publish();
       return projection;
     },
@@ -627,11 +685,12 @@ export function createFixtureDesktopService(): DesktopApplicationService {
       publish();
       return projection;
     },
-    setGeneralSettings: async (nextRestore, nextMode, nextBrowserSync, nextNotifications) => {
+    setGeneralSettings: async (nextRestore, nextMode, nextBrowserSync, nextNotifications, nextDockIcon) => {
       restoreLastTask = nextRestore;
       newTaskWorkspaceMode = nextMode;
       browserSyncEnabled = nextBrowserSync;
       taskNotificationsEnabled = nextNotifications;
+      dockIcon = nextDockIcon;
       publish();
       return projection;
     },

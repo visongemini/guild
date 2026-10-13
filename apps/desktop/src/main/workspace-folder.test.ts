@@ -48,6 +48,10 @@ describe("workspace folder presence", () => {
     assert.equal(ENGINE_START_TIMEOUT, "engine_start_timeout");
     assert.equal(toDesktopIpcFailure(new Error(ENGINE_LOGIN_REQUIRED)).message, ENGINE_LOGIN_REQUIRED);
     assert.equal(toDesktopIpcFailure(new Error(ENGINE_START_TIMEOUT)).message, ENGINE_START_TIMEOUT);
+    // Gemini's two start refusals (PC-ENG-004) pass as codes; the file and variable behind the second are in the conversation, never here.
+    assert.equal(toDesktopIpcFailure(new Error("engine_key_required")).message, "engine_key_required");
+    assert.equal(toDesktopIpcFailure(new Error("engine_env_file_unsafe")).message, "engine_env_file_unsafe");
+    assert.equal(toDesktopIpcFailure(new Error("engine_env_file_unsafe:/Users/me/p/.env")).message, "guild_operation_failed");
     assert.equal(toDesktopIpcFailure(new Error("runtime_start_process_start:preflight")).message, "guild_operation_failed");
     assert.equal(toDesktopIpcFailure("unknown").message, "guild_operation_failed");
   });

@@ -26,6 +26,17 @@ export const CLAUDE_START_TIMEOUT = "claude_start_timeout";
  */
 export const ENGINE_LOGIN_REQUIRED = "engine_login_required";
 /**
+ * PC-ENG-004: the Gemini engine has no usable API key: the binding is not confirmed, or the file or variable it names
+ * gives nothing. Guild never reads a key it was not allowed to, and never starts the CLI without one. The wording is the
+ * engine's own (`engineStatusNoKey`), pointing at Settings > Engines.
+ */
+export const ENGINE_KEY_REQUIRED = "engine_key_required";
+/**
+ * PC-ENG-004: an env file the Gemini CLI would load names a variable that moves the key or changes the sign-in method, so
+ * Guild did not start it. The conversation entry names the file and the variable (never a value).
+ */
+export const ENGINE_ENV_FILE_UNSAFE = "engine_env_file_unsafe";
+/**
  * PC-ENG-003: an add-on engine did not answer within its start window. Nothing was lost: the task keeps its
  * session id and the next send resumes it (`engineStartTimeout`).
  */
@@ -73,6 +84,8 @@ export function toDesktopIpcFailure(cause: unknown): Error {
     message === CLAUDE_LOGIN_REQUIRED ||
     message === CLAUDE_START_TIMEOUT ||
     message === ENGINE_LOGIN_REQUIRED ||
+    message === ENGINE_KEY_REQUIRED ||
+    message === ENGINE_ENV_FILE_UNSAFE ||
     message === ENGINE_START_TIMEOUT ||
     message === TASK_ENGINE_LOCKED ||
     message === MODEL_ROUTER_UNAVAILABLE ||
