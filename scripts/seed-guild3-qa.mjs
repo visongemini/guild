@@ -3,8 +3,9 @@
  *
  * It uses the persistence store API directly, while Guild is NOT running (the database lease allows
  * one owner): a workspace for the QA folder, an Online source `deepseek` and a Local source
- * `lan-llama`, both confirmed through the store's confirm function. That call replaces the native
- * confirmation dialog for QA only. Key files are named, never read: this script handles no key value.
+ * `lan-llama`, both confirmed through the store's confirm function, and the Gemini engine's API key binding
+ * (the default key file and `GEMINI_API_KEY`), confirmed the same way. Those calls replace the native confirmation
+ * dialog for QA only. Key files are named, never read: this script handles no key value.
  *
  * Usage: node scripts/seed-guild3-qa.mjs --data <dir> --workspace <dir>
  */
@@ -38,6 +39,13 @@ export const QA_SOURCES = Object.freeze([
   }),
 ]);
 
+/** The Gemini engine's key binding (PC-ENG-004): names only, bound to the engine's own host by the confirm call. */
+export const QA_GEMINI_KEY = Object.freeze({
+  engine: "gemini",
+  keyFile: DEFAULT_KEY_FILE,
+  keyVariable: "GEMINI_API_KEY",
+});
+
 function argument(name) {
   const index = process.argv.indexOf(`--${name}`);
   const value = index >= 0 ? process.argv[index + 1] : undefined;
@@ -67,7 +75,11 @@ export async function seedQaData({ dataDir, workspaceDir }) {
       const confirmed = store.confirmModelSource({ sourceId: source.id, expectedRevision: source.revision });
       sources.push({ id: confirmed.id, kind: confirmed.kind, confirmedHost: confirmed.confirmedHost });
     }
-    return { workspaceId: workspace.workspaceId, canonicalPath, sources };
+
+    const saved = store.saveEngineKeyBinding(QA_GEMINI_KEY);
+    const binding = store.confirmEngineKeyBinding({ engine: saved.engine, expectedRevision: saved.revision });
+    const geminiKey = { keyFile: binding.keyFile, keyVariable: binding.keyVariable, confirmedHost: binding.confirmedHost };
+    return { workspaceId: workspace.workspaceId, canonicalPath, sources, geminiKey };
   } finally {
     store.close();
   }

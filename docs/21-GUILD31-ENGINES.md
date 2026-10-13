@@ -200,7 +200,7 @@ server.
 | Modes | `session/set_mode {sessionId, modeId}`; an unknown id answers `-32603`. A change emits an `agent_message_chunk` whose text is `[MODE_UPDATE] yolo` instead of a `current_mode_update`. |
 | Prompt with a tool | `agent_thought_chunk` x2, `tool_call` (pending, kind `edit`, a `diff` content block with `_meta.kind`), `session/request_permission` with options `proceed_always` "Allow for this session" (`allow_always`), `proceed_once` "Allow" (`allow_once`), `cancel` "Reject" (`reject_once`); then `tool_call_update` completed, `agent_message_chunk`, and the result `{"stopReason":"end_turn","_meta":{"quota":{"token_count":{"input_tokens":22065,"output_tokens":25},"model_usage":[...]}}}`. An MCP tool adds `proceed_always_server` and `proceed_always_tool`. No `rawInput`. Some shell commands run with no request at all. |
 | Cancel | `session/cancel` mid-stream: the result `cancelled` arrives within milliseconds, without `_meta.quota`, and the session is reusable. **While a permission request is pending the prompt resolves only after the client answers that request with `{"outcome":{"outcome":"cancelled"}}`.** Nothing arrives after the result (3 s watched); `available_commands_update` arrives from a `setTimeout(0)` after `session/new`, possibly during the first prompt. |
-| Resume / load | `session/resume` answers `-32601`. `session/load` (same cwd, `selectedType` set) answers `{modes, models}` after replaying the history as `session/update` frames, which include a synthetic `user_message_chunk` starting `<session_context>` and `user_message_chunk` frames reading `[Function Response: write_file]`. The replay differs from the live frames: the tool title is the tool's name (`WriteFile`, live "Writing to hello.txt"), the diff path is relative, there is no `locations`, the tool call is already `completed`, and the final text lacks the live trailing newline. Sessions persist at `<home>/.gemini/tmp/<slug>/chats/session-<ts>-<id8>.jsonl` (prompts and tool output in full). |
+| Resume / load | `session/resume` answers `-32601`. `session/load` (same cwd, `selectedType` set) answers `{modes, models}` and streams the history as `session/update` frames without waiting for it (the CLI calls `streamHistory` and returns its answer at once): the frames arrive before, around and after the answer, and nothing marks the end. They include a synthetic `user_message_chunk` starting `<session_context>` and `user_message_chunk` frames reading `[Function Response: write_file]`. The replay differs from the live frames: the tool title is the tool's name (`WriteFile`, live "Writing to hello.txt"), the diff path is relative, there is no `locations`, the tool call is already `completed`, and the final text lacks the live trailing newline. Sessions persist at `<home>/.gemini/tmp/<slug>/chats/session-<ts>-<id8>.jsonl` (prompts and tool output in full). |
 | Usage | Only the prompt result `_meta.quota` (`input_tokens`, `output_tokens` per model); no `usage_update`, cost or cached tokens. `output_tokens` excludes thinking, and nothing is reported for a cancelled or failed turn. A trivial turn is about 10.9k input tokens, a tool turn about 22k (two requests). |
 | HTTP MCP | `{"type":"http","name":"stub","url":"http://127.0.0.1:<port>/mcp","headers":[...]}` is accepted and its headers are sent on every request; tools appear behind permission requests. **Only in a trusted folder**: in an untrusted one the server is silently dropped. `--skip-trust` fixes that, and also allows `autoEdit` and `yolo`. |
 | Client file system | Do not advertise it. If it is advertised, answering a read of a missing file with `-32002` breaks `write_file` for a new file. |
@@ -208,14 +208,15 @@ server.
 | Telemetry | Usage statistics are on by default (`privacy.usageStatisticsEnabled: false` turns them off, verified). OpenTelemetry is off unless `GEMINI_TELEMETRY_ENABLED` is set. |
 | Trust | `--skip-trust` also enables workspace `.gemini/settings.json`, hooks, skills and `GEMINI.md`, and the CLI loads `.env` files from the working directory upward and from `<home>/.gemini/.env` (not tested). |
 
-Ten gotchas, highest impact first: (1) node 26 ignores the proxy variables, set `NODE_USE_ENV_PROXY=1`; (2) the default
+Eleven gotchas, highest impact first: (1) node 26 ignores the proxy variables, set `NODE_USE_ENV_PROXY=1`; (2) the default
 model `auto` can route to Pro and returns after a load, set the model explicitly; (3) the real home is hazardous, use a
 Guild-owned `GEMINI_CLI_HOME`; (4) an untrusted folder drops ACP MCP servers and refuses `autoEdit` and `yolo`, so
 decide on `--skip-trust` deliberately; (5) two processes unless `GEMINI_CLI_NO_RELAUNCH=1`; (6) `[MODE_UPDATE]` is fake
 chat text, filter it; (7) permission options by kind, and answer pending requests with `cancelled` after
 `session/cancel`; (8) usage under-reports, the billing page is authoritative; (9) with no key `initialize` still
 succeeds and the failure comes at `session/new`; (10) npm skipped the install scripts of the optional native
-packages and the interactive shell tool of the CLI (`node-pty`) was not tested.
+packages and the interactive shell tool of the CLI (`node-pty`) was not tested; (11) `session/load` does not wait for its
+replay (see Resume / load): a client that closes the replay at the answer loses most of the history.
 
 ## 8. The Gemini engine
 
@@ -300,6 +301,10 @@ modes are shown with Guild's own words: Default (asks before edits and commands)
 (read-only), Full access (YOLO, asks nothing; marked as a warning like Codex's full access); the setting default is `default`.
 
 ### 8.6 Session restore
+The load answer does not end the replay (section 7, gotcha 11), so the replay barrier stays open after the answer until no
+`session/update` of the session has arrived for 400 ms, and for at most 15 s; a history still streaming then fails the load as a
+start that got no answer in time, which keeps the session for the next try. A normal load costs those 400 ms. A frame Guild cannot
+decode (a replayed tool call names its file relative to the workspace) is dropped and counted, which is harmless to the check.
 Because the replay is not faithful (section 7), the replay check of a Gemini task requires that the loaded session replays
 exactly the user prompts of the task's completed turns, in order, by the same digest as for the other engines; it does not
 compare titles, thoughts, tool snapshots or assistant text. A prompt sent with attached files cannot be proven and is
@@ -352,6 +357,20 @@ a @google/gemini-cli install>` is set (handed to the unpackaged app as the dev-o
 it and the locator pins whatever it finds there like any other install) and the key file holds `GEMINI_API_KEY`. The key binding is
 seeded through the store the way the model sources are (`confirmEngineKeyBinding`, which stands in for the native dialog for QA
 only). Check K needs no engine.
+
+Check J asserts: the engine reports ready with the CLI's version and a confirmed, usable key bound to
+`generativelanguage.googleapis.com` (a projection with no key field), the model list has no `auto` and no effort, the new task
+already sits on the cheapest Flash(-Lite) model, the picker's Gemini group says pay-as-you-go and carries the cost hint, one turn
+writes a file behind a permission card approved in the UI (Allow, not Allow for this session), no mode narration or replayed
+context reaches the conversation, the footer and the stored label name the model, the child is `node <bundle>/gemini.js --acp
+--skip-trust` with HOME and `GEMINI_CLI_HOME` under Guild's own home, the key present (presence only), `GEMINI_CLI_NO_RELAUNCH=1`,
+`NODE_USE_ENV_PROXY=1` and none of the OAuth, Vertex, base-URL, Google key or other engine variables, the settings file Guild wrote
+(API-key sign-in, statistics and updates off, and after a restart the task's model) and no OAuth file in that home, the account card
+says Gemini API and defers to Google AI Studio for billing, the Gemini section of Settings has no key input, and after a Guild
+restart the same session continues through a committed `session/load` on the stored model and mode. Check K asserts the default is
+Dark, both choices are previewed and named, Light is saved at once, reported as applied by the main process (`dock_icon_applied` in
+the runtime diagnostics; the Dock itself cannot be read over CDP), kept across a restart and applied again at startup, and Dark
+again afterwards. The Gemini home the run created is removed with its chat files after the secret scan.
 
 ## 11. What the owner installs
 `npm install -g @google/gemini-cli` (0.63 up to 0.69; Node >= 20 on PATH, Guild uses its own pinned node). A Gemini API key from

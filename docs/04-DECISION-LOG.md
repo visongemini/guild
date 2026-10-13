@@ -1292,9 +1292,10 @@ Consequences
     other adapters have (`model`, `mode`) and maps their changes to `session/set_model` and `session/set_mode`. The
     model is applied explicitly after every start, `auto` is never offered (it can route to the Pro model), and a new
     task starts on the cheapest Flash or Flash-Lite model the session lists. There is no effort control.
-  - History is restored with `session/load` only. The replay is not byte-faithful to what the live turn showed
-    (titles, paths and trailing text differ), so the replay check for a Gemini task compares the user prompts of each turn
-    and nothing else.
+  - History is restored with `session/load` only. The CLI answers it at once and streams the history afterwards without
+    waiting, so the replay barrier stays open until no update has arrived for 400 ms (at most 15 s after the answer). The
+    replay is not byte-faithful to what the live turn showed (titles, paths and trailing text differ), so the replay check
+    for a Gemini task compares the user prompts of each turn and nothing else.
   - Usage is what the prompt result reports (`_meta.quota` tokens); it is labelled as approximate and Google AI Studio is the
     billing authority. Guild shows no cost for Gemini.
 - Icon: the new artwork (hand-drawn vector, dark and light) replaces the application icon; the dark variant is the bundle icon
